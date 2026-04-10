@@ -1,7 +1,7 @@
 // ============================================================================
-// FLOCK DETECTOR v8.4-ADV — Tactical Edition (Stable Release)
+// FLOCK DETECTOR v8.5-ADV — Tactical Edition (Stable Release)
 // ============================================================================
-// v8.4 Signature Database Corrections (Medium/Low Priority):
+// v8.5 Signature Database Corrections (Medium/Low Priority):
 //
 //   [FIX 1 — MISSED DETECTIONS] b4:1e:52 (Flock's own IEEE-registered OUI),
 //   90:35:ea, f0:82:c0, b4:e3:f9, and 04:0d:84 (confirmed FS Ext Battery
@@ -181,7 +181,9 @@ void apply_color_palette() {
 #define SCORE_BONUS_RSSI 10   
 #define SCORE_BONUS_STAT 15   
 
-// RAISED TO 75 TO ELIMINATE LITEON/RING CAMERA FALSE POSITIVES
+// 75 requires at least T1 OUI + corroboration (name/UUID/mfg/SSID).
+// A lone T1 OUI hits SCORE_STRONG (60) + RSSI bonus (10) = 70 — below threshold.
+// Liteon/Ring false-positive OUIs were also addressed at the OUI tier level in v8.4.
 #define CONFIDENCE_ALARM_THRESHOLD 75
 #define CONFIDENCE_HIGH            85
 #define CONFIDENCE_CERTAIN         100
@@ -208,10 +210,15 @@ SemaphoreHandle_t dataMutex;
 
 static uint8_t current_channel = 1;
 static unsigned long last_channel_hop = 0;
-static unsigned long channel_lock_until = 0; 
+static volatile unsigned long channel_lock_until = 0; 
 static unsigned long last_ble_scan = 0;
 static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
+// Limits live ble_process_task instances. Each needs 6144B stack; unbounded
+// spawning exhausts heap in dense BLE environments. Drops excess advertisements
+// (device will re-advertise within ~100ms so detections are not lost).
+#define BLE_MAX_CONCURRENT_TASKS 6
+static SemaphoreHandle_t ble_proc_sem = NULL;
 bool sd_available = false;
 bool littlefs_available = false;
 volatile int trigger_alarm_confidence = 0;
@@ -330,6 +337,7 @@ int capture_history_count = 0;
 char toast_text[32]       = "";
 unsigned long toast_start = 0;
 bool toast_active         = false;
+uint16_t toast_accent_color = 0;  // set by trigger_toast; 0 = fallback to TOAST_COLOR
 
 unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
@@ -411,9 +419,7 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5,0,0)
-    neopixelWrite(21, r, g, b); 
-#endif
+    neopixelWrite(21, r, g, b);
 }
 
 // ============================================================================
@@ -646,14 +652,16 @@ static const char* raven_standard_service_uuids[] = {
 };
 static const int NUM_RAVEN_STANDARD_UUIDS = sizeof(raven_standard_service_uuids) / sizeof(raven_standard_service_uuids[0]);
 
-// Combined array preserved for firmware version detection logic in ble_process_task.
-static const char* raven_service_uuids[] = {
-    "0000180a-0000-1000-8000-00805f9b34fb", "00003100-0000-1000-8000-00805f9b34fb", 
-    "00003200-0000-1000-8000-00805f9b34fb", "00003300-0000-1000-8000-00805f9b34fb", 
-    "00003400-0000-1000-8000-00805f9b34fb", "00003500-0000-1000-8000-00805f9b34fb", 
-    "00001809-0000-1000-8000-00805f9b34fb", "00001819-0000-1000-8000-00805f9b34fb"
-};
-static const int NUM_RAVEN_UUIDS = sizeof(raven_service_uuids) / sizeof(raven_service_uuids[0]);
+// Combined array preserved here as documentation only — the firmware version
+// detection block in ble_process_task uses strcasestr directly on the device's
+// advertised UUIDs and does NOT iterate this array.
+// static const char* raven_service_uuids[] = { ... };  // (see above arrays)
+
+// Helper macro — strncat with correct remaining-space bound.
+// The naive strncat(buf, str, 63) pattern is wrong: the third argument is the
+// max bytes to append, but it doesn't know how full buf already is. This macro
+// computes the actual remaining capacity each time.
+#define MCAT(buf, str) strncat((buf), (str), sizeof(buf) - strlen(buf) - 1)
 
 // NOTE: 0x09C8 is not a registered Bluetooth SIG company ID as of the last
 // public assignment list. Verify this value against physical hardware captures
@@ -913,18 +921,13 @@ static int noise_max_life[NUM_PARTICLES] = {0};
 
 void add_blip(uint16_t blip_color, int rssi) {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    last_blip_time = millis(); 
+    last_blip_time = millis();
     int band = random(0, NUM_RADIAL_BANDS);
     float strength_mult = constrain(map(rssi, -100, -30, 50, 200), 50, 200) / 100.0f;
-    
-    radial_spikes[band] = 0.5f + strength_mult; 
+    radial_spikes[band] = 0.5f + strength_mult;
     radial_colors[band] = blip_color;
-    radial_rssi[band] = rssi;
-    
-    int prev = (band - 1 + NUM_RADIAL_BANDS) % NUM_RADIAL_BANDS;
-    int next = (band + 1) % NUM_RADIAL_BANDS;
-    if(radial_spikes[prev] < 0.6f) { radial_spikes[prev] = 0.6f; radial_colors[prev] = blip_color; radial_rssi[prev] = rssi - 10;}
-    if(radial_spikes[next] < 0.6f) { radial_spikes[next] = 0.6f; radial_colors[next] = blip_color; radial_rssi[next] = rssi - 10;}
+    radial_rssi[band]   = rssi;
+    // Single band only — the previous adjacent-band spreading was drawing 3 blips per detection.
     xSemaphoreGive(dataMutex);
 }
 
@@ -985,6 +988,11 @@ void flush_sd_buffer() {
 }
 
 void trigger_toast(const char* type, const char* name, int confidence) {
+    // Accent color: RAVEN=teal, BLE=purple, WiFi/sim=yellow, system=cyan
+    if      (strncmp(type, "RAVEN",     5) == 0) toast_accent_color = TEAL_COLOR;
+    else if (strcmp (type, "FLOCK_BLE") == 0)    toast_accent_color = PURPLE_COLOR;
+    else if (strcmp (type, "TARGET")    == 0)    toast_accent_color = HEADER_COLOR;
+    else                                          toast_accent_color = TOAST_COLOR;
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
     char pct_str[6];
     snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
@@ -1296,13 +1304,13 @@ void process_wifi_event_queue() {
         bool ssid_flock_fmt = (strlen(local.ssid) > 0 && is_flock_ssid_format(local.ssid));
 
         if (ssid_flock_fmt) {
-            confidence = SCORE_DEFINITIVE; strncat(methods, "ssid_fmt ", 63);
+            confidence = SCORE_DEFINITIVE; MCAT(methods, "ssid_fmt ");
         } else if (mac_score == 1) {
-            confidence = SCORE_STRONG; strncat(methods, "mac_t1 ", 63);
-            if (ssid_generic) { confidence = SCORE_DEFINITIVE; strncat(methods, "ssid ", 63); }
+            confidence = SCORE_STRONG; MCAT(methods, "mac_t1 ");
+            if (ssid_generic) { confidence = SCORE_DEFINITIVE; MCAT(methods, "ssid "); }
         } else {
-            if (mac_score == 2) { confidence += SCORE_WEAK; strncat(methods, "mac_t2 ", 63); }
-            if (ssid_generic)   { confidence += SCORE_WEAK; strncat(methods, "ssid ", 63); }
+            if (mac_score == 2) { confidence += SCORE_WEAK; MCAT(methods, "mac_t2 "); }
+            if (ssid_generic)   { confidence += SCORE_WEAK; MCAT(methods, "ssid "); }
         }
         if (confidence > 0 && local.rssi > -50) confidence += SCORE_BONUS_RSSI;
 
@@ -1314,7 +1322,12 @@ void process_wifi_event_queue() {
         const char* frame_type_str = local.is_beacon ? "Beacon" : "ProbeReq";
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+            // channel_lock_until is also written by ble_process_task on Core 1.
+            // Protect the write so a near-simultaneous BLE+WiFi detection doesn't
+            // produce a torn 32-bit value on the scanner task's reader.
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
             channel_lock_until = millis() + 10000;
+            xSemaphoreGive(dataMutex);
             rssi_track_update(mac_str, local.rssi);
             if (rssi_track_is_stationary(mac_str)) confidence += SCORE_BONUS_STAT;
             if (confidence > 100) confidence = 100;
@@ -1327,10 +1340,16 @@ void process_wifi_event_queue() {
                           local.channel, 0, frame_type_str, methods, confidence, local.seq_num);
             write_threat_pcap(local.payload_snap, local.payload_snap_len);
 
+            // last_buzzer_time is also written by ble_process_task on Core 1.
+            // The check-and-set must be atomic to prevent both paths from both
+            // passing the cooldown guard in the same ~millisecond window and
+            // triggering a double alarm.
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
             if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
                 trigger_alarm_confidence = confidence;
                 last_buzzer_time = millis();
             }
+            xSemaphoreGive(dataMutex);
         }
     }
 }
@@ -1356,8 +1375,13 @@ struct BleEventData {
 static void ble_process_task(void* pvParameters) {
     BleEventData* ev = (BleEventData*)pvParameters;
 
-    if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); vTaskDelete(NULL); return; }
+    if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); xSemaphoreGive(ble_proc_sem); vTaskDelete(NULL); return; }
+    // Mutex-protected: multiple ble_process_task instances run concurrently on
+    // Core 1 and all increment this counter. The non-atomic read-modify-write
+    // on a 32-bit value is a real race even on Xtensa.
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     session_ble_packets++;
+    xSemaphoreGive(dataMutex);
 
     int  confidence   = 0;
     char methods[64]  = {0};
@@ -1378,10 +1402,10 @@ static void ble_process_task(void* pvParameters) {
     if (ev->have_name) {
         clean_device_name_char(dev_name_char);
         if (check_device_name_pattern(dev_name_char)) {
-            strncat(methods, "name ", 63); got_name = true;
+            MCAT(methods, "name "); got_name = true;
         } else if (is_penguin_numeric_name(dev_name_char)) {
             // Corroborating evidence only — see scoring block below.
-            strncat(methods, "penguin_num ", 63); got_penguin_name = true;
+            MCAT(methods, "penguin_num "); got_penguin_name = true;
         }
     }
 
@@ -1389,8 +1413,8 @@ static void ble_process_task(void* pvParameters) {
     std::string mfg_std((const char*)ev->mfg_data, ev->mfg_data_len);
     if (ev->have_mfg) {
         if (check_manufacturer_id(mfg_std)) {
-            strncat(methods, "mfg_0x09C8 ", 63); got_mfg = true;
-            if (has_tn_serial(mfg_std)) strncat(methods, "tn_serial ", 63);
+            MCAT(methods, "mfg_0x09C8 "); got_mfg = true;
+            if (has_tn_serial(mfg_std)) MCAT(methods, "tn_serial ");
         }
     }
 
@@ -1419,9 +1443,9 @@ static void ble_process_task(void* pvParameters) {
     // got_raven: any custom UUID is sufficient; standard-only requires 2+.
     if (raven_custom_count > 0 || raven_uuid_count >= 2) {
         strncpy(capture_type, "RAVEN_BLE", sizeof(capture_type)); got_raven = true;
-        if (raven_uuid_count >= 3)        strncat(methods, "raven_multi ", 63);
-        else if (raven_custom_count > 0)  strncat(methods, "raven_custom ", 63);
-        else                              strncat(methods, "raven_uuid ", 63);
+        if (raven_uuid_count >= 3)        MCAT(methods, "raven_multi ");
+        else if (raven_custom_count > 0)  MCAT(methods, "raven_custom ");
+        else                              MCAT(methods, "raven_uuid ");
     }
 
     // ── Confidence scoring ────────────────────────────────────────────────
@@ -1436,15 +1460,15 @@ static void ble_process_task(void* pvParameters) {
     if (got_raven || got_name || got_mfg) {
         // Any definitive-path signal is sufficient to alarm.
         confidence = SCORE_DEFINITIVE;
-        if (mac_score == 1) strncat(methods, "mac_t1 ", 63);  // note co-occurrence
+        if (mac_score == 1) MCAT(methods, "mac_t1 ");  // note co-occurrence
     } else if (mac_score == 1) {
         confidence = SCORE_STRONG;
-        strncat(methods, "mac_t1 ", 63);
+        MCAT(methods, "mac_t1 ");
         // Penguin numeric name corroborates a Tier-1 OUI → escalate to definitive.
         if (got_penguin_name) { confidence = SCORE_DEFINITIVE; }
     } else {
         // Accumulate weak signals.
-        if (mac_score == 2) { confidence += SCORE_WEAK; strncat(methods, "mac_t2 ", 63); }
+        if (mac_score == 2) { confidence += SCORE_WEAK; MCAT(methods, "mac_t2 "); }
         if (got_penguin_name) { confidence += SCORE_WEAK; }  // already in methods from detection
         // [v8.4 FIX 5] static_addr bonus now requires corroboration — it only fires
         // when mac_score==2 or got_penguin_name is also true. A device with a static
@@ -1453,7 +1477,7 @@ static void ble_process_task(void* pvParameters) {
         // random-static addresses are the default for most BLE peripherals.
         if ((mac_score == 2 || got_penguin_name) &&
             (ev->addr_type == 0 || (ev->addr_type == 1 && (ev->mac[0] >> 6) == 0x03))) {
-            confidence += SCORE_WEAK; strncat(methods, "static_addr ", 63);
+            confidence += SCORE_WEAK; MCAT(methods, "static_addr ");
         }
     }
     if (confidence > 0 && ev->rssi > -50) confidence += SCORE_BONUS_RSSI;
@@ -1464,7 +1488,10 @@ static void ble_process_task(void* pvParameters) {
         ev->mac[3], ev->mac[4], ev->mac[5]);
 
     if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+        // See process_wifi_event_queue for race rationale on channel_lock_until.
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
         channel_lock_until = millis() + 10000;
+        xSemaphoreGive(dataMutex);
         rssi_track_update(mac_string, ev->rssi);
         if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
         locator_add_sample(mac_string, ev->rssi);
@@ -1504,13 +1531,17 @@ static void ble_process_task(void* pvParameters) {
                       0, ev->have_tx_power ? ev->tx_power : 0,
                       extra_data, methods, confidence, -1);
 
+        // See process_wifi_event_queue for race rationale on last_buzzer_time.
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
             trigger_alarm_confidence = confidence;
             last_buzzer_time = millis();
         }
+        xSemaphoreGive(dataMutex);
     }
 
     free(ev);
+    xSemaphoreGive(ble_proc_sem);
     vTaskDelete(NULL);
 }
 
@@ -1558,9 +1589,13 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
             }
         }
 
+        // Try to claim a task slot. If all BLE_MAX_CONCURRENT_TASKS slots are
+        // occupied, drop this advertisement — the device will re-advertise.
+        if (xSemaphoreTake(ble_proc_sem, 0) != pdTRUE) { free(ev); return; }
         BaseType_t created = xTaskCreatePinnedToCore(
             ble_process_task, "BLEProc", 6144, ev, 1, NULL, 1);
         if (created != pdPASS) {
+            xSemaphoreGive(ble_proc_sem);
             free(ev);
         }
     }
@@ -1677,20 +1712,21 @@ void draw_toast_spr() {
     if (!toast_active) return;
     unsigned long elapsed = millis() - toast_start;
     if (elapsed > TOAST_DURATION_MS) { toast_active = false; return; }
-    
+
     int y_pos = DISP_H - 34;
     if (elapsed < 150) y_pos = DISP_H - 10 - (int)((elapsed / 150.0f) * 24);
     else if (elapsed > TOAST_DURATION_MS - 150) y_pos = DISP_H - 34 + (int)(((elapsed - (TOAST_DURATION_MS - 150)) / 150.0f) * 24);
 
+    uint16_t accent = toast_accent_color ? toast_accent_color : TOAST_COLOR;
     int t_w = 210; int t_x = (DISP_W - t_w) / 2;
-    
+
     spr.fillRect(t_x, y_pos, t_w, 26, CARD_COLOR);
     spr.drawRect(t_x, y_pos, t_w, 26, CARD_BORDER);
-    spr.fillRect(t_x, y_pos, 4, 26, TOAST_COLOR); 
-    
-    spr.setTextColor(TOAST_COLOR, CARD_COLOR); spr.setTextSize(1); 
-    spr.setCursor(t_x + 10, y_pos + 9); spr.print("[!]"); 
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); 
+    spr.fillRect(t_x, y_pos, 4, 26, accent);
+
+    spr.setTextColor(accent, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(t_x + 10, y_pos + 9); spr.print("[!]");
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR);
     spr.setCursor(t_x + 32, y_pos + 9); spr.print(toast_text);
 }
 
@@ -1699,34 +1735,35 @@ void draw_vol_overlay() {
     unsigned long elapsed = millis() - vol_overlay_start;
     if (elapsed > 1500) { show_vol_overlay = false; return; }
 
+    // Slide down from top — mirrors toast sliding up from bottom
     const int TARGET_Y = 20;
-    const int v_w = 140;
-    const int v_x = (DISP_W - v_w) / 2;
-    const int v_h = 26;
+    const int t_w = 210;
+    const int t_x = (DISP_W - t_w) / 2;
+    const int t_h = 26;
 
     int v_y;
-    if (elapsed < 120) {
-        v_y = -v_h + (int)((float)elapsed / 120.0f * (TARGET_Y + v_h));
-    } else if (elapsed > 1380) {
-        v_y = TARGET_Y - (int)(((float)(elapsed - 1380) / 120.0f) * (TARGET_Y + v_h));
-    } else {
-        v_y = TARGET_Y;
-    }
+    if (elapsed < 150)        v_y = -(t_h) + (int)((float)elapsed / 150.0f * (TARGET_Y + t_h));
+    else if (elapsed > 1350)  v_y = TARGET_Y - (int)(((float)(elapsed - 1350) / 150.0f) * (TARGET_Y + t_h));
+    else                      v_y = TARGET_Y;
 
-    spr.fillRect(v_x + 2, v_y + 2, v_w, v_h, lgfx::color565(2, 4, 10));
-    spr.fillRect(v_x, v_y, v_w, v_h, CARD_COLOR);
-    spr.drawRect(v_x, v_y, v_w, v_h, CARD_BORDER);
-    spr.fillRect(v_x, v_y, 4, v_h, HEADER_COLOR);
+    // Same card style as toast
+    spr.fillRect(t_x, v_y, t_w, t_h, CARD_COLOR);
+    spr.drawRect(t_x, v_y, t_w, t_h, CARD_BORDER);
+    spr.fillRect(t_x, v_y, 4, t_h, HEADER_COLOR);
 
+    // "VOL" label in same position as "[!]"
     spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(v_x + 10, v_y + 11); spr.print("VOL");
+    spr.setCursor(t_x + 10, v_y + 9); spr.print("VOL");
 
+    // Percentage
     int vol_pct = map(current_volume, 0, 255, 0, 100);
-    char vol_str[8]; snprintf(vol_str, sizeof(vol_str), "%d%%", vol_pct);
+    char vol_str[6]; snprintf(vol_str, sizeof(vol_str), "%d%%", vol_pct);
     spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-    spr.setCursor(v_x + 34, v_y + 11); spr.print(vol_str);
+    spr.setCursor(t_x + 38, v_y + 9); spr.print(vol_str);
 
-    int bar_x = v_x + 62; int bar_y = v_y + 9; int bar_w = v_w - 70; int bar_h = 10;
+    // Volume bar (fills the remaining right portion)
+    int bar_x = t_x + 70; int bar_y = v_y + 8;
+    int bar_w = t_w - 78;  int bar_h = 10;
     spr.drawRect(bar_x, bar_y, bar_w, bar_h, GRID_COLOR);
     int fill = (current_volume * (bar_w - 2)) / 255;
     if (fill > 0) {
@@ -2415,159 +2452,196 @@ void draw_gps_screen() {
     xSemaphoreGive(dataMutex);
 
     drawCard(4, 22, 114, 108);
-    int gx0 = 61, gy0 = 73;
-    int gx = gx0 + (int)imu_px;
-    int gy = gy0 + (int)imu_py;
-    int gr = 26;
-
-    const float TILT_GPS = 0.65f;
+    // Globe/pin center reference point
+    int gx0 = 56, gy0 = 68;
+    int gx  = gx0 + (int)imu_px;
+    int gy  = gy0 + (int)imu_py;
+    int gr  = 28;
+    const float GPS_TILT = 0.62f;
 
     if (!has_loc || stale) {
-        const int LEAN = 8;
-        int pin_cx  = gx0 - 4 + (int)imu_px;
-        int pin_top = gy0 - 28 + (int)imu_py;
-        int pin_hr  = 11;
-        int pin_hvr = (int)(pin_hr * TILT_GPS);
-        int pin_tip_x = gx0 - 4 + LEAN + (int)(imu_px / 2);
-        int pin_tip_y = gy0 + 16 + (int)(imu_py / 2);
+        // ── SEARCHING STATE ─────────────────────────────────────────────────
+        // 3-D GPS location-pin marker with pulsing signal rings.
+        // The pin head is an oblique circle (matching radar tilt perspective).
+        // Colors follow the radar palette: HEADER_COLOR rim, dark fills.
 
-        spr.fillEllipse(pin_tip_x + 3, pin_tip_y + 4, 6, 2, lgfx::color565(4, 8, 16));
+        int px = gx0 + (int)imu_px;      // pin head centre x
+        int py = gy0 - 22 + (int)imu_py; // pin head centre y
+        int pr = 15;                      // pin head radius
 
-        for (int y = pin_top + pin_hvr - 2; y <= pin_tip_y; y++) {
-            float t = (float)(y - (pin_top + pin_hvr - 2))
-                    / (float)(pin_tip_y - (pin_top + pin_hvr - 2) + 1);
-            int half_w = max(0, (int)(pin_hr * (1.0f - t * t)));
-            int cx_here = pin_cx + (int)(LEAN * t);
-            uint8_t bv = 20 + (uint8_t)((1.0f - t) * 40);
-            uint8_t blended_b = bv * 3 / 2;
-            uint16_t seg = night_mode
-                ? lgfx::color565(bv, bv / 6, bv / 6)
-                : lgfx::color565(bv / 4, bv / 2, blended_b);
-            spr.drawLine(cx_here - half_w, y, cx_here + half_w, y, seg);
+        // ── Shadow under pin tip ─────────────────────────────────────────
+        int tip_y = py + pr + 28;
+        spr.fillEllipse(px + 3, tip_y + 4, 7, 3, lgfx::color565(3, 6, 14));
+
+        // ── Pin body (teardrop, tapering to tip) ─────────────────────────
+        int body_top = py + (int)(pr * GPS_TILT);
+        for (int row = body_top; row <= tip_y; row++) {
+            float t = (float)(row - body_top) / (float)(tip_y - body_top + 1);
+            float curve = (1.0f - t) * (1.0f - t * 0.4f);
+            int hw = max(1, (int)(pr * curve));
+            uint8_t bv = 10 + (uint8_t)((1.0f - t) * 45.0f);
+            spr.drawLine(px - hw, row, px + hw, row,
+                         lgfx::color565(bv / 6, bv, (uint8_t)min(255, bv * 2)));
         }
 
-        spr.fillEllipse(pin_cx, pin_top + 2, pin_hr, pin_hvr, lgfx::color565(4, 12, 28));
-        int HEAD_THICK = 5;
-        for (int i = HEAD_THICK - 1; i > 0; i--) {
-            uint8_t wv = 10 + i * 5;
-            spr.drawEllipse(pin_cx, pin_top + i, pin_hr, pin_hvr,
-                            night_mode
-                            ? lgfx::color565(wv * 2, wv / 4, wv / 4)
-                            : lgfx::color565(wv / 4, wv, wv * 2));
+        // ── Pin head depth layers (3-D effect) ───────────────────────────
+        spr.fillEllipse(px, py + 3, pr, (int)(pr * GPS_TILT), lgfx::color565(2, 8, 25));
+        for (int i = 3; i > 0; i--) {
+            uint8_t wv = 6 + i * 6;
+            spr.drawEllipse(px, py + i, pr, (int)(pr * GPS_TILT),
+                            lgfx::color565(wv / 6, wv, (uint8_t)min(255, wv * 2)));
         }
-        spr.fillEllipse(pin_cx, pin_top, pin_hr, pin_hvr,
-                        night_mode ? lgfx::color565(28, 5, 5) : lgfx::color565(10, 28, 65));
+        // Face fill
+        spr.fillEllipse(px, py, pr, (int)(pr * GPS_TILT), lgfx::color565(6, 22, 58));
+        // Concentric inner rings
+        spr.drawEllipse(px, py, pr - 5, (int)((pr - 5) * GPS_TILT), lgfx::color565(0, 80, 160));
+        spr.drawEllipse(px, py, pr - 9, (int)((pr - 9) * GPS_TILT), lgfx::color565(0, 130, 200));
+        // Centre dot
+        spr.fillEllipse(px, py, 3, (int)(3 * GPS_TILT), HEADER_COLOR);
+        // Outer rim
+        uint16_t rim_col = stale ? WARN_COLOR : HEADER_COLOR;
+        spr.drawEllipse(px, py, pr, (int)(pr * GPS_TILT), rim_col);
+        // Specular highlight (top-left)
+        spr.fillEllipse(px - pr / 3, py - (int)(pr * GPS_TILT * 0.45f),
+                        pr / 5, (int)(pr / 5 * GPS_TILT * 0.7f),
+                        lgfx::color565(100, 200, 255));
 
-        spr.fillEllipse(pin_cx - 4, pin_top - 2, pin_hr / 3, pin_hvr / 2,
-                        night_mode ? lgfx::color565(140, 30, 30) : lgfx::color565(80, 150, 240));
-        spr.fillEllipse(pin_cx - 5, pin_top - 3, pin_hr / 5, pin_hvr / 3,
-                        night_mode ? lgfx::color565(200, 60, 60) : lgfx::color565(160, 210, 255));
-
-        spr.drawEllipse(pin_cx, pin_top, pin_hr, pin_hvr,
-                        stale ? WARN_COLOR : HEADER_COLOR);
-        spr.drawEllipse(pin_cx, pin_top, pin_hr / 2, pin_hvr / 2,
-                        stale ? WARN_COLOR : DIM_COLOR);
-        spr.fillCircle(pin_cx, pin_top, 2, stale ? WARN_COLOR : ACCENT_COLOR);
-
-        float phase_pin = millis() / 80.0f;
-        for (int i = 0; i < 4; i++) {
-            float raw = fmodf(phase_pin + i * 20.0f, 60.0f);
-            if (raw < 4.0f) continue;
-
-            float frac = (raw - 4.0f) / 56.0f;
-            int   ring_r = pin_hr + 2 + (int)(frac * 36.0f);
-
+        // ── Pulsing signal rings ──────────────────────────────────────────
+        float phase_sig = millis() / 650.0f;
+        for (int i = 0; i < 3; i++) {
+            float raw  = fmodf(phase_sig + i * 1.05f, 3.15f);
+            float frac = raw / 3.15f;
+            int ring_r = pr + 2 + (int)(frac * 28.0f);
             float opacity = sinf(frac * (float)M_PI);
-            int   bright  = (int)(opacity * 180.0f);
-            if (bright < 10) continue;
-
-            uint16_t ring_col = night_mode
-                ? lgfx::color565(bright, bright / 6, bright / 6)
+            int bright = (int)(opacity * 160.0f);
+            if (bright < 8) continue;
+            uint16_t ring_col = stale
+                ? lgfx::color565(bright, bright / 3, 0)
                 : lgfx::color565(0, bright / 2, bright);
-
-            spr.drawArc(pin_cx, pin_top, ring_r, ring_r - 1, 210, 330, ring_col);
+            spr.drawEllipse(px, py, ring_r, (int)(ring_r * GPS_TILT), ring_col);
+            // Faint radial spokes for connection feel
+            if (frac > 0.3f && frac < 0.7f && bright > 60) {
+                for (int s = 0; s < 4; s++) {
+                    float sa = radians(s * 90.0f + frac * 45.0f);
+                    int sx = px + (int)(ring_r * cosf(sa));
+                    int sy = py + (int)(ring_r * sinf(sa) * GPS_TILT);
+                    int sx2 = px + (int)((ring_r + 4) * cosf(sa));
+                    int sy2 = py + (int)((ring_r + 4) * sinf(sa) * GPS_TILT);
+                    spr.drawLine(sx, sy, sx2, sy2, lgfx::color565(0, bright / 4, bright / 2));
+                }
+            }
         }
 
+        // Status text
         spr.setTextColor(stale ? WARN_COLOR : TEAL_COLOR, CARD_COLOR);
         spr.setTextSize(1);
-        spr.setCursor(14, gy0 + 36);
+        spr.setCursor(8, gy0 + 30);
         spr.print(stale ? "SIGNAL LOST" : "SEARCHING...");
-
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
-        spr.setCursor(14, gy0 + 48); spr.print("SATS: ");
+        spr.setCursor(8, gy0 + 42); spr.print("SATS: ");
         spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, CARD_COLOR); spr.print(sats);
 
     } else {
-        float phase = (millis() / 8000.0f) * (float)M_PI;
-
-        spr.fillCircle(gx, gy, gr, lgfx::color565(4, 10, 30));
-        spr.fillCircle(gx + gr/4, gy - gr/4, gr/2, lgfx::color565(14, 30, 70));
-        spr.fillCircle(gx + gr/3, gy - gr/3, gr/4, lgfx::color565(22, 45, 100));
-        spr.drawCircle(gx, gy, gr, HEADER_COLOR);
-
-        const float AXIS_TILT_RAD = radians(23.0f);
-        int ax1x = gx - (int)((gr - 2) * sinf(AXIS_TILT_RAD));
-        int ax1y = gy - (int)((gr - 2) * cosf(AXIS_TILT_RAD));
-        int ax2x = gx + (int)((gr - 2) * sinf(AXIS_TILT_RAD));
-        int ax2y = gy + (int)((gr - 2) * cosf(AXIS_TILT_RAD));
-        spr.drawLine(ax1x, ax1y, ax2x, ax2y, DIM2_COLOR);
-        spr.fillCircle(ax1x, ax1y, 2, DIM_COLOR);
-        spr.fillCircle(ax2x, ax2y, 2, DIM_COLOR);
-
-        const float GLOBE_TILT = 0.35f;
-        spr.drawEllipse(gx, gy, gr, (int)(gr * GLOBE_TILT), DIM_COLOR);
-
-        for (int m = 0; m < 2; m++) {
-            float mp = phase + m * (float)M_PI / 2.0f;
-            int mw = max(1, (int)fabsf(gr * cosf(mp)));
-            float ff = (cosf(mp) + 1.0f) / 2.0f;
-            uint8_t mv = 18 + (uint8_t)(ff * 50.0f);
-            uint16_t mc = night_mode
-                ? lgfx::color565(mv, mv / 8, mv / 8)
-                : lgfx::color565(mv / 8, mv / 3, mv);
-            spr.drawEllipse(gx, gy, mw, gr, mc);
-        }
+        // ── LOCKED STATE — GLOBE + ORBITING SATELLITE ───────────────────
+        // The satellite is drawn in two passes (below/above globe) for correct
+        // z-ordering: back-hemisphere before globe, front-hemisphere after.
 
         float sat_phase = (millis() / 2200.0f) * (float)M_PI;
-        const float SAT_R   = (float)(gr + 9);
-        const float SAT_INC = 0.50f;
+        const float SAT_R   = (float)(gr + 10);
+        const float SAT_INC = 0.48f;
+        int sat_x = gx + (int)(SAT_R * cosf(sat_phase));
+        int sat_y = gy - (int)(SAT_R * sinf(sat_phase) * SAT_INC);
+        bool sat_front = sinf(sat_phase) > 0.0f;
 
+        // ── Back-hemisphere satellite (draw BEFORE globe) ─────────────────
+        if (!sat_front) {
+            // Only visible if it's outside the globe's projected disk
+            float dx = sat_x - gx, dy = (sat_y - gy) / GPS_TILT;
+            if (sqrtf(dx * dx + dy * dy) > gr + 1) {
+                spr.fillCircle(sat_x, sat_y, 2, lgfx::color565(10, 18, 36));
+            }
+        }
+
+        // ── Globe ─────────────────────────────────────────────────────────
+        // Deep-space ocean fill
+        spr.fillCircle(gx, gy, gr, lgfx::color565(5, 18, 56));
+
+        // Latitude grid lines (3 rings)
+        const float GLOB_T = 0.34f;
+        for (int lat = -2; lat <= 2; lat++) {
+            if (lat == 0) continue;
+            float lf = lat / 3.0f;
+            float lr = sqrtf(1.0f - lf * lf) * gr;
+            int   ly = gy + (int)(lf * gr);
+            if (lr >= 3) spr.drawEllipse(gx, ly, (int)lr, (int)(lr * GLOB_T),
+                                         lgfx::color565(12, 35, 90));
+        }
+        spr.drawEllipse(gx, gy, gr, (int)(gr * GLOB_T), lgfx::color565(15, 45, 105));
+
+        // Animated longitude meridian
+        float mer_phase = (millis() / 9000.0f) * (float)M_PI;
+        for (int m = 0; m < 2; m++) {
+            float mp = mer_phase + m * (float)M_PI / 2.0f;
+            int   mw = max(2, (int)fabsf(gr * cosf(mp)));
+            float ff = (cosf(mp) + 1.0f) / 2.0f;
+            uint8_t mv = 10 + (uint8_t)(ff * 38.0f);
+            spr.drawEllipse(gx, gy, mw, gr, lgfx::color565(mv / 6, mv / 2, mv));
+        }
+
+        // Land masses (two simple continent blobs)
+        spr.fillEllipse(gx - gr / 3, gy - gr / 5, gr / 6, gr / 3,
+                        lgfx::color565(12, 65, 30));  // Americas
+        spr.fillEllipse(gx + gr / 5, gy + gr / 10, gr / 5, gr / 2,
+                        lgfx::color565(10, 58, 26));  // Eurasia/Africa
+
+        // Atmosphere rim
+        spr.drawCircle(gx, gy, gr,     lgfx::color565(35, 75, 160));
+        spr.drawCircle(gx, gy, gr + 1, lgfx::color565(18, 40, 100));
+
+        // Specular highlight
+        spr.fillEllipse(gx - gr / 3, gy - gr / 3, gr / 5, (int)(gr / 5 * 0.75f),
+                        lgfx::color565(75, 135, 215));
+
+        // Axis dot indicators
+        const float ATR = radians(23.0f);
+        spr.fillCircle(gx - (int)((gr - 3) * sinf(ATR)), gy - (int)((gr - 3) * cosf(ATR)),
+                       2, lgfx::color565(25, 50, 100));
+        spr.fillCircle(gx + (int)((gr - 3) * sinf(ATR)), gy + (int)((gr - 3) * cosf(ATR)),
+                       2, lgfx::color565(25, 50, 100));
+
+        // Orbit ring
         spr.drawEllipse(gx0, gy0, (int)SAT_R, (int)(SAT_R * SAT_INC),
-                        lgfx::color565(12, 22, 42));
-
-        for (int tr = 1; tr <= 6; tr++) {
-            float ta = sat_phase - tr * 0.18f;
+                        lgfx::color565(14, 28, 58));
+        // Orbit trail (front-hemisphere only)
+        for (int tr = 1; tr <= 8; tr++) {
+            float ta = sat_phase - tr * 0.14f;
+            if (sinf(ta) <= 0.0f) continue;
             int tx = gx0 + (int)(SAT_R * cosf(ta));
             int ty = gy0 - (int)(SAT_R * sinf(ta) * SAT_INC);
-            bool t_front = sinf(ta) > 0;
-            if (!t_front) continue;
-            uint8_t tv = (uint8_t)((7 - tr) * 20);
+            uint8_t tv = (uint8_t)((9 - tr) * 10);
             spr.drawPixel(tx, ty, lgfx::color565(tv, tv * 2, tv));
         }
 
-        int sat_x = gx0 + (int)(SAT_R * cosf(sat_phase));
-        int sat_y = gy0 - (int)(SAT_R * sinf(sat_phase) * SAT_INC);
-        bool sat_front = sinf(sat_phase) > 0;
+        // ── Front-hemisphere satellite (draw AFTER globe) ─────────────────
         if (sat_front) {
             spr.fillCircle(sat_x, sat_y, 3, ACCENT_COLOR);
             spr.drawCircle(sat_x, sat_y, 4, lgfx::color565(50, 180, 80));
-        } else {
-            spr.fillCircle(sat_x, sat_y, 2, DIM_COLOR);
+            // Solar panel wings
+            spr.drawLine(sat_x - 5, sat_y, sat_x - 8, sat_y, lgfx::color565(180, 180, 80));
+            spr.drawLine(sat_x + 5, sat_y, sat_x + 8, sat_y, lgfx::color565(180, 180, 80));
         }
 
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
         spr.setTextSize(1);
-        spr.setCursor(20, gy0 + 36);
+        spr.setCursor(12, gy0 + 36);
         spr.print("GPS LOCKED");
     }
 
-    spr.setTextColor(DIM_COLOR, CARD_COLOR);
-    spr.setTextSize(1);
+    // Page dots
     spr.fillCircle(112, 124, 3, gps_page == 0 ? HEADER_COLOR : DIM2_COLOR);
     spr.fillCircle(104, 124, 3, gps_page == 1 ? HEADER_COLOR : DIM2_COLOR);
-    spr.setCursor(8, 124);
-    spr.setTextColor(DIM_COLOR, CARD_COLOR);
-    spr.print("g=pg");
+    spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(8, 124); spr.print("g=pg");
 
     if (gps_page == 0) {
         drawCard(122, 22, 114, 19);
@@ -2738,6 +2812,12 @@ void setup() {
     int16_t init_v = M5Cardputer.Power.getBatteryVoltage();
     for(int i = 0; i < BATTERY_SAMPLE_SIZE; i++) battery_buffer[i] = init_v;
     WiFi.mode(WIFI_STA); delay(50);
+
+    // Initialize sprite BEFORE the charging-loop check so dedicated_charging_loop()
+    // can render to the display. Previously spr.createSprite() came after the check,
+    // meaning the charging screen drew into an unallocated buffer (blank display).
+    spr.setColorDepth(16);
+    spr.createSprite(DISP_W, DISP_H);
     
     int32_t start_v = get_median_voltage(); unsigned long trap_start = millis();
     while (millis() - trap_start < 800) { M5Cardputer.update(); update_battery_metrics(); delay(15); }
@@ -2745,7 +2825,7 @@ void setup() {
     if (end_v > 3900 || (end_v - start_v >= 15)) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
-    setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex();
+    setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex(); ble_proc_sem = xSemaphoreCreateCounting(BLE_MAX_CONCURRENT_TASKS, BLE_MAX_CONCURRENT_TASKS);
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
@@ -2783,10 +2863,13 @@ void setup() {
 
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     pBLEScan = NimBLEDevice::getScan(); pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
-    pBLEScan->setActiveScan(true); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
+    // Passive scan: do NOT send SCAN_REQ packets. Active scanning would broadcast
+    // our presence to every BLE device in range, including the Flock hardware we
+    // are trying to detect passively. All advertisement data we need (name, UUIDs,
+    // manufacturer data) is present in the primary ADV_IND/ADV_NONCONN_IND packets.
+    pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
 
-    spr.setColorDepth(16);
-    spr.createSprite(DISP_W, DISP_H);
+    // spr sprite was already initialized before dedicated_charging_loop() above.
 
     WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
@@ -2799,11 +2882,11 @@ void setup() {
     if (!is_muted) {
         int boot_vol = current_volume > 120 ? current_volume : 120;
         M5Cardputer.Speaker.setVolume(boot_vol);
-        M5Cardputer.Speaker.tone(1320, 80);  delay(100);
-        M5Cardputer.Speaker.tone(880,  80);  delay(100);
-        M5Cardputer.Speaker.tone(660,  80);  delay(100);
-        M5Cardputer.Speaker.tone(220,  200); delay(260);
-        delay(50);
+        delay(120);  // Let DAC/amp settle before first tone — prevents the pop-only issue
+        M5Cardputer.Speaker.tone(1320, 120); delay(160);
+        M5Cardputer.Speaker.tone(880,  120); delay(160);
+        M5Cardputer.Speaker.tone(660,  120); delay(160);
+        M5Cardputer.Speaker.tone(220,  280); delay(320);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
