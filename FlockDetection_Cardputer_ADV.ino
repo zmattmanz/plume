@@ -890,7 +890,7 @@ void rssi_track_expire() {
 // ============================================================================
 #define radar_cx 66
 #define radar_cy 71
-#define radar_r  52
+#define radar_r  50
 #define inner_r  20
 
 #define NUM_RADIAL_BANDS 36
