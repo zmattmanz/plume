@@ -386,15 +386,24 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
+    // Bruce-style breathing: incremental angle avoids float-precision wrap
+    // glitches that cause the flicker seen with millis() % period.
+    // exp(sin(angle)) gives a slow dim phase / quick bright peak — the natural
+    // inhale-exhale feel that Bruce's ledEffectTask uses.
+    // EMIN = e^-1 ≈ 0.368, ERANGE = e - e^-1 ≈ 2.350 → normalises to 0..1.
+    // Step 0.07 rad @ 20 ms ≈ 3.5 s period; cap output at 200/255 to avoid
+    // eye-blinding intensity on a pocket device.
+    constexpr float STEP   = 0.07f;
+    constexpr float EMIN   = 0.36787944f;
+    constexpr float ERANGE = 2.71828183f - EMIN;
+    float angle = 0.0f;
     for (;;) {
-        // Modular time keeps the sinf argument in [0, 2π], preventing float
-        // precision drift that causes jitter at long uptimes.
-        // Period = 2000 ms, speed = 1.0 — matches Bruce's default (ledEffectSpeed 5).
-        float t = (float)(millis() % 2000) / 1000.0f; // 0.0 .. 2.0, wraps every 2 s
-        float phase = sinf(t * (float)M_PI);           // Bruce: sinf(time * speed * PI)
-        uint8_t value = (uint8_t)((phase + 1.0f) * 127.5f); // Bruce: (phase+1)*127.5 → 0..255
-        set_cardputer_led(0, value, 0);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        float breathe = (expf(sinf(angle)) - EMIN) / ERANGE; // 0.0 .. 1.0
+        uint8_t val   = (uint8_t)(breathe * 200.0f);
+        set_cardputer_led(0, val, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        angle += STEP;
+        if (angle >= 2.0f * (float)M_PI) angle -= 2.0f * (float)M_PI;
     }
 }
 
@@ -498,16 +507,32 @@ void dedicated_charging_loop() {
         unsigned long elapsed = millis() - boot_time;
 
         spr.fillSprite(BG_COLOR);
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); 
-        
+
+        // ── "CHARGING" label — top-center ─────────────────────────────────
+        spr.setTextDatum(TC_DATUM);
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setTextSize(2);
-        spr.setCursor(72, 40);
-        spr.print("CHARGING");
-        
+        spr.drawString("CHARGING", DISP_W / 2, 10);
+
+        // ── Battery percentage — large, centred below label ────────────────
+        char pct_str[8];
+        snprintf(pct_str, sizeof(pct_str), "%d%%", display_pct);
+        spr.setTextSize(3);
+        spr.drawString(pct_str, DISP_W / 2, 34);
+
+        // ── Animated progress bar — horizontally centred ───────────────────
+        const int bar_x = 40, bar_y = 72, bar_w = 160, bar_h = 10;
+        spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
+        int fill_w = (millis() / 15) % (bar_w - 2);
+        if (fill_w > 0) spr.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, ACCENT_COLOR);
+
+        // ── Boot instruction ───────────────────────────────────────────────
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(1);
-        spr.setCursor(DISP_W - 40, DISP_H - 10); spr.printf("%dmV", current_mv);
+        spr.drawString("PRESS ANY KEY TO BOOT DEVICE", DISP_W / 2, 93);
 
+        // ── Bottom info row: auto-boot timer (left) · voltage (right) ──────
+        spr.setTextDatum(TL_DATUM);
         unsigned long remaining_ms = (elapsed < CHARGE_AUTO_BOOT_MS)
                                      ? (CHARGE_AUTO_BOOT_MS - elapsed) : 0;
         if (remaining_ms < 60000UL) {
@@ -515,15 +540,10 @@ void dedicated_charging_loop() {
             spr.setCursor(4, DISP_H - 10);
             spr.printf("AUTO-BOOT IN %lus", remaining_ms / 1000UL);
         }
-        
-        int bar_x = 40, bar_y = 95, bar_w = 160, bar_h = 10;
-        spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR); 
-        int fill_w = (millis() / 15) % (bar_w - 2); 
-        if (fill_w > 0) spr.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, ACCENT_COLOR);
-        
-        spr.setTextColor(DIM_COLOR, BG_COLOR); 
-        spr.setTextSize(1); 
-        spr.setCursor(35, 115); spr.print("PRESS ANY KEY TO BOOT DEVICE"); 
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(DISP_W - 40, DISP_H - 10);
+        spr.printf("%dmV", current_mv);
+
         spr.pushSprite(0, 0);
 
         if (current_mv < 3200 && elapsed > 3000) {
