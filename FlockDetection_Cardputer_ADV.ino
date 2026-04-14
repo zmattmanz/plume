@@ -2198,13 +2198,18 @@ void draw_locator_screen() {
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    // ── Grid background — fills entire left panel as background element ──
+    // ── Diagonal-scrolling infinite grid ──
     const int GRID_RIGHT = 113;
     const int GRID_STEP  = 10;
-    for (int gx = 0; gx <= GRID_RIGHT; gx += GRID_STEP)
+    // Phase: 8 px/s diagonal scroll (down-right), integer pixel
+    int grid_o = (int)fmodf((float)millis() / 125.0f, (float)GRID_STEP);
+
+    // Vertical lines — scroll rightward
+    for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
         spr.drawLine(gx, 19, gx, DISP_H - 1, CARD_BORDER);
-    for (int gy = 19; gy < DISP_H; gy += GRID_STEP)
-        spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
+    // Horizontal lines — scroll downward (same phase = diagonal)
+    for (int gy = 19 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
+        if (gy >= 19) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
 
     const int cx = 56, cy = 65;  // arrow center — slightly above middle of left panel
     unsigned long now_ms = millis();
@@ -2250,20 +2255,41 @@ void draw_locator_screen() {
     }
     float ang = ease_arrow;
 
-    // ── Arrow: solid GPS_COLOR triangle ──
+    // ── Sharp navigation-pointer arrow ──
+    // rotpt: rotate local (lx,ly) by angle a, output to screen (ox,oy)
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
-        *ox = cx + (int)(lx * ca - ly * sa);
-        *oy = cy + (int)(lx * sa + ly * ca);
+        *ox = cx + (int)roundf(lx * ca - ly * sa);
+        *oy = cy + (int)roundf(lx * sa + ly * ca);
     };
-    int tri_ox[3], tri_oy[3];
-    rotpt(  0, -14, ang, &tri_ox[0], &tri_oy[0]);
-    rotpt(  8,  10, ang, &tri_ox[1], &tri_oy[1]);
-    rotpt( -8,  10, ang, &tri_ox[2], &tri_oy[2]);
-    spr.fillTriangle(tri_ox[0], tri_oy[0], tri_ox[1], tri_oy[1], tri_ox[2], tri_oy[2], GPS_COLOR);
-    spr.drawLine(tri_ox[0], tri_oy[0], tri_ox[1], tri_oy[1], GPS_COLOR);
-    spr.drawLine(tri_ox[1], tri_oy[1], tri_ox[2], tri_oy[2], GPS_COLOR);
-    spr.drawLine(tri_ox[2], tri_oy[2], tri_ox[0], tri_oy[0], GPS_COLOR);
+
+    // Layer 1: dark BG halo — slightly expanded triangle (clean crisp edge)
+    int hx[3], hy[3];
+    rotpt(  0, -19, ang, &hx[0], &hy[0]);
+    rotpt( 10,  12, ang, &hx[1], &hy[1]);
+    rotpt(-10,  12, ang, &hx[2], &hy[2]);
+    spr.fillTriangle(hx[0], hy[0], hx[1], hy[1], hx[2], hy[2], BG_COLOR);
+
+    // Layer 2: main GPS_COLOR fill
+    int fx[3], fy[3];
+    rotpt(  0, -17, ang, &fx[0], &fy[0]);
+    rotpt(  8,  10, ang, &fx[1], &fy[1]);
+    rotpt( -8,  10, ang, &fx[2], &fy[2]);
+    spr.fillTriangle(fx[0], fy[0], fx[1], fy[1], fx[2], fy[2], GPS_COLOR);
+
+    // Layer 3: concave notch at base (BG_COLOR cutout) → navigation-pointer shape
+    int nx[3], ny[3];
+    rotpt(  0,   1, ang, &nx[0], &ny[0]);
+    rotpt(  6,  10, ang, &nx[1], &ny[1]);
+    rotpt( -6,  10, ang, &nx[2], &ny[2]);
+    spr.fillTriangle(nx[0], ny[0], nx[1], ny[1], nx[2], ny[2], BG_COLOR);
+
+    // Layer 4: bright left-leading edge line (adds crispness + 3D feel)
+    uint16_t edge_hi = lgfx::color565(160, 230, 255);
+    spr.drawLine(fx[0], fy[0], fx[2], fy[2], edge_hi);
+
+    // Layer 5: sharp tip highlight (1px HEADER_COLOR dot)
+    spr.drawPixel(fx[0], fy[0], HEADER_COLOR);
 
     // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : (demo ? 2 : 0);
