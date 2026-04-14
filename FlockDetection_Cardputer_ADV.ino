@@ -2013,9 +2013,9 @@ void draw_scanner_screen() {
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
     // WiFi badge box + text
-    spr.drawRect(right_text_x - 1, 21, 58, 13, wf_col);
+    spr.drawRect(right_text_x - 3, 24, 60, 14, wf_col);
     spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 25);
+    spr.setCursor(right_text_x, 28);
     spr.printf("WiFi: %d", current_channel);
     if (millis() < channel_lock_until) {
         spr.setTextColor(CAUTION_COLOR, BG_COLOR);
@@ -2023,9 +2023,9 @@ void draw_scanner_screen() {
     }
 
     // BLE badge box + text
-    spr.drawRect(right_text_x + 59, 21, 30, 13, ble_col);
+    spr.drawRect(right_text_x + 59, 24, 33, 14, ble_col);
     spr.setTextColor(ble_col, BG_COLOR);
-    spr.setCursor(right_text_x + 62, 25);
+    spr.setCursor(right_text_x + 62, 28);
     spr.print("BLE");
 
     // Labels simplified
