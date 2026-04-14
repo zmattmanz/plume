@@ -399,19 +399,22 @@ static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
     for (;;) {
-        float time_s = millis() / 1000.0f;
-        // sinf(-1..+1) shifted to 0..1 then scaled to 0..255
-        // speed = 0.5 gives a 4-second full cycle (period = 2 / speed)
-        float phase = sinf(time_s * 0.5f * (float)M_PI);
-        uint8_t led_val = (uint8_t)((phase + 1.0f) * 127.5f);
-        set_cardputer_led(0, led_val, 0);
+        // Modular time keeps the sinf argument in [0, 2π], preventing float
+        // precision drift that causes jitter at long uptimes.
+        // Period = 2000 ms, speed = 1.0 — matches Bruce's default (ledEffectSpeed 5).
+        float t = (float)(millis() % 2000) / 1000.0f; // 0.0 .. 2.0, wraps every 2 s
+        float phase = sinf(t * (float)M_PI);           // Bruce: sinf(time * speed * PI)
+        uint8_t value = (uint8_t)((phase + 1.0f) * 127.5f); // Bruce: (phase+1)*127.5 → 0..255
+        set_cardputer_led(0, value, 0);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void start_charge_led() {
     if (chargeLedTaskHandle == NULL)
-        xTaskCreate(chargeLedTask, "ChargeLed", 2048, NULL, 1, &chargeLedTaskHandle);
+        // Pin to Core 1 (APP_CPU) — same core as the Arduino loop and neopixelWrite,
+        // avoiding RMT channel conflicts that cause flickering from Core 0.
+        xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 2048, NULL, 1, &chargeLedTaskHandle, 1);
 }
 
 void stop_charge_led() {
