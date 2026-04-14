@@ -2097,11 +2097,9 @@ void draw_locator_screen() {
     float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
     bool has_loc   = gps.location.isValid();
-    bool stale     = has_loc && (gps.location.age() > 2000);
     float gps_course = gps.course.deg();
     unsigned long newest_ms = locator_newest_sample_ms;
     int sample_count = locator_sample_count;
-    // RSSI for target from tracker
     int target_rssi = 0; bool has_rssi = false;
     for (int _i = 0; _i < rssi_tracker_count; _i++) {
         if (strncmp(rssi_tracker[_i].mac, locator_target_mac, 17) == 0
@@ -2113,24 +2111,31 @@ void draw_locator_screen() {
     xSemaphoreGive(dataMutex);
 
     unsigned long est_age_ms = (has_est && newest_ms > 0) ? (millis() - newest_ms) : 0;
-    bool est_stale      = has_est && (est_age_ms > 60000UL);
-    bool est_very_stale = has_est && (est_age_ms > 300000UL);
+    bool est_stale = has_est && (est_age_ms > 60000UL);
+
+    // Demo placeholder values shown when no active target
+    bool demo = !active;
+    const char* demo_name = "Pixel-6A-7F";
+    const char* demo_type = "WiFi";
+    const char* demo_mac  = "A8:5E:45:F1:2B:3C";
+    const int   demo_rssi = -67;
+    const float demo_dist = 43.0f;
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    int cx = 56, cy = 76;  // cy bumped for header separation
+    // ── Radar graphic ── smaller, higher up
+    const int cx = 52, cy = 56;
+    const int R1 = 8, R2 = 16, R3 = 24, R4 = 32;
 
-    static float ease_arrow = -1.5708f;  // initialise pointing north
+    static float ease_arrow = -1.5708f;
     float north_course = gps_valid ? gps_course : 0.0f;
-
-    // Acquiring sats: arrow frozen at north; rings animate
     bool acquiring_sats = !gps.satellites.isValid() || gps.satellites.value() < 1;
 
     if (acquiring_sats) {
-        ease_arrow = -1.5708f;
+        ease_arrow = -1.5708f;  // frozen north while searching
     } else if (active && has_est) {
-        float rel  = brng - north_course;
-        float tgt  = radians(rel - 90.0f);
+        float rel = brng - north_course;
+        float tgt = radians(rel - 90.0f);
         float d = tgt - ease_arrow;
         while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
         while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
@@ -2142,18 +2147,18 @@ void draw_locator_screen() {
     }
     float ang = ease_arrow;
 
-    // Rings — honing-in pulse (outer→inner) when acquiring sats, slowed period 2600ms
+    // Rings
     if (acquiring_sats) {
         unsigned long pt = millis() % 2600;
-        spr.drawCircle(cx, cy, 43, (pt < 900)                ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, 33, (pt > 450  && pt < 1350)  ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, 22, (pt > 900  && pt < 1800)  ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, 11, (pt > 1350 && pt < 2250)  ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, R4, (pt < 900)               ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, R3, (pt > 450  && pt < 1350) ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, R2, (pt > 900  && pt < 1800) ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, R1, (pt > 1350 && pt < 2250) ? GPS_COLOR : DIM_COLOR);
     } else {
-        spr.drawCircle(cx, cy, 11, GPS_COLOR);
-        spr.drawCircle(cx, cy, 22, GPS_COLOR);
-        spr.drawCircle(cx, cy, 33, GPS_COLOR);
-        spr.drawCircle(cx, cy, 43, GPS_COLOR);
+        spr.drawCircle(cx, cy, R1, GPS_COLOR);
+        spr.drawCircle(cx, cy, R2, GPS_COLOR);
+        spr.drawCircle(cx, cy, R3, GPS_COLOR);
+        spr.drawCircle(cx, cy, R4, GPS_COLOR);
     }
 
     auto rotpt = [&](float rpx, float rpy, float a, int* ox, int* oy) {
@@ -2162,125 +2167,150 @@ void draw_locator_screen() {
         *oy = cy + (int)(rpx * sa + rpy * ca);
     };
 
-    // Arrow — GPS_COLOR fill, BG_COLOR interior, GPS_COLOR lines on ALL edges for uniform weight
+    // Arrow — scaled for smaller graphic, uniform GPS_COLOR weight on all edges
     int bx[4], by[4];
-    rotpt(0,   -26, ang, &bx[0], &by[0]);
-    rotpt(16,   18, ang, &bx[1], &by[1]);
-    rotpt(0,     3, ang, &bx[2], &by[2]);
-    rotpt(-16,  18, ang, &bx[3], &by[3]);
+    rotpt(0,   -20, ang, &bx[0], &by[0]);
+    rotpt(12,   14, ang, &bx[1], &by[1]);
+    rotpt(0,     2, ang, &bx[2], &by[2]);
+    rotpt(-12,  14, ang, &bx[3], &by[3]);
     spr.fillTriangle(bx[0], by[0], bx[1], by[1], bx[2], by[2], GPS_COLOR);
     spr.fillTriangle(bx[0], by[0], bx[2], by[2], bx[3], by[3], GPS_COLOR);
 
     int ax[4], ay[4];
-    rotpt(0,   -22, ang, &ax[0], &ay[0]);
-    rotpt(13,   15, ang, &ax[1], &ay[1]);
-    rotpt(0,     5, ang, &ax[2], &ay[2]);
-    rotpt(-13,  15, ang, &ax[3], &ay[3]);
+    rotpt(0,   -17, ang, &ax[0], &ay[0]);
+    rotpt(10,   11, ang, &ax[1], &ay[1]);
+    rotpt(0,     4, ang, &ax[2], &ay[2]);
+    rotpt(-10,  11, ang, &ax[3], &ay[3]);
     spr.fillTriangle(ax[0], ay[0], ax[1], ay[1], ax[2], ay[2], BG_COLOR);
     spr.fillTriangle(ax[0], ay[0], ax[2], ay[2], ax[3], ay[3], BG_COLOR);
-    // Outer edge lines — ensures uniform stroke weight around the entire arrow
     spr.drawLine(bx[0], by[0], bx[1], by[1], GPS_COLOR);
     spr.drawLine(bx[1], by[1], bx[2], by[2], GPS_COLOR);
     spr.drawLine(bx[2], by[2], bx[3], by[3], GPS_COLOR);
     spr.drawLine(bx[3], by[3], bx[0], by[0], GPS_COLOR);
-    // Inner edge lines
     spr.drawLine(ax[0], ay[0], ax[1], ay[1], GPS_COLOR);
     spr.drawLine(ax[1], ay[1], ax[2], ay[2], GPS_COLOR);
     spr.drawLine(ax[2], ay[2], ax[3], ay[3], GPS_COLOR);
     spr.drawLine(ax[3], ay[3], ax[0], ay[0], GPS_COLOR);
 
-    int rx = 118; spr.drawLine(rx - 2, 22, rx - 2, DISP_H - 14, CARD_BORDER);
-    int rpx = rx + 2;
+    // ── SAMPLES below radar ──
+    {
+        int sc = active ? sample_count : (demo ? 2 : 0);
+        bool lock = active ? has_est : demo;
+        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
+        spr.setCursor(cx - 16, cy + R4 + 8); spr.print("SMPL");
+        for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
+            uint16_t dc = (di < sc) ? (lock ? ACCENT_COLOR : CAUTION_COLOR) : DIM_COLOR;
+            spr.fillCircle(cx - 8 + di * 10, cy + R4 + 20, 3, dc);
+        }
+        if (lock) {
+            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+            spr.setCursor(cx + 16, cy + R4 + 17); spr.print("LOCK");
+        } else {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            char sc_buf[5]; snprintf(sc_buf, sizeof(sc_buf), "%d/%d", sc, LOC_MIN_SAMPLES_EST);
+            spr.setCursor(cx + 16, cy + R4 + 17); spr.print(sc_buf);
+        }
+    }
 
-    // Status box — filled CARD_COLOR background for readability
+    // ── Right panel ──
+    int rx = 116; spr.drawLine(rx, 22, rx, DISP_H - 14, CARD_BORDER);
+    int rpx = rx + 4;
+
+    // Status box — CARD_COLOR fill + colored border, all uppercase
     const char* status_str; uint16_t status_col;
     if (north_mode) {
-        status_str = "Locating North";   status_col = GPS_COLOR;
+        status_str = "LOCATING NORTH";  status_col = GPS_COLOR;
     } else if (!has_loc && !gps_valid) {
-        status_str = "Searching";        status_col = DIM_COLOR;
+        status_str = "SEARCHING";       status_col = DIM_COLOR;
     } else if (gps_valid && !active) {
-        status_str = "Awaiting Target";  status_col = CAUTION_COLOR;
+        status_str = "AWAITING TARGET"; status_col = CAUTION_COLOR;
     } else if (active && has_est && !est_stale) {
-        status_str = "Tracking Target";  status_col = ACCENT_COLOR;
+        status_str = "TRACKING TARGET"; status_col = ACCENT_COLOR;
     } else if (active && !has_est) {
-        status_str = "Acquiring...";     status_col = CAUTION_COLOR;
+        status_str = "ACQUIRING...";    status_col = CAUTION_COLOR;
     } else {
-        status_str = "Searching";        status_col = DIM_COLOR;
+        status_str = "SEARCHING";       status_col = DIM_COLOR;
     }
-    spr.fillRect(rpx, 24, DISP_W - rpx - 4, 12, CARD_COLOR);
-    spr.drawRect(rpx, 24, DISP_W - rpx - 4, 12, status_col);
+    spr.fillRect(rpx, 24, DISP_W - rpx - 2, 11, CARD_COLOR);
+    spr.drawRect(rpx, 24, DISP_W - rpx - 2, 11, status_col);
     spr.setTextColor(status_col, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx + 3, 27); spr.print(status_str);
+    spr.setCursor(rpx + 2, 27); spr.print(status_str);
 
-    // TARGET label + name
+    // TARGET NAME
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 41); spr.print("TARGET");
-
-    char tname[15] = "-- none --";
-    if (active) {
-        bool nok = (target_name[0] != '\0' && strcmp(target_name,"Hidden")!=0 && strcmp(target_name,"Unknown")!=0);
-        const char* src = nok ? target_name : ((strlen(target_mac)>8)?target_mac+9:target_mac);
-        strncpy(tname, src, 14); tname[14] = '\0';
-    }
-    spr.setTextColor(active ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
-    spr.setCursor(rpx, 51); spr.print(tname);
-
-    // ID (#RRGGBB style hash) + type tag on one line
-    if (active && target_mac[0] != '\0') {
-        char id6[7]; mac_to_short_id(target_mac, id6);
-        char idbuf[8]; snprintf(idbuf, sizeof(idbuf), "#%s", id6);
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setCursor(rpx, 61); spr.print(idbuf);
-        if (target_type[0] != '\0') {
-            uint16_t tcol = (strncmp(target_type, "BLE", 3) == 0) ? PURPLE_COLOR : TEAL_COLOR;
-            spr.setTextColor(tcol, BG_COLOR);
-            spr.setCursor(rpx + 50, 61); spr.print(target_type);
+    spr.setCursor(rpx, 39); spr.print("TARGET");
+    {
+        char tname[15];
+        if (active) {
+            bool nok = (target_name[0] != '\0' && strcmp(target_name,"Hidden")!=0 && strcmp(target_name,"Unknown")!=0);
+            const char* src = nok ? target_name : ((strlen(target_mac)>8)?target_mac+9:target_mac);
+            strncpy(tname, src, 14); tname[14] = '\0';
+        } else {
+            strncpy(tname, demo_name, 14); tname[14] = '\0';
         }
+        spr.setTextColor(active ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
+        spr.setCursor(rpx, 48); spr.print(tname);
+    }
+
+    // TYPE
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx, 59); spr.print("TYPE");
+    {
+        const char* disp_type = (active && target_type[0]) ? target_type : (demo ? demo_type : "--");
+        bool is_ble = strncmp(disp_type, "BLE", 3) == 0;
+        bool is_rvn = strcmp(disp_type, "Raven") == 0 || strcmp(disp_type, "RAVEN") == 0;
+        uint16_t tcol = is_ble ? PURPLE_COLOR : is_rvn ? CAUTION_COLOR : TEAL_COLOR;
+        if (strcmp(disp_type, "--") == 0) tcol = DIM_COLOR;
+        spr.setTextColor(tcol, BG_COLOR);
+        spr.setCursor(rpx, 68); spr.print(disp_type);
+    }
+
+    // MAC
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx, 79); spr.print("MAC");
+    {
+        const char* disp_mac;
+        if (active && target_mac[0] != '\0') {
+            disp_mac = (strlen(target_mac) > 8) ? target_mac + 9 : target_mac;
+        } else {
+            disp_mac = demo ? (demo_mac + 9) : "--";
+        }
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(rpx, 88); spr.print(disp_mac);
     }
 
     // SIGNAL
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 72); spr.print("SIGNAL");
-    spr.setCursor(rpx, 81);
-    if (!active || !has_rssi) {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
-    } else {
-        uint16_t sig_col = target_rssi > -60 ? ACCENT_COLOR : target_rssi > -80 ? CAUTION_COLOR : DIM_COLOR;
-        spr.setTextColor(sig_col, BG_COLOR);
+    spr.setCursor(rpx, 99); spr.print("SIGNAL");
+    spr.setCursor(rpx, 108);
+    if (active && has_rssi) {
+        uint16_t sc = target_rssi > -60 ? ACCENT_COLOR : target_rssi > -80 ? CAUTION_COLOR : DIM_COLOR;
+        spr.setTextColor(sc, BG_COLOR);
         char sbuf[10]; snprintf(sbuf, sizeof(sbuf), "%d dBm", target_rssi);
         spr.print(sbuf);
+    } else if (demo) {
+        uint16_t sc = demo_rssi > -60 ? ACCENT_COLOR : demo_rssi > -80 ? CAUTION_COLOR : DIM_COLOR;
+        spr.setTextColor(sc, BG_COLOR);
+        char sbuf[10]; snprintf(sbuf, sizeof(sbuf), "%d dBm", demo_rssi);
+        spr.print(sbuf);
+    } else {
+        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
     }
 
     // DISTANCE
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 92); spr.print("DISTANCE");
-    spr.setCursor(rpx, 101);
-    if (!active || !has_est) {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
-    } else {
-        spr.setTextColor(dist < 60 ? CAUTION_COLOR : TEXT_COLOR, BG_COLOR);
-        char dbuf[12];
-        if (dist < 100) snprintf(dbuf, sizeof(dbuf), "%.0fm", dist);
-        else            snprintf(dbuf, sizeof(dbuf), "%.1fkm", dist/1000.0f);
-        spr.print(dbuf);
-    }
-
-    // SAMPLES — three dot progress + LOCKED/count label
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 112); spr.print("SAMPLES");
+    spr.setCursor(rpx, 119); spr.print("DIST");
+    spr.setCursor(rpx, 128);
     {
-        int sc = active ? sample_count : 0;
-        for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
-            uint16_t dc = (di < sc) ? (has_est ? ACCENT_COLOR : CAUTION_COLOR) : DIM_COLOR;
-            spr.fillCircle(rpx + 4 + di * 10, 122, 3, dc);
-        }
-        if (has_est) {
-            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-            spr.setCursor(rpx + 36, 119); spr.print("LOCKED");
-        } else if (active) {
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            char scbuf[6]; snprintf(scbuf, sizeof(scbuf), "%d/%d", sc, LOC_MIN_SAMPLES_EST);
-            spr.setCursor(rpx + 36, 119); spr.print(scbuf);
+        float show_d = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
+        if (show_d < 0) {
+            spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
+        } else {
+            spr.setTextColor(show_d < 60 ? CAUTION_COLOR : TEXT_COLOR, BG_COLOR);
+            char dbuf[12];
+            if (show_d < 100) snprintf(dbuf, sizeof(dbuf), "%.0fm", show_d);
+            else              snprintf(dbuf, sizeof(dbuf), "%.1fkm", show_d / 1000.0f);
+            spr.print(dbuf);
         }
     }
 }
@@ -2545,81 +2575,75 @@ void draw_gps_screen() {
         spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, CARD_COLOR); spr.print(sats);
 
     } else {
-        float sat_phase = (millis() / 2200.0f) * (float)M_PI;
-        const float SAT_R   = (float)(gr + 10);
-        const float SAT_INC = 0.48f;
-        int sat_x = gx + (int)(SAT_R * cosf(sat_phase));
-        int sat_y = gy - (int)(SAT_R * sinf(sat_phase) * SAT_INC);
-        bool sat_front = sinf(sat_phase) > 0.0f;
+        // ── 3D wireframe globe, GPS locked ──
+        const float GLOB_T  = 0.44f;   // equatorial compression (perspective tilt)
+        const float SAT_R   = (float)(gr + 13);
+        const float SAT_INC = 0.50f;   // orbital ellipse vertical ratio
 
-        if (!sat_front) {
-            float dx = sat_x - gx, dy = (sat_y - gy) / GPS_TILT;
-            if (sqrtf(dx * dx + dy * dy) > gr + 1) {
-                spr.fillCircle(sat_x, sat_y, 2, lgfx::color565(10, 18, 36));
-            }
+        // Slow axial rotation
+        float rot = fmodf((float)millis() / 9000.0f, 1.0f) * 2.0f * (float)M_PI;
+
+        // Globe fill — deep space blue
+        spr.fillCircle(gx, gy, gr, lgfx::color565(3, 11, 38));
+
+        // Latitude lines: 5 parallels at ±60°, ±30°, equator
+        const float lat_degs[5] = { -60.0f, -30.0f, 0.0f, 30.0f, 60.0f };
+        for (int li = 0; li < 5; li++) {
+            float lf = sinf(radians(lat_degs[li]));
+            float lr = cosf(radians(lat_degs[li])) * (float)gr;
+            int   ly = gy + (int)(lf * (float)gr);
+            if (lr < 2) continue;
+            uint16_t lc = (li == 2)
+                ? lgfx::color565(28, 68, 168)   // equator slightly brighter
+                : lgfx::color565(16, 42, 108);
+            spr.drawEllipse(gx, ly, (int)lr, (int)(lr * GLOB_T), lc);
         }
 
-        spr.fillCircle(gx, gy, gr, lgfx::color565(5, 18, 56));
-
-        const float GLOB_T = 0.34f;
-        for (int lat = -2; lat <= 2; lat++) {
-            if (lat == 0) continue;
-            float lf = lat / 3.0f;
-            float lr = sqrtf(1.0f - lf * lf) * gr;
-            int   ly = gy + (int)(lf * gr);
-            if (lr >= 3) spr.drawEllipse(gx, ly, (int)lr, (int)(lr * GLOB_T),
-                                         lgfx::color565(12, 35, 90));
-        }
-        spr.drawEllipse(gx, gy, gr, (int)(gr * GLOB_T), lgfx::color565(12, 35, 90));
-
-        float mer_phase = (millis() / 9000.0f) * (float)M_PI;
-        for (int m = 0; m < 2; m++) {
-            float mp = mer_phase + m * (float)M_PI / 2.0f;
-            int   mw = max(2, (int)fabsf(gr * cosf(mp)));
-            float ff = (cosf(mp) + 1.0f) / 2.0f;
-            uint8_t mv = 10 + (uint8_t)(ff * 38.0f);
-            spr.drawEllipse(gx, gy, mw, gr, lgfx::color565(mv / 6, mv / 2, mv));
+        // Longitude lines: 4 meridians, slowly rotating
+        for (int m = 0; m < 4; m++) {
+            float mp  = rot + m * (float)M_PI / 4.0f;
+            float cp  = cosf(mp);
+            int   mw  = max(1, (int)(fabsf(cp) * (float)gr));
+            float brt = (cp + 1.0f) / 2.0f;
+            uint8_t mv = 16 + (uint8_t)(brt * 52.0f);
+            spr.drawEllipse(gx, gy, mw, gr, lgfx::color565(mv / 8, mv / 3, mv));
         }
 
-        spr.fillEllipse(gx - gr / 3, gy - gr / 5, gr / 6, gr / 3,
-                        lgfx::color565(12, 65, 30));
-        spr.fillEllipse(gx + gr / 5, gy + gr / 10, gr / 5, gr / 2,
-                        lgfx::color565(12, 65, 30));
+        // Globe rim — crisp bright edge
+        spr.drawCircle(gx, gy, gr,     lgfx::color565(48, 108, 220));
+        spr.drawCircle(gx, gy, gr + 1, lgfx::color565(32,  76, 160));
 
-        spr.drawCircle(gx, gy, gr,     lgfx::color565(35, 75, 160));
-        spr.drawCircle(gx, gy, gr + 1, lgfx::color565(35, 75, 160));
+        // Specular highlight
+        spr.fillEllipse(gx - gr/4, gy - gr/4, gr/5, (int)(gr/5 * 0.60f),
+                        lgfx::color565(95, 160, 235));
 
-        spr.fillEllipse(gx - gr / 3, gy - gr / 3, gr / 5, (int)(gr / 5 * 0.75f),
-                        lgfx::color565(75, 135, 215));
+        // Orbital track ellipse (subtle)
+        spr.drawEllipse(gx, gy, (int)SAT_R, (int)(SAT_R * SAT_INC),
+                        lgfx::color565(18, 32, 64));
 
-        const float ATR = radians(23.0f);
-        spr.fillCircle(gx - (int)((gr - 3) * sinf(ATR)), gy - (int)((gr - 3) * cosf(ATR)),
-                       2, lgfx::color565(35, 75, 160));
-        spr.fillCircle(gx + (int)((gr - 3) * sinf(ATR)), gy + (int)((gr - 3) * cosf(ATR)),
-                       2, lgfx::color565(35, 75, 160));
+        // Satellite — full orbit, 3.2 s period, always visible
+        float sp  = fmodf((float)millis() / 3200.0f, 1.0f) * 2.0f * (float)M_PI;
+        int sat_x = gx + (int)(SAT_R * cosf(sp));
+        int sat_y = gy - (int)(SAT_R * sinf(sp) * SAT_INC);
 
-        spr.drawEllipse(gx0, gy0, (int)SAT_R, (int)(SAT_R * SAT_INC),
-                        lgfx::color565(14, 28, 58));
-        for (int tr = 1; tr <= 8; tr++) {
-            float ta = sat_phase - tr * 0.14f;
-            if (sinf(ta) <= 0.0f) continue;
-            int tx = gx0 + (int)(SAT_R * cosf(ta));
-            int ty = gy0 - (int)(SAT_R * sinf(ta) * SAT_INC);
-            uint8_t tv = (uint8_t)((9 - tr) * 10);
-            spr.drawPixel(tx, ty, lgfx::color565(tv, tv * 2, tv));
+        // Fading orbital trail
+        for (int tr = 1; tr <= 18; tr++) {
+            float ta  = sp - tr * 0.055f;
+            int   tx  = gx + (int)(SAT_R * cosf(ta));
+            int   ty  = gy - (int)(SAT_R * sinf(ta) * SAT_INC);
+            int   bv  = max(0, (18 - tr) * 12);
+            spr.drawPixel(tx, ty, lgfx::color565(0, (uint8_t)bv, (uint8_t)(bv / 3)));
         }
 
-        if (sat_front) {
-            spr.fillCircle(sat_x, sat_y, 3, ACCENT_COLOR);
-            spr.drawCircle(sat_x, sat_y, 4, lgfx::color565(50, 180, 80));
-            spr.drawLine(sat_x - 5, sat_y, sat_x - 8, sat_y, lgfx::color565(180, 180, 80));
-            spr.drawLine(sat_x + 5, sat_y, sat_x + 8, sat_y, lgfx::color565(180, 180, 80));
-        }
+        // Satellite dot (always shown — user said don't bother hiding it)
+        spr.fillCircle(sat_x, sat_y, 3, ACCENT_COLOR);
+        spr.drawCircle(sat_x, sat_y, 4, lgfx::color565(80, 230, 100));
+        // Solar panels
+        spr.drawLine(sat_x - 6, sat_y, sat_x - 9, sat_y, lgfx::color565(200, 200, 70));
+        spr.drawLine(sat_x + 6, sat_y, sat_x + 9, sat_y, lgfx::color565(200, 200, 70));
 
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(12, gy0 + 36);
-        spr.print("GPS LOCKED");
+        spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+        spr.setCursor(12, gy0 + 36); spr.print("GPS LOCKED");
     }
 
     spr.fillCircle(112, 124, 3, gps_page == 0 ? HEADER_COLOR : CARD_BORDER);
