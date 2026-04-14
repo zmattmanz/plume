@@ -524,7 +524,7 @@ void dedicated_charging_loop() {
 
         // ── Battery level bar — shorter, thicker, actual percentage ────────
         const int bar_w = 120, bar_h = 16;
-        const int bar_x = (DISP_W - bar_w) / 2, bar_y = 90;
+        const int bar_x = (DISP_W - bar_w) / 2, bar_y = 72;
         spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
         int fill_w = (display_pct * (bar_w - 2)) / 100;
         if (fill_w > 0) {
@@ -1607,17 +1607,17 @@ void AlarmTask(void* pvParameters) {
     int conf = (int)(intptr_t)pvParameters;
     
     if (conf >= CONFIDENCE_CERTAIN) {
-        M5Cardputer.Speaker.tone(880, 60); vTaskDelay(80 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(1319, 60); vTaskDelay(80 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(1760, 120); vTaskDelay(120 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(523, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(659, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(880, 140); vTaskDelay(160 / portTICK_PERIOD_MS);
     } else if (conf >= CONFIDENCE_HIGH) {
-        for (int i = 0; i < 3; i++) {
-            M5Cardputer.Speaker.tone(DETECT_FREQ_HIGH, DETECT_BEEP_DURATION);
-            vTaskDelay((DETECT_BEEP_DURATION + 50) / portTICK_PERIOD_MS); 
+        for (int i = 0; i < 2; i++) {
+            M5Cardputer.Speaker.tone(740, 110);
+            vTaskDelay(180 / portTICK_PERIOD_MS);
         }
     } else {
-        M5Cardputer.Speaker.tone(DETECT_FREQ, DETECT_BEEP_DURATION);
-        vTaskDelay((DETECT_BEEP_DURATION + 50) / portTICK_PERIOD_MS); 
+        M5Cardputer.Speaker.tone(620, 90);
+        vTaskDelay(140 / portTICK_PERIOD_MS);
     }
     
     is_alarming = false;
@@ -1695,7 +1695,7 @@ void draw_toast_spr() {
 void draw_vol_overlay() {
     if (!show_vol_overlay) return;
     unsigned long elapsed = millis() - vol_overlay_start;
-    const unsigned long SHOW_MS = 1600;
+    const unsigned long SHOW_MS = 2200;
     if (elapsed > SHOW_MS) { show_vol_overlay = false; return; }
 
     // Quick fade-in (100ms), quadratic ease-out fade — no position change
@@ -1740,8 +1740,7 @@ void draw_vol_overlay() {
     spr.drawRect(bar_x, bar_y, bar_w, bar_h, brd_c);
     int fill = (current_volume * (bar_w - 2)) / 255;
     if (fill > 0) {
-        uint16_t bar_col_raw = vol_pct > 80 ? CAUTION_COLOR : vol_pct > 40 ? HEADER_COLOR : GPS_COLOR;
-        spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, blend16(BG_COLOR, bar_col_raw, alpha));
+        spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, blend16(BG_COLOR, HEADER_COLOR, alpha));
     }
 }
 
@@ -2112,62 +2111,77 @@ void draw_locator_screen() {
 
     unsigned long est_age_ms = (has_est && newest_ms > 0) ? (millis() - newest_ms) : 0;
     bool est_stale = has_est && (est_age_ms > 60000UL);
-
-    // Demo placeholder values shown when no active target
     bool demo = !active;
     const char* demo_name = "Pixel-6A-7F";
     const char* demo_type = "WiFi";
-    const char* demo_mac  = "A8:5E:45:F1:2B:3C";
     const int   demo_rssi = -67;
     const float demo_dist = 43.0f;
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    // ── Radar graphic ── smaller, higher up
     const int cx = 52, cy = 56;
     const int R1 = 8, R2 = 16, R3 = 24, R4 = 32;
+    unsigned long now_ms = millis();
 
-    static float ease_arrow = -1.5708f;
-    float north_course = gps_valid ? gps_course : 0.0f;
+    // ── Arrow: frame-rate-independent rotation ──
+    static float ease_arrow = 0.0f;  // 0 = north
+    static unsigned long last_fr_ms = 0;
+    if (last_fr_ms == 0) last_fr_ms = now_ms;
+    unsigned long frame_dt = now_ms - last_fr_ms;
+    if (frame_dt > 100) frame_dt = 33;  // clamp on first frame or long pauses
+    last_fr_ms = now_ms;
+
     bool acquiring_sats = !gps.satellites.isValid() || gps.satellites.value() < 1;
-
     if (acquiring_sats) {
-        ease_arrow = -1.5708f;  // frozen north while searching
+        ease_arrow = 0.0f;  // frozen north
     } else if (active && has_est) {
-        float rel = brng - north_course;
+        float rel = brng - (gps_valid ? gps_course : 0.0f);
         float tgt = radians(rel - 90.0f);
         float d = tgt - ease_arrow;
         while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
         while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
         ease_arrow += 0.09f * d;
     } else {
-        // Idle: slow continuous clockwise drift
-        ease_arrow += 0.0006f;
+        // Idle: slow clockwise drift — ~40 s per full revolution
+        ease_arrow += (float)frame_dt * (2.0f*(float)M_PI / 40000.0f);
         if (ease_arrow > (float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
     }
     float ang = ease_arrow;
 
-    // Rings
-    if (acquiring_sats) {
-        unsigned long pt = millis() % 2600;
-        spr.drawCircle(cx, cy, R4, (pt < 900)               ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, R3, (pt > 450  && pt < 1350) ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, R2, (pt > 900  && pt < 1800) ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, R1, (pt > 1350 && pt < 2250) ? GPS_COLOR : DIM_COLOR);
-    } else {
-        spr.drawCircle(cx, cy, R1, GPS_COLOR);
-        spr.drawCircle(cx, cy, R2, GPS_COLOR);
-        spr.drawCircle(cx, cy, R3, GPS_COLOR);
-        spr.drawCircle(cx, cy, R4, GPS_COLOR);
+    // ── Rings: pulse sweep when acquiring; sinusoidal ripple at rest ──
+    {
+        uint16_t dim_c = DIM_COLOR, gps_c = GPS_COLOR;
+        uint8_t dr = ((dim_c >> 11) & 0x1F) << 3, dg = ((dim_c >> 5) & 0x3F) << 2, db = (dim_c & 0x1F) << 3;
+        uint8_t gr_ = ((gps_c >> 11) & 0x1F) << 3, gg = ((gps_c >> 5) & 0x3F) << 2, gb = (gps_c & 0x1F) << 3;
+        auto lerp_rc = [&](float t) -> uint16_t {
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            return lgfx::color565(
+                (uint8_t)(dr + (gr_ - dr) * t),
+                (uint8_t)(dg + (gg  - dg) * t),
+                (uint8_t)(db + (gb  - db) * t));
+        };
+        if (acquiring_sats) {
+            unsigned long pt = now_ms % 2600;
+            spr.drawCircle(cx, cy, R4, (pt < 900)               ? GPS_COLOR : DIM_COLOR);
+            spr.drawCircle(cx, cy, R3, (pt > 450  && pt < 1350) ? GPS_COLOR : DIM_COLOR);
+            spr.drawCircle(cx, cy, R2, (pt > 900  && pt < 1800) ? GPS_COLOR : DIM_COLOR);
+            spr.drawCircle(cx, cy, R1, (pt > 1350 && pt < 2250) ? GPS_COLOR : DIM_COLOR);
+        } else {
+            float t_s = (float)now_ms / 1000.0f;
+            const int radii[4] = {R1, R2, R3, R4};
+            for (int ri = 0; ri < 4; ri++) {
+                float bright = (sinf(t_s * 1.4f - ri * 0.55f) + 1.0f) * 0.5f;
+                spr.drawCircle(cx, cy, radii[ri], lerp_rc(bright));
+            }
+        }
     }
 
-    auto rotpt = [&](float rpx, float rpy, float a, int* ox, int* oy) {
+    // ── Arrow: GPS_COLOR outline, BG interior ──
+    auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
-        *ox = cx + (int)(rpx * ca - rpy * sa);
-        *oy = cy + (int)(rpx * sa + rpy * ca);
+        *ox = cx + (int)(lx * ca - ly * sa);
+        *oy = cy + (int)(lx * sa + ly * ca);
     };
-
-    // Arrow — scaled for smaller graphic, uniform GPS_COLOR weight on all edges
     int bx[4], by[4];
     rotpt(0,   -20, ang, &bx[0], &by[0]);
     rotpt(12,   14, ang, &bx[1], &by[1]);
@@ -2175,7 +2189,6 @@ void draw_locator_screen() {
     rotpt(-12,  14, ang, &bx[3], &by[3]);
     spr.fillTriangle(bx[0], by[0], bx[1], by[1], bx[2], by[2], GPS_COLOR);
     spr.fillTriangle(bx[0], by[0], bx[2], by[2], bx[3], by[3], GPS_COLOR);
-
     int ax[4], ay[4];
     rotpt(0,   -17, ang, &ax[0], &ay[0]);
     rotpt(10,   11, ang, &ax[1], &ay[1]);
@@ -2192,126 +2205,140 @@ void draw_locator_screen() {
     spr.drawLine(ax[2], ay[2], ax[3], ay[3], GPS_COLOR);
     spr.drawLine(ax[3], ay[3], ax[0], ay[0], GPS_COLOR);
 
-    // ── SAMPLES below radar ──
-    {
-        int sc = active ? sample_count : (demo ? 2 : 0);
-        bool lock = active ? has_est : demo;
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(cx - 16, cy + R4 + 8); spr.print("SMPL");
-        for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
-            uint16_t dc = (di < sc) ? (lock ? ACCENT_COLOR : CAUTION_COLOR) : DIM_COLOR;
-            spr.fillCircle(cx - 8 + di * 10, cy + R4 + 20, 3, dc);
-        }
-        if (lock) {
-            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-            spr.setCursor(cx + 16, cy + R4 + 17); spr.print("LOCK");
-        } else {
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            char sc_buf[5]; snprintf(sc_buf, sizeof(sc_buf), "%d/%d", sc, LOC_MIN_SAMPLES_EST);
-            spr.setCursor(cx + 16, cy + R4 + 17); spr.print(sc_buf);
-        }
-    }
-
     // ── Right panel ──
-    int rx = 116; spr.drawLine(rx, 22, rx, DISP_H - 14, CARD_BORDER);
-    int rpx = rx + 4;
+    int rx = 116; spr.drawLine(rx, 22, rx, 115, CARD_BORDER);
+    int rpx = rx + 5;
 
-    // Status box — CARD_COLOR fill + colored border, all uppercase
-    const char* status_str; uint16_t status_col;
+    // Status — animated cycling dots for active-search states
+    const char* status_base; uint16_t status_col; bool status_anim = false;
     if (north_mode) {
-        status_str = "LOCATING NORTH";  status_col = GPS_COLOR;
+        status_base = "LOCATING NORTH";  status_col = GPS_COLOR;
     } else if (!has_loc && !gps_valid) {
-        status_str = "SEARCHING";       status_col = DIM_COLOR;
+        status_base = "SEARCHING";       status_col = DIM_COLOR;   status_anim = true;
     } else if (gps_valid && !active) {
-        status_str = "AWAITING TARGET"; status_col = CAUTION_COLOR;
+        status_base = "AWAITING TARGET"; status_col = CAUTION_COLOR; status_anim = true;
     } else if (active && has_est && !est_stale) {
-        status_str = "TRACKING TARGET"; status_col = ACCENT_COLOR;
+        status_base = "TRACKING TARGET"; status_col = ACCENT_COLOR;
     } else if (active && !has_est) {
-        status_str = "ACQUIRING...";    status_col = CAUTION_COLOR;
+        status_base = "ACQUIRING";       status_col = CAUTION_COLOR; status_anim = true;
     } else {
-        status_str = "SEARCHING";       status_col = DIM_COLOR;
+        status_base = "SEARCHING";       status_col = DIM_COLOR;   status_anim = true;
     }
-    spr.fillRect(rpx, 24, DISP_W - rpx - 2, 11, CARD_COLOR);
-    spr.drawRect(rpx, 24, DISP_W - rpx - 2, 11, status_col);
+    char status_str[26];
+    if (status_anim) {
+        int nd = (int)(now_ms / 500) % 4;
+        snprintf(status_str, sizeof(status_str), "%s%s", status_base,
+                 nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
+    } else {
+        strncpy(status_str, status_base, sizeof(status_str) - 1);
+        status_str[sizeof(status_str) - 1] = '\0';
+    }
+    int sw = DISP_W - rpx - 2;
+    spr.fillRect(rpx, 26, sw, 13, CARD_COLOR);
+    spr.drawRect(rpx, 26, sw, 13, status_col);
     spr.setTextColor(status_col, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx + 2, 27); spr.print(status_str);
+    spr.setCursor(rpx + 4, 30); spr.print(status_str);
 
-    // TARGET NAME
+    // TARGET — green label, white value
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 39); spr.print("TARGET");
+    spr.setCursor(rpx, 46); spr.print("TARGET");
     {
         char tname[15];
         if (active) {
             bool nok = (target_name[0] != '\0' && strcmp(target_name,"Hidden")!=0 && strcmp(target_name,"Unknown")!=0);
             const char* src = nok ? target_name : ((strlen(target_mac)>8)?target_mac+9:target_mac);
             strncpy(tname, src, 14); tname[14] = '\0';
-        } else {
-            strncpy(tname, demo_name, 14); tname[14] = '\0';
-        }
-        spr.setTextColor(active ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
-        spr.setCursor(rpx, 48); spr.print(tname);
+        } else { strncpy(tname, demo_name, 14); tname[14] = '\0'; }
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(rpx, 55); spr.print(tname);
     }
 
-    // TYPE
+    // TYPE — green label, white value
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 59); spr.print("TYPE");
+    spr.setCursor(rpx, 66); spr.print("TYPE");
     {
-        const char* disp_type = (active && target_type[0]) ? target_type : (demo ? demo_type : "--");
-        bool is_ble = strncmp(disp_type, "BLE", 3) == 0;
-        bool is_rvn = strcmp(disp_type, "Raven") == 0 || strcmp(disp_type, "RAVEN") == 0;
-        uint16_t tcol = is_ble ? PURPLE_COLOR : is_rvn ? CAUTION_COLOR : TEAL_COLOR;
-        if (strcmp(disp_type, "--") == 0) tcol = DIM_COLOR;
-        spr.setTextColor(tcol, BG_COLOR);
-        spr.setCursor(rpx, 68); spr.print(disp_type);
+        const char* dt = (active && target_type[0]) ? target_type : (demo ? demo_type : "--");
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(rpx, 75); spr.print(dt);
     }
 
-    // MAC
+    // SIGNAL — green label, white value
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 79); spr.print("MAC");
+    spr.setCursor(rpx, 86); spr.print("SIGNAL");
     {
-        const char* disp_mac;
-        if (active && target_mac[0] != '\0') {
-            disp_mac = (strlen(target_mac) > 8) ? target_mac + 9 : target_mac;
-        } else {
-            disp_mac = demo ? (demo_mac + 9) : "--";
-        }
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setCursor(rpx, 88); spr.print(disp_mac);
+        int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(rpx, 95);
+        if (sr == -999) { spr.print("--"); }
+        else { spr.print(sr > -60 ? "STRONG" : sr > -80 ? "MEDIUM" : "WEAK"); }
     }
 
-    // SIGNAL
+    // DISTANCE — green label, white value (spelled out)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 99); spr.print("SIGNAL");
-    spr.setCursor(rpx, 108);
-    if (active && has_rssi) {
-        uint16_t sc = target_rssi > -60 ? ACCENT_COLOR : target_rssi > -80 ? CAUTION_COLOR : DIM_COLOR;
-        spr.setTextColor(sc, BG_COLOR);
-        char sbuf[10]; snprintf(sbuf, sizeof(sbuf), "%d dBm", target_rssi);
-        spr.print(sbuf);
-    } else if (demo) {
-        uint16_t sc = demo_rssi > -60 ? ACCENT_COLOR : demo_rssi > -80 ? CAUTION_COLOR : DIM_COLOR;
-        spr.setTextColor(sc, BG_COLOR);
-        char sbuf[10]; snprintf(sbuf, sizeof(sbuf), "%d dBm", demo_rssi);
-        spr.print(sbuf);
-    } else {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
-    }
-
-    // DISTANCE
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 119); spr.print("DIST");
-    spr.setCursor(rpx, 128);
+    spr.setCursor(rpx, 106); spr.print("DISTANCE");
     {
-        float show_d = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
-        if (show_d < 0) {
-            spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
+        float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(rpx, 115);
+        if (sd < 0) { spr.print("--"); }
+        else { char db[12]; if (sd < 100) snprintf(db,sizeof(db),"%.0fm",sd); else snprintf(db,sizeof(db),"%.1fkm",sd/1000.0f); spr.print(db); }
+    }
+
+    // ── Horizontal separator + SAMPLES bar ──
+    spr.drawLine(0, 120, DISP_W - 1, 120, CARD_BORDER);
+
+    int sc = active ? sample_count : (demo ? 2 : 0);
+    bool lock = active ? has_est : demo;
+
+    // Track when each sample was acquired for X draw-in animation
+    static unsigned long smpl_birth[3] = {0, 0, 0};
+    static int smpl_prev = 0;
+    if (sc != smpl_prev) {
+        if (sc > smpl_prev) {
+            for (int i = smpl_prev; i < sc && i < LOC_MIN_SAMPLES_EST; i++)
+                smpl_birth[i] = now_ms;
         } else {
-            spr.setTextColor(show_d < 60 ? CAUTION_COLOR : TEXT_COLOR, BG_COLOR);
-            char dbuf[12];
-            if (show_d < 100) snprintf(dbuf, sizeof(dbuf), "%.0fm", show_d);
-            else              snprintf(dbuf, sizeof(dbuf), "%.1fkm", show_d / 1000.0f);
-            spr.print(dbuf);
+            for (int i = 0; i < LOC_MIN_SAMPLES_EST; i++) smpl_birth[i] = 0;
         }
+        smpl_prev = sc;
+    }
+
+    // "SAMPLES" label (green, left side of bar)
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(8, 126); spr.print("SAMPLES");
+
+    // 3 checkbox-style squares with animated X draw-in
+    const int BOX = 9, PAD = 2, XLEN = BOX - PAD*2 - 1;  // XLEN=4
+    const unsigned long X_MS = 320;
+    const int bx0 = 90, by0 = 123;  // top-left of first box; spaced 15px apart
+
+    for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
+        int bxi = bx0 + di * 15;
+        bool filled = di < sc;
+        uint16_t col = filled ? (lock ? ACCENT_COLOR : CAUTION_COLOR) : DIM_COLOR;
+
+        spr.drawRect(bxi, by0, BOX, BOX, col);
+
+        if (filled) {
+            unsigned long elapsed = (smpl_birth[di] > 0) ? (now_ms - smpl_birth[di]) : X_MS + 1;
+            float phase = min(1.0f, (float)elapsed / (float)X_MS);
+
+            // Diagonal 1 (TL→BR) draws in over first half
+            float p1 = min(1.0f, phase * 2.0f);
+            spr.drawLine(bxi+PAD,        by0+PAD,
+                         bxi+PAD+(int)(XLEN*p1), by0+PAD+(int)(XLEN*p1), col);
+
+            // Diagonal 2 (TR→BL) draws in over second half
+            float p2 = max(0.0f, min(1.0f, (phase - 0.5f) * 2.0f));
+            spr.drawLine(bxi+BOX-PAD-1,              by0+PAD,
+                         bxi+BOX-PAD-1-(int)(XLEN*p2), by0+PAD+(int)(XLEN*p2), col);
+        }
+    }
+
+    // Lock indicator to the right of boxes
+    if (lock) {
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+        spr.setCursor(bx0 + LOC_MIN_SAMPLES_EST * 15 + 4, 126); spr.print("LOCKED");
     }
 }
 
@@ -2878,13 +2905,13 @@ void setup() {
     draw_current_screen(); spr.pushSprite(0,0);
 
     if (!is_muted) {
-        int boot_vol = current_volume > 70 ? 70 : current_volume;
+        int boot_vol = current_volume > 50 ? 50 : current_volume;
         M5Cardputer.Speaker.setVolume(boot_vol);
         delay(200);
-        M5Cardputer.Speaker.tone(1320, 180); delay(260);
-        M5Cardputer.Speaker.tone(880,  180); delay(260);
-        M5Cardputer.Speaker.tone(660,  180); delay(260);
-        M5Cardputer.Speaker.tone(220,  420); delay(500);
+        M5Cardputer.Speaker.tone(1320, 220); delay(320);
+        M5Cardputer.Speaker.tone(880,  220); delay(320);
+        M5Cardputer.Speaker.tone(660,  220); delay(320);
+        M5Cardputer.Speaker.tone(1760, 320); delay(420);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
