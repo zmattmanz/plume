@@ -1652,6 +1652,15 @@ void draw_header_spr(int screen_num) {
 
     spr.drawRect(DISP_W - 18, 5, 14, 7, bcol); spr.fillRect(DISP_W - 4, 7, 2, 3, bcol);
     int bfill = (display_bat * 12) / 100; if (bfill > 0) spr.fillRect(DISP_W - 17, 6, bfill, 5, bcol);
+
+    // GPS satellite icon (white crosshair) shown when satellites are locked
+    if (gps.satellites.isValid() && gps.satellites.value() >= 1) {
+        uint16_t gc = lgfx::color565(255, 255, 255);
+        int gx = DISP_W - 28, gy = 9;
+        spr.drawLine(gx - 3, gy, gx + 3, gy, gc);
+        spr.drawLine(gx, gy - 3, gx, gy + 3, gc);
+        spr.fillRect(gx - 1, gy - 1, 3, 3, gc);
+    }
 }
 
 void draw_toast_spr() {
@@ -1668,48 +1677,63 @@ void draw_toast_spr() {
 
     spr.fillRect(t_x, y_pos, t_w, 26, CARD_COLOR);
     spr.drawRect(t_x, y_pos, t_w, 26, CARD_BORDER);
-    spr.fillRect(t_x, y_pos, 4, 26, accent);
 
     spr.setTextColor(accent, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(t_x + 10, y_pos + 9); spr.print("[!]");
+    spr.setCursor(t_x + 6, y_pos + 9); spr.print("[!]");
     spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-    spr.setCursor(t_x + 32, y_pos + 9); spr.print(toast_text);
+    spr.setCursor(t_x + 26, y_pos + 9); spr.print(toast_text);
 }
 
 void draw_vol_overlay() {
     if (!show_vol_overlay) return;
     unsigned long elapsed = millis() - vol_overlay_start;
-    if (elapsed > 1500) { show_vol_overlay = false; return; }
+    const unsigned long SHOW_MS = 1600;
+    if (elapsed > SHOW_MS) { show_vol_overlay = false; return; }
 
-    const int TARGET_Y = 20;
-    const int t_w = 210;
-    const int t_x = (DISP_W - t_w) / 2;
-    const int t_h = 26;
+    // Quick fade-in (100ms), quadratic ease-out fade — no position change
+    float alpha;
+    const unsigned long FADE_IN_MS = 100;
+    if (elapsed < FADE_IN_MS) {
+        alpha = (float)elapsed / (float)FADE_IN_MS;
+    } else {
+        float t = (float)(elapsed - FADE_IN_MS) / (float)(SHOW_MS - FADE_IN_MS);
+        alpha = 1.0f - (t * t);
+    }
 
-    int v_y;
-    if (elapsed < 150)        v_y = -(t_h) + (int)((float)elapsed / 150.0f * (TARGET_Y + t_h));
-    else if (elapsed > 1350)  v_y = TARGET_Y - (int)(((float)(elapsed - 1350) / 150.0f) * (TARGET_Y + t_h));
-    else                      v_y = TARGET_Y;
+    const int t_w = 92;
+    const int t_h = 22;
+    const int t_x = DISP_W - t_w - 3;
+    const int t_y = DISP_H - t_h - 3;
 
-    spr.fillRect(t_x, v_y, t_w, t_h, CARD_COLOR);
-    spr.drawRect(t_x, v_y, t_w, t_h, CARD_BORDER);
-    spr.fillRect(t_x, v_y, 4, t_h, HEADER_COLOR);
+    auto blend16 = [](uint16_t bg, uint16_t fg, float a) -> uint16_t {
+        int br = ((bg >> 11) & 0x1F) << 3, bg_g = ((bg >> 5) & 0x3F) << 2, bb = (bg & 0x1F) << 3;
+        int fr = ((fg >> 11) & 0x1F) << 3, fg_g = ((fg >> 5) & 0x3F) << 2, fb = (fg & 0x1F) << 3;
+        return lgfx::color565((uint8_t)(br+(fr-br)*a),(uint8_t)(bg_g+(fg_g-bg_g)*a),(uint8_t)(bb+(fb-bb)*a));
+    };
 
-    spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(t_x + 10, v_y + 9); spr.print("VOL");
+    uint16_t bg_c  = blend16(BG_COLOR, CARD_COLOR,   alpha);
+    uint16_t brd_c = blend16(BG_COLOR, CARD_BORDER,  alpha);
+    uint16_t hdr_c = blend16(BG_COLOR, HEADER_COLOR, alpha);
+    uint16_t txt_c = blend16(BG_COLOR, TEXT_COLOR,    alpha);
+
+    spr.fillRect(t_x, t_y, t_w, t_h, bg_c);
+    spr.drawRect(t_x, t_y, t_w, t_h, brd_c);
 
     int vol_pct = map(current_volume, 0, 255, 0, 100);
-    char vol_str[6]; snprintf(vol_str, sizeof(vol_str), "%d%%", vol_pct);
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-    spr.setCursor(t_x + 38, v_y + 9); spr.print(vol_str);
+    char vol_str[5]; snprintf(vol_str, sizeof(vol_str), "%d%%", vol_pct);
 
-    int bar_x = t_x + 70; int bar_y = v_y + 8;
-    int bar_w = t_w - 78;  int bar_h = 10;
-    spr.drawRect(bar_x, bar_y, bar_w, bar_h, CARD_BORDER);
+    spr.setTextColor(hdr_c, bg_c); spr.setTextSize(1);
+    spr.setCursor(t_x + 5, t_y + 7); spr.print("VOL");
+    spr.setTextColor(txt_c, bg_c);
+    spr.setCursor(t_x + 28, t_y + 7); spr.print(vol_str);
+
+    int bar_x = t_x + 50; int bar_y = t_y + 6;
+    int bar_w = t_w - 54;  int bar_h = 10;
+    spr.drawRect(bar_x, bar_y, bar_w, bar_h, brd_c);
     int fill = (current_volume * (bar_w - 2)) / 255;
     if (fill > 0) {
-        uint16_t bar_col = vol_pct > 80 ? CAUTION_COLOR : vol_pct > 40 ? HEADER_COLOR : GPS_COLOR;
-        spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, bar_col);
+        uint16_t bar_col_raw = vol_pct > 80 ? CAUTION_COLOR : vol_pct > 40 ? HEADER_COLOR : GPS_COLOR;
+        spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, blend16(BG_COLOR, bar_col_raw, alpha));
     }
 }
 
@@ -1766,7 +1790,7 @@ void draw_scanner_screen() {
     int divider_x = 132;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
-    spr.drawLine(0, 18, DISP_W - 1, 18, HEADER_COLOR);
+    spr.drawLine(0, 18, DISP_W - 1, 18, TEAL_COLOR);
     spr.setClipRect(0, 19, divider_x, DISP_H - 19);
     
     float TILT = 0.55f;
@@ -2001,8 +2025,8 @@ void draw_scanner_screen() {
     // Smooth easing for indicator color transitions
     static float wf_ease = 0.0f;
     static float ble_ease = 0.0f;
-    wf_ease  += ((wifi_active ? 1.0f : 0.0f) - wf_ease)  * 0.08f;
-    ble_ease += ((ble_active  ? 1.0f : 0.0f) - ble_ease) * 0.08f;
+    wf_ease  += ((wifi_active ? 1.0f : 0.0f) - wf_ease)  * 0.2f;
+    ble_ease += ((ble_active  ? 1.0f : 0.0f) - ble_ease) * 0.2f;
 
     auto lerp_col16 = [](uint16_t fc, uint16_t tc, float t) -> uint16_t {
         int fr = ((fc >> 11) & 0x1F) << 3, fg = ((fc >> 5) & 0x3F) << 2, fb = (fc & 0x1F) << 3;
@@ -2013,9 +2037,9 @@ void draw_scanner_screen() {
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
     // WiFi badge box + text
-    spr.drawRect(right_text_x - 3, 24, 60, 14, wf_col);
+    spr.drawRect(right_text_x - 5, 24, 61, 16, wf_col);
     spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 28);
+    spr.setCursor(right_text_x, 29);
     spr.printf("WiFi: %d", current_channel);
     if (millis() < channel_lock_until) {
         spr.setTextColor(CAUTION_COLOR, BG_COLOR);
@@ -2023,9 +2047,9 @@ void draw_scanner_screen() {
     }
 
     // BLE badge box + text
-    spr.drawRect(right_text_x + 59, 24, 33, 14, ble_col);
+    spr.drawRect(right_text_x + 58, 24, 37, 16, ble_col);
     spr.setTextColor(ble_col, BG_COLOR);
-    spr.setCursor(right_text_x + 62, 28);
+    spr.setCursor(right_text_x + 63, 29);
     spr.print("BLE");
 
     // Labels simplified
@@ -2068,6 +2092,7 @@ void draw_locator_screen() {
     bool est_very_stale = has_est && (est_age_ms > 300000UL);
     
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
+    spr.drawLine(0, 18, DISP_W - 1, 18, TEAL_COLOR);
 
     int cx = 56, cy = 72;
 
@@ -2140,8 +2165,8 @@ void draw_locator_screen() {
     spr.setTextColor(status_col, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx + 3, 25); spr.print(status_str); 
 
-    spr.drawRect(rpx, 44, 46, 14, ACCENT_COLOR); 
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.drawRect(rpx, 44, 46, 14, HEADER_COLOR);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx + 3, 47); spr.print("TARGET");
     
     char tname[15] = "-- none --";
@@ -2154,8 +2179,8 @@ void draw_locator_screen() {
     spr.setTextSize(1); 
     spr.setCursor(rpx, 61); spr.print(tname);
 
-    spr.drawRect(rpx, 78, 56, 14, ACCENT_COLOR); 
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.drawRect(rpx, 78, 56, 14, HEADER_COLOR);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx + 3, 81); spr.print("DISTANCE");
     
     spr.setTextSize(1); spr.setCursor(rpx, 95); 
@@ -2169,8 +2194,8 @@ void draw_locator_screen() {
         spr.print(dbuf);
     }
 
-    spr.drawRect(rpx, 112, 50, 14, ACCENT_COLOR); 
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.drawRect(rpx, 112, 50, 14, HEADER_COLOR);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx + 3, 115); spr.print("BEARING");
     
     spr.setTextSize(1); spr.setCursor(rpx, 128); 
