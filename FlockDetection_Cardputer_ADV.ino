@@ -1,43 +1,5 @@
 // ============================================================================
-// FLOCK DETECTOR v8.5-ADV — Tactical Edition (Stable Release)
-// ============================================================================
-// v8.5 Signature Database Corrections (Medium/Low Priority):
-//
-//   [FIX 1 — MISSED DETECTIONS] b4:1e:52 (Flock's own IEEE-registered OUI),
-//   90:35:ea, f0:82:c0, b4:e3:f9, and 04:0d:84 (confirmed FS Ext Battery
-//   BLE OUIs) promoted from Tier 2 to Tier 1. Previously these scored
-//   SCORE_WEAK (25) alone — below any useful threshold. Now SCORE_STRONG (60),
-//   compounding correctly with name/UUID/mfg signals.
-//
-//   [FIX 2 — FALSE POSITIVES] cc:cc:cc demoted from Tier 1 to Tier 2.
-//   Not a real IEEE OUI — it is a locally-administered/placeholder pattern
-//   that appears in spoofed, misconfigured, and non-Flock devices.
-//
-//   [FIX 3 — FALSE POSITIVES] 08:3a:88 and d8:f3:bc (Liteon Technology WiFi
-//   module OUIs) demoted from Tier 1 to Tier 2. Both appear in Flock captures
-//   but are used extensively in commodity laptops, routers, and generic IoT
-//   hardware. At Tier 1 they could solo-alarm on non-Flock devices.
-//
-//   [FIX 4 — MISSED DETECTIONS] "test_flck" added to wifi_ssid_patterns[].
-//   CVE-2025-59409: hardcoded development SSID broadcast by Flock cameras
-//   during certain firmware states. Was previously undetected.
-//
-//   [FIX 5 — FALSE POSITIVES] static_addr bonus now requires corroboration.
-//   Previously fired on any BLE device with a public or random-static address,
-//   which describes the majority of BLE peripherals. Now only contributes
-//   SCORE_WEAK when mac_score==2 or got_penguin_name is already true.
-//
-// v8.3 Detection Logic Fixes (High Priority — unchanged):
-//
-//   [FIX 1 — MISSED DETECTIONS] 0x09C8 manufacturer ID now scores
-//   SCORE_DEFINITIVE (100) unconditionally.
-//
-//   [FIX 2 — FALSE POSITIVES] Raven UUID scoring now requires EITHER at least
-//   one custom UUID (0x3100–0x3500) OR two or more total matching Raven UUIDs.
-//
-//   [FIX 3 — FALSE POSITIVES] Penguin numeric names (8–12 digit all-numeric)
-//   now contribute SCORE_WEAK (25) as corroborating evidence only.
-//
+// FLOCK DETECTOR v8.13-ADV — Tactical Edition (Stable Release)
 // ============================================================================
 
 #include <M5Cardputer.h>
@@ -55,6 +17,7 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <math.h>
+#include "ui_beep.h"  // PCM sound for screen transitions
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -75,23 +38,29 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
 void beep(int frequency, int duration_ms);
 void apply_color_palette();
 void draw_help_overlay();
-void draw_arrow(int cx, int cy, int r, float angle_deg, uint16_t fill_col, uint16_t line_col);
+void draw_locator_help_overlay();
+void draw_gps_screen();
 void gps_page_toggle();
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
-// ============================================================================
+// =====================================================================================
 #define DISP_W       240
 #define DISP_H       135
 
 uint16_t BG_COLOR, CARD_COLOR, CARD_BORDER, PANEL_BG, HEADER_COLOR, TEXT_COLOR;
 uint16_t DIM_COLOR, DIM2_COLOR, ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
 uint16_t ALERT_COLOR, TOAST_COLOR, WARN_COLOR, GRID_COLOR, HILIGHT_BG;
+uint16_t GPS_COLOR;   // satellite-lock blue — mirrors WiFi/BLE per-protocol coloring
 bool night_mode = false;
 bool show_help_overlay = false;
 
 unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
+bool show_locator_help = false;  // 'h' on locator screen
+bool north_mode = false;
+int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
+static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};          // 'N' on locator screen = point to true north
 
 void apply_color_palette() {
     if (night_mode) {
@@ -111,6 +80,7 @@ void apply_color_palette() {
         WARN_COLOR    = lgfx::color565(220, 100,  10);
         GRID_COLOR    = lgfx::color565( 50,   5,   5);
         HILIGHT_BG    = lgfx::color565( 45,   0,   0);
+        GPS_COLOR     = lgfx::color565( 80,  80, 220);  // night: dim slate-blue
     } else {
         BG_COLOR      = lgfx::color565( 10,  20,  48);
         CARD_COLOR    = lgfx::color565( 18,  36,  80);
@@ -128,6 +98,7 @@ void apply_color_palette() {
         WARN_COLOR    = lgfx::color565(255, 165,   0); 
         GRID_COLOR    = lgfx::color565( 26,  42,  58);
         HILIGHT_BG    = lgfx::color565( 18,  36,  80);
+        GPS_COLOR     = lgfx::color565( 80, 200, 255);  // sky blue — distinct from WiFi/BLE/Raven
     }
 }
 
@@ -166,35 +137,33 @@ void apply_color_palette() {
 #define RSSI_TRACK_EXPIRY_MS 15000
 
 #define PERSIST_INTERVAL_MS 60000
-#define PERSIST_FILE "/flock_session.dat"
+#define FLASH_FAIL_TOAST_THRESHOLD 3
+#define PERSIST_FILE  "/flock_session.dat"
+#define DETECT_FILE   "/flock_detections.txt"
 #define TOAST_DURATION_MS 3500
 
 #define LOC_MAX_SAMPLES 40
 #define LOC_SAMPLE_INTERVAL 500
 #define LOC_PATH_LOSS_N 2.5
 #define LOC_MIN_SAMPLES_EST 3
-#define LOC_ARROW_RADIUS 28
 
 #define SCORE_DEFINITIVE 100  
-#define SCORE_STRONG     60
+#define SCORE_STRONG     60   
 #define SCORE_WEAK       25   
 #define SCORE_BONUS_RSSI 10   
 #define SCORE_BONUS_STAT 15   
 
-// 75 requires at least T1 OUI + corroboration (name/UUID/mfg/SSID).
-// A lone T1 OUI hits SCORE_STRONG (60) + RSSI bonus (10) = 70 — below threshold.
-// Liteon/Ring false-positive OUIs were also addressed at the OUI tier level in v8.4.
-#define CONFIDENCE_ALARM_THRESHOLD 75
-#define CONFIDENCE_HIGH            85
-#define CONFIDENCE_CERTAIN         100
+#define CONFIDENCE_ALARM_THRESHOLD 75   
+#define CONFIDENCE_HIGH            85   
+#define CONFIDENCE_CERTAIN         100  
 
 #define SD_SPI_SCK_PIN  40
 #define SD_SPI_MISO_PIN 39
 #define SD_SPI_MOSI_PIN 14
 #define SD_CS_PIN       12
 
-// Version string — single source of truth, used in draw_device_info_screen().
-#define VERSION_STRING "FLOCK DETECTOR v8.4 [ADV]"
+// Version string — single source of truth
+#define VERSION_STRING "FLOCK DETECTOR v8.5 [ADV]"
 
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
 #define NUM_SCREENS 6
@@ -214,9 +183,6 @@ static volatile unsigned long channel_lock_until = 0;
 static unsigned long last_ble_scan = 0;
 static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
-// Limits live ble_process_task instances. Each needs 6144B stack; unbounded
-// spawning exhausts heap in dense BLE environments. Drops excess advertisements
-// (device will re-advertise within ~100ms so detections are not lost).
 #define BLE_MAX_CONCURRENT_TASKS 6
 static SemaphoreHandle_t ble_proc_sem = NULL;
 bool sd_available = false;
@@ -228,6 +194,7 @@ volatile bool is_alarming = false;
 char sd_write_buffer[MAX_LOG_BUFFER][SD_LINE_LEN];
 int  sd_write_count = 0;
 unsigned long last_sd_flush = 0;
+static int flash_write_fail_count = 0; 
 
 String current_log_file = "/FlockLog.csv";
 String current_pcap_file = "/Threats.pcap";
@@ -324,12 +291,14 @@ int  last_cap_seq_num        = -1;
 
 #define CAPTURE_HISTORY_SIZE 5
 struct CaptureEntry {
-    char type[16];
-    char mac[18];
-    char name[65];
-    int  rssi;
-    int  confidence;
-    char time[9];
+    char  type[16];
+    char  mac[18];
+    char  name[65];
+    int   rssi;
+    int   confidence;
+    char  time[9];
+    double lat;
+    double lng;
 };
 CaptureEntry capture_history[CAPTURE_HISTORY_SIZE];
 int capture_history_count = 0;
@@ -337,7 +306,7 @@ int capture_history_count = 0;
 char toast_text[32]       = "";
 unsigned long toast_start = 0;
 bool toast_active         = false;
-uint16_t toast_accent_color = 0;  // set by trigger_toast; 0 = fallback to TOAST_COLOR
+uint16_t toast_accent_color = 0;
 
 unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
@@ -362,13 +331,13 @@ struct LocSample {
 };
 
 bool locator_active = false;
-char locator_target_mac[18]  = "";
-char locator_target_name[65] = "";
+char locator_target_mac[18]  = "";   
+char locator_target_name[65] = "";   
 LocSample locator_samples[LOC_MAX_SAMPLES];
 int locator_sample_count = 0;
 unsigned long locator_last_sample = 0;
 unsigned long locator_start_time = 0;
-unsigned long locator_newest_sample_ms = 0;
+unsigned long locator_newest_sample_ms = 0;  
 
 double locator_est_lat = 0.0;
 double locator_est_lng = 0.0;
@@ -380,10 +349,6 @@ int locator_peak_rssi = -120;
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
-
-static float imu_px = 0.0f;
-static float imu_py = 0.0f;
-static bool  imu_available = false;
 
 // ============================================================================
 // PCAP RING BUFFER STRUCT
@@ -419,7 +384,9 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    neopixelWrite(21, r, g, b);
+#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5,0,0)
+    neopixelWrite(21, r, g, b); 
+#endif
 }
 
 // ============================================================================
@@ -435,7 +402,7 @@ void update_battery_metrics() {
 }
 
 static int32_t cached_median_mv = 0;
-static uint8_t last_median_battery_index = 255;
+static uint8_t last_median_battery_index = 255; 
 
 int32_t get_median_voltage() {
     if (battery_index == last_median_battery_index && cached_median_mv != 0) {
@@ -508,11 +475,12 @@ void dedicated_charging_loop() {
 
         spr.fillSprite(BG_COLOR);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR); 
-        spr.setTextSize(3); 
-        spr.setCursor(48, 20); spr.print("CHARGING");
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); 
+        
+        // Enlarged and centered CHARGING text, removed USB LINK
         spr.setTextSize(4); 
-        spr.setCursor(20, 55); spr.print("USB LINK"); 
+        spr.setCursor(24, 40); 
+        spr.print("CHARGING");
+        
         spr.setTextColor(DIM2_COLOR, BG_COLOR); 
         spr.setTextSize(1); 
         spr.setCursor(DISP_W - 40, DISP_H - 10); spr.printf("%dmV", current_mv);
@@ -535,10 +503,11 @@ void dedicated_charging_loop() {
         spr.setCursor(35, 115); spr.print("PRESS ANY KEY TO BOOT DEVICE"); 
         spr.pushSprite(0, 0);
 
-        float t_breath = millis() / 2000.0f * (float)M_PI;
-        float breathe = sinf(t_breath);
-        breathe = breathe * breathe;
-        uint8_t led_val = (uint8_t)(breathe * 80.0f);
+        // Smooth LED breath using cubic easing
+        float t_cycle = (millis() % 4000) / 4000.0f; // 0.0 to 1.0 over 4 sec
+        float val = (t_cycle < 0.5f) ? (t_cycle * 2.0f) : (1.0f - (t_cycle - 0.5f) * 2.0f);
+        uint8_t led_val = (uint8_t)(val * val * val * 60.0f); 
+        
         if (led_val != last_led_val) { set_cardputer_led(0, led_val, 0); last_led_val = led_val; }
 
         if (current_mv < 3200 && elapsed > 3000) { 
@@ -555,7 +524,7 @@ void dedicated_charging_loop() {
 }
 
 // ============================================================================
-// STRING SCRUBBER (Fixes Apple "Smart Quotes" & UTF-8 Garbage safely)
+// STRING SCRUBBER
 // ============================================================================
 void clean_device_name_char(char* str) {
     int read_idx = 0;
@@ -583,25 +552,16 @@ void clean_device_name_char(char* str) {
 // SIGNATURE DATABASE
 // ============================================================================
 static const char* wifi_ssid_patterns[] = {
-    "flock", "Flock", "FLOCK", "FS Ext Battery", "FS_",
+    "flock", "Flock", "FLOCK", "FS Ext Battery", "FS_", 
     "Penguin", "Pigvision", "FlockOS", "flocksafety", "OFS_IoT", "PFS_",
-    "test_flck"  // CVE-2025-59409: hardcoded dev SSID broadcast during certain firmware states
+    "test_flck"  // CVE-2025-59409
 };
 static const int NUM_SSID_PATTERNS = sizeof(wifi_ssid_patterns) / sizeof(wifi_ssid_patterns[0]);
 
-// v8.4: MAC tier corrections
-//   PROMOTED to Tier 1 (confirmed Flock hardware, were incorrectly in T2):
-//     b4:1e:52 — Flock Safety's own IEEE-registered OUI
-//     90:35:ea, f0:82:c0, b4:e3:f9, 04:0d:84 — confirmed FS Ext Battery BLE OUIs
-//   DEMOTED to Tier 2 (insufficient specificity for a solo SCORE_STRONG alarm):
-//     08:3a:88, d8:f3:bc — Liteon Technology WiFi module OUIs; appear in Flock
-//                          captures but are used across laptops/routers/IoT gear
-//     cc:cc:cc — not a real IEEE OUI; locally-administered/placeholder pattern
 static const char* mac_prefixes_tier1[] = {
     "ec:1b:bd", "58:8e:81", "d8:a0:d8",
     "dc:54:75", "e0:e2:e6", "f0:9f:c2", "68:b6:b3", "a0:b7:65", "24:0a:c4",
     "a4:e5:7c", "78:e3:6d", "fc:f5:c4", "b0:b2:1c",
-    // confirmed Flock-registered OUIs (promoted from T2 in v8.4)
     "b4:1e:52", "90:35:ea", "f0:82:c0", "b4:e3:f9", "04:0d:84"
 };
 static const int NUM_MAC_TIER1 = sizeof(mac_prefixes_tier1) / sizeof(mac_prefixes_tier1[0]);
@@ -612,7 +572,6 @@ static const char* mac_prefixes_tier2[] = {
     "3c:91:80", "80:30:49", "14:5a:fc", "9c:2f:9d", "e4:aa:ea",
     "c8:c9:a3", "70:c9:4e", "d0:39:57",
     "24:b2:b9", "00:f4:8d", "e0:0a:f6",
-    // demoted from T1 in v8.4 (Liteon WiFi modules + non-IEEE placeholder)
     "08:3a:88", "d8:f3:bc", "cc:cc:cc"
 };
 static const int NUM_MAC_TIER2 = sizeof(mac_prefixes_tier2) / sizeof(mac_prefixes_tier2[0]);
@@ -622,50 +581,23 @@ static const char* device_name_patterns[] = {
 };
 static const int NUM_NAME_PATTERNS = sizeof(device_name_patterns) / sizeof(device_name_patterns[0]);
 
-// ============================================================================
-// RAVEN UUID SETS — SPLIT INTO CUSTOM (DEFINITIVE) AND STANDARD SIG (CORROBORATING)
-//
-// [v8.3 FIX 2] Standard SIG UUIDs (0x180A, 0x1809, 0x1819) are used by
-// thousands of non-Flock devices (fitness trackers, thermometers, hearing aids,
-// etc.). A single match must NOT set got_raven=true.
-//
-// Custom UUIDs (0x3100–0x3500) are Flock-proprietary, unregistered with
-// Bluetooth SIG, and strongly indicate Raven hardware. Any single custom
-// UUID match is sufficient to set got_raven=true.
-//
-// A device with 2+ total Raven UUIDs (even all standard) also sets got_raven=true,
-// since the combination is far more specific than any single standard service.
-// ============================================================================
 static const char* raven_custom_service_uuids[] = {
-    "00003100-0000-1000-8000-00805f9b34fb",  // GPS service (Flock-proprietary)
-    "00003200-0000-1000-8000-00805f9b34fb",  // Power service (Flock-proprietary)
-    "00003300-0000-1000-8000-00805f9b34fb",  // Network service (Flock-proprietary)
-    "00003400-0000-1000-8000-00805f9b34fb",  // Uptime service (Flock-proprietary)
-    "00003500-0000-1000-8000-00805f9b34fb",  // Error service (Flock-proprietary)
+    "00003100-0000-1000-8000-00805f9b34fb", 
+    "00003200-0000-1000-8000-00805f9b34fb", 
+    "00003300-0000-1000-8000-00805f9b34fb", 
+    "00003400-0000-1000-8000-00805f9b34fb", 
+    "00003500-0000-1000-8000-00805f9b34fb", 
 };
 static const int NUM_RAVEN_CUSTOM_UUIDS = sizeof(raven_custom_service_uuids) / sizeof(raven_custom_service_uuids[0]);
 
 static const char* raven_standard_service_uuids[] = {
-    "0000180a-0000-1000-8000-00805f9b34fb",  // Device Information (standard SIG)
-    "00001809-0000-1000-8000-00805f9b34fb",  // Health Thermometer (standard SIG)
-    "00001819-0000-1000-8000-00805f9b34fb",  // Location and Navigation (standard SIG)
+    "0000180a-0000-1000-8000-00805f9b34fb", 
+    "00001809-0000-1000-8000-00805f9b34fb", 
+    "00001819-0000-1000-8000-00805f9b34fb", 
 };
 static const int NUM_RAVEN_STANDARD_UUIDS = sizeof(raven_standard_service_uuids) / sizeof(raven_standard_service_uuids[0]);
 
-// Combined array preserved here as documentation only — the firmware version
-// detection block in ble_process_task uses strcasestr directly on the device's
-// advertised UUIDs and does NOT iterate this array.
-// static const char* raven_service_uuids[] = { ... };  // (see above arrays)
-
-// Helper macro — strncat with correct remaining-space bound.
-// The naive strncat(buf, str, 63) pattern is wrong: the third argument is the
-// max bytes to append, but it doesn't know how full buf already is. This macro
-// computes the actual remaining capacity each time.
 #define MCAT(buf, str) strncat((buf), (str), sizeof(buf) - strlen(buf) - 1)
-
-// NOTE: 0x09C8 is not a registered Bluetooth SIG company ID as of the last
-// public assignment list. Verify this value against physical hardware captures
-// before treating it as definitive. It may be a Flock-internal/prototype ID.
 #define FLOCK_MFG_COMPANY_ID 0x09C8
 
 int check_mac_prefix_tiered(const uint8_t* mac) {
@@ -780,8 +712,48 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
 // ============================================================================
 // PERSISTENCE & TRACKING
 // ============================================================================
-static int flash_write_fail_count = 0;
-#define FLASH_FAIL_TOAST_THRESHOLD 3
+void save_detections_to_flash() {
+    if (!littlefs_available) return;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    int cnt = capture_history_count;
+    CaptureEntry local_hist[CAPTURE_HISTORY_SIZE];
+    for (int i = 0; i < cnt; i++) local_hist[i] = capture_history[i];
+    xSemaphoreGive(dataMutex);
+    File f = LittleFS.open(DETECT_FILE, "w");
+    if (!f) return;
+    for (int i = 0; i < cnt; i++) {
+        f.printf("%s|%s|%s|%d|%.6f|%.6f\n",
+            local_hist[i].type, local_hist[i].mac, local_hist[i].name,
+            local_hist[i].confidence, local_hist[i].lat, local_hist[i].lng);
+    }
+    f.close();
+}
+
+void load_detections_from_flash() {
+    if (!littlefs_available || !LittleFS.exists(DETECT_FILE)) return;
+    File f = LittleFS.open(DETECT_FILE, "r");
+    if (!f) return;
+    capture_history_count = 0;
+    while (f.available() && capture_history_count < CAPTURE_HISTORY_SIZE) {
+        String line = f.readStringUntil('\n');
+        if (line.length() < 5) continue;
+        int idx = capture_history_count;
+        int p0=0, p1=line.indexOf('|'), p2=line.indexOf('|',p1+1),
+            p3=line.indexOf('|',p2+1), p4=line.indexOf('|',p3+1),
+            p5=line.indexOf('|',p4+1);
+        if (p4 < 0) continue;
+        strncpy(capture_history[idx].type, line.substring(p0,p1).c_str(), 15);
+        strncpy(capture_history[idx].mac,  line.substring(p1+1,p2).c_str(), 17);
+        strncpy(capture_history[idx].name, line.substring(p2+1,p3).c_str(), 64);
+        capture_history[idx].confidence = line.substring(p3+1,p4).toInt();
+        capture_history[idx].lat = line.substring(p4+1, p5>0?p5:line.length()).toDouble();
+        capture_history[idx].lng = p5>0 ? line.substring(p5+1).toDouble() : 0.0;
+        capture_history[idx].rssi = -70;  
+        strncpy(capture_history[idx].time, "??:??:??", 8);
+        capture_history_count++;
+    }
+    f.close();
+}
 
 void save_session_to_flash() {
     if (!littlefs_available) return;
@@ -796,10 +768,7 @@ void save_session_to_flash() {
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
         File f = LittleFS.open(PERSIST_FILE, "w");
-        if (!f) {
-            delay(5);
-            continue;
-        }
+        if (!f) { delay(5); continue; }
         size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n",
                                   l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots);
         f.close();
@@ -809,6 +778,7 @@ void save_session_to_flash() {
     if (write_ok) {
         flash_write_fail_count = 0;
         last_persist_save = millis();
+        save_detections_to_flash();
     } else {
         flash_write_fail_count++;
         if (flash_write_fail_count >= FLASH_FAIL_TOAST_THRESHOLD) {
@@ -927,7 +897,6 @@ void add_blip(uint16_t blip_color, int rssi) {
     radial_spikes[band] = 0.5f + strength_mult;
     radial_colors[band] = blip_color;
     radial_rssi[band]   = rssi;
-    // Single band only — the previous adjacent-band spreading was drawing 3 blips per detection.
     xSemaphoreGive(dataMutex);
 }
 
@@ -988,7 +957,6 @@ void flush_sd_buffer() {
 }
 
 void trigger_toast(const char* type, const char* name, int confidence) {
-    // Accent color: RAVEN=teal, BLE=purple, WiFi/sim=yellow, system=cyan
     if      (strncmp(type, "RAVEN",     5) == 0) toast_accent_color = TEAL_COLOR;
     else if (strcmp (type, "FLOCK_BLE") == 0)    toast_accent_color = PURPLE_COLOR;
     else if (strcmp (type, "TARGET")    == 0)    toast_accent_color = HEADER_COLOR;
@@ -1101,13 +1069,13 @@ double rssi_to_weight(int rssi) {
 
 double haversine_m(double lat1, double lon1, double lat2, double lon2) {
     double dLat = radians(lat2 - lat1); double dLon = radians(lon2 - lon1);
-    double a = sin(dLat/2)*sin(dLat/2) + cos(radians(lat1))*cos(radians(lat2))*sin(dLon/2)*sin(dLon/2);
+    double a = sinf(dLat/2)*sinf(dLat/2) + cosf(radians(lat1))*cosf(radians(lat2))*sinf(dLon/2)*sinf(dLon/2);
     return 6371000.0 * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
 }
 
 float bearing_to(double lat1, double lon1, double lat2, double lon2) {
-    double dLon = radians(lon2 - lon1); double y = sin(dLon) * cos(radians(lat2));
-    double x = cos(radians(lat1)) * sin(radians(lat2)) - sin(radians(lat1)) * cos(radians(lat2)) * cos(dLon);
+    double dLon = radians(lon2 - lon1); double y = sinf(dLon) * cosf(radians(lat2));
+    double x = cosf(radians(lat1)) * sinf(radians(lat2)) - sinf(radians(lat1)) * cosf(radians(lat2)) * cosf(dLon);
     float brng = degrees(atan2(y, x)); if (brng < 0) brng += 360.0; return brng;
 }
 
@@ -1192,16 +1160,6 @@ void locator_stop() {
     locator_active = false; locator_has_estimate = false; locator_sample_count = 0;
     locator_newest_sample_ms = 0;
     xSemaphoreGive(dataMutex);
-}
-
-void draw_arrow(int cx, int cy, int r, float angle_deg, uint16_t fill_col, uint16_t line_col) {
-    float a = radians(angle_deg - 90.0f); 
-    int tip_x = cx + (int)(r * cosf(a)); int tip_y = cy + (int)(r * sinf(a));
-    float a_left  = a + radians(140.0f); float a_right = a - radians(140.0f);
-    int left_x  = cx + (int)((r * 0.5f) * cosf(a_left)); int left_y  = cy + (int)((r * 0.5f) * sinf(a_left));
-    int right_x = cx + (int)((r * 0.5f) * cosf(a_right)); int right_y = cy + (int)((r * 0.5f) * sinf(a_right));
-    spr.fillTriangle(tip_x, tip_y, left_x, left_y, right_x, right_y, fill_col);
-    spr.drawTriangle(tip_x, tip_y, left_x, left_y, right_x, right_y, line_col);
 }
 
 // ============================================================================
@@ -1322,9 +1280,6 @@ void process_wifi_event_queue() {
         const char* frame_type_str = local.is_beacon ? "Beacon" : "ProbeReq";
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-            // channel_lock_until is also written by ble_process_task on Core 1.
-            // Protect the write so a near-simultaneous BLE+WiFi detection doesn't
-            // produce a torn 32-bit value on the scanner task's reader.
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             channel_lock_until = millis() + 10000;
             xSemaphoreGive(dataMutex);
@@ -1340,10 +1295,6 @@ void process_wifi_event_queue() {
                           local.channel, 0, frame_type_str, methods, confidence, local.seq_num);
             write_threat_pcap(local.payload_snap, local.payload_snap_len);
 
-            // last_buzzer_time is also written by ble_process_task on Core 1.
-            // The check-and-set must be atomic to prevent both paths from both
-            // passing the cooldown guard in the same ~millisecond window and
-            // triggering a double alarm.
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
                 trigger_alarm_confidence = confidence;
@@ -1376,9 +1327,7 @@ static void ble_process_task(void* pvParameters) {
     BleEventData* ev = (BleEventData*)pvParameters;
 
     if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); xSemaphoreGive(ble_proc_sem); vTaskDelete(NULL); return; }
-    // Mutex-protected: multiple ble_process_task instances run concurrently on
-    // Core 1 and all increment this counter. The non-atomic read-modify-write
-    // on a 32-bit value is a real race even on Xtensa.
+    
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     session_ble_packets++;
     xSemaphoreGive(dataMutex);
@@ -1388,14 +1337,10 @@ static void ble_process_task(void* pvParameters) {
     char capture_type[16] = "FLOCK_BLE";
     bool got_name = false, got_mfg = false, got_raven = false;
 
-    // [v8.3 FIX 3] Penguin numeric names are now tracked separately.
-    // They contribute SCORE_WEAK as corroborating evidence only, NOT as a
-    // definitive signal. got_penguin_name does NOT set got_name=true.
     bool got_penguin_name = false;
 
     int mac_score = check_mac_prefix_tiered(ev->mac);
 
-    // ── Name check ────────────────────────────────────────────────────────
     char dev_name_char[65];
     strncpy(dev_name_char, ev->dev_name, 64);
     dev_name_char[64] = '\0';
@@ -1404,12 +1349,10 @@ static void ble_process_task(void* pvParameters) {
         if (check_device_name_pattern(dev_name_char)) {
             MCAT(methods, "name "); got_name = true;
         } else if (is_penguin_numeric_name(dev_name_char)) {
-            // Corroborating evidence only — see scoring block below.
             MCAT(methods, "penguin_num "); got_penguin_name = true;
         }
     }
 
-    // ── Manufacturer data check ───────────────────────────────────────────
     std::string mfg_std((const char*)ev->mfg_data, ev->mfg_data_len);
     if (ev->have_mfg) {
         if (check_manufacturer_id(mfg_std)) {
@@ -1418,11 +1361,6 @@ static void ble_process_task(void* pvParameters) {
         }
     }
 
-    // ── Raven UUID check — split into custom vs standard SIG ─────────────
-    // [v8.3 FIX 2] Only custom UUIDs (0x3100–0x3500) trigger got_raven alone.
-    // Standard SIG UUIDs (0x180A, 0x1809, 0x1819) require a second Raven UUID
-    // to corroborate before we classify as Raven. Single 0x180A alone is NOT
-    // sufficient — it appears on thousands of non-Flock devices.
     int raven_custom_count = 0;
     int raven_std_count = 0;
     for (int i = 0; i < ev->uuid_count; i++) {
@@ -1437,10 +1375,8 @@ static void ble_process_task(void* pvParameters) {
             }
         }
     }
-    // Total Raven UUID count preserved for firmware version detection below.
     int raven_uuid_count = raven_custom_count + raven_std_count;
 
-    // got_raven: any custom UUID is sufficient; standard-only requires 2+.
     if (raven_custom_count > 0 || raven_uuid_count >= 2) {
         strncpy(capture_type, "RAVEN_BLE", sizeof(capture_type)); got_raven = true;
         if (raven_uuid_count >= 3)        MCAT(methods, "raven_multi ");
@@ -1448,33 +1384,16 @@ static void ble_process_task(void* pvParameters) {
         else                              MCAT(methods, "raven_uuid ");
     }
 
-    // ── Confidence scoring ────────────────────────────────────────────────
-    // [v8.3 FIX 1] 0x09C8 manufacturer ID (got_mfg) now routes to
-    // SCORE_DEFINITIVE unconditionally. Previously, got_mfg without a TN
-    // serial fell into the SCORE_STRONG (60) path — below CONFIDENCE_ALARM_
-    // THRESHOLD=75 even with the RSSI bonus. The 0x09C8 ID is more durable
-    // than any single OUI prefix and survives firmware name changes.
-    //
-    // [v8.3 FIX 3] Penguin numeric name alone contributes SCORE_WEAK (25).
-    // It escalates to definitive only when paired with a Tier-1 OUI or got_mfg.
     if (got_raven || got_name || got_mfg) {
-        // Any definitive-path signal is sufficient to alarm.
         confidence = SCORE_DEFINITIVE;
-        if (mac_score == 1) MCAT(methods, "mac_t1 ");  // note co-occurrence
+        if (mac_score == 1) MCAT(methods, "mac_t1 ");
     } else if (mac_score == 1) {
         confidence = SCORE_STRONG;
         MCAT(methods, "mac_t1 ");
-        // Penguin numeric name corroborates a Tier-1 OUI → escalate to definitive.
         if (got_penguin_name) { confidence = SCORE_DEFINITIVE; }
     } else {
-        // Accumulate weak signals.
         if (mac_score == 2) { confidence += SCORE_WEAK; MCAT(methods, "mac_t2 "); }
-        if (got_penguin_name) { confidence += SCORE_WEAK; }  // already in methods from detection
-        // [v8.4 FIX 5] static_addr bonus now requires corroboration — it only fires
-        // when mac_score==2 or got_penguin_name is also true. A device with a static
-        // address alone (no OUI match, no name signal) contributes nothing.
-        // Previously the bonus fired on the majority of BLE traffic, since public and
-        // random-static addresses are the default for most BLE peripherals.
+        if (got_penguin_name) { confidence += SCORE_WEAK; }
         if ((mac_score == 2 || got_penguin_name) &&
             (ev->addr_type == 0 || (ev->addr_type == 1 && (ev->mac[0] >> 6) == 0x03))) {
             confidence += SCORE_WEAK; MCAT(methods, "static_addr ");
@@ -1488,7 +1407,6 @@ static void ble_process_task(void* pvParameters) {
         ev->mac[3], ev->mac[4], ev->mac[5]);
 
     if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-        // See process_wifi_event_queue for race rationale on channel_lock_until.
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         channel_lock_until = millis() + 10000;
         xSemaphoreGive(dataMutex);
@@ -1520,7 +1438,7 @@ static void ble_process_task(void* pvParameters) {
             }
             const char* fw = (has_gps && has_power && has_net && has_up && has_err) ? "1.3.x"
                            : (has_gps && has_power && has_net)                      ? "1.2.x"
-                           :                                                           "Unknown";
+                           :                                                        "Unknown";
             snprintf(extra_data, sizeof(extra_data), "FW:%s UUIDs:%d", fw, raven_uuid_count);
         }
 
@@ -1531,7 +1449,6 @@ static void ble_process_task(void* pvParameters) {
                       0, ev->have_tx_power ? ev->tx_power : 0,
                       extra_data, methods, confidence, -1);
 
-        // See process_wifi_event_queue for race rationale on last_buzzer_time.
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
             trigger_alarm_confidence = confidence;
@@ -1589,8 +1506,6 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
             }
         }
 
-        // Try to claim a task slot. If all BLE_MAX_CONCURRENT_TASKS slots are
-        // occupied, drop this advertisement — the device will re-advertise.
         if (xSemaphoreTake(ble_proc_sem, 0) != pdTRUE) { free(ev); return; }
         BaseType_t created = xTaskCreatePinnedToCore(
             ble_process_task, "BLEProc", 6144, ev, 1, NULL, 1);
@@ -1735,7 +1650,6 @@ void draw_vol_overlay() {
     unsigned long elapsed = millis() - vol_overlay_start;
     if (elapsed > 1500) { show_vol_overlay = false; return; }
 
-    // Slide down from top — mirrors toast sliding up from bottom
     const int TARGET_Y = 20;
     const int t_w = 210;
     const int t_x = (DISP_W - t_w) / 2;
@@ -1746,22 +1660,18 @@ void draw_vol_overlay() {
     else if (elapsed > 1350)  v_y = TARGET_Y - (int)(((float)(elapsed - 1350) / 150.0f) * (TARGET_Y + t_h));
     else                      v_y = TARGET_Y;
 
-    // Same card style as toast
     spr.fillRect(t_x, v_y, t_w, t_h, CARD_COLOR);
     spr.drawRect(t_x, v_y, t_w, t_h, CARD_BORDER);
     spr.fillRect(t_x, v_y, 4, t_h, HEADER_COLOR);
 
-    // "VOL" label in same position as "[!]"
     spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
     spr.setCursor(t_x + 10, v_y + 9); spr.print("VOL");
 
-    // Percentage
     int vol_pct = map(current_volume, 0, 255, 0, 100);
     char vol_str[6]; snprintf(vol_str, sizeof(vol_str), "%d%%", vol_pct);
     spr.setTextColor(TEXT_COLOR, CARD_COLOR);
     spr.setCursor(t_x + 38, v_y + 9); spr.print(vol_str);
 
-    // Volume bar (fills the remaining right portion)
     int bar_x = t_x + 70; int bar_y = v_y + 8;
     int bar_w = t_w - 78;  int bar_h = 10;
     spr.drawRect(bar_x, bar_y, bar_w, bar_h, GRID_COLOR);
@@ -1800,6 +1710,24 @@ void draw_help_overlay() {
     spr.setCursor(130,  68); spr.print("g: GPS page");
 }
 
+void draw_locator_help_overlay() {
+    spr.fillRoundRect(62, 22, DISP_W - 66, DISP_H - 28, 5, lgfx::color565(8, 12, 28));
+    spr.drawRoundRect(62, 22, DISP_W - 66, DISP_H - 28, 5, HEADER_COLOR);
+    spr.fillRect(62, 22, 4, DISP_H - 28, HEADER_COLOR);
+    spr.setTextColor(HEADER_COLOR); spr.setTextSize(1);
+    spr.setCursor(70, 28); spr.print("LOCATOR KEYS");
+    spr.drawLine(62, 38, DISP_W - 4, 38, GRID_COLOR);
+    spr.setTextColor(TEXT_COLOR);
+    spr.setCursor(68, 42);  spr.print("l : start/stop track");
+    spr.setCursor(68, 52);  spr.print("t : cycle target");
+    spr.setCursor(68, 62);  spr.print("arrow = bearing");
+    spr.setCursor(68, 72);  spr.print("N   = true north");
+    spr.setCursor(68, 82);  spr.print("blue rim = GPS lock");
+    spr.setCursor(68, 92);  spr.print("amber = stale data");
+    spr.setTextColor(DIM_COLOR);
+    spr.setCursor(68, 107); spr.print("h to close");
+}
+
 // ============================================================================
 // UI RENDERING - SCREENS 
 // ============================================================================
@@ -1810,10 +1738,8 @@ void draw_scanner_screen() {
     spr.setClipRect(0, 19, divider_x, DISP_H - 19);
     
     float TILT = 0.65f;
-
-    int rcx = radar_cx + (int)imu_px;
-    int rcy = radar_cy + (int)imu_py;
-
+    int rcx = radar_cx;
+    int rcy = radar_cy;
     int THICKNESS = 10;
 
     spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
@@ -1900,23 +1826,20 @@ void draw_scanner_screen() {
             int px = rcx + (int)(noise_r[i] * cosf(noise_a[i]));
             int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
 
+            // Smaller, flattened dots (lines) matching the radar's color scale
             uint16_t p_col = night_mode
-                ? lgfx::color565(intensity, intensity / 4, 0)
-                : ((i % 3 == 0)
-                    ? lgfx::color565(intensity / 4, intensity, intensity / 3)
-                    : lgfx::color565(0, intensity / 2, intensity));
-            spr.fillRect(px - 1, py - 1, 3, 3, p_col);
+                ? lgfx::color565(intensity, 0, 0)
+                : lgfx::color565(0, intensity / 2, intensity);
+            
+            // Draw a flat horizontal dash to match perspective
+            spr.drawLine(px - 1, py, px + 1, py, p_col);
 
-            if (intensity > 80) {
+            if (intensity > 120) {
                 uint16_t glow = night_mode
-                    ? lgfx::color565(intensity / 3, intensity / 8, 0)
-                    : ((i % 3 == 0)
-                        ? lgfx::color565(0, intensity / 4, 0)
-                        : lgfx::color565(0, intensity / 6, intensity / 3));
-                spr.drawPixel(px - 2, py,     glow);
-                spr.drawPixel(px + 2, py,     glow);
-                spr.drawPixel(px,     py - 2, glow);
-                spr.drawPixel(px,     py + 2, glow);
+                    ? lgfx::color565(intensity / 3, 0, 0)
+                    : lgfx::color565(0, intensity / 4, intensity / 2);
+                spr.drawPixel(px - 2, py, glow);
+                spr.drawPixel(px + 2, py, glow);
             }
         }
     }
@@ -2016,46 +1939,49 @@ void draw_scanner_screen() {
     long wp = session_wifi_packets;
     long bp = session_ble_packets;
 
-    spr.drawFastHLine(4, DISP_H - 14, (divider_x - 4) - 4, GRID_COLOR);
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(4, DISP_H - 10); spr.print("SESSION:"); 
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    { char _tbuf[9]; format_time_buf((millis() - session_start_time) / 1000, _tbuf, sizeof(_tbuf)); spr.print(_tbuf); }
-
-    bool ble_scanning = pBLEScan->isScanning();
     int right_text_x = divider_x + 2;
 
-    spr.drawRect(right_text_x, 22, 46, 14, ble_scanning ? DIM2_COLOR : TOAST_COLOR);
-    spr.setTextColor(ble_scanning ? DIM_COLOR : TOAST_COLOR, BG_COLOR);
-    spr.setCursor(right_text_x + 2, 25); spr.print("WF:"); spr.print(current_channel);
-    
+    bool ble_active = pBLEScan->isScanning();
+    bool wifi_active = !ble_active; 
+
+    uint16_t inactive_col = lgfx::color565(40, 140, 180); 
+    uint16_t wf_col  = wifi_active ? TOAST_COLOR : inactive_col;
+    uint16_t ble_col = ble_active ? PURPLE_COLOR : inactive_col;
+
+    // WiFi Badge
+    spr.drawRect(right_text_x, 22, 46, 14, wf_col);
+    spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(right_text_x + 2, 25);
+    spr.print("WF:"); spr.print(current_channel);
+
     if (millis() < channel_lock_until) {
         spr.fillRect(right_text_x + 34, 23, 10, 12, TOAST_COLOR);
         spr.setTextColor(TFT_BLACK, TOAST_COLOR);
         spr.setCursor(right_text_x + 35, 25); spr.print("L");
     }
 
-    spr.drawRect(right_text_x + 50, 22, 46, 14, ble_scanning ? PURPLE_COLOR : DIM2_COLOR);
-    spr.setTextColor(ble_scanning ? PURPLE_COLOR : DIM_COLOR, BG_COLOR);
-    spr.setCursor(right_text_x + 52, 25); spr.print("BL:SCN");
+    // BLE Badge
+    spr.drawRect(right_text_x + 50, 22, 46, 14, ble_col);
+    spr.setTextColor(ble_col, BG_COLOR);
+    spr.setCursor(right_text_x + 52, 25);
+    spr.print("BL:SCN");
 
+    // Labels simplified
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 42); spr.print("WIFI HITS");
+    spr.setCursor(right_text_x, 42); spr.print("WIFI");
     spr.setTextColor(TOAST_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 52); spr.print(sw);
     spr.setTextColor(DIM2_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 65); spr.printf("%ld pkts", wp);
 
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 74); spr.print("BLE HITS");
+    spr.setCursor(right_text_x, 74); spr.print("BLE");
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 84); spr.print(sb);
     spr.setTextColor(DIM2_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 97); spr.printf("%ld pkts", bp);
 
     spr.setTextSize(1);
-    spr.drawLine(right_text_x, 106, DISP_W - 2, 106, GRID_COLOR);
-    
     if (l_cap_type[0] != '\0' && strcmp(l_cap_type, "None") != 0) {
         spr.setTextColor(confidence_color(l_cap_conf), BG_COLOR);
         spr.setCursor(right_text_x, 109);
@@ -2075,7 +2001,16 @@ void draw_scanner_screen() {
         snprintf(conf_str, sizeof(conf_str), "%d%% %s", l_cap_conf, confidence_label(l_cap_conf));
         spr.setCursor(right_text_x, 121); spr.print(conf_str);
     } else {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setCursor(right_text_x, 109); spr.print("-- no hits yet --");
+        // Replaced 'no hits yet' with Session Time
+        spr.setTextColor(DIM_COLOR, BG_COLOR); 
+        spr.setCursor(right_text_x, 109); 
+        spr.print("SESSION:");
+        
+        char sess_buf[9]; 
+        format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); 
+        spr.setCursor(right_text_x, 121); 
+        spr.print(sess_buf);
     }
 }
 
@@ -2084,184 +2019,131 @@ void draw_locator_screen() {
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  strncpy(target_mac,  locator_target_mac,  sizeof(target_mac)  - 1); target_mac[sizeof(target_mac)-1]   = '\0';
     char target_name[65]; strncpy(target_name, locator_target_name, sizeof(target_name) - 1); target_name[sizeof(target_name)-1] = '\0';
-    int samples=locator_sample_count, peak=locator_peak_rssi;
-    float dist=locator_est_distance, brng=locator_bearing, conf_r=locator_confidence_radius;
+    float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
+    bool has_loc   = gps.location.isValid();
+    bool stale     = has_loc && (gps.location.age() > 2000);
     float gps_course = gps.course.deg();
     unsigned long newest_ms = locator_newest_sample_ms;
     xSemaphoreGive(dataMutex);
 
     unsigned long est_age_ms = (has_est && newest_ms > 0) ? (millis() - newest_ms) : 0;
-    bool est_stale = has_est && (est_age_ms > 60000UL);
+    bool est_stale      = has_est && (est_age_ms > 60000UL);
     bool est_very_stale = has_est && (est_age_ms > 300000UL);
     
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    int arrow_cx = 56 + (int)imu_px, arrow_cy = 78 + (int)imu_py;
-    const float COMP_TILT  = 0.60f;
-    const int   COMP_R     = 42;
-    const int   COMP_INNER = 14;
-    const int   COMP_THICK = 8;
+    int cx = 56, cy = 72;
 
-    uint16_t comp_rim_col  = !active          ? DIM_COLOR
-                           : est_very_stale   ? DIM_COLOR
-                           : est_stale        ? WARN_COLOR
-                           :                   HEADER_COLOR;
-    uint16_t comp_face_col = !active          ? lgfx::color565(10, 10, 18)
-                           : est_stale        ? lgfx::color565(24, 16, 8)
-                           :                   lgfx::color565(10, 22, 50);
-
-    float rel_bearing = brng;
-    if (active && has_est && gps_valid) {
-        rel_bearing = brng - gps_course; if (rel_bearing < 0) rel_bearing += 360.0f;
-    }
-
-    spr.fillEllipse(arrow_cx, arrow_cy + COMP_THICK + 3,
-                    COMP_R, (int)(COMP_R * COMP_TILT), lgfx::color565(4, 6, 12));
-    spr.drawEllipse(arrow_cx, arrow_cy + COMP_THICK,
-                    COMP_R, (int)(COMP_R * COMP_TILT), active ? DIM_COLOR : DIM2_COLOR);
-    for (int i = COMP_THICK - 1; i > 0; i--) {
-        uint8_t wv = 6 + i * 3;
-        spr.drawEllipse(arrow_cx, arrow_cy + i, COMP_R, (int)(COMP_R * COMP_TILT),
-                        active ? lgfx::color565(wv / 2, wv, wv * 3)
-                               : lgfx::color565(wv / 2, wv / 2, wv));
-    }
-    spr.fillEllipse(arrow_cx, arrow_cy, COMP_R, (int)(COMP_R * COMP_TILT), comp_face_col);
-    spr.drawEllipse(arrow_cx, arrow_cy, COMP_R - 4, (int)((COMP_R - 4) * COMP_TILT),
-                    lgfx::color565(20, 35, 70));
-    spr.drawEllipse(arrow_cx, arrow_cy, COMP_R, (int)(COMP_R * COMP_TILT), comp_rim_col);
-    spr.drawEllipse(arrow_cx, arrow_cy, COMP_INNER, (int)(COMP_INNER * COMP_TILT),
-                    active ? lgfx::color565(30, 50, 90) : DIM2_COLOR);
-
-    for (int c = 0; c < 8; c++) {
-        float ca = radians(c * 45.0f - 90.0f);
-        bool major = (c % 2 == 0);
-        int tick_len = major ? 7 : 4;
-        int ox = arrow_cx + (int)(COMP_R * cosf(ca));
-        int oy = arrow_cy + (int)(COMP_R * sinf(ca) * COMP_TILT);
-        int ix = arrow_cx + (int)((COMP_R - tick_len) * cosf(ca));
-        int iy = arrow_cy + (int)((COMP_R - tick_len) * sinf(ca) * COMP_TILT);
-        spr.drawLine(ix, iy, ox, oy, major ? comp_rim_col : DIM2_COLOR);
-    }
-    {
-        float ca = radians(-90.0f);
-        int lx = arrow_cx + (int)(COMP_R * cosf(ca));
-        int ly = arrow_cy + (int)(COMP_R * sinf(ca) * COMP_TILT);
-        spr.setTextColor(comp_rim_col, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(lx - 3, ly - 11); spr.print("N");
-    }
-
-    if (!active || !has_est) {
-        float idle_rad = (millis() / 4000.0f) * (float)M_PI * 2.0f;
-        for (int t = 1; t <= 16; t++) {
-            float ta = idle_rad - t * 0.08f;
-            float fade = (16.0f - t) / 16.0f;
-            int brightness = (int)(fade * 80.0f);
-            uint16_t tc = lgfx::color565(0, brightness / 2, brightness);
-            for (int rr = COMP_INNER + 2; rr < COMP_R - 2; rr += 3) {
-                spr.drawPixel(arrow_cx + (int)(rr * cosf(ta)),
-                              arrow_cy + (int)(rr * sinf(ta) * COMP_TILT), tc);
-            }
-        }
-        spr.drawLine(arrow_cx, arrow_cy,
-                     arrow_cx + (int)((COMP_R - 3) * cosf(idle_rad)),
-                     arrow_cy + (int)((COMP_R - 3) * sinf(idle_rad) * COMP_TILT),
-                     lgfx::color565(0, 100, 140));
+    static float ease_arrow = 0.0f;
+    float north_course = gps_valid ? gps_course : 0.0f;
+    
+    float target_angle;
+    if (north_mode) {
+        target_angle = -1.5708f; 
+    } else if (active && has_est) {
+        float rel = brng - north_course;
+        target_angle = radians(rel - 90.0f);
     } else {
-        float ba = radians(rel_bearing - 90.0f);
-        int tip_x = arrow_cx + (int)((COMP_R - 4) * cosf(ba));
-        int tip_y = arrow_cy + (int)((COMP_R - 4) * sinf(ba) * COMP_TILT);
+        target_angle = (millis() / 1500.0f) * (float)M_PI; 
+    }
 
-        uint8_t line_bright = est_very_stale ? 80 : est_stale ? 150 : 255;
-        uint16_t bear_col = est_stale
-            ? lgfx::color565(line_bright, line_bright / 2, 0)
-            : ALERT_COLOR;
+    { float d = target_angle - ease_arrow;
+      while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
+      while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
+      ease_arrow += 0.09f * d; }
+    float ang = ease_arrow;
 
-        spr.drawLine(arrow_cx, arrow_cy, tip_x, tip_y, bear_col);
-        spr.drawLine(arrow_cx + 1, arrow_cy, tip_x + 1, tip_y, bear_col);
-        spr.fillCircle(tip_x, tip_y, 4, bear_col);
-        spr.drawCircle(tip_x, tip_y, 5, lgfx::color565(
-            (bear_col >> 11) << 3,
-            ((bear_col >> 5) & 0x3F) << 2,
-            (bear_col & 0x1F) << 3));
-        int tail_x = arrow_cx - (int)(10 * cosf(ba));
-        int tail_y = arrow_cy - (int)(10 * sinf(ba) * COMP_TILT);
-        spr.drawLine(arrow_cx, arrow_cy, tail_x, tail_y, DIM_COLOR);
+    uint16_t circle_col = HEADER_COLOR;
+    spr.drawCircle(cx, cy, 12, circle_col);
+    spr.drawCircle(cx, cy, 24, circle_col);
+    spr.drawCircle(cx, cy, 36, circle_col);
+    
+    for (int i = 0; i < 360; i += 5) {
+        float rad = radians(i);
+        float wave = 46.0f + 1.5f * sinf(rad * 8.0f + millis() / 400.0f);
+        spr.drawPixel(cx + (int)(wave * cosf(rad)), cy + (int)(wave * sinf(rad)), circle_col);
+    }
+
+    uint16_t pointer_col = TOAST_COLOR; 
+    
+    auto rotpt = [&](float px, float py, float a, int* ox, int* oy) {
+        float ca = cosf(a), sa = sinf(a);
+        *ox = cx + (int)(px * ca - py * sa);
+        *oy = cy + (int)(px * sa + py * ca);
+    };
+
+    int px[4], py[4];
+    rotpt(0, -14, ang, &px[0], &py[0]); 
+    rotpt(9, 10, ang,  &px[1], &py[1]); 
+    rotpt(0, 4, ang,   &px[2], &py[2]); 
+    rotpt(-9, 10, ang, &px[3], &py[3]); 
+
+    spr.fillTriangle(px[0], py[0], px[1], py[1], px[2], py[2], pointer_col);
+    spr.fillTriangle(px[0], py[0], px[2], py[2], px[3], py[3], pointer_col);
+
+    int rx = 118; spr.drawLine(rx - 2, 20, rx - 2, DISP_H - 14, GRID_COLOR);
+    int rpx = rx + 2;
+
+    const char* status_str; uint16_t status_col;
+    if (north_mode) {
+        status_str = "Locating North";   status_col = GPS_COLOR;
+    } else if (!has_loc && !gps_valid) {
+        status_str = "Searching";        status_col = DIM_COLOR;
+    } else if (gps_valid && !active) {
+        status_str = "Awaiting Target";  status_col = WARN_COLOR;
+    } else if (active && has_est && !est_stale) {
+        status_str = "Tracking Target";  status_col = ACCENT_COLOR;
+    } else if (active && !has_est) {
+        status_str = "Acquiring...";     status_col = TOAST_COLOR;
+    } else {
+        status_str = "Searching";        status_col = DIM_COLOR;
     }
     
-    int rx = 118; spr.drawLine(rx - 2, 20, rx - 2, DISP_H - 14, GRID_COLOR);
+    spr.drawRect(rpx, 22, DISP_W - rpx - 4, 14, status_col);
+    spr.setTextColor(status_col, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx + 3, 25); spr.print(status_str); 
+
+    spr.drawRect(rpx, 44, 46, 14, ACCENT_COLOR); 
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx + 3, 47); spr.print("TARGET");
     
-    char tname[16] = "AWAITING TARGET";
+    char tname[15] = "-- none --";
     if (active) {
-        bool name_ok = (target_name[0] != '\0' &&
-                        strcmp(target_name, "Hidden")  != 0 &&
-                        strcmp(target_name, "Unknown") != 0);
-        const char* src = name_ok
-            ? target_name
-            : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
+        bool nok = (target_name[0] != '\0' && strcmp(target_name,"Hidden")!=0 && strcmp(target_name,"Unknown")!=0);
+        const char* src = nok ? target_name : ((strlen(target_mac)>8)?target_mac+9:target_mac);
         strncpy(tname, src, 14); tname[14] = '\0';
     }
-    spr.setCursor(rx + 2, 22); spr.setTextColor(active ? TEXT_COLOR : DIM_COLOR, BG_COLOR); spr.print(tname);
+    spr.setTextColor(active ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
+    spr.setTextSize(1); 
+    spr.setCursor(rpx, 61); spr.print(tname);
+
+    spr.drawRect(rpx, 78, 56, 14, ACCENT_COLOR); 
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx + 3, 81); spr.print("DISTANCE");
     
-    drawCard(rx + 2, 34, 116, 28);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(rx + 6, 38); spr.print("DISTANCE");
-    spr.setTextSize(2); spr.setCursor(rx + 6, 46);
+    spr.setTextSize(1); spr.setCursor(rpx, 95); 
     if (!active || !has_est) {
-        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.print("--");
+        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
     } else {
-        if (dist < 20) spr.setTextColor(ALERT_COLOR, CARD_COLOR);
-        else if (dist < 60) spr.setTextColor(TOAST_COLOR, CARD_COLOR);
-        else spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-        char dist_buf[12];
-        if (dist < 100) snprintf(dist_buf, sizeof(dist_buf), "%.0fm", dist);
-        else            snprintf(dist_buf, sizeof(dist_buf), "%.2fk", dist / 1000.0f);
-        spr.print(dist_buf);
-    }
-    
-    drawCard(rx + 2, 66, 116, 28);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(rx + 6, 70); spr.print("BEARING");
-    spr.setTextSize(2); spr.setCursor(rx + 6, 78);
-    if (!active || !has_est) {
-        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.print("--");
-    } else {
-        spr.setTextColor(HEADER_COLOR, CARD_COLOR);
-        static const char* cardinals[] = {"N","NE","E","SE","S","SW","W","NW"}; int card_idx = ((int)(brng + 22.5) / 45) % 8;
-        spr.print(cardinals[card_idx]);
-    }
-    
-    drawCard(rx + 2, 98, 116, 28);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(rx + 6, 102); spr.print("ACCURACY +/-");
-    spr.setTextSize(2); spr.setCursor(rx + 6, 110);
-    if (!active || !has_est) {
-        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.print("--");
-    } else {
-        spr.setTextColor(TEAL_COLOR, CARD_COLOR);
-        char acc_buf[10];
-        snprintf(acc_buf, sizeof(acc_buf), "%.0fm", conf_r);
-        spr.print(acc_buf);
+        spr.setTextColor(dist<20?ALERT_COLOR:dist<60?TOAST_COLOR:TEXT_COLOR, BG_COLOR);
+        char dbuf[12];
+        if (dist < 100) snprintf(dbuf, sizeof(dbuf), "%.0fm", dist);
+        else            snprintf(dbuf, sizeof(dbuf), "%.1fk", dist/1000.0f);
+        spr.print(dbuf);
     }
 
-    spr.setTextSize(1); spr.setCursor(4, DISP_H - 10);
-    if (!active) {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("Press 'l' to target last match");
-    } else if (!has_est) {
-        char coll_buf[40];
-        snprintf(coll_buf, sizeof(coll_buf), "Collecting: %d/%d  Peak:%ddB",
-                 samples, LOC_MIN_SAMPLES_EST, peak);
-        spr.setTextColor(TOAST_COLOR, BG_COLOR); spr.print(coll_buf);
-    } else if (est_very_stale) {
-        unsigned long age_min = est_age_ms / 60000UL;
-        char stale_buf[32]; snprintf(stale_buf, sizeof(stale_buf), "EST %lum OLD - MOVE!", age_min);
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print(stale_buf);
-    } else if (est_stale) {
-        unsigned long age_sec = est_age_ms / 1000UL;
-        char stale_buf[32]; snprintf(stale_buf, sizeof(stale_buf), "EST %lus OLD", age_sec);
-        spr.setTextColor(WARN_COLOR, BG_COLOR); spr.print(stale_buf);
+    spr.drawRect(rpx, 112, 50, 14, ACCENT_COLOR); 
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx + 3, 115); spr.print("BEARING");
+    
+    spr.setTextSize(1); spr.setCursor(rpx, 128); 
+    if (!active || !has_est) {
+        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
     } else {
-        if      (dist < 15 && conf_r < 25) { spr.setTextColor(ALERT_COLOR, BG_COLOR); spr.print("** LOOK UP! **"); }
-        else if (dist < 30)  { spr.setTextColor(ALERT_COLOR, BG_COLOR); spr.print("Very close"); }
-        else if (dist < 75)  { spr.setTextColor(TOAST_COLOR, BG_COLOR); spr.print("Closing in..."); }
-        else                 { spr.setTextColor(TEAL_COLOR,  BG_COLOR); spr.print("Keep going..."); }
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        static const char* cards[] = {"N","NE","E","SE","S","SW","W","NW"};
+        spr.print(cards[((int)(brng+22.5f)/45)%8]);
     }
 }
 
@@ -2452,28 +2334,20 @@ void draw_gps_screen() {
     xSemaphoreGive(dataMutex);
 
     drawCard(4, 22, 114, 108);
-    // Globe/pin center reference point
     int gx0 = 56, gy0 = 68;
-    int gx  = gx0 + (int)imu_px;
-    int gy  = gy0 + (int)imu_py;
+    int gx  = gx0;
+    int gy  = gy0;
     int gr  = 28;
     const float GPS_TILT = 0.62f;
 
     if (!has_loc || stale) {
-        // ── SEARCHING STATE ─────────────────────────────────────────────────
-        // 3-D GPS location-pin marker with pulsing signal rings.
-        // The pin head is an oblique circle (matching radar tilt perspective).
-        // Colors follow the radar palette: HEADER_COLOR rim, dark fills.
+        int px = gx0;
+        int py = gy0 - 22;
+        int pr = 15;
 
-        int px = gx0 + (int)imu_px;      // pin head centre x
-        int py = gy0 - 22 + (int)imu_py; // pin head centre y
-        int pr = 15;                      // pin head radius
-
-        // ── Shadow under pin tip ─────────────────────────────────────────
         int tip_y = py + pr + 28;
         spr.fillEllipse(px + 3, tip_y + 4, 7, 3, lgfx::color565(3, 6, 14));
 
-        // ── Pin body (teardrop, tapering to tip) ─────────────────────────
         int body_top = py + (int)(pr * GPS_TILT);
         for (int row = body_top; row <= tip_y; row++) {
             float t = (float)(row - body_top) / (float)(tip_y - body_top + 1);
@@ -2484,29 +2358,22 @@ void draw_gps_screen() {
                          lgfx::color565(bv / 6, bv, (uint8_t)min(255, bv * 2)));
         }
 
-        // ── Pin head depth layers (3-D effect) ───────────────────────────
         spr.fillEllipse(px, py + 3, pr, (int)(pr * GPS_TILT), lgfx::color565(2, 8, 25));
         for (int i = 3; i > 0; i--) {
             uint8_t wv = 6 + i * 6;
             spr.drawEllipse(px, py + i, pr, (int)(pr * GPS_TILT),
                             lgfx::color565(wv / 6, wv, (uint8_t)min(255, wv * 2)));
         }
-        // Face fill
         spr.fillEllipse(px, py, pr, (int)(pr * GPS_TILT), lgfx::color565(6, 22, 58));
-        // Concentric inner rings
         spr.drawEllipse(px, py, pr - 5, (int)((pr - 5) * GPS_TILT), lgfx::color565(0, 80, 160));
         spr.drawEllipse(px, py, pr - 9, (int)((pr - 9) * GPS_TILT), lgfx::color565(0, 130, 200));
-        // Centre dot
         spr.fillEllipse(px, py, 3, (int)(3 * GPS_TILT), HEADER_COLOR);
-        // Outer rim
         uint16_t rim_col = stale ? WARN_COLOR : HEADER_COLOR;
         spr.drawEllipse(px, py, pr, (int)(pr * GPS_TILT), rim_col);
-        // Specular highlight (top-left)
         spr.fillEllipse(px - pr / 3, py - (int)(pr * GPS_TILT * 0.45f),
                         pr / 5, (int)(pr / 5 * GPS_TILT * 0.7f),
                         lgfx::color565(100, 200, 255));
 
-        // ── Pulsing signal rings ──────────────────────────────────────────
         float phase_sig = millis() / 650.0f;
         for (int i = 0; i < 3; i++) {
             float raw  = fmodf(phase_sig + i * 1.05f, 3.15f);
@@ -2519,7 +2386,6 @@ void draw_gps_screen() {
                 ? lgfx::color565(bright, bright / 3, 0)
                 : lgfx::color565(0, bright / 2, bright);
             spr.drawEllipse(px, py, ring_r, (int)(ring_r * GPS_TILT), ring_col);
-            // Faint radial spokes for connection feel
             if (frac > 0.3f && frac < 0.7f && bright > 60) {
                 for (int s = 0; s < 4; s++) {
                     float sa = radians(s * 90.0f + frac * 45.0f);
@@ -2532,7 +2398,6 @@ void draw_gps_screen() {
             }
         }
 
-        // Status text
         spr.setTextColor(stale ? WARN_COLOR : TEAL_COLOR, CARD_COLOR);
         spr.setTextSize(1);
         spr.setCursor(8, gy0 + 30);
@@ -2542,10 +2407,6 @@ void draw_gps_screen() {
         spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, CARD_COLOR); spr.print(sats);
 
     } else {
-        // ── LOCKED STATE — GLOBE + ORBITING SATELLITE ───────────────────
-        // The satellite is drawn in two passes (below/above globe) for correct
-        // z-ordering: back-hemisphere before globe, front-hemisphere after.
-
         float sat_phase = (millis() / 2200.0f) * (float)M_PI;
         const float SAT_R   = (float)(gr + 10);
         const float SAT_INC = 0.48f;
@@ -2553,20 +2414,15 @@ void draw_gps_screen() {
         int sat_y = gy - (int)(SAT_R * sinf(sat_phase) * SAT_INC);
         bool sat_front = sinf(sat_phase) > 0.0f;
 
-        // ── Back-hemisphere satellite (draw BEFORE globe) ─────────────────
         if (!sat_front) {
-            // Only visible if it's outside the globe's projected disk
             float dx = sat_x - gx, dy = (sat_y - gy) / GPS_TILT;
             if (sqrtf(dx * dx + dy * dy) > gr + 1) {
                 spr.fillCircle(sat_x, sat_y, 2, lgfx::color565(10, 18, 36));
             }
         }
 
-        // ── Globe ─────────────────────────────────────────────────────────
-        // Deep-space ocean fill
         spr.fillCircle(gx, gy, gr, lgfx::color565(5, 18, 56));
 
-        // Latitude grid lines (3 rings)
         const float GLOB_T = 0.34f;
         for (int lat = -2; lat <= 2; lat++) {
             if (lat == 0) continue;
@@ -2578,7 +2434,6 @@ void draw_gps_screen() {
         }
         spr.drawEllipse(gx, gy, gr, (int)(gr * GLOB_T), lgfx::color565(15, 45, 105));
 
-        // Animated longitude meridian
         float mer_phase = (millis() / 9000.0f) * (float)M_PI;
         for (int m = 0; m < 2; m++) {
             float mp = mer_phase + m * (float)M_PI / 2.0f;
@@ -2588,31 +2443,25 @@ void draw_gps_screen() {
             spr.drawEllipse(gx, gy, mw, gr, lgfx::color565(mv / 6, mv / 2, mv));
         }
 
-        // Land masses (two simple continent blobs)
         spr.fillEllipse(gx - gr / 3, gy - gr / 5, gr / 6, gr / 3,
-                        lgfx::color565(12, 65, 30));  // Americas
+                        lgfx::color565(12, 65, 30)); 
         spr.fillEllipse(gx + gr / 5, gy + gr / 10, gr / 5, gr / 2,
-                        lgfx::color565(10, 58, 26));  // Eurasia/Africa
+                        lgfx::color565(10, 58, 26)); 
 
-        // Atmosphere rim
         spr.drawCircle(gx, gy, gr,     lgfx::color565(35, 75, 160));
         spr.drawCircle(gx, gy, gr + 1, lgfx::color565(18, 40, 100));
 
-        // Specular highlight
         spr.fillEllipse(gx - gr / 3, gy - gr / 3, gr / 5, (int)(gr / 5 * 0.75f),
                         lgfx::color565(75, 135, 215));
 
-        // Axis dot indicators
         const float ATR = radians(23.0f);
         spr.fillCircle(gx - (int)((gr - 3) * sinf(ATR)), gy - (int)((gr - 3) * cosf(ATR)),
                        2, lgfx::color565(25, 50, 100));
         spr.fillCircle(gx + (int)((gr - 3) * sinf(ATR)), gy + (int)((gr - 3) * cosf(ATR)),
                        2, lgfx::color565(25, 50, 100));
 
-        // Orbit ring
         spr.drawEllipse(gx0, gy0, (int)SAT_R, (int)(SAT_R * SAT_INC),
                         lgfx::color565(14, 28, 58));
-        // Orbit trail (front-hemisphere only)
         for (int tr = 1; tr <= 8; tr++) {
             float ta = sat_phase - tr * 0.14f;
             if (sinf(ta) <= 0.0f) continue;
@@ -2622,11 +2471,9 @@ void draw_gps_screen() {
             spr.drawPixel(tx, ty, lgfx::color565(tv, tv * 2, tv));
         }
 
-        // ── Front-hemisphere satellite (draw AFTER globe) ─────────────────
         if (sat_front) {
             spr.fillCircle(sat_x, sat_y, 3, ACCENT_COLOR);
             spr.drawCircle(sat_x, sat_y, 4, lgfx::color565(50, 180, 80));
-            // Solar panel wings
             spr.drawLine(sat_x - 5, sat_y, sat_x - 8, sat_y, lgfx::color565(180, 180, 80));
             spr.drawLine(sat_x + 5, sat_y, sat_x + 8, sat_y, lgfx::color565(180, 180, 80));
         }
@@ -2637,7 +2484,6 @@ void draw_gps_screen() {
         spr.print("GPS LOCKED");
     }
 
-    // Page dots
     spr.fillCircle(112, 124, 3, gps_page == 0 ? HEADER_COLOR : DIM2_COLOR);
     spr.fillCircle(104, 124, 3, gps_page == 1 ? HEADER_COLOR : DIM2_COLOR);
     spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
@@ -2766,12 +2612,20 @@ void draw_current_screen() {
     
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
+    if (show_locator_help && current_screen == 1) draw_locator_help_overlay();
     draw_toast_spr();
 }
 
 void transition_screen(int new_screen, int dir) {
     if (stealth_mode) { current_screen = new_screen; return; }
+    if (!is_muted) {
+        int prev_vol = current_volume;
+        M5Cardputer.Speaker.setVolume(max(prev_vol, 35));
+        M5Cardputer.Speaker.playRaw(ui_beep_pcm, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
+        M5Cardputer.Speaker.setVolume(prev_vol);
+    }
     if (new_screen == 3) history_scroll_offset = 0;
+    if (new_screen != 1) show_locator_help = false;
     current_screen = new_screen;
     draw_current_screen();
 
@@ -2781,7 +2635,7 @@ void transition_screen(int new_screen, int dir) {
 
     if (dir > 0) {
         for (int x = DISP_W; x >= 0; x -= STEP) {
-            if (trigger_alarm_confidence > 0) break;
+            if (trigger_alarm_confidence > 0) break; 
             while (millis() < frame_due) { vTaskDelay(1 / portTICK_PERIOD_MS); }
             spr.pushSprite(x, 0);
             frame_due += FRAME_MS;
@@ -2813,9 +2667,6 @@ void setup() {
     for(int i = 0; i < BATTERY_SAMPLE_SIZE; i++) battery_buffer[i] = init_v;
     WiFi.mode(WIFI_STA); delay(50);
 
-    // Initialize sprite BEFORE the charging-loop check so dedicated_charging_loop()
-    // can render to the display. Previously spr.createSprite() came after the check,
-    // meaning the charging screen drew into an unallocated buffer (blank display).
     spr.setColorDepth(16);
     spr.createSprite(DISP_W, DISP_H);
     
@@ -2832,7 +2683,8 @@ void setup() {
     if (!LittleFS.begin(true)) { littlefs_available = false; } 
     else { 
         littlefs_available = true; 
-        load_session_from_flash(); 
+        load_session_from_flash();
+        load_detections_from_flash(); 
     }
     
     lifetime_boots++;
@@ -2863,13 +2715,7 @@ void setup() {
 
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     pBLEScan = NimBLEDevice::getScan(); pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
-    // Passive scan: do NOT send SCAN_REQ packets. Active scanning would broadcast
-    // our presence to every BLE device in range, including the Flock hardware we
-    // are trying to detect passively. All advertisement data we need (name, UUIDs,
-    // manufacturer data) is present in the primary ADV_IND/ADV_NONCONN_IND packets.
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
-
-    // spr sprite was already initialized before dedicated_charging_loop() above.
 
     WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
@@ -2882,7 +2728,7 @@ void setup() {
     if (!is_muted) {
         int boot_vol = current_volume > 120 ? current_volume : 120;
         M5Cardputer.Speaker.setVolume(boot_vol);
-        delay(120);  // Let DAC/amp settle before first tone — prevents the pop-only issue
+        delay(120);  
         M5Cardputer.Speaker.tone(1320, 120); delay(160);
         M5Cardputer.Speaker.tone(880,  120); delay(160);
         M5Cardputer.Speaker.tone(660,  120); delay(160);
@@ -2901,29 +2747,6 @@ void setup() {
 void loop() {
     M5Cardputer.update(); yield(); update_battery_metrics();
     int32_t loop_mv = get_median_voltage();
-
-    // ── IMU PARALLAX UPDATE ───────────────────────────────────────────────
-    {
-        static bool imu_checked = false;
-        if (!imu_checked) {
-            imu_available = (M5.Imu.getType() != m5::imu_none);
-            imu_checked = true;
-        }
-        if (imu_available && M5.Imu.update()) {
-            auto d = M5.Imu.getImuData();
-            const float ACCEL_SCALE = 6.0f;
-            const float MAX_PX     = 3.0f;
-            float raw_px =  d.accel.x * ACCEL_SCALE;
-            float raw_py = -d.accel.y * ACCEL_SCALE;
-            if (raw_px >  MAX_PX) raw_px =  MAX_PX;
-            if (raw_px < -MAX_PX) raw_px = -MAX_PX;
-            if (raw_py >  MAX_PX) raw_py =  MAX_PX;
-            if (raw_py < -MAX_PX) raw_py = -MAX_PX;
-            const float ALPHA = 0.08f;
-            imu_px += ALPHA * (raw_px - imu_px);
-            imu_py += ALPHA * (raw_py - imu_py);
-        }
-    }
 
     process_wifi_event_queue();
 
@@ -3107,13 +2930,14 @@ void loop() {
         xSemaphoreGive(dataMutex);
     }
 
-    if (!stealth_mode) {
+if (!stealth_mode) {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
         static uint8_t last_loop_led = 255;
         if (is_device_charging(loop_mv)) {
-            float t_breath = now / 2000.0f * (float)M_PI;
-            float br = sinf(t_breath); br = br * br;
-            uint8_t led_val = (uint8_t)(br * 80.0f);
+            // Smooth LED breath using cubic easing
+            float t_cycle = (now % 4000) / 4000.0f;
+            float val = (t_cycle < 0.5f) ? (t_cycle * 2.0f) : (1.0f - (t_cycle - 0.5f) * 2.0f);
+            uint8_t led_val = (uint8_t)(val * val * val * 60.0f);
             if (led_val != last_loop_led) { set_cardputer_led(0, led_val, 0); last_loop_led = led_val; }
         } else { if (last_loop_led != 0) { set_cardputer_led(0, 0, 0); last_loop_led = 0; } }
         
