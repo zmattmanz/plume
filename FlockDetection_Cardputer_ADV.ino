@@ -512,20 +512,21 @@ void dedicated_charging_loop() {
         spr.setTextDatum(TC_DATUM);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setTextSize(2);
-        spr.drawString("CHARGING", DISP_W / 2, 10);
+        spr.drawString("CHARGING", DISP_W / 2, 25);
 
-        // ── Battery percentage — large, centred below label ────────────────
+        // ── Battery percentage — large, white, centred below label ─────────
         char pct_str[8];
         snprintf(pct_str, sizeof(pct_str), "%d%%", display_pct);
+        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
         spr.setTextSize(3);
-        spr.drawString(pct_str, DISP_W / 2, 34);
+        spr.drawString(pct_str, DISP_W / 2, 50);
 
-        // ── Battery level bar — actual percentage with pulsing fill ───────
-        const int bar_x = 40, bar_y = 72, bar_w = 160, bar_h = 10;
+        // ── Battery level bar — shorter, thicker, actual percentage ────────
+        const int bar_w = 120, bar_h = 16;
+        const int bar_x = (DISP_W - bar_w) / 2, bar_y = 90;
         spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
         int fill_w = (display_pct * (bar_w - 2)) / 100;
         if (fill_w > 0) {
-            // Pulse the fill color to indicate active charging
             bool pulse = ((millis() / 600) % 2 == 0);
             uint16_t bar_col = pulse ? ACCENT_COLOR : TEAL_COLOR;
             spr.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, bar_col);
@@ -534,9 +535,9 @@ void dedicated_charging_loop() {
         // ── Boot instruction ───────────────────────────────────────────────
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(1);
-        spr.drawString("PRESS ANY KEY TO BOOT DEVICE", DISP_W / 2, 93);
+        spr.drawString("PRESS ANY KEY TO BOOT DEVICE", DISP_W / 2, 114);
 
-        // ── Bottom info row: auto-boot timer (left) · voltage (right) ──────
+        // ── Auto-boot countdown (only in final minute) ─────────────────────
         spr.setTextDatum(TL_DATUM);
         unsigned long remaining_ms = (elapsed < CHARGE_AUTO_BOOT_MS)
                                      ? (CHARGE_AUTO_BOOT_MS - elapsed) : 0;
@@ -545,9 +546,6 @@ void dedicated_charging_loop() {
             spr.setCursor(4, DISP_H - 10);
             spr.printf("AUTO-BOOT IN %lus", remaining_ms / 1000UL);
         }
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setCursor(DISP_W - 40, DISP_H - 10);
-        spr.printf("%dmV", current_mv);
 
         spr.pushSprite(0, 0);
 
@@ -1666,6 +1664,9 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(gx, gy - 3, gx, gy + 3, gc);
         spr.fillRect(gx - 1, gy - 1, 3, 3, gc);
     }
+
+    // Header divider line — same color as inactive scan indicator (CARD_BORDER)
+    spr.drawLine(0, 18, DISP_W - 1, 18, CARD_BORDER);
 }
 
 void draw_toast_spr() {
@@ -1795,7 +1796,6 @@ void draw_scanner_screen() {
     int divider_x = 132;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
-    spr.drawLine(0, 18, DISP_W - 1, 18, TEAL_COLOR);
     spr.setClipRect(0, 19, divider_x, DISP_H - 19);
     
     float TILT = 0.55f;
@@ -2097,56 +2097,71 @@ void draw_locator_screen() {
     bool est_very_stale = has_est && (est_age_ms > 300000UL);
     
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
-    spr.drawLine(0, 18, DISP_W - 1, 18, TEAL_COLOR);
 
     int cx = 56, cy = 72;
 
-    static float ease_arrow = 0.0f;
+    static float ease_arrow = -1.5708f;  // initialise pointing north
     float north_course = gps_valid ? gps_course : 0.0f;
-    
-    float target_angle;
-    if (north_mode) {
-        target_angle = -1.5708f; 
-    } else if (active && has_est) {
-        float rel = brng - north_course;
-        target_angle = radians(rel - 90.0f);
-    } else {
-        target_angle = (millis() / 1500.0f) * (float)M_PI; 
-    }
 
-    { float d = target_angle - ease_arrow;
-      while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-      while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-      ease_arrow += 0.09f * d; }
+    // Acquiring sats: arrow frozen at north; rings animate
+    bool acquiring_sats = !gps.satellites.isValid() || gps.satellites.value() < 1;
+
+    if (acquiring_sats) {
+        ease_arrow = -1.5708f;
+    } else if (active && has_est) {
+        float rel  = brng - north_course;
+        float tgt  = radians(rel - 90.0f);
+        float d = tgt - ease_arrow;
+        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
+        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
+        ease_arrow += 0.09f * d;
+    } else {
+        // Default idle: ease back to north
+        float d = -1.5708f - ease_arrow;
+        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
+        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
+        ease_arrow += 0.09f * d;
+    }
     float ang = ease_arrow;
 
-    uint16_t circle_col = GPS_COLOR;
-    spr.drawCircle(cx, cy, 12, circle_col);
-    spr.drawCircle(cx, cy, 24, circle_col);
-    spr.drawCircle(cx, cy, 36, circle_col);
-    
-    for (int i = 0; i < 360; i += 5) {
-        float rad = radians(i);
-        float wave = 46.0f + 1.5f * sinf(rad * 8.0f + millis() / 400.0f);
-        spr.drawPixel(cx + (int)(wave * cosf(rad)), cy + (int)(wave * sinf(rad)), circle_col);
+    // Rings — perfect circles; expand-pulse when acquiring sats
+    if (acquiring_sats) {
+        unsigned long pt = millis() % 1800;
+        spr.drawCircle(cx, cy, 12, (pt < 700)              ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 24, (pt > 300 && pt < 1000) ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 36, (pt > 600 && pt < 1300) ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 46, (pt > 900 && pt < 1600) ? GPS_COLOR : DIM_COLOR);
+    } else {
+        spr.drawCircle(cx, cy, 12, GPS_COLOR);
+        spr.drawCircle(cx, cy, 24, GPS_COLOR);
+        spr.drawCircle(cx, cy, 36, GPS_COLOR);
+        spr.drawCircle(cx, cy, 46, GPS_COLOR);
     }
 
-    uint16_t pointer_col = CAUTION_COLOR;
-    
-    auto rotpt = [&](float px, float py, float a, int* ox, int* oy) {
+    auto rotpt = [&](float rpx, float rpy, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
-        *ox = cx + (int)(px * ca - py * sa);
-        *oy = cy + (int)(px * sa + py * ca);
+        *ox = cx + (int)(rpx * ca - rpy * sa);
+        *oy = cy + (int)(rpx * sa + rpy * ca);
     };
 
-    int px[4], py[4];
-    rotpt(0, -14, ang, &px[0], &py[0]); 
-    rotpt(9, 10, ang,  &px[1], &py[1]); 
-    rotpt(0, 4, ang,   &px[2], &py[2]); 
-    rotpt(-9, 10, ang, &px[3], &py[3]); 
+    // Arrow — larger, GPS_COLOR outlined, BG_COLOR filled
+    // Outer shape (border) drawn first in GPS_COLOR
+    int bx[4], by[4];
+    rotpt(0,   -24, ang, &bx[0], &by[0]);
+    rotpt(15,   17, ang, &bx[1], &by[1]);
+    rotpt(0,     4, ang, &bx[2], &by[2]);
+    rotpt(-15,  17, ang, &bx[3], &by[3]);
+    spr.fillTriangle(bx[0], by[0], bx[1], by[1], bx[2], by[2], GPS_COLOR);
+    spr.fillTriangle(bx[0], by[0], bx[2], by[2], bx[3], by[3], GPS_COLOR);
 
-    spr.fillTriangle(px[0], py[0], px[1], py[1], px[2], py[2], pointer_col);
-    spr.fillTriangle(px[0], py[0], px[2], py[2], px[3], py[3], pointer_col);
+    // Inner shape (fill) in BG_COLOR
+    int ax[4], ay[4];
+    rotpt(0,   -22, ang, &ax[0], &ay[0]);
+    rotpt(13,   15, ang, &ax[1], &ay[1]);
+    rotpt(0,     5, ang, &ax[2], &ay[2]);
+    rotpt(-13,  15, ang, &ax[3], &ay[3]);
+    spr.fillTriangle(ax[0], ay[0], ax[1], ay[1], ax[2], ay[2], BG_COLOR);
+    spr.fillTriangle(ax[0], ay[0], ax[2], ay[2], ax[3], ay[3], BG_COLOR);
 
     int rx = 118; spr.drawLine(rx - 2, 20, rx - 2, DISP_H - 14, CARD_BORDER);
     int rpx = rx + 2;
