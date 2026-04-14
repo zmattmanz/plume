@@ -2731,28 +2731,28 @@ void setup() {
 
     session_start_time = millis();
 
-    NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    pBLEScan = NimBLEDevice::getScan(); pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
-    pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
-
-    WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
-    wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-    esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true); 
-    esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler); 
-    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
-
     draw_current_screen(); spr.pushSprite(0,0);
 
     if (!is_muted) {
         int boot_vol = current_volume > 120 ? current_volume : 120;
         M5Cardputer.Speaker.setVolume(boot_vol);
-        delay(120);  
+        delay(120);
         M5Cardputer.Speaker.tone(1320, 120); delay(160);
         M5Cardputer.Speaker.tone(880,  120); delay(160);
         M5Cardputer.Speaker.tone(660,  120); delay(160);
         M5Cardputer.Speaker.tone(220,  280); delay(320);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
+
+    NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    pBLEScan = NimBLEDevice::getScan(); pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+    pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
+
+    WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
+    wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
 
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
