@@ -389,9 +389,8 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5,0,0)
+    // neopixelWrite is available from Arduino ESP32 Core 2.0 / IDF 4.4+
     neopixelWrite(21, r, g, b);
-#endif
 }
 
 // ============================================================================
@@ -403,20 +402,12 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
-    // Bruce-style breathing: incremental angle avoids float-precision wrap
-    // glitches that cause the flicker seen with millis() % period.
-    // exp(sin(angle)) gives a slow dim phase / quick bright peak — the natural
-    // inhale-exhale feel that Bruce's ledEffectTask uses.
-    // EMIN = e^-1 ≈ 0.368, ERANGE = e - e^-1 ≈ 2.350 → normalises to 0..1.
-    // Step 0.07 rad @ 20 ms ≈ 3.5 s period; cap output at 200/255 to avoid
-    // eye-blinding intensity on a pocket device.
-    constexpr float STEP   = 0.07f;
-    constexpr float EMIN   = 0.36787944f;   // e^-1
-    constexpr float ERANGE = 1.95028182f;   // e^1 - e^-1 ≈ 2.718 - 0.368 = 2.350  (normalises breathe to 0..1)
+    // Bruce-style sin breathing: (sin(x)+1)*scale → clean 0..200 range,
+    // no normalization constants to get wrong. Step 0.07 rad @ 20ms ≈ 3.5s period.
+    constexpr float STEP = 0.07f;
     float angle = 0.0f;
     for (;;) {
-        float breathe = (expf(sinf(angle)) - EMIN) / ERANGE; // 0.0 .. 1.0
-        uint8_t val   = (uint8_t)(breathe * 200.0f);
+        uint8_t val = (uint8_t)((sinf(angle) + 1.0f) * 100.0f); // 0..200
         set_cardputer_led(0, val, 0);
         vTaskDelay(pdMS_TO_TICKS(20));
         angle += STEP;
