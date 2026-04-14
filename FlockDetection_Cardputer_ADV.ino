@@ -85,7 +85,7 @@ void apply_color_palette() {
         ACCENT_COLOR  = lgfx::color565( 50, 255, 100);
         TEAL_COLOR    = lgfx::color565(  0, 215, 160);
         PURPLE_COLOR  = lgfx::color565(210, 110, 255);
-        CAUTION_COLOR = lgfx::color565(255, 170,  30);
+        CAUTION_COLOR = lgfx::color565(255, 224,   0);
         GPS_COLOR     = lgfx::color565( 80, 200, 255);
     }
 }
@@ -1618,25 +1618,18 @@ void draw_header_spr(int screen_num) {
     if (display_bat == -1) display_bat = raw_bat;
     if (abs(raw_bat - display_bat) >= 2 || raw_bat == 100 || raw_bat == 0) display_bat = raw_bat; 
 
-    spr.fillRect(0, 0, DISP_W, 18, BG_COLOR); spr.fillRect(0, 0, 3, 18, HEADER_COLOR);
-    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1); spr.setCursor(7, 5); spr.print(screen_names[screen_num]);
+    spr.fillRect(0, 0, DISP_W, 18, BG_COLOR);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1); spr.setCursor(4, 5); spr.print(screen_names[screen_num]);
 
     uint16_t bcol = chg ? ACCENT_COLOR : (display_bat > 50 ? ACCENT_COLOR : (display_bat > 20 ? CAUTION_COLOR : CAUTION_COLOR));
-    if (chg) {
-        spr.drawLine(DISP_W - 65, 4, DISP_W - 67, 8, TEXT_COLOR); spr.drawLine(DISP_W - 67, 8, DISP_W - 63, 8, TEXT_COLOR);
-        spr.drawLine(DISP_W - 64, 8, DISP_W - 66, 12, TEXT_COLOR); spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-    } else { spr.setTextColor(bcol, BG_COLOR); }
-    
+
     if (is_muted) {
         spr.setTextColor(CAUTION_COLOR, BG_COLOR);
-        spr.setCursor(DISP_W - 85, 5); spr.print("MUTED");
+        spr.setCursor(DISP_W - 55, 5); spr.print("MUTED");
     }
 
-    spr.setTextColor(bcol, BG_COLOR);
-    spr.setCursor(DISP_W - 55, 5); spr.printf("%d%%", display_bat);
-    spr.drawRect(DISP_W - 26, 3, 22, 11, bcol); spr.fillRect(DISP_W - 4, 6, 2, 5, bcol);
-    int bfill = (display_bat * 19) / 100; if (bfill > 0) spr.fillRect(DISP_W - 25, 4, bfill, 9, bcol);
-    spr.drawLine(0, 18, DISP_W, 18, CARD_BORDER);
+    spr.drawRect(DISP_W - 18, 5, 14, 7, bcol); spr.fillRect(DISP_W - 4, 7, 2, 3, bcol);
+    int bfill = (display_bat * 12) / 100; if (bfill > 0) spr.fillRect(DISP_W - 17, 6, bfill, 5, bcol);
 }
 
 void draw_toast_spr() {
@@ -1936,23 +1929,23 @@ void draw_scanner_screen() {
 
             if (is_strong) {
                 spr.drawLine(base_x, base_y, base_x, base_y - spike_len, line_col);
-                int blip_r = max(2, (int)(local_spikes[i] * 2.0f));
-                spr.fillCircle(base_x, base_y - spike_len, blip_r, line_col);
-                spr.drawCircle(base_x, base_y - spike_len, blip_r + 1,
-                               lgfx::color565(
-                                   (line_col >> 11) << 3,
-                                   ((line_col >> 5) & 0x3F) << 2,
-                                   (line_col & 0x1F) << 3));
+                // Noise-style horizontal dash at top of line
+                spr.drawLine(base_x - 2, base_y - spike_len, base_x + 2, base_y - spike_len, line_col);
+                uint16_t glow_col = lgfx::color565(
+                    ((line_col >> 11) & 0x1F) << 2,
+                    ((line_col >> 5)  & 0x3F) << 1,
+                    ((line_col)       & 0x1F) << 2);
+                spr.drawPixel(base_x - 3, base_y - spike_len, glow_col);
+                spr.drawPixel(base_x + 3, base_y - spike_len, glow_col);
             } else {
-                int dot_r = max(1, (int)(local_spikes[i] * 2.5f));
-                spr.fillCircle(base_x, base_y - 2, dot_r, line_col);
+                // Small noise-style dash for weak signals
+                spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
             }
         }
     }
     hud_rotation += 0.0033f;
     spr.clearClipRect();
 
-    spr.drawLine(divider_x - 4, 20, divider_x - 4, DISP_H, CARD_BORDER);
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     long sw = session_flock_wifi; long sb = session_flock_ble;
