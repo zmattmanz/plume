@@ -1655,7 +1655,7 @@ void draw_header_spr(int screen_num) {
         spr.setCursor(DISP_W - 55, 5); spr.print("MUTED");
     }
 
-    spr.drawRect(DISP_W - 18, 5, 14, 7, bcol); spr.fillRect(DISP_W - 4, 7, 2, 3, bcol);
+    spr.drawRoundRect(DISP_W - 18, 5, 14, 7, 3, bcol);
     int bfill = (display_bat * 12) / 100; if (bfill > 0) spr.fillRect(DISP_W - 17, 6, bfill, 5, bcol);
 
     // GPS satellite icon (white crosshair) shown when satellites are locked
@@ -2043,7 +2043,7 @@ void draw_scanner_screen() {
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
     // WiFi badge box + text
-    spr.drawRect(right_text_x - 5, 24, 61, 16, wf_col);
+    spr.drawRoundRect(right_text_x - 5, 24, 61, 16, 3, wf_col);
     spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 29);
     spr.printf("WiFi: %d", current_channel);
@@ -2053,7 +2053,7 @@ void draw_scanner_screen() {
     }
 
     // BLE badge box + text
-    spr.drawRect(right_text_x + 58, 24, 37, 16, ble_col);
+    spr.drawRoundRect(right_text_x + 58, 24, 37, 16, 3, ble_col);
     spr.setTextColor(ble_col, BG_COLOR);
     spr.setCursor(right_text_x + 63, 29);
     spr.print("BLE");
@@ -2092,7 +2092,6 @@ void draw_locator_screen() {
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  strncpy(target_mac,  locator_target_mac,  sizeof(target_mac)  - 1); target_mac[sizeof(target_mac)-1]   = '\0';
     char target_name[65]; strncpy(target_name, locator_target_name, sizeof(target_name) - 1); target_name[sizeof(target_name)-1] = '\0';
-    char target_type[8];  strncpy(target_type, locator_target_type, sizeof(target_type)  - 1); target_type[sizeof(target_type)-1]  = '\0';
     float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
     bool has_loc   = gps.location.isValid();
@@ -2113,28 +2112,28 @@ void draw_locator_screen() {
     bool est_stale = has_est && (est_age_ms > 60000UL);
     bool demo = !active;
     const char* demo_name = "Pixel-6A-7F";
-    const char* demo_type = "WiFi";
     const int   demo_rssi = -67;
     const float demo_dist = 43.0f;
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    const int cx = 52, cy = 56;
+    // Radar center — vertically centered with samples row (block height ~79px, available 117px → 19px top margin)
+    const int cx = 56, cy = 69;
     const int R1 = 8, R2 = 16, R3 = 24, R4 = 32;
     unsigned long now_ms = millis();
 
-    // ── Arrow: frame-rate-independent rotation ──
-    static float ease_arrow = 0.0f;  // 0 = north
+    // ── Arrow: frame-rate-independent; rotates whenever not locked onto an estimate ──
+    static float ease_arrow = 0.0f;
     static unsigned long last_fr_ms = 0;
     if (last_fr_ms == 0) last_fr_ms = now_ms;
     unsigned long frame_dt = now_ms - last_fr_ms;
-    if (frame_dt > 100) frame_dt = 33;  // clamp on first frame or long pauses
+    if (frame_dt > 100) frame_dt = 33;
     last_fr_ms = now_ms;
 
     bool acquiring_sats = !gps.satellites.isValid() || gps.satellites.value() < 1;
-    if (acquiring_sats) {
-        ease_arrow = 0.0f;  // frozen north
-    } else if (active && has_est) {
+
+    if (active && has_est && !acquiring_sats) {
+        // Ease toward bearing
         float rel = brng - (gps_valid ? gps_course : 0.0f);
         float tgt = radians(rel - 90.0f);
         float d = tgt - ease_arrow;
@@ -2142,13 +2141,13 @@ void draw_locator_screen() {
         while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
         ease_arrow += 0.09f * d;
     } else {
-        // Idle: slow clockwise drift — ~40 s per full revolution
+        // Slow clockwise drift in all searching/acquiring/no-GPS states
         ease_arrow += (float)frame_dt * (2.0f*(float)M_PI / 40000.0f);
         if (ease_arrow > (float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
     }
     float ang = ease_arrow;
 
-    // ── Rings: pulse sweep when acquiring; sinusoidal ripple at rest ──
+    // ── Rings: pulse sweep acquiring GPS; slow smooth sinusoidal ripple otherwise ──
     {
         uint16_t dim_c = DIM_COLOR, gps_c = GPS_COLOR;
         uint8_t dr = ((dim_c >> 11) & 0x1F) << 3, dg = ((dim_c >> 5) & 0x3F) << 2, db = (dim_c & 0x1F) << 3;
@@ -2170,46 +2169,83 @@ void draw_locator_screen() {
             float t_s = (float)now_ms / 1000.0f;
             const int radii[4] = {R1, R2, R3, R4};
             for (int ri = 0; ri < 4; ri++) {
-                float bright = (sinf(t_s * 1.4f - ri * 0.55f) + 1.0f) * 0.5f;
+                // Slower wave (~7.8s period), larger phase offset per ring for smooth outward cascade
+                float bright = (sinf(t_s * 0.8f - ri * 0.9f) + 1.0f) * 0.5f;
                 spr.drawCircle(cx, cy, radii[ri], lerp_rc(bright));
             }
         }
     }
 
-    // ── Arrow: GPS_COLOR outline, BG interior ──
+    // ── Arrow: clean triangle, GPS_COLOR outline with BG-filled interior ──
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
         *ox = cx + (int)(lx * ca - ly * sa);
         *oy = cy + (int)(lx * sa + ly * ca);
     };
-    int bx[4], by[4];
-    rotpt(0,   -20, ang, &bx[0], &by[0]);
-    rotpt(12,   14, ang, &bx[1], &by[1]);
-    rotpt(0,     2, ang, &bx[2], &by[2]);
-    rotpt(-12,  14, ang, &bx[3], &by[3]);
-    spr.fillTriangle(bx[0], by[0], bx[1], by[1], bx[2], by[2], GPS_COLOR);
-    spr.fillTriangle(bx[0], by[0], bx[2], by[2], bx[3], by[3], GPS_COLOR);
-    int ax[4], ay[4];
-    rotpt(0,   -17, ang, &ax[0], &ay[0]);
-    rotpt(10,   11, ang, &ax[1], &ay[1]);
-    rotpt(0,     4, ang, &ax[2], &ay[2]);
-    rotpt(-10,  11, ang, &ax[3], &ay[3]);
-    spr.fillTriangle(ax[0], ay[0], ax[1], ay[1], ax[2], ay[2], BG_COLOR);
-    spr.fillTriangle(ax[0], ay[0], ax[2], ay[2], ax[3], ay[3], BG_COLOR);
-    spr.drawLine(bx[0], by[0], bx[1], by[1], GPS_COLOR);
-    spr.drawLine(bx[1], by[1], bx[2], by[2], GPS_COLOR);
-    spr.drawLine(bx[2], by[2], bx[3], by[3], GPS_COLOR);
-    spr.drawLine(bx[3], by[3], bx[0], by[0], GPS_COLOR);
-    spr.drawLine(ax[0], ay[0], ax[1], ay[1], GPS_COLOR);
-    spr.drawLine(ax[1], ay[1], ax[2], ay[2], GPS_COLOR);
-    spr.drawLine(ax[2], ay[2], ax[3], ay[3], GPS_COLOR);
-    spr.drawLine(ax[3], ay[3], ax[0], ay[0], GPS_COLOR);
+    // Outer triangle: tip=(0,-19), base=(±10, 13)
+    int tri_ox[3], tri_oy[3];
+    rotpt(  0, -19, ang, &tri_ox[0], &tri_oy[0]);
+    rotpt( 10,  13, ang, &tri_ox[1], &tri_oy[1]);
+    rotpt(-10,  13, ang, &tri_ox[2], &tri_oy[2]);
+    spr.fillTriangle(tri_ox[0], tri_oy[0], tri_ox[1], tri_oy[1], tri_ox[2], tri_oy[2], GPS_COLOR);
+    // Inner triangle (BG fill): tip=(0,-15), base=(±7, 10)
+    int tri_ix[3], tri_iy[3];
+    rotpt(  0, -15, ang, &tri_ix[0], &tri_iy[0]);
+    rotpt(  7,  10, ang, &tri_ix[1], &tri_iy[1]);
+    rotpt( -7,  10, ang, &tri_ix[2], &tri_iy[2]);
+    spr.fillTriangle(tri_ix[0], tri_iy[0], tri_ix[1], tri_iy[1], tri_ix[2], tri_iy[2], BG_COLOR);
+    spr.drawLine(tri_ox[0], tri_oy[0], tri_ox[1], tri_oy[1], GPS_COLOR);
+    spr.drawLine(tri_ox[1], tri_oy[1], tri_ox[2], tri_oy[2], GPS_COLOR);
+    spr.drawLine(tri_ox[2], tri_oy[2], tri_ox[0], tri_oy[0], GPS_COLOR);
+
+    // ── Sample boxes — integrated below radar, centered under rings ──
+    int sc = active ? sample_count : (demo ? 2 : 0);
+    bool lock = active ? has_est : demo;
+
+    static unsigned long smpl_birth[3] = {0, 0, 0};
+    static int smpl_prev = 0;
+    if (sc != smpl_prev) {
+        if (sc > smpl_prev) {
+            for (int i = smpl_prev; i < sc && i < LOC_MIN_SAMPLES_EST; i++)
+                smpl_birth[i] = now_ms;
+        } else {
+            for (int i = 0; i < LOC_MIN_SAMPLES_EST; i++) smpl_birth[i] = 0;
+        }
+        smpl_prev = sc;
+    }
+
+    const int BOX = 9, PAD = 2, XLEN = BOX - PAD*2 - 1;
+    const unsigned long X_MS = 320;
+    // Center 3 boxes (39px span) under cx: bx0 = cx-19 = 37
+    const int by0 = cy + R4 + 7;  // 69+32+7 = 108
+    const int bx0 = cx - 19;      // = 37
+
+    for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
+        int bxi = bx0 + di * 15;
+        bool filled = di < sc;
+        uint16_t col = filled ? (lock ? ACCENT_COLOR : CAUTION_COLOR) : DIM_COLOR;
+        spr.drawRect(bxi, by0, BOX, BOX, col);
+        if (filled) {
+            unsigned long elapsed = (smpl_birth[di] > 0) ? (now_ms - smpl_birth[di]) : X_MS + 1;
+            float phase = min(1.0f, (float)elapsed / (float)X_MS);
+            float p1 = min(1.0f, phase * 2.0f);
+            spr.drawLine(bxi+PAD,               by0+PAD,
+                         bxi+PAD+(int)(XLEN*p1), by0+PAD+(int)(XLEN*p1), col);
+            float p2 = max(0.0f, min(1.0f, (phase - 0.5f) * 2.0f));
+            spr.drawLine(bxi+BOX-PAD-1,                  by0+PAD,
+                         bxi+BOX-PAD-1-(int)(XLEN*p2), by0+PAD+(int)(XLEN*p2), col);
+        }
+    }
+    if (lock) {
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+        spr.setCursor(bx0 + LOC_MIN_SAMPLES_EST * 15 + 4, by0 + 1); spr.print("LOCK");
+    }
 
     // ── Right panel ──
-    int rx = 116; spr.drawLine(rx, 22, rx, 115, CARD_BORDER);
-    int rpx = rx + 5;
+    int rx = 114; spr.drawLine(rx, 22, rx, DISP_H - 1, CARD_BORDER);
+    int rpx = rx + 4;
 
-    // Status — animated cycling dots for active-search states
+    // Status — animated dots; box width keyed to max possible string to avoid jitter
     const char* status_base; uint16_t status_col; bool status_anim = false;
     if (north_mode) {
         status_base = "LOCATING NORTH";  status_col = GPS_COLOR;
@@ -2233,13 +2269,17 @@ void draw_locator_screen() {
         strncpy(status_str, status_base, sizeof(status_str) - 1);
         status_str[sizeof(status_str) - 1] = '\0';
     }
-    int sw = DISP_W - rpx - 2;
-    spr.fillRect(rpx, 26, sw, 13, CARD_COLOR);
-    spr.drawRect(rpx, 26, sw, 13, status_col);
+    // Size box to max possible length for this state (avoids width jitter from dot animation)
+    int max_chars = (int)strlen(status_base) + (status_anim ? 3 : 0);
+    int box_w = max_chars * 6 + 8;
+    int avail_w = DISP_W - rpx - 1;
+    if (box_w > avail_w) box_w = avail_w;
+    spr.fillRect(rpx, 26, box_w, 13, CARD_COLOR);
+    spr.drawRect(rpx, 26, box_w, 13, status_col);
     spr.setTextColor(status_col, CARD_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx + 4, 30); spr.print(status_str);
 
-    // TARGET — green label, white value
+    // TARGET
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx, 46); spr.print("TARGET");
     {
@@ -2253,92 +2293,26 @@ void draw_locator_screen() {
         spr.setCursor(rpx, 55); spr.print(tname);
     }
 
-    // TYPE — green label, white value
+    // SIGNAL
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 66); spr.print("TYPE");
-    {
-        const char* dt = (active && target_type[0]) ? target_type : (demo ? demo_type : "--");
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setCursor(rpx, 75); spr.print(dt);
-    }
-
-    // SIGNAL — green label, white value
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 86); spr.print("SIGNAL");
+    spr.setCursor(rpx, 68); spr.print("SIGNAL");
     {
         int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setCursor(rpx, 95);
+        spr.setCursor(rpx, 77);
         if (sr == -999) { spr.print("--"); }
         else { spr.print(sr > -60 ? "STRONG" : sr > -80 ? "MEDIUM" : "WEAK"); }
     }
 
-    // DISTANCE — green label, white value (spelled out)
+    // DISTANCE
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 106); spr.print("DISTANCE");
+    spr.setCursor(rpx, 90); spr.print("DISTANCE");
     {
         float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setCursor(rpx, 115);
+        spr.setCursor(rpx, 99);
         if (sd < 0) { spr.print("--"); }
         else { char db[12]; if (sd < 100) snprintf(db,sizeof(db),"%.0fm",sd); else snprintf(db,sizeof(db),"%.1fkm",sd/1000.0f); spr.print(db); }
-    }
-
-    // ── Horizontal separator + SAMPLES bar ──
-    spr.drawLine(0, 120, DISP_W - 1, 120, CARD_BORDER);
-
-    int sc = active ? sample_count : (demo ? 2 : 0);
-    bool lock = active ? has_est : demo;
-
-    // Track when each sample was acquired for X draw-in animation
-    static unsigned long smpl_birth[3] = {0, 0, 0};
-    static int smpl_prev = 0;
-    if (sc != smpl_prev) {
-        if (sc > smpl_prev) {
-            for (int i = smpl_prev; i < sc && i < LOC_MIN_SAMPLES_EST; i++)
-                smpl_birth[i] = now_ms;
-        } else {
-            for (int i = 0; i < LOC_MIN_SAMPLES_EST; i++) smpl_birth[i] = 0;
-        }
-        smpl_prev = sc;
-    }
-
-    // "SAMPLES" label (green, left side of bar)
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(8, 126); spr.print("SAMPLES");
-
-    // 3 checkbox-style squares with animated X draw-in
-    const int BOX = 9, PAD = 2, XLEN = BOX - PAD*2 - 1;  // XLEN=4
-    const unsigned long X_MS = 320;
-    const int bx0 = 90, by0 = 123;  // top-left of first box; spaced 15px apart
-
-    for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
-        int bxi = bx0 + di * 15;
-        bool filled = di < sc;
-        uint16_t col = filled ? (lock ? ACCENT_COLOR : CAUTION_COLOR) : DIM_COLOR;
-
-        spr.drawRect(bxi, by0, BOX, BOX, col);
-
-        if (filled) {
-            unsigned long elapsed = (smpl_birth[di] > 0) ? (now_ms - smpl_birth[di]) : X_MS + 1;
-            float phase = min(1.0f, (float)elapsed / (float)X_MS);
-
-            // Diagonal 1 (TL→BR) draws in over first half
-            float p1 = min(1.0f, phase * 2.0f);
-            spr.drawLine(bxi+PAD,        by0+PAD,
-                         bxi+PAD+(int)(XLEN*p1), by0+PAD+(int)(XLEN*p1), col);
-
-            // Diagonal 2 (TR→BL) draws in over second half
-            float p2 = max(0.0f, min(1.0f, (phase - 0.5f) * 2.0f));
-            spr.drawLine(bxi+BOX-PAD-1,              by0+PAD,
-                         bxi+BOX-PAD-1-(int)(XLEN*p2), by0+PAD+(int)(XLEN*p2), col);
-        }
-    }
-
-    // Lock indicator to the right of boxes
-    if (lock) {
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(bx0 + LOC_MIN_SAMPLES_EST * 15 + 4, 126); spr.print("LOCKED");
     }
 }
 
