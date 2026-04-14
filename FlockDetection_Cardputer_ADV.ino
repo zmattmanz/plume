@@ -1766,6 +1766,7 @@ void draw_scanner_screen() {
     int divider_x = 132;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
+    spr.drawLine(0, 18, DISP_W - 1, 18, HEADER_COLOR);
     spr.setClipRect(0, 19, divider_x, DISP_H - 19);
     
     float TILT = 0.55f;
@@ -1788,6 +1789,24 @@ void draw_scanner_screen() {
     // Top face fill and border
     spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
     spr.drawEllipse(rcx, rcy, radar_r, radar_r * TILT, HEADER_COLOR);
+
+    // Hatching on both sides of the cylinder rim seam
+    {
+        const int HAT_TICKS = 20;
+        uint16_t hat_col = lgfx::color565(30, 60, 100);
+        for (int t = 0; t < HAT_TICKS; t++) {
+            float a  = (float)t / HAT_TICKS * (float)M_PI * 2.0f;
+            float ca = cosf(a), sa = sinf(a);
+            int ex = rcx + (int)(radar_r * ca);
+            int ey = rcy + (int)(radar_r * TILT * sa);
+            // Cylinder wall side: 3px tick downward from rim
+            spr.drawLine(ex, ey + 1, ex, ey + 4, hat_col);
+            // Top face side: 4px tick inward from rim toward center
+            int ix = rcx + (int)((radar_r - 4) * ca);
+            int iy = rcy + (int)((radar_r - 4) * TILT * sa);
+            spr.drawLine(ex, ey, ix, iy, hat_col);
+        }
+    }
 
     // Redraw bottom rim so it shows over the top face fill
     spr.drawEllipse(rcx, rcy + THICKNESS, radar_r, radar_r * TILT, DIM_COLOR);
@@ -1975,13 +1994,26 @@ void draw_scanner_screen() {
     int right_text_x = divider_x + 2;
 
     bool ble_active = pBLEScan->isScanning();
-    bool wifi_active = !ble_active; 
+    bool wifi_active = !ble_active;
 
     uint16_t inactive_col = CARD_BORDER;
-    uint16_t wf_col  = wifi_active ? CAUTION_COLOR : inactive_col;
-    uint16_t ble_col = ble_active ? PURPLE_COLOR : inactive_col;
 
-    // WiFi plain text
+    // Smooth easing for indicator color transitions
+    static float wf_ease = 0.0f;
+    static float ble_ease = 0.0f;
+    wf_ease  += ((wifi_active ? 1.0f : 0.0f) - wf_ease)  * 0.08f;
+    ble_ease += ((ble_active  ? 1.0f : 0.0f) - ble_ease) * 0.08f;
+
+    auto lerp_col16 = [](uint16_t fc, uint16_t tc, float t) -> uint16_t {
+        int fr = ((fc >> 11) & 0x1F) << 3, fg = ((fc >> 5) & 0x3F) << 2, fb = (fc & 0x1F) << 3;
+        int tr = ((tc >> 11) & 0x1F) << 3, tg = ((tc >> 5) & 0x3F) << 2, tb = (tc & 0x1F) << 3;
+        return lgfx::color565((uint8_t)(fr+(tr-fr)*t),(uint8_t)(fg+(tg-fg)*t),(uint8_t)(fb+(tb-fb)*t));
+    };
+    uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
+    uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
+
+    // WiFi badge box + text
+    spr.drawRect(right_text_x - 1, 21, 58, 13, wf_col);
     spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 25);
     spr.printf("WiFi: %d", current_channel);
@@ -1990,7 +2022,8 @@ void draw_scanner_screen() {
         spr.print(" L");
     }
 
-    // BLE plain text
+    // BLE badge box + text
+    spr.drawRect(right_text_x + 59, 21, 30, 13, ble_col);
     spr.setTextColor(ble_col, BG_COLOR);
     spr.setCursor(right_text_x + 62, 25);
     spr.print("BLE");
