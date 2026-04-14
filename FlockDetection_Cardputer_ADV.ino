@@ -1664,6 +1664,9 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(gx, gy - 3, gx, gy + 3, gc);
         spr.fillRect(gx - 1, gy - 1, 3, 3, gc);
     }
+
+    // Header divider line — same color as inactive scan indicator (CARD_BORDER)
+    spr.drawLine(0, 18, DISP_W - 1, 18, CARD_BORDER);
 }
 
 void draw_toast_spr() {
@@ -1793,7 +1796,6 @@ void draw_scanner_screen() {
     int divider_x = 132;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
-    spr.drawLine(0, 18, DISP_W - 1, 18, TEAL_COLOR);
     spr.setClipRect(0, 19, divider_x, DISP_H - 19);
     
     float TILT = 0.55f;
@@ -2095,7 +2097,6 @@ void draw_locator_screen() {
     bool est_very_stale = has_est && (est_age_ms > 300000UL);
     
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
-    spr.drawLine(0, 18, DISP_W - 1, 18, TEAL_COLOR);
 
     int cx = 56, cy = 72;
 
