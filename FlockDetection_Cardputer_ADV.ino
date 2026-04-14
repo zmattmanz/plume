@@ -1777,14 +1777,15 @@ void draw_scanner_screen() {
     // Structural ribs on left wall — tight at far edge, progressively spacing out
     {
         const int offsets[] = {2, 7, 13, 20, 28};  // px from leftmost edge; gaps 5,6,7,8
-        uint16_t rib_col = lgfx::color565(45, 90, 160);
+        uint16_t rib_col = lgfx::color565(80, 180, 255);
         for (int j = 0; j < 5; j++) {
             int cdx = radar_r - offsets[j];
             if (cdx <= 0) continue;
             float h  = sqrtf((float)(radar_r * radar_r - cdx * cdx)) * TILT;
             int lx   = rcx - cdx;
             int ytop = rcy + (int)h;
-            spr.drawLine(lx, ytop, lx, ytop + THICKNESS, rib_col);
+            spr.drawLine(lx,     ytop, lx,     ytop + THICKNESS, rib_col);
+            spr.drawLine(lx + 1, ytop, lx + 1, ytop + THICKNESS, rib_col);
         }
     }
 
@@ -1947,9 +1948,10 @@ void draw_scanner_screen() {
 
             if (is_strong) {
                 spr.drawLine(base_x, base_y, base_x, base_y - spike_len, line_col);
-                // Upward-pointing triangle at top of spike
-                spr.fillTriangle(base_x - 2, base_y - spike_len + 3,
-                                 base_x + 2, base_y - spike_len + 3,
+                // Upward-pointing equilateral triangle outline at top of spike
+                // base 6px wide, height 5px (~6 * sqrt(3)/2)
+                spr.drawTriangle(base_x - 3, base_y - spike_len + 5,
+                                 base_x + 3, base_y - spike_len + 5,
                                  base_x,     base_y - spike_len, line_col);
             } else {
                 // Small noise-style dash for weak signals
