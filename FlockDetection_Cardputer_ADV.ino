@@ -2198,98 +2198,64 @@ void draw_locator_screen() {
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    // ── Diagonal-scrolling infinite grid ──
+    // ── Diagonal-scrolling infinite grid (larger cells, smooth at 15ms updates) ──
     const int GRID_RIGHT = 113;
-    const int GRID_STEP  = 10;
-    // Phase: 8 px/s diagonal scroll (down-right), integer pixel
-    int grid_o = (int)fmodf((float)millis() / 125.0f, (float)GRID_STEP);
+    const int GRID_STEP  = 18;
+    unsigned long now_ms = millis();
+    // 1 cell per 1500ms → smooth visible motion
+    int grid_o = (int)fmodf((float)now_ms / (1500.0f / GRID_STEP), (float)GRID_STEP);
 
-    // Vertical lines — scroll rightward
     for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
         spr.drawLine(gx, 19, gx, DISP_H - 1, CARD_BORDER);
-    // Horizontal lines — scroll downward (same phase = diagonal)
     for (int gy = 19 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
         if (gy >= 19) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
 
-    const int cx = 56, cy = 65;  // arrow center — slightly above middle of left panel
-    unsigned long now_ms = millis();
+    const int cx = 56, cy = 65;
 
-    // ── IMU heading ──
+    // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
-    static unsigned long last_fr_ms = 0;
-    if (last_fr_ms == 0) last_fr_ms = now_ms;
-    unsigned long frame_dt = now_ms - last_fr_ms;
-    if (frame_dt > 100) frame_dt = 33;
-    last_fr_ms = now_ms;
+    static unsigned long last_ar_ms = 0;
+    unsigned long ar_dt = now_ms - last_ar_ms;
+    if (ar_dt > 100) ar_dt = 15;
+    last_ar_ms = now_ms;
 
-    float ax = 0.0f, ay = 0.0f;
-    bool imu_ok = false;
-    if (M5.Imu.isEnabled()) {
-        M5.Imu.update();
-        auto imudata = M5.Imu.getImuData();
-        ax = imudata.accel.x;
-        ay = imudata.accel.y;
-        imu_ok = true;
-    }
-    float raw_imu = imu_ok ? atan2f(-ax, ay) : ease_arrow;
-
-    bool acquiring_sats = !gps.satellites.isValid() || gps.satellites.value() < 1;
-
-    if (active && has_est && !acquiring_sats) {
+    if (active && has_est) {
         float rel = brng - (gps_valid ? gps_course : 0.0f);
         float tgt = radians(rel - 90.0f);
         float d = tgt - ease_arrow;
         while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
         while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
         ease_arrow += 0.09f * d;
-    } else if (imu_ok) {
-        // Arrow follows physical device orientation via accelerometer
-        float d = raw_imu - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.25f * d;
     } else {
-        // Fallback: slow clockwise drift
-        ease_arrow += (float)frame_dt * (2.0f*(float)M_PI / 40000.0f);
-        if (ease_arrow > (float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
+        // Slow clockwise drift: 1 rev per 20s
+        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 20000.0f);
+        if (ease_arrow > 2.0f*(float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
     }
     float ang = ease_arrow;
 
-    // ── Sharp navigation-pointer arrow ──
-    // rotpt: rotate local (lx,ly) by angle a, output to screen (ox,oy)
+    // ── Arrow: BG_COLOR fill + GPS_COLOR outline triangle ──
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
         *ox = cx + (int)roundf(lx * ca - ly * sa);
         *oy = cy + (int)roundf(lx * sa + ly * ca);
     };
-
-    // Layer 1: dark BG halo — slightly expanded triangle (clean crisp edge)
-    int hx[3], hy[3];
-    rotpt(  0, -19, ang, &hx[0], &hy[0]);
-    rotpt( 10,  12, ang, &hx[1], &hy[1]);
-    rotpt(-10,  12, ang, &hx[2], &hy[2]);
-    spr.fillTriangle(hx[0], hy[0], hx[1], hy[1], hx[2], hy[2], BG_COLOR);
-
-    // Layer 2: main GPS_COLOR fill
-    int fx[3], fy[3];
-    rotpt(  0, -17, ang, &fx[0], &fy[0]);
-    rotpt(  8,  10, ang, &fx[1], &fy[1]);
-    rotpt( -8,  10, ang, &fx[2], &fy[2]);
-    spr.fillTriangle(fx[0], fy[0], fx[1], fy[1], fx[2], fy[2], GPS_COLOR);
-
-    // Layer 3: concave notch at base (BG_COLOR cutout) → navigation-pointer shape
-    int nx[3], ny[3];
-    rotpt(  0,   1, ang, &nx[0], &ny[0]);
-    rotpt(  6,  10, ang, &nx[1], &ny[1]);
-    rotpt( -6,  10, ang, &nx[2], &ny[2]);
-    spr.fillTriangle(nx[0], ny[0], nx[1], ny[1], nx[2], ny[2], BG_COLOR);
-
-    // Layer 4: bright left-leading edge line (adds crispness + 3D feel)
-    uint16_t edge_hi = lgfx::color565(160, 230, 255);
-    spr.drawLine(fx[0], fy[0], fx[2], fy[2], edge_hi);
-
-    // Layer 5: sharp tip highlight (1px HEADER_COLOR dot)
-    spr.drawPixel(fx[0], fy[0], HEADER_COLOR);
+    int ax3[3], ay3[3];
+    rotpt(  0, -17, ang, &ax3[0], &ay3[0]);
+    rotpt( 10,  11, ang, &ax3[1], &ay3[1]);
+    rotpt(-10,  11, ang, &ax3[2], &ay3[2]);
+    // Fill with BG so grid shows through cleanly behind the outline
+    spr.fillTriangle(ax3[0], ay3[0], ax3[1], ay3[1], ax3[2], ay3[2], BG_COLOR);
+    // GPS_COLOR outline — draw each edge twice for a 2px-thick look
+    spr.drawLine(ax3[0], ay3[0], ax3[1], ay3[1], GPS_COLOR);
+    spr.drawLine(ax3[1], ay3[1], ax3[2], ay3[2], GPS_COLOR);
+    spr.drawLine(ax3[2], ay3[2], ax3[0], ay3[0], GPS_COLOR);
+    // Inner offset lines for edge thickness on the two leading sides
+    int bx3[3], by3[3];
+    rotpt(  0, -15, ang, &bx3[0], &by3[0]);
+    rotpt(  8,  10, ang, &bx3[1], &by3[1]);
+    rotpt( -8,  10, ang, &bx3[2], &by3[2]);
+    spr.drawLine(bx3[0], by3[0], bx3[1], by3[1], GPS_COLOR);
+    spr.drawLine(bx3[2], by3[2], bx3[0], by3[0], GPS_COLOR);
 
     // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : (demo ? 2 : 0);
@@ -2363,13 +2329,13 @@ void draw_locator_screen() {
         status_str[sizeof(status_str) - 1] = '\0';
     }
     int max_chars = (int)strlen(status_base) + (status_anim ? 3 : 0);
-    int box_w = max_chars * 6 + 8;
-    int avail_w = DISP_W - rpx - 1;
+    int box_w = max_chars * 6 + 12;   // 6px left+right padding inside
+    int avail_w = DISP_W - rpx - 2;
     if (box_w > avail_w) box_w = avail_w;
-    spr.fillRect(rpx, 24, box_w, 13, CARD_COLOR);
-    spr.drawRect(rpx, 24, box_w, 13, status_col);
+    spr.fillRoundRect(rpx, 23, box_w, 16, 5, CARD_COLOR);
+    spr.drawRoundRect(rpx, 23, box_w, 16, 5, status_col);
     spr.setTextColor(status_col, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx + 4, 28); spr.print(status_str);
+    spr.setCursor(rpx + 6, 27); spr.print(status_str);
 
     // TARGET — label y=42, value y=52 (textSize=1), +10 spacing
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
@@ -3169,7 +3135,7 @@ if (!stealth_mode) {
             was_charging = now_charging;
         }
         
-        if (current_screen == 0 || current_screen == 2 || current_screen == 4 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) { 
+        if (current_screen == 0 || current_screen == 1 || current_screen == 2 || current_screen == 4 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
             if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; } 
         } 
         else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
