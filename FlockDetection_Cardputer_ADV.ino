@@ -48,13 +48,10 @@ void gps_page_toggle();
 #define DISP_W       240
 #define DISP_H       135
 
-uint16_t BG_COLOR, CARD_COLOR, CARD_BORDER, HEADER_COLOR, TEXT_COLOR;
-uint16_t DIM_COLOR, DIM2_COLOR, ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
-uint16_t ALERT_COLOR, TOAST_COLOR, WARN_COLOR, GPS_COLOR;
-uint16_t OVERLAY_COLOR, RADAR_FACE, RADAR_SHADOW;
-uint16_t GPS_PIN_BODY, GPS_PIN_RING1, GPS_PIN_RING2;
-uint16_t GPS_GLOBE_OCEAN, GPS_GLOBE_GRID, GPS_GLOBE_LAND, GPS_GLOBE_ICE, GPS_GLOBE_OUTLINE;
-uint16_t GPS_SAT_NEAR, GPS_WIRE_COLOR, GPS_ORBIT, GPS_SAT_FAR;
+uint16_t BG_COLOR, CARD_COLOR, CARD_BORDER;
+uint16_t HEADER_COLOR, TEXT_COLOR, DIM_COLOR;
+uint16_t ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
+uint16_t CAUTION_COLOR, GPS_COLOR;
 bool night_mode = false;
 bool show_help_overlay = false;
 
@@ -67,65 +64,29 @@ static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};          // 'N' on locat
 
 void apply_color_palette() {
     if (night_mode) {
-        BG_COLOR      = lgfx::color565(  8,   0,   0); 
+        BG_COLOR      = lgfx::color565(  8,   0,   0);
         CARD_COLOR    = lgfx::color565( 25,   0,   0);
         CARD_BORDER   = lgfx::color565( 60,   5,   5);
         HEADER_COLOR  = lgfx::color565(255,  60,  60);
         TEXT_COLOR    = lgfx::color565(220, 200, 200);
         DIM_COLOR     = lgfx::color565(150,  30,  30);
-        DIM2_COLOR    = lgfx::color565( 80,  15,  15);
         ACCENT_COLOR  = lgfx::color565(255,  90,  90);
         TEAL_COLOR    = lgfx::color565(220,  60,  60);
-        PURPLE_COLOR  = lgfx::color565(255, 100, 255); 
-        ALERT_COLOR   = lgfx::color565(255,  10,  10);
-        TOAST_COLOR   = lgfx::color565(255, 140,  20); 
-        WARN_COLOR    = lgfx::color565(220, 100,  10);
-        GPS_COLOR     = lgfx::color565( 80,  80, 220);  // night: dim slate-blue
-        OVERLAY_COLOR     = lgfx::color565(5,  0,  0);
-        RADAR_FACE        = lgfx::color565(20, 5,  5);
-        RADAR_SHADOW      = lgfx::color565(8,  0,  0);
-        GPS_PIN_BODY      = lgfx::color565(40, 5,  5);
-        GPS_PIN_RING1     = lgfx::color565(120,20, 20);
-        GPS_PIN_RING2     = lgfx::color565(180,40, 40);
-        GPS_GLOBE_OCEAN   = lgfx::color565(40, 5,  5);
-        GPS_GLOBE_GRID    = lgfx::color565(60, 8,  8);
-        GPS_GLOBE_LAND    = lgfx::color565(70, 20, 5);
-        GPS_GLOBE_ICE     = lgfx::color565(180,60, 60);
-        GPS_GLOBE_OUTLINE = lgfx::color565(100,15, 15);
-        GPS_SAT_NEAR      = lgfx::color565(255,80, 80);
-        GPS_WIRE_COLOR    = lgfx::color565(255,180,80);
-        GPS_ORBIT         = lgfx::color565(50, 5,  5);
-        GPS_SAT_FAR       = lgfx::color565(30, 2,  2);
+        PURPLE_COLOR  = lgfx::color565(255, 100, 255);
+        CAUTION_COLOR = lgfx::color565(255, 140,  20);
+        GPS_COLOR     = lgfx::color565( 80,  80, 220);
     } else {
         BG_COLOR      = lgfx::color565( 10,  20,  48);
         CARD_COLOR    = lgfx::color565( 18,  36,  80);
-        CARD_BORDER   = lgfx::color565( 26,  42,  58);
-        HEADER_COLOR  = lgfx::color565(  0, 238, 255);
-        TEXT_COLOR    = lgfx::color565(255, 255, 255);
-        DIM_COLOR     = lgfx::color565(  0, 170, 204);
-        DIM2_COLOR    = lgfx::color565( 26,  42,  58);
+        CARD_BORDER   = lgfx::color565( 24,  46, 100);
+        HEADER_COLOR  = lgfx::color565(  0, 215, 235);
+        TEXT_COLOR    = lgfx::color565(220, 232, 255);
+        DIM_COLOR     = lgfx::color565(100, 140, 180);
         ACCENT_COLOR  = lgfx::color565( 50, 255, 100);
-        TEAL_COLOR    = lgfx::color565(  0, 180, 180);
-        PURPLE_COLOR  = lgfx::color565(255, 100, 255); 
-        ALERT_COLOR   = lgfx::color565(255,  50,  50);
-        TOAST_COLOR   = lgfx::color565(255, 224,   0); 
-        WARN_COLOR    = lgfx::color565(255, 165,   0);
-        GPS_COLOR     = lgfx::color565( 80, 200, 255);  // sky blue — distinct from WiFi/BLE/Raven
-        OVERLAY_COLOR     = lgfx::color565(10, 15, 25);
-        RADAR_FACE        = lgfx::color565(14, 26, 52);
-        RADAR_SHADOW      = lgfx::color565(4,  8,  16);
-        GPS_PIN_BODY      = lgfx::color565(6,  22, 58);
-        GPS_PIN_RING1     = lgfx::color565(0,  80, 160);
-        GPS_PIN_RING2     = lgfx::color565(0,  130,200);
-        GPS_GLOBE_OCEAN   = lgfx::color565(5,  18, 56);
-        GPS_GLOBE_GRID    = lgfx::color565(12, 35, 90);
-        GPS_GLOBE_LAND    = lgfx::color565(12, 65, 30);
-        GPS_GLOBE_ICE     = lgfx::color565(75, 135,215);
-        GPS_GLOBE_OUTLINE = lgfx::color565(35, 75, 160);
-        GPS_SAT_NEAR      = lgfx::color565(50, 180,80);
-        GPS_WIRE_COLOR    = lgfx::color565(180,180,80);
-        GPS_ORBIT         = lgfx::color565(14, 28, 58);
-        GPS_SAT_FAR       = lgfx::color565(10, 18, 36);
+        TEAL_COLOR    = lgfx::color565(  0, 215, 160);
+        PURPLE_COLOR  = lgfx::color565(210, 110, 255);
+        CAUTION_COLOR = lgfx::color565(255, 170,  30);
+        GPS_COLOR     = lgfx::color565( 80, 200, 255);
     }
 }
 
@@ -543,14 +504,14 @@ void dedicated_charging_loop() {
         spr.setCursor(72, 40);
         spr.print("CHARGING");
         
-        spr.setTextColor(DIM2_COLOR, BG_COLOR); 
-        spr.setTextSize(1); 
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(1);
         spr.setCursor(DISP_W - 40, DISP_H - 10); spr.printf("%dmV", current_mv);
 
         unsigned long remaining_ms = (elapsed < CHARGE_AUTO_BOOT_MS)
                                      ? (CHARGE_AUTO_BOOT_MS - elapsed) : 0;
         if (remaining_ms < 60000UL) {
-            spr.setTextColor(WARN_COLOR, BG_COLOR);
+            spr.setTextColor(CAUTION_COLOR, BG_COLOR);
             spr.setCursor(4, DISP_H - 10);
             spr.printf("AUTO-BOOT IN %lus", remaining_ms / 1000UL);
         }
@@ -739,10 +700,10 @@ const char* confidence_label(int score) {
 }
 
 uint16_t confidence_color(int score) {
-    if (score >= CONFIDENCE_CERTAIN) return ACCENT_COLOR;  
-    if (score >= CONFIDENCE_HIGH)    return TOAST_COLOR;   
-    if (score >= CONFIDENCE_ALARM_THRESHOLD) return WARN_COLOR; 
-    return TEXT_COLOR; 
+    if (score >= CONFIDENCE_CERTAIN) return ACCENT_COLOR;
+    if (score >= CONFIDENCE_HIGH)    return CAUTION_COLOR;
+    if (score >= CONFIDENCE_ALARM_THRESHOLD) return CAUTION_COLOR;
+    return TEXT_COLOR;
 }
 
 void write_threat_pcap(const uint8_t* payload, uint32_t length) {
@@ -1015,7 +976,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
     if      (strncmp(type, "RAVEN",     5) == 0) toast_accent_color = TEAL_COLOR;
     else if (strcmp (type, "FLOCK_BLE") == 0)    toast_accent_color = PURPLE_COLOR;
     else if (strcmp (type, "TARGET")    == 0)    toast_accent_color = HEADER_COLOR;
-    else                                          toast_accent_color = TOAST_COLOR;
+    else                                          toast_accent_color = CAUTION_COLOR;
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
     char pct_str[6];
     snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
@@ -1054,7 +1015,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         add_seen_mac(String(mac));
         uint16_t blip_col = ACCENT_COLOR;
         if (strcmp(proto, "WIFI") == 0) {
-            session_wifi++; lifetime_wifi++; session_flock_wifi++; blip_col = TOAST_COLOR;
+            session_wifi++; lifetime_wifi++; session_flock_wifi++; blip_col = CAUTION_COLOR;
         } else {
             session_ble++; lifetime_ble++; blip_col = PURPLE_COLOR;
         }
@@ -1660,14 +1621,14 @@ void draw_header_spr(int screen_num) {
     spr.fillRect(0, 0, DISP_W, 18, BG_COLOR); spr.fillRect(0, 0, 3, 18, HEADER_COLOR);
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1); spr.setCursor(7, 5); spr.print(screen_names[screen_num]);
 
-    uint16_t bcol = chg ? ACCENT_COLOR : (display_bat > 50 ? ACCENT_COLOR : (display_bat > 20 ? WARN_COLOR : ALERT_COLOR));
+    uint16_t bcol = chg ? ACCENT_COLOR : (display_bat > 50 ? ACCENT_COLOR : (display_bat > 20 ? CAUTION_COLOR : CAUTION_COLOR));
     if (chg) {
         spr.drawLine(DISP_W - 65, 4, DISP_W - 67, 8, TEXT_COLOR); spr.drawLine(DISP_W - 67, 8, DISP_W - 63, 8, TEXT_COLOR);
         spr.drawLine(DISP_W - 64, 8, DISP_W - 66, 12, TEXT_COLOR); spr.setTextColor(ACCENT_COLOR, BG_COLOR);
     } else { spr.setTextColor(bcol, BG_COLOR); }
     
     if (is_muted) {
-        spr.setTextColor(ALERT_COLOR, BG_COLOR);
+        spr.setTextColor(CAUTION_COLOR, BG_COLOR);
         spr.setCursor(DISP_W - 85, 5); spr.print("MUTED");
     }
 
@@ -1687,7 +1648,7 @@ void draw_toast_spr() {
     if (elapsed < 150) y_pos = DISP_H - 10 - (int)((elapsed / 150.0f) * 24);
     else if (elapsed > TOAST_DURATION_MS - 150) y_pos = DISP_H - 34 + (int)(((elapsed - (TOAST_DURATION_MS - 150)) / 150.0f) * 24);
 
-    uint16_t accent = toast_accent_color ? toast_accent_color : TOAST_COLOR;
+    uint16_t accent = toast_accent_color ? toast_accent_color : CAUTION_COLOR;
     int t_w = 210; int t_x = (DISP_W - t_w) / 2;
 
     spr.fillRect(t_x, y_pos, t_w, 26, CARD_COLOR);
@@ -1732,7 +1693,7 @@ void draw_vol_overlay() {
     spr.drawRect(bar_x, bar_y, bar_w, bar_h, CARD_BORDER);
     int fill = (current_volume * (bar_w - 2)) / 255;
     if (fill > 0) {
-        uint16_t bar_col = vol_pct > 80 ? ALERT_COLOR : vol_pct > 40 ? HEADER_COLOR : TEAL_COLOR;
+        uint16_t bar_col = vol_pct > 80 ? CAUTION_COLOR : vol_pct > 40 ? HEADER_COLOR : GPS_COLOR;
         spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, bar_col);
     }
 }
@@ -1742,7 +1703,7 @@ void drawCard(int x, int y, int w, int h) {
 }
 
 void draw_help_overlay() {
-    spr.fillRoundRect(10, 15, DISP_W - 20, DISP_H - 30, 6, OVERLAY_COLOR);
+    spr.fillRoundRect(10, 15, DISP_W - 20, DISP_H - 30, 6, lgfx::color565(10, 15, 25));
     spr.drawRoundRect(10, 15, DISP_W - 20, DISP_H - 30, 6, HEADER_COLOR);
     spr.setTextColor(HEADER_COLOR); spr.setTextSize(1);
     spr.setCursor(14, 20); spr.print("--- HOTKEYS ---");
@@ -1766,7 +1727,7 @@ void draw_help_overlay() {
 }
 
 void draw_locator_help_overlay() {
-    spr.fillRoundRect(62, 22, DISP_W - 66, DISP_H - 28, 5, OVERLAY_COLOR);
+    spr.fillRoundRect(62, 22, DISP_W - 66, DISP_H - 28, 5, lgfx::color565(10, 15, 25));
     spr.drawRoundRect(62, 22, DISP_W - 66, DISP_H - 28, 5, HEADER_COLOR);
     spr.fillRect(62, 22, 4, DISP_H - 28, HEADER_COLOR);
     spr.setTextColor(HEADER_COLOR); spr.setTextSize(1);
@@ -1797,7 +1758,7 @@ void draw_scanner_screen() {
     int rcy = radar_cy;
     int THICKNESS = 10;
 
-    spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, RADAR_SHADOW);
+    spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
     spr.drawEllipse(rcx, rcy + THICKNESS, radar_r, radar_r * TILT, DIM_COLOR);
     for (int i = THICKNESS - 1; i > 0; i--) {
         uint8_t wall_v = 8 + (i * 2);
@@ -1805,7 +1766,7 @@ void draw_scanner_screen() {
                         lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
     }
 
-    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, RADAR_FACE);
+    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
     spr.drawEllipse(rcx, rcy, radar_r, radar_r * TILT, HEADER_COLOR);
     spr.drawEllipse(rcx, rcy, inner_r, inner_r * TILT, DIM_COLOR);
 
@@ -2000,7 +1961,7 @@ void draw_scanner_screen() {
     bool wifi_active = !ble_active; 
 
     uint16_t inactive_col = DIM_COLOR;
-    uint16_t wf_col  = wifi_active ? TOAST_COLOR : inactive_col;
+    uint16_t wf_col  = wifi_active ? CAUTION_COLOR : inactive_col;
     uint16_t ble_col = ble_active ? PURPLE_COLOR : inactive_col;
 
     // WiFi Badge
@@ -2010,8 +1971,8 @@ void draw_scanner_screen() {
     spr.print("WF:"); spr.print(current_channel);
 
     if (millis() < channel_lock_until) {
-        spr.fillRect(right_text_x + 34, 23, 10, 12, TOAST_COLOR);
-        spr.setTextColor(TFT_BLACK, TOAST_COLOR);
+        spr.fillRect(right_text_x + 34, 23, 10, 12, CAUTION_COLOR);
+        spr.setTextColor(TFT_BLACK, CAUTION_COLOR);
         spr.setCursor(right_text_x + 35, 25); spr.print("L");
     }
 
@@ -2024,16 +1985,16 @@ void draw_scanner_screen() {
     // Labels simplified
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 42); spr.print("WIFI");
-    spr.setTextColor(TOAST_COLOR, BG_COLOR); spr.setTextSize(2);
+    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 52); spr.print(sw);
-    spr.setTextColor(DIM2_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(CARD_BORDER, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 65); spr.printf("%ld pkts", wp);
 
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 74); spr.print("BLE");
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 84); spr.print(sb);
-    spr.setTextColor(DIM2_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(CARD_BORDER, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 97); spr.printf("%ld pkts", bp);
 
     spr.setTextSize(1);
@@ -2109,7 +2070,7 @@ void draw_locator_screen() {
       ease_arrow += 0.09f * d; }
     float ang = ease_arrow;
 
-    uint16_t circle_col = HEADER_COLOR;
+    uint16_t circle_col = GPS_COLOR;
     spr.drawCircle(cx, cy, 12, circle_col);
     spr.drawCircle(cx, cy, 24, circle_col);
     spr.drawCircle(cx, cy, 36, circle_col);
@@ -2120,7 +2081,7 @@ void draw_locator_screen() {
         spr.drawPixel(cx + (int)(wave * cosf(rad)), cy + (int)(wave * sinf(rad)), circle_col);
     }
 
-    uint16_t pointer_col = TOAST_COLOR; 
+    uint16_t pointer_col = CAUTION_COLOR;
     
     auto rotpt = [&](float px, float py, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
@@ -2146,11 +2107,11 @@ void draw_locator_screen() {
     } else if (!has_loc && !gps_valid) {
         status_str = "Searching";        status_col = DIM_COLOR;
     } else if (gps_valid && !active) {
-        status_str = "Awaiting Target";  status_col = WARN_COLOR;
+        status_str = "Awaiting Target";  status_col = CAUTION_COLOR;
     } else if (active && has_est && !est_stale) {
         status_str = "Tracking Target";  status_col = ACCENT_COLOR;
     } else if (active && !has_est) {
-        status_str = "Acquiring...";     status_col = TOAST_COLOR;
+        status_str = "Acquiring...";     status_col = CAUTION_COLOR;
     } else {
         status_str = "Searching";        status_col = DIM_COLOR;
     }
@@ -2181,7 +2142,7 @@ void draw_locator_screen() {
     if (!active || !has_est) {
         spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
     } else {
-        spr.setTextColor(dist<20?ALERT_COLOR:dist<60?TOAST_COLOR:TEXT_COLOR, BG_COLOR);
+        spr.setTextColor(dist<20?CAUTION_COLOR:dist<60?CAUTION_COLOR:TEXT_COLOR, BG_COLOR);
         char dbuf[12];
         if (dist < 100) snprintf(dbuf, sizeof(dbuf), "%.0fm", dist);
         else            snprintf(dbuf, sizeof(dbuf), "%.1fk", dist/1000.0f);
@@ -2241,7 +2202,7 @@ void draw_last_detect_screen() {
     spr.setTextColor(ccol, CARD_COLOR); spr.setTextSize(1);
     spr.setCursor(10, 28); spr.print(t_type);
 
-    uint16_t dot_col = is_active ? ((millis() % 800 < 400) ? ACCENT_COLOR : DIM_COLOR) : DIM2_COLOR;
+    uint16_t dot_col = is_active ? ((millis() % 800 < 400) ? ACCENT_COLOR : DIM_COLOR) : CARD_BORDER;
     spr.fillCircle(DISP_W - 14, 31, 4, dot_col);
     spr.setTextColor(is_active ? ACCENT_COLOR : DIM_COLOR, CARD_COLOR);
     spr.setCursor(DISP_W - 56, 28); spr.print(is_active ? "LIVE" : "LOST");
@@ -2307,9 +2268,9 @@ void draw_capture_history_screen() {
     if (local_count == 0) {
         for (int i = 0; i < 4; i++) {
             int y = 20 + i * 28;
-            spr.fillRect(0, y, 3, 27, DIM2_COLOR);
+            spr.fillRect(0, y, 3, 27, CARD_BORDER);
             spr.fillRect(3, y, DISP_W - 3, 27, (i % 2 == 0) ? CARD_COLOR : BG_COLOR);
-            spr.setTextColor(DIM2_COLOR, (i % 2 == 0) ? CARD_COLOR : BG_COLOR); spr.setTextSize(1);
+            spr.setTextColor(CARD_BORDER, (i % 2 == 0) ? CARD_COLOR : BG_COLOR); spr.setTextSize(1);
             spr.setCursor(10, y + 9); spr.print("-- Listening...");
         }
         return;
@@ -2401,7 +2362,7 @@ void draw_gps_screen() {
         int pr = 15;
 
         int tip_y = py + pr + 28;
-        spr.fillEllipse(px + 3, tip_y + 4, 7, 3, RADAR_SHADOW);
+        spr.fillEllipse(px + 3, tip_y + 4, 7, 3, lgfx::color565(4, 8, 16));
 
         int body_top = py + (int)(pr * GPS_TILT);
         for (int row = body_top; row <= tip_y; row++) {
@@ -2413,17 +2374,17 @@ void draw_gps_screen() {
                          lgfx::color565(bv / 6, bv, (uint8_t)min(255, bv * 2)));
         }
 
-        spr.fillEllipse(px, py + 3, pr, (int)(pr * GPS_TILT), RADAR_SHADOW);
+        spr.fillEllipse(px, py + 3, pr, (int)(pr * GPS_TILT), lgfx::color565(4, 8, 16));
         for (int i = 3; i > 0; i--) {
             uint8_t wv = 6 + i * 6;
             spr.drawEllipse(px, py + i, pr, (int)(pr * GPS_TILT),
                             lgfx::color565(wv / 6, wv, (uint8_t)min(255, wv * 2)));
         }
-        spr.fillEllipse(px, py, pr, (int)(pr * GPS_TILT), GPS_PIN_BODY);
-        spr.drawEllipse(px, py, pr - 5, (int)((pr - 5) * GPS_TILT), GPS_PIN_RING1);
-        spr.drawEllipse(px, py, pr - 9, (int)((pr - 9) * GPS_TILT), GPS_PIN_RING2);
+        spr.fillEllipse(px, py, pr, (int)(pr * GPS_TILT), lgfx::color565(6, 22, 58));
+        spr.drawEllipse(px, py, pr - 5, (int)((pr - 5) * GPS_TILT), lgfx::color565(0, 80, 160));
+        spr.drawEllipse(px, py, pr - 9, (int)((pr - 9) * GPS_TILT), lgfx::color565(0, 130, 200));
         spr.fillEllipse(px, py, 3, (int)(3 * GPS_TILT), HEADER_COLOR);
-        uint16_t rim_col = stale ? WARN_COLOR : HEADER_COLOR;
+        uint16_t rim_col = stale ? CAUTION_COLOR : HEADER_COLOR;
         spr.drawEllipse(px, py, pr, (int)(pr * GPS_TILT), rim_col);
         spr.fillEllipse(px - pr / 3, py - (int)(pr * GPS_TILT * 0.45f),
                         pr / 5, (int)(pr / 5 * GPS_TILT * 0.7f),
@@ -2453,7 +2414,7 @@ void draw_gps_screen() {
             }
         }
 
-        spr.setTextColor(stale ? WARN_COLOR : TEAL_COLOR, CARD_COLOR);
+        spr.setTextColor(stale ? CAUTION_COLOR : GPS_COLOR, CARD_COLOR);
         spr.setTextSize(1);
         spr.setCursor(8, gy0 + 30);
         spr.print(stale ? "SIGNAL LOST" : "SEARCHING...");
@@ -2472,11 +2433,11 @@ void draw_gps_screen() {
         if (!sat_front) {
             float dx = sat_x - gx, dy = (sat_y - gy) / GPS_TILT;
             if (sqrtf(dx * dx + dy * dy) > gr + 1) {
-                spr.fillCircle(sat_x, sat_y, 2, GPS_SAT_FAR);
+                spr.fillCircle(sat_x, sat_y, 2, lgfx::color565(10, 18, 36));
             }
         }
 
-        spr.fillCircle(gx, gy, gr, GPS_GLOBE_OCEAN);
+        spr.fillCircle(gx, gy, gr, lgfx::color565(5, 18, 56));
 
         const float GLOB_T = 0.34f;
         for (int lat = -2; lat <= 2; lat++) {
@@ -2485,9 +2446,9 @@ void draw_gps_screen() {
             float lr = sqrtf(1.0f - lf * lf) * gr;
             int   ly = gy + (int)(lf * gr);
             if (lr >= 3) spr.drawEllipse(gx, ly, (int)lr, (int)(lr * GLOB_T),
-                                         GPS_GLOBE_GRID);
+                                         lgfx::color565(12, 35, 90));
         }
-        spr.drawEllipse(gx, gy, gr, (int)(gr * GLOB_T), GPS_GLOBE_GRID);
+        spr.drawEllipse(gx, gy, gr, (int)(gr * GLOB_T), lgfx::color565(12, 35, 90));
 
         float mer_phase = (millis() / 9000.0f) * (float)M_PI;
         for (int m = 0; m < 2; m++) {
@@ -2499,24 +2460,24 @@ void draw_gps_screen() {
         }
 
         spr.fillEllipse(gx - gr / 3, gy - gr / 5, gr / 6, gr / 3,
-                        GPS_GLOBE_LAND);
+                        lgfx::color565(12, 65, 30));
         spr.fillEllipse(gx + gr / 5, gy + gr / 10, gr / 5, gr / 2,
-                        GPS_GLOBE_LAND);
+                        lgfx::color565(12, 65, 30));
 
-        spr.drawCircle(gx, gy, gr,     GPS_GLOBE_OUTLINE);
-        spr.drawCircle(gx, gy, gr + 1, GPS_GLOBE_OUTLINE);
+        spr.drawCircle(gx, gy, gr,     lgfx::color565(35, 75, 160));
+        spr.drawCircle(gx, gy, gr + 1, lgfx::color565(35, 75, 160));
 
         spr.fillEllipse(gx - gr / 3, gy - gr / 3, gr / 5, (int)(gr / 5 * 0.75f),
-                        GPS_GLOBE_ICE);
+                        lgfx::color565(75, 135, 215));
 
         const float ATR = radians(23.0f);
         spr.fillCircle(gx - (int)((gr - 3) * sinf(ATR)), gy - (int)((gr - 3) * cosf(ATR)),
-                       2, GPS_GLOBE_OUTLINE);
+                       2, lgfx::color565(35, 75, 160));
         spr.fillCircle(gx + (int)((gr - 3) * sinf(ATR)), gy + (int)((gr - 3) * cosf(ATR)),
-                       2, GPS_GLOBE_OUTLINE);
+                       2, lgfx::color565(35, 75, 160));
 
         spr.drawEllipse(gx0, gy0, (int)SAT_R, (int)(SAT_R * SAT_INC),
-                        GPS_ORBIT);
+                        lgfx::color565(14, 28, 58));
         for (int tr = 1; tr <= 8; tr++) {
             float ta = sat_phase - tr * 0.14f;
             if (sinf(ta) <= 0.0f) continue;
@@ -2528,9 +2489,9 @@ void draw_gps_screen() {
 
         if (sat_front) {
             spr.fillCircle(sat_x, sat_y, 3, ACCENT_COLOR);
-            spr.drawCircle(sat_x, sat_y, 4, GPS_SAT_NEAR);
-            spr.drawLine(sat_x - 5, sat_y, sat_x - 8, sat_y, GPS_WIRE_COLOR);
-            spr.drawLine(sat_x + 5, sat_y, sat_x + 8, sat_y, GPS_WIRE_COLOR);
+            spr.drawCircle(sat_x, sat_y, 4, lgfx::color565(50, 180, 80));
+            spr.drawLine(sat_x - 5, sat_y, sat_x - 8, sat_y, lgfx::color565(180, 180, 80));
+            spr.drawLine(sat_x + 5, sat_y, sat_x + 8, sat_y, lgfx::color565(180, 180, 80));
         }
 
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
@@ -2539,8 +2500,8 @@ void draw_gps_screen() {
         spr.print("GPS LOCKED");
     }
 
-    spr.fillCircle(112, 124, 3, gps_page == 0 ? HEADER_COLOR : DIM2_COLOR);
-    spr.fillCircle(104, 124, 3, gps_page == 1 ? HEADER_COLOR : DIM2_COLOR);
+    spr.fillCircle(112, 124, 3, gps_page == 0 ? HEADER_COLOR : CARD_BORDER);
+    spr.fillCircle(104, 124, 3, gps_page == 1 ? HEADER_COLOR : CARD_BORDER);
     spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
     spr.setCursor(8, 124); spr.print("g=pg");
 
@@ -2603,7 +2564,7 @@ void draw_gps_screen() {
         drawCard(122, 88, 114, 19);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
         spr.setCursor(126, 92); spr.print("FIX:");
-        spr.setTextColor(has_loc && !stale ? ACCENT_COLOR : (stale ? WARN_COLOR : DIM_COLOR), CARD_COLOR);
+        spr.setTextColor(has_loc && !stale ? GPS_COLOR : (stale ? CAUTION_COLOR : DIM_COLOR), CARD_COLOR);
         spr.setCursor(152, 92);
         spr.print(has_loc && !stale ? "3D LOCK" : (stale ? "STALE" : "NONE"));
 
@@ -2637,11 +2598,11 @@ void draw_device_info_screen() {
     
     drawCard(160, 46, 76, 38);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, 50); spr.print("ALL-TIME");
-    spr.setTextColor(TOAST_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, 60); spr.print(lt);
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, 60); spr.print(lt);
     
     drawCard(4,   88, 72, 38);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, 92); spr.print("WIFI SESS");
-    spr.setTextColor(TOAST_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, 102); spr.print(sw);
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, 102); spr.print(sw);
     
     drawCard(82,  88, 72, 38);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, 92); spr.print("BLE SESS");
