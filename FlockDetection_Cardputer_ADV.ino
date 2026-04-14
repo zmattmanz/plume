@@ -503,11 +503,11 @@ void dedicated_charging_loop() {
         spr.setCursor(35, 115); spr.print("PRESS ANY KEY TO BOOT DEVICE"); 
         spr.pushSprite(0, 0);
 
-        // Smooth LED breath using cubic easing
+        // Smooth LED breath using sinusoidal easing — no dark gaps, strong and perceptually even
         float t_cycle = (millis() % 4000) / 4000.0f; // 0.0 to 1.0 over 4 sec
-        float val = (t_cycle < 0.5f) ? (t_cycle * 2.0f) : (1.0f - (t_cycle - 0.5f) * 2.0f);
-        uint8_t led_val = (uint8_t)(val * val * val * 60.0f); 
-        
+        float brightness = 0.5f * (1.0f - cosf(t_cycle * 2.0f * (float)M_PI));
+        uint8_t led_val = (uint8_t)(brightness * 200.0f);
+
         if (led_val != last_led_val) { set_cardputer_led(0, led_val, 0); last_led_val = led_val; }
 
         if (current_mv < 3200 && elapsed > 3000) { 
@@ -2933,12 +2933,16 @@ void loop() {
 if (!stealth_mode) {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
         static uint8_t last_loop_led = 255;
+        static unsigned long last_led_ms = 0;
         if (is_device_charging(loop_mv)) {
-            // Smooth LED breath using cubic easing
-            float t_cycle = (now % 4000) / 4000.0f;
-            float val = (t_cycle < 0.5f) ? (t_cycle * 2.0f) : (1.0f - (t_cycle - 0.5f) * 2.0f);
-            uint8_t led_val = (uint8_t)(val * val * val * 60.0f);
-            if (led_val != last_loop_led) { set_cardputer_led(0, led_val, 0); last_loop_led = led_val; }
+            if (now - last_led_ms >= 20) {
+                // Smooth LED breath using sinusoidal easing — no dark gaps, strong and perceptually even
+                float t_cycle = (now % 4000) / 4000.0f;
+                float brightness = 0.5f * (1.0f - cosf(t_cycle * 2.0f * (float)M_PI));
+                uint8_t led_val = (uint8_t)(brightness * 200.0f);
+                if (led_val != last_loop_led) { set_cardputer_led(0, led_val, 0); last_loop_led = led_val; }
+                last_led_ms = now;
+            }
         } else { if (last_loop_led != 0) { set_cardputer_led(0, 0, 0); last_loop_led = 0; } }
         
         if (current_screen == 0 || current_screen == 2 || current_screen == 4 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) { 
