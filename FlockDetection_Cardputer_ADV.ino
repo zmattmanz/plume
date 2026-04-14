@@ -452,11 +452,11 @@ int32_t get_median_voltage() {
 }
 
 uint8_t get_unified_battery_pct(int16_t mv) {
-    const int16_t VOLT_MAX     = 3550; 
-    const int16_t VOLT_HIGH    = 3450; 
-    const int16_t VOLT_NOMINAL = 3300; 
-    const int16_t VOLT_LOW     = 3100; 
-    const int16_t VOLT_MIN     = 2800; 
+    const int16_t VOLT_MAX     = 4200;  // 100% — fully charged LiPo
+    const int16_t VOLT_HIGH    = 4000;  // ~80%
+    const int16_t VOLT_NOMINAL = 3700;  // ~50% — nominal voltage
+    const int16_t VOLT_LOW     = 3400;  // ~20%
+    const int16_t VOLT_MIN     = 3000;  // 0%  — cutoff
 
     if (mv >= VOLT_MAX) return 100;
     if (mv <= VOLT_MIN) return 0;
@@ -520,11 +520,16 @@ void dedicated_charging_loop() {
         spr.setTextSize(3);
         spr.drawString(pct_str, DISP_W / 2, 34);
 
-        // ── Animated progress bar — horizontally centred ───────────────────
+        // ── Battery level bar — actual percentage with pulsing fill ───────
         const int bar_x = 40, bar_y = 72, bar_w = 160, bar_h = 10;
         spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
-        int fill_w = (millis() / 15) % (bar_w - 2);
-        if (fill_w > 0) spr.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, ACCENT_COLOR);
+        int fill_w = (display_pct * (bar_w - 2)) / 100;
+        if (fill_w > 0) {
+            // Pulse the fill color to indicate active charging
+            bool pulse = ((millis() / 600) % 2 == 0);
+            uint16_t bar_col = pulse ? ACCENT_COLOR : TEAL_COLOR;
+            spr.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, bar_col);
+        }
 
         // ── Boot instruction ───────────────────────────────────────────────
         spr.setTextColor(DIM_COLOR, BG_COLOR);
