@@ -319,8 +319,9 @@ struct LocSample {
 };
 
 bool locator_active = false;
-char locator_target_mac[18]  = "";   
-char locator_target_name[65] = "";   
+char locator_target_mac[18]  = "";
+char locator_target_name[65] = "";
+char locator_target_type[8]  = "";   // "WiFi", "BLE", or ""
 LocSample locator_samples[LOC_MAX_SAMPLES];
 int locator_sample_count = 0;
 unsigned long locator_last_sample = 0;
@@ -1185,11 +1186,12 @@ void locator_add_sample(const char* mac, int rssi) {
     xSemaphoreGive(dataMutex);
 }
 
-void locator_start(const char* mac, const char* name) {
+void locator_start(const char* mac, const char* name, const char* type = "") {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     locator_active = true;
     strncpy(locator_target_mac,  mac,  sizeof(locator_target_mac)  - 1); locator_target_mac[17]  = '\0';
     strncpy(locator_target_name, name, sizeof(locator_target_name) - 1); locator_target_name[64] = '\0';
+    strncpy(locator_target_type, type, sizeof(locator_target_type) - 1); locator_target_type[7]  = '\0';
     locator_sample_count = 0; locator_has_estimate = false; locator_peak_rssi = -120;
     locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
     locator_start_time = millis(); locator_newest_sample_ms = 0;
@@ -2079,17 +2081,26 @@ void draw_scanner_screen() {
     spr.print(sess_buf);
 }
 
+// FNV-1a 32-bit hash of MAC address → 6 uppercase hex chars (deterministic, no storage)
+void mac_to_short_id(const char* mac, char* out7) {
+    uint32_t h = 2166136261UL;
+    for (const char* p = mac; *p; p++) { h ^= (uint8_t)*p; h *= 16777619UL; }
+    snprintf(out7, 7, "%06X", h & 0xFFFFFF);
+}
+
 void draw_locator_screen() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  strncpy(target_mac,  locator_target_mac,  sizeof(target_mac)  - 1); target_mac[sizeof(target_mac)-1]   = '\0';
     char target_name[65]; strncpy(target_name, locator_target_name, sizeof(target_name) - 1); target_name[sizeof(target_name)-1] = '\0';
+    char target_type[8];  strncpy(target_type, locator_target_type, sizeof(target_type)  - 1); target_type[sizeof(target_type)-1]  = '\0';
     float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
     bool has_loc   = gps.location.isValid();
     bool stale     = has_loc && (gps.location.age() > 2000);
     float gps_course = gps.course.deg();
     unsigned long newest_ms = locator_newest_sample_ms;
+    int sample_count = locator_sample_count;
     // RSSI for target from tracker
     int target_rssi = 0; bool has_rssi = false;
     for (int _i = 0; _i < rssi_tracker_count; _i++) {
@@ -2104,10 +2115,10 @@ void draw_locator_screen() {
     unsigned long est_age_ms = (has_est && newest_ms > 0) ? (millis() - newest_ms) : 0;
     bool est_stale      = has_est && (est_age_ms > 60000UL);
     bool est_very_stale = has_est && (est_age_ms > 300000UL);
-    
+
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    int cx = 56, cy = 72;
+    int cx = 56, cy = 76;  // cy bumped for header separation
 
     static float ease_arrow = -1.5708f;  // initialise pointing north
     float north_course = gps_valid ? gps_course : 0.0f;
@@ -2125,23 +2136,19 @@ void draw_locator_screen() {
         while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
         ease_arrow += 0.09f * d;
     } else {
-        // Idle: gentle meander around north — slow sine drift ±12°
-        float meander = sinf((float)millis() / 2500.0f) * 0.21f;
-        float tgt = -1.5708f + meander;
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.03f * d;
+        // Idle: slow continuous clockwise drift
+        ease_arrow += 0.0006f;
+        if (ease_arrow > (float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
     }
     float ang = ease_arrow;
 
-    // Rings — 7% smaller radii; honing-in pulse (outer→inner) when acquiring sats
+    // Rings — honing-in pulse (outer→inner) when acquiring sats, slowed period 2600ms
     if (acquiring_sats) {
-        unsigned long pt = millis() % 1800;
-        spr.drawCircle(cx, cy, 43, (pt < 700)              ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, 33, (pt > 300 && pt < 1000) ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, 22, (pt > 600 && pt < 1300) ? GPS_COLOR : DIM_COLOR);
-        spr.drawCircle(cx, cy, 11, (pt > 900 && pt < 1600) ? GPS_COLOR : DIM_COLOR);
+        unsigned long pt = millis() % 2600;
+        spr.drawCircle(cx, cy, 43, (pt < 900)                ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 33, (pt > 450  && pt < 1350)  ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 22, (pt > 900  && pt < 1800)  ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 11, (pt > 1350 && pt < 2250)  ? GPS_COLOR : DIM_COLOR);
     } else {
         spr.drawCircle(cx, cy, 11, GPS_COLOR);
         spr.drawCircle(cx, cy, 22, GPS_COLOR);
@@ -2155,7 +2162,7 @@ void draw_locator_screen() {
         *oy = cy + (int)(rpx * sa + rpy * ca);
     };
 
-    // Arrow — thicker GPS_COLOR border (4px), BG_COLOR interior
+    // Arrow — GPS_COLOR fill, BG_COLOR interior, GPS_COLOR lines on ALL edges for uniform weight
     int bx[4], by[4];
     rotpt(0,   -26, ang, &bx[0], &by[0]);
     rotpt(16,   18, ang, &bx[1], &by[1]);
@@ -2171,15 +2178,21 @@ void draw_locator_screen() {
     rotpt(-13,  15, ang, &ax[3], &ay[3]);
     spr.fillTriangle(ax[0], ay[0], ax[1], ay[1], ax[2], ay[2], BG_COLOR);
     spr.fillTriangle(ax[0], ay[0], ax[2], ay[2], ax[3], ay[3], BG_COLOR);
-    // Crisp inner edge lines
+    // Outer edge lines — ensures uniform stroke weight around the entire arrow
+    spr.drawLine(bx[0], by[0], bx[1], by[1], GPS_COLOR);
+    spr.drawLine(bx[1], by[1], bx[2], by[2], GPS_COLOR);
+    spr.drawLine(bx[2], by[2], bx[3], by[3], GPS_COLOR);
+    spr.drawLine(bx[3], by[3], bx[0], by[0], GPS_COLOR);
+    // Inner edge lines
     spr.drawLine(ax[0], ay[0], ax[1], ay[1], GPS_COLOR);
     spr.drawLine(ax[1], ay[1], ax[2], ay[2], GPS_COLOR);
     spr.drawLine(ax[2], ay[2], ax[3], ay[3], GPS_COLOR);
     spr.drawLine(ax[3], ay[3], ax[0], ay[0], GPS_COLOR);
 
-    int rx = 118; spr.drawLine(rx - 2, 20, rx - 2, DISP_H - 14, CARD_BORDER);
+    int rx = 118; spr.drawLine(rx - 2, 22, rx - 2, DISP_H - 14, CARD_BORDER);
     int rpx = rx + 2;
 
+    // Status box — filled CARD_COLOR background for readability
     const char* status_str; uint16_t status_col;
     if (north_mode) {
         status_str = "Locating North";   status_col = GPS_COLOR;
@@ -2194,14 +2207,14 @@ void draw_locator_screen() {
     } else {
         status_str = "Searching";        status_col = DIM_COLOR;
     }
-    
-    spr.drawRect(rpx, 22, DISP_W - rpx - 4, 14, status_col);
-    spr.setTextColor(status_col, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx + 3, 25); spr.print(status_str); 
+    spr.fillRect(rpx, 24, DISP_W - rpx - 4, 12, CARD_COLOR);
+    spr.drawRect(rpx, 24, DISP_W - rpx - 4, 12, status_col);
+    spr.setTextColor(status_col, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx + 3, 27); spr.print(status_str);
 
-    // TARGET — scanner-style: ACCENT_COLOR label, white value, no box
+    // TARGET label + name
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 42); spr.print("TARGET");
+    spr.setCursor(rpx, 41); spr.print("TARGET");
 
     char tname[15] = "-- none --";
     if (active) {
@@ -2210,14 +2223,25 @@ void draw_locator_screen() {
         strncpy(tname, src, 14); tname[14] = '\0';
     }
     spr.setTextColor(active ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(rpx, 52); spr.print(tname);
+    spr.setCursor(rpx, 51); spr.print(tname);
+
+    // ID (#RRGGBB style hash) + type tag on one line
+    if (active && target_mac[0] != '\0') {
+        char id6[7]; mac_to_short_id(target_mac, id6);
+        char idbuf[8]; snprintf(idbuf, sizeof(idbuf), "#%s", id6);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(rpx, 61); spr.print(idbuf);
+        if (target_type[0] != '\0') {
+            uint16_t tcol = (strncmp(target_type, "BLE", 3) == 0) ? PURPLE_COLOR : TEAL_COLOR;
+            spr.setTextColor(tcol, BG_COLOR);
+            spr.setCursor(rpx + 50, 61); spr.print(target_type);
+        }
+    }
 
     // SIGNAL
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 66); spr.print("SIGNAL");
-
-    spr.setTextSize(1); spr.setCursor(rpx, 76);
+    spr.setCursor(rpx, 72); spr.print("SIGNAL");
+    spr.setCursor(rpx, 81);
     if (!active || !has_rssi) {
         spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
     } else {
@@ -2229,9 +2253,8 @@ void draw_locator_screen() {
 
     // DISTANCE
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 90); spr.print("DISTANCE");
-
-    spr.setTextSize(1); spr.setCursor(rpx, 100);
+    spr.setCursor(rpx, 92); spr.print("DISTANCE");
+    spr.setCursor(rpx, 101);
     if (!active || !has_est) {
         spr.setTextColor(DIM_COLOR, BG_COLOR); spr.print("--");
     } else {
@@ -2242,17 +2265,23 @@ void draw_locator_screen() {
         spr.print(dbuf);
     }
 
-    // MAC (short, dim)
+    // SAMPLES — three dot progress + LOCKED/count label
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 114); spr.print("MAC");
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setCursor(rpx, 124);
-    if (active && target_mac[0] != '\0') {
-        // Last 8 chars of MAC (e.g. "AB:CD:EF")
-        const char* short_mac = strlen(target_mac) > 8 ? target_mac + 9 : target_mac;
-        spr.print(short_mac);
-    } else {
-        spr.print("--");
+    spr.setCursor(rpx, 112); spr.print("SAMPLES");
+    {
+        int sc = active ? sample_count : 0;
+        for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
+            uint16_t dc = (di < sc) ? (has_est ? ACCENT_COLOR : CAUTION_COLOR) : DIM_COLOR;
+            spr.fillCircle(rpx + 4 + di * 10, 122, 3, dc);
+        }
+        if (has_est) {
+            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+            spr.setCursor(rpx + 36, 119); spr.print("LOCKED");
+        } else if (active) {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            char scbuf[6]; snprintf(scbuf, sizeof(scbuf), "%d/%d", sc, LOC_MIN_SAMPLES_EST);
+            spr.setCursor(rpx + 36, 119); spr.print(scbuf);
+        }
     }
 }
 
@@ -2945,7 +2974,7 @@ void loop() {
                     int t_conf = capture_history[target_select_idx].confidence;
                     xSemaphoreGive(dataMutex);
                     
-                    locator_start(t_mac, t_name);
+                    locator_start(t_mac, t_name, capture_history[target_select_idx].type);
                     trigger_toast("TARGET", t_name, t_conf);
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
@@ -2990,7 +3019,7 @@ void loop() {
                     char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
                     xSemaphoreGive(dataMutex);
                     if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
-                        locator_start(l_mac, l_name);
+                        locator_start(l_mac, l_name, l_type);
                         transition_screen(1, 1); 
                     } 
                 } 
