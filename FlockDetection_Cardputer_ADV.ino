@@ -524,7 +524,7 @@ void dedicated_charging_loop() {
 
         // ── Battery level bar — shorter, thicker, actual percentage ────────
         const int bar_w = 120, bar_h = 16;
-        const int bar_x = (DISP_W - bar_w) / 2, bar_y = 90;
+        const int bar_x = (DISP_W - bar_w) / 2, bar_y = 72;
         spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
         int fill_w = (display_pct * (bar_w - 2)) / 100;
         if (fill_w > 0) {
@@ -1607,17 +1607,17 @@ void AlarmTask(void* pvParameters) {
     int conf = (int)(intptr_t)pvParameters;
     
     if (conf >= CONFIDENCE_CERTAIN) {
-        M5Cardputer.Speaker.tone(880, 60); vTaskDelay(80 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(1319, 60); vTaskDelay(80 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(1760, 120); vTaskDelay(120 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(523, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(659, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(880, 140); vTaskDelay(160 / portTICK_PERIOD_MS);
     } else if (conf >= CONFIDENCE_HIGH) {
-        for (int i = 0; i < 3; i++) {
-            M5Cardputer.Speaker.tone(DETECT_FREQ_HIGH, DETECT_BEEP_DURATION);
-            vTaskDelay((DETECT_BEEP_DURATION + 50) / portTICK_PERIOD_MS); 
+        for (int i = 0; i < 2; i++) {
+            M5Cardputer.Speaker.tone(740, 110);
+            vTaskDelay(180 / portTICK_PERIOD_MS);
         }
     } else {
-        M5Cardputer.Speaker.tone(DETECT_FREQ, DETECT_BEEP_DURATION);
-        vTaskDelay((DETECT_BEEP_DURATION + 50) / portTICK_PERIOD_MS); 
+        M5Cardputer.Speaker.tone(620, 90);
+        vTaskDelay(140 / portTICK_PERIOD_MS);
     }
     
     is_alarming = false;
@@ -1695,7 +1695,7 @@ void draw_toast_spr() {
 void draw_vol_overlay() {
     if (!show_vol_overlay) return;
     unsigned long elapsed = millis() - vol_overlay_start;
-    const unsigned long SHOW_MS = 1600;
+    const unsigned long SHOW_MS = 2200;
     if (elapsed > SHOW_MS) { show_vol_overlay = false; return; }
 
     // Quick fade-in (100ms), quadratic ease-out fade — no position change
@@ -1740,8 +1740,7 @@ void draw_vol_overlay() {
     spr.drawRect(bar_x, bar_y, bar_w, bar_h, brd_c);
     int fill = (current_volume * (bar_w - 2)) / 255;
     if (fill > 0) {
-        uint16_t bar_col_raw = vol_pct > 80 ? CAUTION_COLOR : vol_pct > 40 ? HEADER_COLOR : GPS_COLOR;
-        spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, blend16(BG_COLOR, bar_col_raw, alpha));
+        spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, blend16(BG_COLOR, HEADER_COLOR, alpha));
     }
 }
 
@@ -2271,7 +2270,7 @@ void draw_locator_screen() {
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setCursor(rpx, 95);
         if (sr == -999) { spr.print("--"); }
-        else { char sb[10]; snprintf(sb, sizeof(sb), "%d dBm", sr); spr.print(sb); }
+        else { spr.print(sr > -60 ? "STRONG" : sr > -80 ? "MEDIUM" : "WEAK"); }
     }
 
     // DISTANCE — green label, white value (spelled out)
@@ -2906,13 +2905,13 @@ void setup() {
     draw_current_screen(); spr.pushSprite(0,0);
 
     if (!is_muted) {
-        int boot_vol = current_volume > 70 ? 70 : current_volume;
+        int boot_vol = current_volume > 50 ? 50 : current_volume;
         M5Cardputer.Speaker.setVolume(boot_vol);
         delay(200);
-        M5Cardputer.Speaker.tone(1320, 180); delay(260);
-        M5Cardputer.Speaker.tone(880,  180); delay(260);
-        M5Cardputer.Speaker.tone(660,  180); delay(260);
-        M5Cardputer.Speaker.tone(220,  420); delay(500);
+        M5Cardputer.Speaker.tone(1320, 220); delay(320);
+        M5Cardputer.Speaker.tone(880,  220); delay(320);
+        M5Cardputer.Speaker.tone(660,  220); delay(320);
+        M5Cardputer.Speaker.tone(1760, 320); delay(420);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
