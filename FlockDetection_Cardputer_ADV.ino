@@ -895,8 +895,9 @@ void rssi_track_expire() {
 
 #define NUM_RADIAL_BANDS 36
 float radial_spikes[NUM_RADIAL_BANDS] = {0};
-uint16_t radial_colors[NUM_RADIAL_BANDS] = {0}; 
-int radial_rssi[NUM_RADIAL_BANDS] = {0}; 
+uint16_t radial_colors[NUM_RADIAL_BANDS] = {0};
+int radial_rssi[NUM_RADIAL_BANDS] = {0};
+unsigned long radial_spike_birth[NUM_RADIAL_BANDS] = {0};
 static float hud_rotation = 0.0f;
 
 #define NUM_PARTICLES 24
@@ -910,9 +911,10 @@ void add_blip(uint16_t blip_color, int rssi) {
     last_blip_time = millis();
     int band = random(0, NUM_RADIAL_BANDS);
     float strength_mult = constrain(map(rssi, -100, -30, 50, 200), 50, 200) / 100.0f;
-    radial_spikes[band] = 0.5f + strength_mult;
-    radial_colors[band] = blip_color;
-    radial_rssi[band]   = rssi;
+    radial_spikes[band]      = 0.5f + strength_mult;
+    radial_colors[band]      = blip_color;
+    radial_rssi[band]        = rssi;
+    radial_spike_birth[band] = millis();
     xSemaphoreGive(dataMutex);
 }
 
@@ -1751,30 +1753,42 @@ void draw_scanner_screen() {
     int rcy = radar_cy;
     int THICKNESS = 10;
 
+    // Shadow below cylinder
     spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
-    spr.drawEllipse(rcx, rcy + THICKNESS, radar_r, radar_r * TILT, DIM_COLOR);
-    for (int i = THICKNESS - 1; i > 0; i--) {
-        uint8_t wall_v = 8 + (i * 2);
-        spr.drawEllipse(rcx, rcy + i, radar_r, radar_r * TILT,
+
+    // Cylinder wall: solid gradient fills from bottom to top (lighter toward top)
+    for (int i = THICKNESS; i >= 1; i--) {
+        uint8_t wall_v = 8 + (THICKNESS - i) * 2;
+        spr.fillEllipse(rcx, rcy + i, radar_r, radar_r * TILT,
                         lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
     }
 
-    // Structural ribs on left wall — tight at far edge, spreading toward center
+    // Left/right edge lines connecting top rim to bottom rim
+    spr.drawLine(rcx - radar_r, rcy, rcx - radar_r, rcy + THICKNESS, HEADER_COLOR);
+    spr.drawLine(rcx + radar_r, rcy, rcx + radar_r, rcy + THICKNESS, HEADER_COLOR);
+
+    // Top face fill and border
+    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
+    spr.drawEllipse(rcx, rcy, radar_r, radar_r * TILT, HEADER_COLOR);
+
+    // Redraw bottom rim so it shows over the top face fill
+    spr.drawEllipse(rcx, rcy + THICKNESS, radar_r, radar_r * TILT, DIM_COLOR);
+
+    // Structural ribs on left wall — tight at far edge, progressively spacing out
     {
         const int offsets[] = {2, 7, 13, 20, 28};  // px from leftmost edge; gaps 5,6,7,8
-        uint16_t rib_col = lgfx::color565(24, 48, 96);
+        uint16_t rib_col = lgfx::color565(80, 180, 255);
         for (int j = 0; j < 5; j++) {
             int cdx = radar_r - offsets[j];
             if (cdx <= 0) continue;
             float h  = sqrtf((float)(radar_r * radar_r - cdx * cdx)) * TILT;
             int lx   = rcx - cdx;
             int ytop = rcy + (int)h;
-            spr.drawLine(lx, ytop, lx, ytop + THICKNESS + 2, rib_col);
+            spr.drawLine(lx,     ytop, lx,     ytop + THICKNESS, rib_col);
+            spr.drawLine(lx + 1, ytop, lx + 1, ytop + THICKNESS, rib_col);
         }
     }
 
-    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(rcx, rcy, radar_r, radar_r * TILT, HEADER_COLOR);
     spr.drawEllipse(rcx, rcy, inner_r, inner_r * TILT, DIM_COLOR);
 
     float sweep_rad = (millis() / 3000.0f) * (float)M_PI * 2.0f;
@@ -1815,6 +1829,11 @@ void draw_scanner_screen() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     unsigned long time_since_blip = now_ms - last_blip_time;
     for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
+        // Enforce 2-minute max detection lifetime
+        if (radial_spike_birth[i] > 0 && (now_ms - radial_spike_birth[i]) > 120000UL) {
+            radial_spikes[i]      = 0;
+            radial_spike_birth[i] = 0;
+        }
         local_spikes[i] = radial_spikes[i];
         local_colors[i] = radial_colors[i];
         radial_spikes[i] -= decay_amount;
@@ -1929,14 +1948,11 @@ void draw_scanner_screen() {
 
             if (is_strong) {
                 spr.drawLine(base_x, base_y, base_x, base_y - spike_len, line_col);
-                // Noise-style horizontal dash at top of line
-                spr.drawLine(base_x - 2, base_y - spike_len, base_x + 2, base_y - spike_len, line_col);
-                uint16_t glow_col = lgfx::color565(
-                    ((line_col >> 11) & 0x1F) << 2,
-                    ((line_col >> 5)  & 0x3F) << 1,
-                    ((line_col)       & 0x1F) << 2);
-                spr.drawPixel(base_x - 3, base_y - spike_len, glow_col);
-                spr.drawPixel(base_x + 3, base_y - spike_len, glow_col);
+                // Upward-pointing equilateral triangle outline at top of spike
+                // base 6px wide, height 5px (~6 * sqrt(3)/2)
+                spr.drawTriangle(base_x - 3, base_y - spike_len + 5,
+                                 base_x + 3, base_y - spike_len + 5,
+                                 base_x,     base_y - spike_len, line_col);
             } else {
                 // Small noise-style dash for weak signals
                 spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
@@ -1949,13 +1965,7 @@ void draw_scanner_screen() {
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     long sw = session_flock_wifi; long sb = session_flock_ble;
-    char l_cap_type[16]; strncpy(l_cap_type, last_cap_type, sizeof(l_cap_type) - 1); l_cap_type[sizeof(l_cap_type)-1] = '\0';
-    char l_cap_name[65]; strncpy(l_cap_name, last_cap_name, sizeof(l_cap_name) - 1); l_cap_name[sizeof(l_cap_name)-1] = '\0';
-    char l_cap_mac[18];  strncpy(l_cap_mac,  last_cap_mac,  sizeof(l_cap_mac)  - 1); l_cap_mac[sizeof(l_cap_mac)-1]   = '\0';
-    int l_cap_conf = last_cap_confidence;
     xSemaphoreGive(dataMutex);
-    long wp = session_wifi_packets;
-    long bp = session_ble_packets;
 
     int right_text_x = divider_x + 2;
 
@@ -1966,22 +1976,18 @@ void draw_scanner_screen() {
     uint16_t wf_col  = wifi_active ? CAUTION_COLOR : inactive_col;
     uint16_t ble_col = ble_active ? PURPLE_COLOR : inactive_col;
 
-    // WiFi Badge
-    spr.drawRect(right_text_x, 22, 46, 14, wf_col);
+    // WiFi plain text
     spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x + 2, 25);
-    spr.print("WF:"); spr.print(current_channel);
-
+    spr.setCursor(right_text_x, 25);
+    spr.printf("WiFi: %d", current_channel);
     if (millis() < channel_lock_until) {
-        spr.fillRect(right_text_x + 34, 23, 10, 12, CAUTION_COLOR);
-        spr.setTextColor(TFT_BLACK, CAUTION_COLOR);
-        spr.setCursor(right_text_x + 35, 25); spr.print("L");
+        spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+        spr.print(" L");
     }
 
-    // BLE Badge
-    spr.drawRect(right_text_x + 50, 22, 46, 14, ble_col);
+    // BLE plain text
     spr.setTextColor(ble_col, BG_COLOR);
-    spr.setCursor(right_text_x + 52, 25);
+    spr.setCursor(right_text_x + 62, 25);
     spr.print("BLE");
 
     // Labels simplified
@@ -1995,37 +2001,15 @@ void draw_scanner_screen() {
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 84); spr.print(sb);
 
-    spr.setTextSize(1);
-    if (l_cap_type[0] != '\0' && strcmp(l_cap_type, "None") != 0) {
-        spr.setTextColor(confidence_color(l_cap_conf), BG_COLOR);
-        spr.setCursor(right_text_x, 109);
-        char dn[14] = "";
-        bool use_name = (l_cap_name[0] != '\0' &&
-                         strcmp(l_cap_name, "Hidden")  != 0 &&
-                         strcmp(l_cap_name, "Unknown") != 0);
-        if (use_name) {
-            strncpy(dn, l_cap_name, 13); dn[13] = '\0';
-        } else {
-            const char* sm = (strlen(l_cap_mac) > 8) ? l_cap_mac + 9 : l_cap_mac;
-            strncpy(dn, sm, 13); dn[13] = '\0';
-        }
-        spr.print(dn);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        char conf_str[24];
-        snprintf(conf_str, sizeof(conf_str), "%d%% %s", l_cap_conf, confidence_label(l_cap_conf));
-        spr.setCursor(right_text_x, 121); spr.print(conf_str);
-    } else {
-        // Replaced 'no hits yet' with Session Time
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(right_text_x, 109);
-        spr.print("SESSION");
-
-        char sess_buf[9];
-        format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setCursor(right_text_x, 121);
-        spr.print(sess_buf);
-    }
+    // Always show session time
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(right_text_x, 109);
+    spr.print("SESSION");
+    char sess_buf[9];
+    format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setCursor(right_text_x, 121);
+    spr.print(sess_buf);
 }
 
 void draw_locator_screen() {
