@@ -1655,7 +1655,7 @@ void draw_header_spr(int screen_num) {
         spr.setCursor(DISP_W - 55, 5); spr.print("MUTED");
     }
 
-    spr.drawRect(DISP_W - 18, 5, 14, 7, bcol); spr.fillRect(DISP_W - 4, 7, 2, 3, bcol);
+    spr.drawRoundRect(DISP_W - 18, 5, 14, 7, 3, bcol);
     int bfill = (display_bat * 12) / 100; if (bfill > 0) spr.fillRect(DISP_W - 17, 6, bfill, 5, bcol);
 
     // GPS satellite icon (white crosshair) shown when satellites are locked
@@ -2043,7 +2043,7 @@ void draw_scanner_screen() {
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
     // WiFi badge box + text
-    spr.drawRect(right_text_x - 5, 24, 61, 16, wf_col);
+    spr.drawRoundRect(right_text_x - 5, 24, 61, 16, 3, wf_col);
     spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 29);
     spr.printf("WiFi: %d", current_channel);
@@ -2053,7 +2053,7 @@ void draw_scanner_screen() {
     }
 
     // BLE badge box + text
-    spr.drawRect(right_text_x + 58, 24, 37, 16, ble_col);
+    spr.drawRoundRect(right_text_x + 58, 24, 37, 16, 3, ble_col);
     spr.setTextColor(ble_col, BG_COLOR);
     spr.setCursor(right_text_x + 63, 29);
     spr.print("BLE");
