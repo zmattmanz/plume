@@ -395,7 +395,7 @@ void chargeLedTask(void* pvParameters) {
     // eye-blinding intensity on a pocket device.
     constexpr float STEP   = 0.07f;
     constexpr float EMIN   = 0.36787944f;
-    constexpr float ERANGE = 2.71828183f - EMIN;
+    constexpr float LED_VAL = 2.71828183f - 1.0f;
     float angle = 0.0f;
     for (;;) {
         float breathe = (expf(sinf(angle)) - EMIN) / ERANGE; // 0.0 .. 1.0
