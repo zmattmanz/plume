@@ -2100,52 +2100,68 @@ void draw_locator_screen() {
 
     int cx = 56, cy = 72;
 
-    static float ease_arrow = 0.0f;
+    static float ease_arrow = -1.5708f;  // initialise pointing north
     float north_course = gps_valid ? gps_course : 0.0f;
-    
-    float target_angle;
-    if (north_mode) {
-        target_angle = -1.5708f; 
-    } else if (active && has_est) {
-        float rel = brng - north_course;
-        target_angle = radians(rel - 90.0f);
-    } else {
-        target_angle = (millis() / 1500.0f) * (float)M_PI; 
-    }
 
-    { float d = target_angle - ease_arrow;
-      while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-      while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-      ease_arrow += 0.09f * d; }
+    // Acquiring sats: arrow frozen at north; rings animate
+    bool acquiring_sats = !gps.satellites.isValid() || gps.satellites.value() < 1;
+
+    if (acquiring_sats) {
+        ease_arrow = -1.5708f;
+    } else if (active && has_est) {
+        float rel  = brng - north_course;
+        float tgt  = radians(rel - 90.0f);
+        float d = tgt - ease_arrow;
+        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
+        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
+        ease_arrow += 0.09f * d;
+    } else {
+        // Default idle: ease back to north
+        float d = -1.5708f - ease_arrow;
+        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
+        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
+        ease_arrow += 0.09f * d;
+    }
     float ang = ease_arrow;
 
-    uint16_t circle_col = GPS_COLOR;
-    spr.drawCircle(cx, cy, 12, circle_col);
-    spr.drawCircle(cx, cy, 24, circle_col);
-    spr.drawCircle(cx, cy, 36, circle_col);
-    
-    for (int i = 0; i < 360; i += 5) {
-        float rad = radians(i);
-        float wave = 46.0f + 1.5f * sinf(rad * 8.0f + millis() / 400.0f);
-        spr.drawPixel(cx + (int)(wave * cosf(rad)), cy + (int)(wave * sinf(rad)), circle_col);
+    // Rings — perfect circles; expand-pulse when acquiring sats
+    if (acquiring_sats) {
+        unsigned long pt = millis() % 1800;
+        spr.drawCircle(cx, cy, 12, (pt < 700)              ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 24, (pt > 300 && pt < 1000) ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 36, (pt > 600 && pt < 1300) ? GPS_COLOR : DIM_COLOR);
+        spr.drawCircle(cx, cy, 46, (pt > 900 && pt < 1600) ? GPS_COLOR : DIM_COLOR);
+    } else {
+        spr.drawCircle(cx, cy, 12, GPS_COLOR);
+        spr.drawCircle(cx, cy, 24, GPS_COLOR);
+        spr.drawCircle(cx, cy, 36, GPS_COLOR);
+        spr.drawCircle(cx, cy, 46, GPS_COLOR);
     }
 
-    uint16_t pointer_col = CAUTION_COLOR;
-    
-    auto rotpt = [&](float px, float py, float a, int* ox, int* oy) {
+    auto rotpt = [&](float rpx, float rpy, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
-        *ox = cx + (int)(px * ca - py * sa);
-        *oy = cy + (int)(px * sa + py * ca);
+        *ox = cx + (int)(rpx * ca - rpy * sa);
+        *oy = cy + (int)(rpx * sa + rpy * ca);
     };
 
-    int px[4], py[4];
-    rotpt(0, -14, ang, &px[0], &py[0]); 
-    rotpt(9, 10, ang,  &px[1], &py[1]); 
-    rotpt(0, 4, ang,   &px[2], &py[2]); 
-    rotpt(-9, 10, ang, &px[3], &py[3]); 
+    // Arrow — larger, GPS_COLOR outlined, BG_COLOR filled
+    // Outer shape (border) drawn first in GPS_COLOR
+    int bx[4], by[4];
+    rotpt(0,   -24, ang, &bx[0], &by[0]);
+    rotpt(15,   17, ang, &bx[1], &by[1]);
+    rotpt(0,     4, ang, &bx[2], &by[2]);
+    rotpt(-15,  17, ang, &bx[3], &by[3]);
+    spr.fillTriangle(bx[0], by[0], bx[1], by[1], bx[2], by[2], GPS_COLOR);
+    spr.fillTriangle(bx[0], by[0], bx[2], by[2], bx[3], by[3], GPS_COLOR);
 
-    spr.fillTriangle(px[0], py[0], px[1], py[1], px[2], py[2], pointer_col);
-    spr.fillTriangle(px[0], py[0], px[2], py[2], px[3], py[3], pointer_col);
+    // Inner shape (fill) in BG_COLOR
+    int ax[4], ay[4];
+    rotpt(0,   -22, ang, &ax[0], &ay[0]);
+    rotpt(13,   15, ang, &ax[1], &ay[1]);
+    rotpt(0,     5, ang, &ax[2], &ay[2]);
+    rotpt(-13,  15, ang, &ax[3], &ay[3]);
+    spr.fillTriangle(ax[0], ay[0], ax[1], ay[1], ax[2], ay[2], BG_COLOR);
+    spr.fillTriangle(ax[0], ay[0], ax[2], ay[2], ax[3], ay[3], BG_COLOR);
 
     int rx = 118; spr.drawLine(rx - 2, 20, rx - 2, DISP_H - 14, CARD_BORDER);
     int rpx = rx + 2;
