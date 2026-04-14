@@ -889,7 +889,7 @@ void rssi_track_expire() {
 // THREAT EQUALIZER DATA
 // ============================================================================
 #define radar_cx 66
-#define radar_cy 60
+#define radar_cy 71
 #define radar_r  52
 #define inner_r  20
 
@@ -1753,7 +1753,7 @@ void draw_scanner_screen() {
     draw_header_spr(0);
     spr.setClipRect(0, 19, divider_x, DISP_H - 19);
     
-    float TILT = 0.65f;
+    float TILT = 0.55f;
     int rcx = radar_cx;
     int rcy = radar_cy;
     int THICKNESS = 10;
@@ -1949,11 +1949,6 @@ void draw_scanner_screen() {
             }
         }
     }
-    if (!any_active) {
-        float pulse_sin = sinf(millis()/400.0f); int pulse_r = inner_r + 3 + (int)(3 * pulse_sin);
-        uint16_t pulse_col = (pulse_sin > 0) ? CARD_BORDER : BG_COLOR;
-        spr.drawEllipse(rcx, rcy, pulse_r, pulse_r * TILT, pulse_col);
-    }
     hud_rotation += 0.0033f;
     spr.clearClipRect();
 
@@ -1974,7 +1969,7 @@ void draw_scanner_screen() {
     bool ble_active = pBLEScan->isScanning();
     bool wifi_active = !ble_active; 
 
-    uint16_t inactive_col = DIM_COLOR;
+    uint16_t inactive_col = CARD_BORDER;
     uint16_t wf_col  = wifi_active ? CAUTION_COLOR : inactive_col;
     uint16_t ble_col = ble_active ? PURPLE_COLOR : inactive_col;
 
@@ -1994,22 +1989,18 @@ void draw_scanner_screen() {
     spr.drawRect(right_text_x + 50, 22, 46, 14, ble_col);
     spr.setTextColor(ble_col, BG_COLOR);
     spr.setCursor(right_text_x + 52, 25);
-    spr.print("BL:SCN");
+    spr.print("BLE");
 
     // Labels simplified
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 42); spr.print("WIFI");
     spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 52); spr.print(sw);
-    spr.setTextColor(CARD_BORDER, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 65); spr.printf("%ld pkts", wp);
 
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 74); spr.print("BLE");
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 84); spr.print(sb);
-    spr.setTextColor(CARD_BORDER, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 97); spr.printf("%ld pkts", bp);
 
     spr.setTextSize(1);
     if (l_cap_type[0] != '\0' && strcmp(l_cap_type, "None") != 0) {
@@ -2032,14 +2023,14 @@ void draw_scanner_screen() {
         spr.setCursor(right_text_x, 121); spr.print(conf_str);
     } else {
         // Replaced 'no hits yet' with Session Time
-        spr.setTextColor(DIM_COLOR, BG_COLOR); 
-        spr.setCursor(right_text_x, 109); 
-        spr.print("SESSION:");
-        
-        char sess_buf[9]; 
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+        spr.setCursor(right_text_x, 109);
+        spr.print("SESSION");
+
+        char sess_buf[9];
         format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); 
-        spr.setCursor(right_text_x, 121); 
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(right_text_x, 121);
         spr.print(sess_buf);
     }
 }
