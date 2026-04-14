@@ -1,0 +1,12 @@
+# Claude Code Instructions
+
+## Git Workflow
+- Work directly on the `main` branch
+- Do NOT create feature branches
+- Do NOT open pull requests
+- Commit changes directly after making them
+
+## Project
+- Arduino/ESP32 firmware for M5Stack Cardputer ADV
+- Main file: FlockDetection_Cardputer_ADV.ino
+- Companion files: ui_beep.h (keep in same folder)
