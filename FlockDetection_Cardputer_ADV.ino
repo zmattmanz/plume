@@ -512,20 +512,21 @@ void dedicated_charging_loop() {
         spr.setTextDatum(TC_DATUM);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setTextSize(2);
-        spr.drawString("CHARGING", DISP_W / 2, 10);
+        spr.drawString("CHARGING", DISP_W / 2, 25);
 
-        // ── Battery percentage — large, centred below label ────────────────
+        // ── Battery percentage — large, white, centred below label ─────────
         char pct_str[8];
         snprintf(pct_str, sizeof(pct_str), "%d%%", display_pct);
+        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
         spr.setTextSize(3);
-        spr.drawString(pct_str, DISP_W / 2, 34);
+        spr.drawString(pct_str, DISP_W / 2, 50);
 
-        // ── Battery level bar — actual percentage with pulsing fill ───────
-        const int bar_x = 40, bar_y = 72, bar_w = 160, bar_h = 10;
+        // ── Battery level bar — shorter, thicker, actual percentage ────────
+        const int bar_w = 120, bar_h = 16;
+        const int bar_x = (DISP_W - bar_w) / 2, bar_y = 90;
         spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
         int fill_w = (display_pct * (bar_w - 2)) / 100;
         if (fill_w > 0) {
-            // Pulse the fill color to indicate active charging
             bool pulse = ((millis() / 600) % 2 == 0);
             uint16_t bar_col = pulse ? ACCENT_COLOR : TEAL_COLOR;
             spr.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, bar_col);
@@ -534,9 +535,9 @@ void dedicated_charging_loop() {
         // ── Boot instruction ───────────────────────────────────────────────
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(1);
-        spr.drawString("PRESS ANY KEY TO BOOT DEVICE", DISP_W / 2, 93);
+        spr.drawString("PRESS ANY KEY TO BOOT DEVICE", DISP_W / 2, 114);
 
-        // ── Bottom info row: auto-boot timer (left) · voltage (right) ──────
+        // ── Auto-boot countdown (only in final minute) ─────────────────────
         spr.setTextDatum(TL_DATUM);
         unsigned long remaining_ms = (elapsed < CHARGE_AUTO_BOOT_MS)
                                      ? (CHARGE_AUTO_BOOT_MS - elapsed) : 0;
@@ -545,9 +546,6 @@ void dedicated_charging_loop() {
             spr.setCursor(4, DISP_H - 10);
             spr.printf("AUTO-BOOT IN %lus", remaining_ms / 1000UL);
         }
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setCursor(DISP_W - 40, DISP_H - 10);
-        spr.printf("%dmV", current_mv);
 
         spr.pushSprite(0, 0);
 
