@@ -1766,6 +1766,20 @@ void draw_scanner_screen() {
                         lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
     }
 
+    // Structural ribs on left wall — tight at far edge, spreading toward center
+    {
+        const int offsets[] = {2, 7, 13, 20, 28};  // px from leftmost edge; gaps 5,6,7,8
+        uint16_t rib_col = lgfx::color565(24, 48, 96);
+        for (int j = 0; j < 5; j++) {
+            int cdx = radar_r - offsets[j];
+            if (cdx <= 0) continue;
+            float h  = sqrtf((float)(radar_r * radar_r - cdx * cdx)) * TILT;
+            int lx   = rcx - cdx;
+            int ytop = rcy + (int)h;
+            spr.drawLine(lx, ytop, lx, ytop + THICKNESS + 2, rib_col);
+        }
+    }
+
     spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
     spr.drawEllipse(rcx, rcy, radar_r, radar_r * TILT, HEADER_COLOR);
     spr.drawEllipse(rcx, rcy, inner_r, inner_r * TILT, DIM_COLOR);
@@ -1836,24 +1850,24 @@ void draw_scanner_screen() {
             if (noise_life[i] < 0) noise_life[i] = 0;
 
             float fade = (float)noise_life[i] / (float)noise_max_life[i];
-            int intensity = (int)(fade * 255.0f * noise_dimming);
-            if (intensity < 8) continue;
+            int intensity = (int)(fade * 320.0f * noise_dimming);
+            if (intensity > 255) intensity = 255;
+            if (intensity < 12) continue;
 
             int px = rcx + (int)(noise_r[i] * cosf(noise_a[i]));
             int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
 
-            // Smaller, flattened dots (lines) matching the radar's color scale
+            // Flat horizontal dash matching radar perspective
             uint16_t p_col = night_mode
-                ? lgfx::color565(intensity, 0, 0)
-                : lgfx::color565(0, intensity / 2, intensity);
-            
-            // Draw a flat horizontal dash to match perspective
+                ? lgfx::color565(intensity, intensity / 6, 0)
+                : lgfx::color565(0, intensity * 2 / 3, intensity);
+
             spr.drawLine(px - 1, py, px + 1, py, p_col);
 
-            if (intensity > 120) {
+            if (intensity > 90) {
                 uint16_t glow = night_mode
-                    ? lgfx::color565(intensity / 3, 0, 0)
-                    : lgfx::color565(0, intensity / 4, intensity / 2);
+                    ? lgfx::color565(intensity / 2, 0, 0)
+                    : lgfx::color565(0, intensity / 3, intensity * 2 / 3);
                 spr.drawPixel(px - 2, py, glow);
                 spr.drawPixel(px + 2, py, glow);
             }
