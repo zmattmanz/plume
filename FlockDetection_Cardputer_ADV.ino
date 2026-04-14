@@ -1783,9 +1783,7 @@ void draw_scanner_screen() {
                         lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
     }
 
-    // Left/right edge lines connecting top rim to bottom rim
-    spr.drawLine(rcx - radar_r, rcy, rcx - radar_r, rcy + THICKNESS, HEADER_COLOR);
-    spr.drawLine(rcx + radar_r, rcy, rcx + radar_r, rcy + THICKNESS, HEADER_COLOR);
+    // Left/right edge lines connecting top rim to bottom rim (removed)
 
     // Top face fill and border
     spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
@@ -1794,20 +1792,7 @@ void draw_scanner_screen() {
     // Redraw bottom rim so it shows over the top face fill
     spr.drawEllipse(rcx, rcy + THICKNESS, radar_r, radar_r * TILT, DIM_COLOR);
 
-    // Structural ribs on left wall — tight at far edge, progressively spacing out
-    {
-        const int offsets[] = {2, 7, 13, 20, 28};  // px from leftmost edge; gaps 5,6,7,8
-        uint16_t rib_col = lgfx::color565(80, 180, 255);
-        for (int j = 0; j < 5; j++) {
-            int cdx = radar_r - offsets[j];
-            if (cdx <= 0) continue;
-            float h  = sqrtf((float)(radar_r * radar_r - cdx * cdx)) * TILT;
-            int lx   = rcx - cdx;
-            int ytop = rcy + (int)h;
-            spr.drawLine(lx,     ytop, lx,     ytop + THICKNESS, rib_col);
-            spr.drawLine(lx + 1, ytop, lx + 1, ytop + THICKNESS, rib_col);
-        }
-    }
+    // Structural ribs on left wall removed
 
     spr.drawEllipse(rcx, rcy, inner_r, inner_r * TILT, DIM_COLOR);
 
@@ -2734,13 +2719,13 @@ void setup() {
     draw_current_screen(); spr.pushSprite(0,0);
 
     if (!is_muted) {
-        int boot_vol = current_volume > 120 ? current_volume : 120;
+        int boot_vol = current_volume > 70 ? 70 : current_volume;
         M5Cardputer.Speaker.setVolume(boot_vol);
-        delay(120);
-        M5Cardputer.Speaker.tone(1320, 120); delay(160);
-        M5Cardputer.Speaker.tone(880,  120); delay(160);
-        M5Cardputer.Speaker.tone(660,  120); delay(160);
-        M5Cardputer.Speaker.tone(220,  280); delay(320);
+        delay(200);
+        M5Cardputer.Speaker.tone(1320, 180); delay(260);
+        M5Cardputer.Speaker.tone(880,  180); delay(260);
+        M5Cardputer.Speaker.tone(660,  180); delay(260);
+        M5Cardputer.Speaker.tone(220,  420); delay(500);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
