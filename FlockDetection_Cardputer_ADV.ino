@@ -91,9 +91,25 @@ void apply_color_palette() {
     }
 }
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
+// ── Module-level rendering helpers ──────────────────────────────────────────
+// lerp_col16: linearly interpolate two RGB565 colours by t ∈ [0,1]
+static inline uint16_t lerp_col16(uint16_t fc, uint16_t tc, float t) {
+    int fr=((fc>>11)&0x1F)<<3, fg=((fc>>5)&0x3F)<<2, fb=(fc&0x1F)<<3;
+    int tr=((tc>>11)&0x1F)<<3, tg=((tc>>5)&0x3F)<<2, tb=(tc&0x1F)<<3;
+    return lgfx::color565((uint8_t)(fr+(tr-fr)*t),(uint8_t)(fg+(tg-fg)*t),(uint8_t)(fb+(tb-fb)*t));
+}
+
+// kprint: print text with +1 px inter-character spacing (kerning) at textSize=1
+// Pass cx/cy from the current sprite cursor position before calling.
+static void kprint(M5Canvas& s, const char* text, int extra = 1) {
+    int cx = s.getCursorX(), cy = s.getCursorY();
+    for (const char* p = text; *p; p++) {
+        char ch[2] = {*p, '\0'};
+        s.setCursor(cx, cy);
+        s.print(ch);
+        cx += 6 + extra;
+    }
+}
 #define GPS_RX_PIN   15  
 #define GPS_TX_PIN   13   
 #define GPS_BAUD     115200 
@@ -402,16 +418,16 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
-    // Bruce-style sin breathing: (sin(x)+1)*scale → clean 0..200 range,
-    // no normalization constants to get wrong. Step 0.07 rad @ 20ms ≈ 3.5s period.
-    constexpr float STEP = 0.07f;
-    float angle = 0.0f;
+    // Mirror Bruce firmware ledEffectTask exactly:
+    // phase = sinf(millis()/1000 * speed * PI), value = (phase+1)*127.5
+    // speed=1.0 → 2s period. 50ms tick = same as Bruce's vTaskDelay.
+    // Using millis() for the time base means scheduling jitter never
+    // accumulates phase error — it is always phase-correct.
     for (;;) {
-        uint8_t val = (uint8_t)((sinf(angle) + 1.0f) * 100.0f); // 0..200
+        float phase = sinf((millis() / 1000.0f) * (float)M_PI);
+        uint8_t val = (uint8_t)((phase + 1.0f) * 100.0f); // 0..200, cap below 255
         set_cardputer_led(0, val, 0);
-        vTaskDelay(pdMS_TO_TICKS(20));
-        angle += STEP;
-        if (angle >= 2.0f * (float)M_PI) angle -= 2.0f * (float)M_PI;
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -1719,7 +1735,8 @@ void draw_header_spr(int screen_num) {
     if (abs(raw_bat - display_bat) >= 2 || raw_bat == 100 || raw_bat == 0) display_bat = raw_bat; 
 
     spr.fillRect(0, 0, DISP_W, 18, BG_COLOR);
-    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1); spr.setCursor(4, 5); spr.print(screen_names[screen_num]);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
 
     uint16_t bcol = chg ? ACCENT_COLOR : (display_bat > 50 ? ACCENT_COLOR : (display_bat > 20 ? CAUTION_COLOR : CAUTION_COLOR));
 
@@ -1728,16 +1745,20 @@ void draw_header_spr(int screen_num) {
         spr.setCursor(DISP_W - 55, 5); spr.print("MUTED");
     }
 
-    spr.drawRoundRect(DISP_W - 20, 4, 18, 10, 5, bcol);
-    int bfill = (display_bat * 16) / 100; if (bfill > 0) spr.fillRect(DISP_W - 19, 5, bfill, 8, bcol);
+    // Battery icon — slightly longer (24px) for better readability
+    spr.drawRoundRect(DISP_W - 26, 4, 24, 10, 2, bcol);
+    int bfill = (display_bat * 22) / 100;
+    if (bfill > 0) spr.fillRect(DISP_W - 25, 5, bfill, 8, bcol);
 
-    // GPS satellite icon (white crosshair) shown when satellites are locked
+    // GPS location-pin icon — shown when at least one satellite is locked
     if (gps.satellites.isValid() && gps.satellites.value() >= 1) {
-        uint16_t gc = lgfx::color565(255, 255, 255);
-        int gx = DISP_W - 28, gy = 9;
-        spr.drawLine(gx - 3, gy, gx + 3, gy, gc);
-        spr.drawLine(gx, gy - 3, gx, gy + 3, gc);
-        spr.fillRect(gx - 1, gy - 1, 3, 3, gc);
+        uint16_t gc = lgfx::color565(80, 200, 255);
+        int px = DISP_W - 36, py = 9; // centre of pin circle
+        // Teardrop: filled circle + triangular point below
+        spr.fillCircle(px, py - 1, 3, gc);
+        spr.fillTriangle(px - 2, py + 1, px + 2, py + 1, px, py + 5, gc);
+        // Knock out centre hole so it reads as a pin not a blob
+        spr.fillCircle(px, py - 1, 1, BG_COLOR);
     }
 
     // Header divider line — same color as inactive scan indicator (CARD_BORDER)
@@ -2107,11 +2128,6 @@ void draw_scanner_screen() {
     wf_ease  += ((wifi_active ? 1.0f : 0.0f) - wf_ease)  * 0.2f;
     ble_ease += ((ble_active  ? 1.0f : 0.0f) - ble_ease) * 0.2f;
 
-    auto lerp_col16 = [](uint16_t fc, uint16_t tc, float t) -> uint16_t {
-        int fr = ((fc >> 11) & 0x1F) << 3, fg = ((fc >> 5) & 0x3F) << 2, fb = (fc & 0x1F) << 3;
-        int tr = ((tc >> 11) & 0x1F) << 3, tg = ((tc >> 5) & 0x3F) << 2, tb = (tc & 0x1F) << 3;
-        return lgfx::color565((uint8_t)(fr+(tr-fr)*t),(uint8_t)(fg+(tg-fg)*t),(uint8_t)(fb+(tb-fb)*t));
-    };
     uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
@@ -2127,29 +2143,28 @@ void draw_scanner_screen() {
         spr.print(" L");
     }
 
-    // BLE badge — tinted fill + outline
+    // BLE badge — width snug to "BLE" text (3×6 + 10px padding = 28px)
     uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
-    spr.fillRoundRect(right_text_x + 62, 24, 37, 16, 7, ble_fill);
-    spr.drawRoundRect(right_text_x + 62, 24, 37, 16, 7, ble_col);
+    spr.fillRoundRect(right_text_x + 62, 24, 28, 16, 7, ble_fill);
+    spr.drawRoundRect(right_text_x + 62, 24, 28, 16, 7, ble_col);
     spr.setTextColor(ble_col, ble_fill);
     spr.setCursor(right_text_x + 67, 29);
     spr.print("BLE");
 
-    // Labels — extra gap below badges (badges bottom = y=40)
+    // Labels — extra gap below badges (badges bottom = y=40); kerned
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 48); spr.print("WIFI");
+    spr.setCursor(right_text_x, 48); kprint(spr, "WIFI");
     spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 58); spr.print(sw);
 
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 80); spr.print("BLE");
+    spr.setCursor(right_text_x, 80); kprint(spr, "BLE");
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 90); spr.print(sb);
 
     // Always show session time
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 113);
-    spr.print("SESSION");
+    spr.setCursor(right_text_x, 113); kprint(spr, "SESSION");
     char sess_buf[9];
     format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
@@ -2235,44 +2250,38 @@ void draw_locator_screen() {
         *ox = cx + (int)roundf(lx * ca - ly * sa);
         *oy = cy + (int)roundf(lx * sa + ly * ca);
     };
-    // Outer vertices: tip (0,-19), base (±11,+12) — ~10% bigger than before
+    // Arrow: tip=(0,-19), base=(±11,+12); triangle height = 31 local units
     int ax3[3], ay3[3];
     rotpt(  0, -19, ang, &ax3[0], &ay3[0]);
     rotpt( 11,  12, ang, &ax3[1], &ay3[1]);
     rotpt(-11,  12, ang, &ax3[2], &ay3[2]);
 
-    // BG fill — clears grid behind arrow
+    // BG fill first — clears grid behind the arrow
     spr.fillTriangle(ax3[0], ay3[0], ax3[1], ay3[1], ax3[2], ay3[2], BG_COLOR);
 
-    // Right-side hatch: diagonal lines in local space across right half of triangle
-    // Lines are in the right half (local x: 0..right_edge_x) at evenly spaced local y
+    // Full-width horizontal hatching in local space.
+    // At any local y the half-width = 11 * (y+19)/31.
+    // Lines are evenly spaced from base upward; they get progressively shorter
+    // as they approach the tip — naturally trailing off to nothing.
     {
         uint16_t hatch_col = lgfx::color565(20, 75, 120);
-        // Outer triangle: tip=(0,-19), right base=(11,12)
-        // Right edge x at local y: lerp from 0 (at y=-19) to 11 (at y=12)
-        for (int hi = 0; hi < 7; hi++) {
-            float ly = -16.0f + hi * 4.5f;
-            float t  = (ly - (-19.0f)) / 31.0f;  // 0..1 along tip→base
-            if (t < 0.0f || t > 1.0f) continue;
-            float rx = 11.0f * t;
-            if (rx < 1.5f) continue;
+        const float TIP_Y = -19.0f, BASE_Y = 12.0f, RANGE = 31.0f, HALF_W = 11.0f;
+        for (int hi = 0; hi < 9; hi++) {
+            float ly = BASE_Y - hi * 3.4f;          // base → tip
+            float t  = (ly - TIP_Y) / RANGE;        // 0 at tip, 1 at base
+            if (t < 0.10f) break;                    // skip lines too close to tip
+            float hw = HALF_W * t;
             int hx0, hy0, hx1, hy1;
-            rotpt(0.0f, ly, ang, &hx0, &hy0);
-            rotpt(rx,   ly, ang, &hx1, &hy1);
+            rotpt(-hw, ly, ang, &hx0, &hy0);
+            rotpt( hw, ly, ang, &hx1, &hy1);
             spr.drawLine(hx0, hy0, hx1, hy1, hatch_col);
         }
     }
 
-    // GPS_COLOR outline — outer + one inner ring for 2px edge thickness
+    // Single GPS_COLOR outline — one line per edge, no double-ring
     spr.drawLine(ax3[0], ay3[0], ax3[1], ay3[1], GPS_COLOR);
     spr.drawLine(ax3[1], ay3[1], ax3[2], ay3[2], GPS_COLOR);
     spr.drawLine(ax3[2], ay3[2], ax3[0], ay3[0], GPS_COLOR);
-    int bx3[3], by3[3];
-    rotpt(  0, -17, ang, &bx3[0], &by3[0]);
-    rotpt(  9,  11, ang, &bx3[1], &by3[1]);
-    rotpt( -9,  11, ang, &bx3[2], &by3[2]);
-    spr.drawLine(bx3[0], by3[0], bx3[1], by3[1], GPS_COLOR);
-    spr.drawLine(bx3[2], by3[2], bx3[0], by3[0], GPS_COLOR);
 
     // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : (demo ? 2 : 0);
@@ -2346,17 +2355,19 @@ void draw_locator_screen() {
         status_str[sizeof(status_str) - 1] = '\0';
     }
     int max_chars = (int)strlen(status_base) + (status_anim ? 3 : 0);
-    int box_w = max_chars * 6 + 12;   // 6px left+right padding inside
+    int box_w = max_chars * 7 + 12;   // 7px/char (kerned) + left+right padding
     int avail_w = DISP_W - rpx - 2;
     if (box_w > avail_w) box_w = avail_w;
-    spr.fillRoundRect(rpx, 23, box_w, 16, 5, CARD_COLOR);
+    // Tinted fill toward status color, matching scanner badge treatment
+    uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
+    spr.fillRoundRect(rpx, 23, box_w, 16, 5, status_fill);
     spr.drawRoundRect(rpx, 23, box_w, 16, 5, status_col);
-    spr.setTextColor(status_col, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx + 6, 27); spr.print(status_str);
+    spr.setTextColor(status_col, status_fill); spr.setTextSize(1);
+    spr.setCursor(rpx + 6, 27); kprint(spr, status_str);
 
-    // TARGET — label y=42, value y=56 (+14 spacing)
+    // TARGET — label y=50 (badge bottom=39, +11 gap), value y=64 (+14)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 42); spr.print("TARGET");
+    spr.setCursor(rpx, 50); kprint(spr, "TARGET");
     {
         char tname[15];
         if (active) {
@@ -2365,27 +2376,27 @@ void draw_locator_screen() {
             strncpy(tname, src, 14); tname[14] = '\0';
         } else { strncpy(tname, demo_name, 14); tname[14] = '\0'; }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 56); spr.print(tname);  // bottom = 64
+        spr.setCursor(rpx, 64); spr.print(tname);  // bottom = 72
     }
 
-    // SIGNAL — label y=72 (64+8), value y=86 (+14)
+    // SIGNAL — label y=80 (72+8), value y=94 (+14)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 72); spr.print("SIGNAL");
+    spr.setCursor(rpx, 80); kprint(spr, "SIGNAL");
     {
         int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 86);
+        spr.setCursor(rpx, 94);
         if (sr == -999) { spr.print("--"); }
         else { spr.print(sr > -60 ? "STRONG" : sr > -80 ? "MEDIUM" : "WEAK"); }
     }
 
-    // DISTANCE — label y=102 (86+8+8), value y=116 (+14)
+    // DISTANCE — label y=110 (94+8+8), value y=124 (+14)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 102); spr.print("DISTANCE");
+    spr.setCursor(rpx, 110); kprint(spr, "DISTANCE");
     {
         float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 116);
+        spr.setCursor(rpx, 124);
         if (sd < 0) { spr.print("--"); }
         else { char db[12]; if (sd < 100) snprintf(db,sizeof(db),"%.0fm",sd); else snprintf(db,sizeof(db),"%.1fkm",sd/1000.0f); spr.print(db); }
     }
@@ -2794,7 +2805,7 @@ void draw_gps_screen() {
     // SAT
     drawCard(RX, ry, RW, 26);
     spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(RX + 4, ry + 4); spr.print("SATS");
+    spr.setCursor(RX + 4, ry + 4); kprint(spr, "SATS");
     spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, CARD_COLOR);
     spr.setTextSize(2); spr.setCursor(RX + 46, ry + 4); spr.print(sats);
 
@@ -2802,7 +2813,7 @@ void draw_gps_screen() {
     ry += 29;
     drawCard(RX, ry, RW, 26);
     spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(RX + 4, ry + 4); spr.print("LAT");
+    spr.setCursor(RX + 4, ry + 4); kprint(spr, "LAT");
     spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
     char lat_buf[14]; snprintf(lat_buf, sizeof(lat_buf), "%.5f", has_loc ? d_lat : 0.0);
     spr.setCursor(RX + 4, ry + 15); spr.print(lat_buf);
@@ -2811,7 +2822,7 @@ void draw_gps_screen() {
     ry += 29;
     drawCard(RX, ry, RW, 26);
     spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(RX + 4, ry + 4); spr.print("LON");
+    spr.setCursor(RX + 4, ry + 4); kprint(spr, "LON");
     spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
     char lon_buf[14]; snprintf(lon_buf, sizeof(lon_buf), "%.5f", has_loc ? d_lng : 0.0);
     spr.setCursor(RX + 4, ry + 15); spr.print(lon_buf);
@@ -2820,7 +2831,7 @@ void draw_gps_screen() {
     ry += 29;
     drawCard(RX, ry, RW, 26);
     spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(RX + 4, ry + 4); spr.print("SPEED");
+    spr.setCursor(RX + 4, ry + 4); kprint(spr, "SPEED");
     spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1);
     char spd_buf[12]; snprintf(spd_buf, sizeof(spd_buf), "%.1f mph", speed_valid ? f_spd : 0.0f);
     spr.setCursor(RX + 4, ry + 15); spr.print(spd_buf);
