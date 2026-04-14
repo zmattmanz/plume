@@ -509,9 +509,8 @@ void dedicated_charging_loop() {
         spr.fillSprite(BG_COLOR);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR); 
         
-        // Enlarged and centered CHARGING text, removed USB LINK
-        spr.setTextSize(4); 
-        spr.setCursor(24, 40); 
+        spr.setTextSize(2);
+        spr.setCursor(72, 40);
         spr.print("CHARGING");
         
         spr.setTextColor(DIM2_COLOR, BG_COLOR); 
