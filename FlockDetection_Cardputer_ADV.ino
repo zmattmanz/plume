@@ -305,6 +305,7 @@ struct SDHistEntry {
 SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
+bool hist_detail_open   = false;
 
 char toast_text[32]       = "";
 unsigned long toast_start = 0;
@@ -410,8 +411,8 @@ void chargeLedTask(void* pvParameters) {
     // Step 0.07 rad @ 20 ms ≈ 3.5 s period; cap output at 200/255 to avoid
     // eye-blinding intensity on a pocket device.
     constexpr float STEP   = 0.07f;
-    constexpr float EMIN   = 0.36787944f;
-    constexpr float LED_VAL = 2.71828183f - 1.0f;
+    constexpr float EMIN   = 0.36787944f;   // e^-1
+    constexpr float ERANGE = 1.95028182f;   // e^1 - e^-1 ≈ 2.718 - 0.368 = 2.350  (normalises breathe to 0..1)
     float angle = 0.0f;
     for (;;) {
         float breathe = (expf(sinf(angle)) - EMIN) / ERANGE; // 0.0 .. 1.0
@@ -2123,40 +2124,50 @@ void draw_scanner_screen() {
     uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
-    // WiFi badge box + text
+    // Subtle right-panel background tint matching active indicator
+    uint16_t panel_tint = lerp_col16(
+        lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.13f),
+        PURPLE_COLOR, ble_ease * 0.13f);
+    spr.fillRect(divider_x + 1, 19, DISP_W - divider_x - 1, DISP_H - 19, panel_tint);
+
+    // WiFi badge — tinted fill + outline
+    uint16_t wf_fill  = lerp_col16(panel_tint, CAUTION_COLOR, wf_ease  * 0.22f);
+    spr.fillRoundRect(right_text_x - 5, 24, 57, 16, 7, wf_fill);
     spr.drawRoundRect(right_text_x - 5, 24, 57, 16, 7, wf_col);
-    spr.setTextColor(wf_col, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1);
     spr.setCursor(right_text_x, 29);
     spr.printf("WiFi: %d", current_channel);
     if (millis() < channel_lock_until) {
-        spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+        spr.setTextColor(CAUTION_COLOR, wf_fill);
         spr.print(" L");
     }
 
-    // BLE badge box + text — pushed right for breathing room
+    // BLE badge — tinted fill + outline
+    uint16_t ble_fill = lerp_col16(panel_tint, PURPLE_COLOR,  ble_ease * 0.22f);
+    spr.fillRoundRect(right_text_x + 62, 24, 37, 16, 7, ble_fill);
     spr.drawRoundRect(right_text_x + 62, 24, 37, 16, 7, ble_col);
-    spr.setTextColor(ble_col, BG_COLOR);
+    spr.setTextColor(ble_col, ble_fill);
     spr.setCursor(right_text_x + 67, 29);
     spr.print("BLE");
 
     // Labels — extra gap below badges (badges bottom = y=40)
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, panel_tint); spr.setTextSize(1);
     spr.setCursor(right_text_x, 48); spr.print("WIFI");
-    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
+    spr.setTextColor(CAUTION_COLOR, panel_tint); spr.setTextSize(2);
     spr.setCursor(right_text_x, 58); spr.print(sw);
 
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, panel_tint); spr.setTextSize(1);
     spr.setCursor(right_text_x, 80); spr.print("BLE");
-    spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
+    spr.setTextColor(PURPLE_COLOR, panel_tint); spr.setTextSize(2);
     spr.setCursor(right_text_x, 90); spr.print(sb);
 
     // Always show session time
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, panel_tint); spr.setTextSize(1);
     spr.setCursor(right_text_x, 113);
     spr.print("SESSION");
     char sess_buf[9];
     format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setTextColor(TEXT_COLOR, panel_tint);
     spr.setCursor(right_text_x, 123);
     spr.print(sess_buf);
 }
@@ -2233,27 +2244,48 @@ void draw_locator_screen() {
     }
     float ang = ease_arrow;
 
-    // ── Arrow: BG_COLOR fill + GPS_COLOR outline triangle ──
+    // ── Arrow: BG_COLOR fill + GPS_COLOR outline triangle (~10% bigger) ──
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
         *ox = cx + (int)roundf(lx * ca - ly * sa);
         *oy = cy + (int)roundf(lx * sa + ly * ca);
     };
+    // Outer vertices: tip (0,-19), base (±11,+12) — ~10% bigger than before
     int ax3[3], ay3[3];
-    rotpt(  0, -17, ang, &ax3[0], &ay3[0]);
-    rotpt( 10,  11, ang, &ax3[1], &ay3[1]);
-    rotpt(-10,  11, ang, &ax3[2], &ay3[2]);
-    // Fill with BG so grid shows through cleanly behind the outline
+    rotpt(  0, -19, ang, &ax3[0], &ay3[0]);
+    rotpt( 11,  12, ang, &ax3[1], &ay3[1]);
+    rotpt(-11,  12, ang, &ax3[2], &ay3[2]);
+
+    // BG fill — clears grid behind arrow
     spr.fillTriangle(ax3[0], ay3[0], ax3[1], ay3[1], ax3[2], ay3[2], BG_COLOR);
-    // GPS_COLOR outline — draw each edge twice for a 2px-thick look
+
+    // Right-side hatch: diagonal lines in local space across right half of triangle
+    // Lines are in the right half (local x: 0..right_edge_x) at evenly spaced local y
+    {
+        uint16_t hatch_col = lgfx::color565(20, 75, 120);
+        // Outer triangle: tip=(0,-19), right base=(11,12)
+        // Right edge x at local y: lerp from 0 (at y=-19) to 11 (at y=12)
+        for (int hi = 0; hi < 7; hi++) {
+            float ly = -16.0f + hi * 4.5f;
+            float t  = (ly - (-19.0f)) / 31.0f;  // 0..1 along tip→base
+            if (t < 0.0f || t > 1.0f) continue;
+            float rx = 11.0f * t;
+            if (rx < 1.5f) continue;
+            int hx0, hy0, hx1, hy1;
+            rotpt(0.0f, ly, ang, &hx0, &hy0);
+            rotpt(rx,   ly, ang, &hx1, &hy1);
+            spr.drawLine(hx0, hy0, hx1, hy1, hatch_col);
+        }
+    }
+
+    // GPS_COLOR outline — outer + one inner ring for 2px edge thickness
     spr.drawLine(ax3[0], ay3[0], ax3[1], ay3[1], GPS_COLOR);
     spr.drawLine(ax3[1], ay3[1], ax3[2], ay3[2], GPS_COLOR);
     spr.drawLine(ax3[2], ay3[2], ax3[0], ay3[0], GPS_COLOR);
-    // Inner offset lines for edge thickness on the two leading sides
     int bx3[3], by3[3];
-    rotpt(  0, -15, ang, &bx3[0], &by3[0]);
-    rotpt(  8,  10, ang, &bx3[1], &by3[1]);
-    rotpt( -8,  10, ang, &bx3[2], &by3[2]);
+    rotpt(  0, -17, ang, &bx3[0], &by3[0]);
+    rotpt(  9,  11, ang, &bx3[1], &by3[1]);
+    rotpt( -9,  11, ang, &bx3[2], &by3[2]);
     spr.drawLine(bx3[0], by3[0], bx3[1], by3[1], GPS_COLOR);
     spr.drawLine(bx3[2], by3[2], bx3[0], by3[0], GPS_COLOR);
 
@@ -2337,7 +2369,7 @@ void draw_locator_screen() {
     spr.setTextColor(status_col, CARD_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx + 6, 27); spr.print(status_str);
 
-    // TARGET — label y=42, value y=52 (textSize=1), +10 spacing
+    // TARGET — label y=42, value y=56 (+14 spacing)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx, 42); spr.print("TARGET");
     {
@@ -2348,27 +2380,27 @@ void draw_locator_screen() {
             strncpy(tname, src, 14); tname[14] = '\0';
         } else { strncpy(tname, demo_name, 14); tname[14] = '\0'; }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 52); spr.print(tname);  // bottom = 60
+        spr.setCursor(rpx, 56); spr.print(tname);  // bottom = 64
     }
 
-    // SIGNAL — label y=68 (60+8), value y=78 (+10)
+    // SIGNAL — label y=72 (64+8), value y=86 (+14)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 68); spr.print("SIGNAL");
+    spr.setCursor(rpx, 72); spr.print("SIGNAL");
     {
         int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 78);
+        spr.setCursor(rpx, 86);
         if (sr == -999) { spr.print("--"); }
         else { spr.print(sr > -60 ? "STRONG" : sr > -80 ? "MEDIUM" : "WEAK"); }
     }
 
-    // DISTANCE — label y=94 (78+8+8), value y=104 (+10)
+    // DISTANCE — label y=102 (86+8+8), value y=116 (+14)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 94); spr.print("DISTANCE");
+    spr.setCursor(rpx, 102); spr.print("DISTANCE");
     {
         float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 104);
+        spr.setCursor(rpx, 116);
         if (sd < 0) { spr.print("--"); }
         else { char db[12]; if (sd < 100) snprintf(db,sizeof(db),"%.0fm",sd); else snprintf(db,sizeof(db),"%.1fkm",sd/1000.0f); spr.print(db); }
     }
@@ -2594,6 +2626,67 @@ void draw_capture_history_screen() {
         char scr_buf[16]; snprintf(scr_buf, sizeof(scr_buf), "%d/%d ;/.", history_selected_idx + 1, total);
         spr.print(scr_buf);
     }
+
+    // Detail overlay — shown when enter was pressed on selected row
+    if (hist_detail_open && total > 0) {
+        int di = history_selected_idx;
+        if (di < 0) di = 0; if (di >= total) di = total - 1;
+
+        const char* d_type;
+        char d_mac[18], d_name[32], d_method[24];
+        int d_rssi, d_conf;
+        if (use_sd) {
+            d_type = sd_hist[di].type;
+            strncpy(d_mac,    sd_hist[di].mac,    17); d_mac[17]    = '\0';
+            strncpy(d_name,   sd_hist[di].name,   31); d_name[31]   = '\0';
+            strncpy(d_method, sd_hist[di].method, 23); d_method[23] = '\0';
+            d_rssi = sd_hist[di].rssi; d_conf = sd_hist[di].confidence;
+        } else {
+            d_type = mem_hist[di].type;
+            strncpy(d_mac,  mem_hist[di].mac,  17); d_mac[17]  = '\0';
+            strncpy(d_name, mem_hist[di].name, 31); d_name[31] = '\0';
+            d_method[0] = '\0';
+            d_rssi = mem_hist[di].rssi; d_conf = mem_hist[di].confidence;
+        }
+
+        const char* proto_lbl; uint16_t proto_col;
+        hist_type_info(d_type, &proto_lbl, &proto_col);
+
+        // Dim backdrop
+        for (int dy = 19; dy < DISP_H; dy += 2)
+            spr.drawFastHLine(0, dy, DISP_W, lgfx::color565(8, 8, 14));
+
+        // Card
+        int cx = 6, cy = 22, cw = DISP_W - 12, ch = DISP_H - 28;
+        spr.fillRoundRect(cx, cy, cw, ch, 6, CARD_COLOR);
+        spr.drawRoundRect(cx, cy, cw, ch, 6, proto_col);
+
+        // Header bar inside card
+        spr.fillRoundRect(cx, cy, cw, 16, 6, proto_col);
+        spr.fillRect(cx, cy + 10, cw, 6, proto_col);  // square bottom of header
+        spr.setTextColor(BG_COLOR, proto_col); spr.setTextSize(1);
+        spr.setCursor(cx + 6, cy + 4); spr.print(proto_lbl);
+        bool dn_ok = (d_name[0] != '\0' && strcmp(d_name,"Hidden")!=0 && strcmp(d_name,"Unknown")!=0);
+        if (dn_ok) { spr.setCursor(cx + 30, cy + 4); spr.print(d_name); }
+
+        // Fields
+        int fy = cy + 22;
+        auto det_row = [&](const char* lbl, const char* val) {
+            spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+            spr.setCursor(cx + 6, fy); spr.print(lbl);
+            spr.setTextColor(TEXT_COLOR,   CARD_COLOR);
+            spr.setCursor(cx + 6 + (int)strlen(lbl)*6 + 4, fy); spr.print(val);
+        };
+        char tmp[32];
+        det_row("MAC: ", d_mac); fy += 14;
+        snprintf(tmp, sizeof(tmp), "%d dBm", d_rssi); det_row("RSSI: ", tmp); fy += 14;
+        snprintf(tmp, sizeof(tmp), "%d%%", d_conf);   det_row("CONF: ", tmp); fy += 14;
+        if (d_method[0]) { det_row("HOW:  ", d_method); fy += 14; }
+
+        // Footer hint
+        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
+        spr.setCursor(cx + 6, cy + ch - 11); spr.print("DEL to close");
+    }
 }
 
 static int gps_page = 0;
@@ -2814,7 +2907,7 @@ void transition_screen(int new_screen, int dir) {
         M5Cardputer.Speaker.playRaw(ui_beep_pcm, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
         M5Cardputer.Speaker.setVolume(prev_vol);
     }
-    if (new_screen == 3) { history_scroll_offset = 0; history_selected_idx = 0; load_sd_history(); }
+    if (new_screen == 3) { history_scroll_offset = 0; history_selected_idx = 0; hist_detail_open = false; load_sd_history(); }
     if (new_screen != 1) show_locator_help = false;
     current_screen = new_screen;
     draw_current_screen();
@@ -2912,7 +3005,7 @@ void setup() {
         M5Cardputer.Speaker.tone(1320, 220); delay(320);
         M5Cardputer.Speaker.tone(880,  220); delay(320);
         M5Cardputer.Speaker.tone(660,  220); delay(320);
-        M5Cardputer.Speaker.tone(1760, 320); delay(420);
+        M5Cardputer.Speaker.tone(1760, 320); delay(720);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
@@ -2995,7 +3088,7 @@ void loop() {
                 }
                 draw_current_screen(); spr.pushSprite(0, 0);
             }
-            else if (c == '+') {
+            else if (c == '+' || c == '=') {
                 current_volume += 15; if (current_volume > 255) current_volume = 255;
                 M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
                 if (!show_vol_overlay) {
@@ -3084,18 +3177,31 @@ void loop() {
             } 
             else if (c == '\n' || c == '\r') {
                 if (!stealth_mode) {
-                    int next = current_screen + 1;
-                    int d = (next >= NUM_SCREENS) ? -1 : 1;
-                    if (next >= NUM_SCREENS) next = 0;
-                    transition_screen(next, d);
+                    if (current_screen == 3) {
+                        int hist_total = sd_available ? sd_hist_count : capture_history_count;
+                        if (hist_total > 0) {
+                            hist_detail_open = !hist_detail_open;
+                            draw_current_screen(); spr.pushSprite(0, 0);
+                        }
+                    } else {
+                        int next = current_screen + 1;
+                        int d = (next >= NUM_SCREENS) ? -1 : 1;
+                        if (next >= NUM_SCREENS) next = 0;
+                        transition_screen(next, d);
+                    }
                 }
             }
         }
         if (status.del && !stealth_mode) {
-            int prev = current_screen - 1;
-            int d = (prev < 0) ? 1 : -1;
-            if (prev < 0) prev = NUM_SCREENS - 1;
-            transition_screen(prev, d);
+            if (current_screen == 3 && hist_detail_open) {
+                hist_detail_open = false;
+                draw_current_screen(); spr.pushSprite(0, 0);
+            } else {
+                int prev = current_screen - 1;
+                int d = (prev < 0) ? 1 : -1;
+                if (prev < 0) prev = NUM_SCREENS - 1;
+                transition_screen(prev, d);
+            }
         }
     }
 
