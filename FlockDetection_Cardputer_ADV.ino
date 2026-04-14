@@ -2219,9 +2219,9 @@ void draw_locator_screen() {
 
     float ax = 0.0f, ay = 0.0f;
     bool imu_ok = false;
-    if (M5Cardputer.Imu.isEnabled()) {
-        M5Cardputer.Imu.update();
-        auto imudata = M5Cardputer.Imu.getImuData();
+    if (M5.Imu.isEnabled()) {
+        M5.Imu.update();
+        auto imudata = M5.Imu.getImuData();
         ax = imudata.accel.x;
         ay = imudata.accel.y;
         imu_ok = true;
