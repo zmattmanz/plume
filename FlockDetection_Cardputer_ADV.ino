@@ -2115,14 +2115,8 @@ void draw_scanner_screen() {
     uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
-    // Subtle right-panel background tint matching active indicator
-    uint16_t panel_tint = lerp_col16(
-        lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.13f),
-        PURPLE_COLOR, ble_ease * 0.13f);
-    spr.fillRect(divider_x + 1, 19, DISP_W - divider_x - 1, DISP_H - 19, panel_tint);
-
     // WiFi badge — tinted fill + outline
-    uint16_t wf_fill  = lerp_col16(panel_tint, CAUTION_COLOR, wf_ease  * 0.22f);
+    uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
     spr.fillRoundRect(right_text_x - 5, 24, 57, 16, 7, wf_fill);
     spr.drawRoundRect(right_text_x - 5, 24, 57, 16, 7, wf_col);
     spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1);
@@ -2134,7 +2128,7 @@ void draw_scanner_screen() {
     }
 
     // BLE badge — tinted fill + outline
-    uint16_t ble_fill = lerp_col16(panel_tint, PURPLE_COLOR,  ble_ease * 0.22f);
+    uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
     spr.fillRoundRect(right_text_x + 62, 24, 37, 16, 7, ble_fill);
     spr.drawRoundRect(right_text_x + 62, 24, 37, 16, 7, ble_col);
     spr.setTextColor(ble_col, ble_fill);
@@ -2142,23 +2136,23 @@ void draw_scanner_screen() {
     spr.print("BLE");
 
     // Labels — extra gap below badges (badges bottom = y=40)
-    spr.setTextColor(ACCENT_COLOR, panel_tint); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 48); spr.print("WIFI");
-    spr.setTextColor(CAUTION_COLOR, panel_tint); spr.setTextSize(2);
+    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 58); spr.print(sw);
 
-    spr.setTextColor(ACCENT_COLOR, panel_tint); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 80); spr.print("BLE");
-    spr.setTextColor(PURPLE_COLOR, panel_tint); spr.setTextSize(2);
+    spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 90); spr.print(sb);
 
     // Always show session time
-    spr.setTextColor(ACCENT_COLOR, panel_tint); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(right_text_x, 113);
     spr.print("SESSION");
     char sess_buf[9];
     format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
-    spr.setTextColor(TEXT_COLOR, panel_tint);
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setCursor(right_text_x, 123);
     spr.print(sess_buf);
 }
