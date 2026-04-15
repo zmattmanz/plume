@@ -17,7 +17,12 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <math.h>
-#define FASTLED_ESP32_I2S true
+// FastLED — explicitly disable I2S parallel mode.
+// The M5Cardputer uses ESP32-S3 which has different I2S hardware than the
+// original ESP32; FastLED's clockless_i2s_esp32 driver fails to link on S3.
+// Setting FASTLED_ESP32_I2S=0 forces FastLED to use its RMT clockless driver
+// instead, which compiles and runs correctly on ESP32-S3.
+#define FASTLED_ESP32_I2S 0
 #include <FastLED.h>
 #include "ui_beep.h"  // PCM sound for screen transitions
 
