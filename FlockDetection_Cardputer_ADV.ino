@@ -2806,8 +2806,8 @@ void draw_gps_screen() {
     xSemaphoreGive(dataMutex);
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
-    // Transparent fill, dramatic tilt, fast spin — no card background
-    const int gx = 55, gy = 65, gr = 32;  // 10% smaller radius
+    // Solid BG fill, tilt, fast spin
+    const int gx = 55, gy = 65, gr = 27;  // 15% smaller than previous 32
 
     // Axial tilt — north pole tilted back, fast spin (8 s/rev)
     const float TILT = -0.52f;  // shallower tilt: more overhead view matching reference angle
@@ -2832,7 +2832,8 @@ void draw_gps_screen() {
         return tz;
     };
 
-    // No fill — transparent globe
+    // Solid BG fill so globe interior matches screen background
+    spr.fillCircle(gx, gy, gr, BG_COLOR);
 
     // ─ Latitude circles (every 30°, 5 lines) ─
     const float lats[] = { -60.0f, -30.0f, 0.0f, 30.0f, 60.0f };
@@ -2878,15 +2879,19 @@ void draw_gps_screen() {
     spr.drawCircle(gx, gy, gr,     rim_col);
     spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
 
-    // SAT count below globe — label then value on next line, both size 1
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(gx - 8, gy + gr + 5); kprint(spr, "SATS");
-    spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(gx - 3, gy + gr + 15); spr.print(sats);
+    // SAT count below globe — single line: label + value
+    {
+        int sat_y = gy + gr + 7;
+        int sat_x = gx - 24;  // centers "SATS 00" under globe
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+        spr.setCursor(sat_x, sat_y); kprint(spr, "SATS ");
+        spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
+        spr.setCursor(sat_x + 35, sat_y); spr.print(sats);
+    }
 
     // ── Right panel: STATUS badge + LAT / LON / SPEED ───────────────────────
     const int RX = 122, RW = 114;
-    int ry = 22;
+    int ry = 28;  // extra gap below header separator
 
     // STATUS badge (top-right, matches scanner/locator badge style)
     {
