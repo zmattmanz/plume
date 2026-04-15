@@ -1798,15 +1798,19 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(bx - 2, by,     bx + 1, by + 3, bolt_col);
     }
 
-    // GPS location-pin icon — shown when at least one satellite is locked
-    if (gps.satellites.isValid() && gps.satellites.value() >= 1) {
-        uint16_t gc = lgfx::color565(255, 255, 255);
-        int px = DISP_W - 36, py = 9; // centre of pin circle
-        // Teardrop: filled circle + triangular point below
-        spr.fillCircle(px, py - 1, 3, gc);
-        spr.fillTriangle(px - 2, py + 1, px + 2, py + 1, px, py + 5, gc);
-        // Knock out centre hole so it reads as a pin not a blob
-        spr.fillCircle(px, py - 1, 1, BG_COLOR);
+    // GPS location-pin icon — matches battery height (y=4..14), eases in on lock
+    {
+        static float gps_ease = 0.0f;
+        bool gps_vis = gps.satellites.isValid() && gps.satellites.value() >= 1;
+        gps_ease += ((gps_vis ? 1.0f : 0.0f) - gps_ease) * 0.08f;
+        if (gps_ease > 0.01f) {
+            uint16_t gc = lerp_col16(BG_COLOR, lgfx::color565(255, 255, 255), gps_ease);
+            int px = DISP_W - 40;   // 4px gap from battery left edge
+            int cy = 7;             // circle centre — radius 3 puts top at y=4
+            spr.fillCircle(px, cy, 3, gc);
+            spr.fillTriangle(px - 2, 9, px + 2, 9, px, 14, gc);  // point reaches y=14
+            spr.fillCircle(px, cy, 1, BG_COLOR);  // centre hole
+        }
     }
 
     // Header divider — dotted line, same color as inactive scan indicator (CARD_BORDER)
