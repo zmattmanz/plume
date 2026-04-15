@@ -2,11 +2,10 @@
 // FLOCK DETECTOR v8.13-ADV — Tactical Edition (Stable Release)
 // ============================================================================
 
-// FastLED I2S mode — must be defined before any other includes so FastLED
-// selects the I2S driver instead of RMT, avoiding LEDC PWM bus contention
-// that corrupts WS2812 timing at sub-255 display brightness levels.
-#define FASTLED_ESP32_I2S true
+// Disable interrupts during LED pushes to prevent screen PWM contention
+#define FASTLED_ALLOW_INTERRUPTS 0
 #include <FastLED.h>
+CRGB leds[1];
 
 #include <M5Cardputer.h>
 #include <WiFi.h>
@@ -83,8 +82,6 @@ static const uint8_t LED_COLORS[][3] = {
     {255,  30,  30},  // red
 };
 static int led_col_idx = 0;
-
-static CRGB leds[1];  // single WS2812 on GPIO 21; driven via FastLED I2S
 
 void apply_color_palette() {
     if (night_mode) {
