@@ -17,13 +17,6 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <math.h>
-// FastLED — explicitly disable I2S parallel mode.
-// The M5Cardputer uses ESP32-S3 which has different I2S hardware than the
-// original ESP32; FastLED's clockless_i2s_esp32 driver fails to link on S3.
-// Setting FASTLED_ESP32_I2S=0 forces FastLED to use its RMT clockless driver
-// instead, which compiles and runs correctly on ESP32-S3.
-#define FASTLED_ESP32_I2S 0
-#include <FastLED.h>
 #include "ui_beep.h"  // PCM sound for screen transitions
 
 #ifndef M_PI
@@ -85,9 +78,7 @@ static const uint8_t LED_COLORS[][3] = {
 };
 static int led_col_idx = 0;
 
-// FastLED in I2S mode — bypasses the RMT/APB bus entirely, immune to
-// LEDC PWM backlight DMA starvation that corrupted WS2812 timing at <255 brightness.
-CRGB leds[1];
+// LED driver: neopixelWrite (ESP32 Arduino core 3.x / IDF 5.x RMT, DMA-backed on S3).
 
 void apply_color_palette() {
     if (night_mode) {
@@ -431,16 +422,15 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    leds[0] = CRGB(r, g, b);
-    FastLED.show();
+    neopixelWrite(21, r, g, b);
 }
 
 // ============================================================================
 // CHARGE LED TASK — persistent FreeRTOS task (never created/deleted after boot).
 // Spawned once in setup(), lives on Core 0 at priority 5 forever.
 // led_breathing_on flag controls output; toggling it is the only lifecycle control.
-// FastLED I2S mode bypasses RMT/APB entirely — immune to LEDC PWM DMA starvation
-// that caused WS2812 corruption at any brightness < 255.
+// Persistent task (not dynamic create/delete) eliminates the FreeRTOS scheduling
+// jitter that caused WS2812 corruption — the task never stops, it just sets dark.
 // Reference: BruceDevices/firmware src/core/led_control.cpp (ledEffectTask)
 // ============================================================================
 static TaskHandle_t chargeLedTaskHandle = NULL;
@@ -2962,13 +2952,11 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
-    // FastLED I2S init — must happen before dedicated_charging_loop() or any LED call
-    FastLED.addLeds<WS2812, 21, GRB>(leds, 1);
-    FastLED.setBrightness(255); // dimming handled by sine-wave math, keep master at max
+    // LED: start dark, then spawn the persistent breathing task.
+    // Must happen before dedicated_charging_loop() which sets led_breathing_on=true.
     set_cardputer_led(0, 0, 0);
-
-    // Spawn LED task once — it runs forever; toggle led_breathing_on to control output
-    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
+    // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
+    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 2048, NULL, 5, &chargeLedTaskHandle, 0);
 
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
