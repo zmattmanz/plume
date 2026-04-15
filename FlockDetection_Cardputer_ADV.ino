@@ -1956,59 +1956,51 @@ void draw_scanner_screen() {
     float TILT = 0.55f;
     int rcx = radar_cx;
     int rcy = radar_cy;
+    int THICKNESS = 10;
 
-    // ── Rotating wireframe globe ──
+    // Shadow below cylinder
+    spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
+
+    // Cylinder wall: solid gradient fills from bottom to top (lighter toward top)
+    for (int i = THICKNESS; i >= 1; i--) {
+        uint8_t wall_v = 8 + (THICKNESS - i) * 2;
+        spr.fillEllipse(rcx, rcy + i, radar_r, radar_r * TILT,
+                        lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
+    }
+
+    // Left/right edge lines connecting top rim to bottom rim (removed)
+
+    // Top face fill and border — draw ellipse twice (y offset 1) for thicker rim
+    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
+    spr.drawEllipse(rcx, rcy - 1, radar_r, radar_r * TILT, HEADER_COLOR);
+    spr.drawEllipse(rcx, rcy,     radar_r, radar_r * TILT, HEADER_COLOR);
+
+    // Hatching on both sides of the cylinder rim seam
     {
-        // Slow rotation: one full revolution every 20 seconds
-        static float grot = 0.0f;
-        static unsigned long last_globe_ms = 0;
-        unsigned long cur_ms_g = millis();
-        float gdt = (last_globe_ms == 0) ? 0.0f : (float)(cur_ms_g - last_globe_ms);
-        if (gdt > 100.0f) gdt = 100.0f;
-        last_globe_ms = cur_ms_g;
-        grot += gdt * (2.0f * (float)M_PI) / 20000.0f;
-        if (grot > 2.0f * (float)M_PI) grot -= 2.0f * (float)M_PI;
-
-        const int  GR      = radar_r;
-        const float GT     = TILT;
-        uint16_t col_front = lgfx::color565(0, 180, 220);
-        uint16_t col_back  = lgfx::color565(0, 45,  70);
-        uint16_t col_lat   = lgfx::color565(0, 130, 170);
-
-        // Globe background
-        spr.fillEllipse(rcx, rcy, GR, (int)(GR * GT), lgfx::color565(4, 10, 22));
-
-        // --- Back longitude lines (dim, drawn first) ---
-        const int NLON = 6, NSTEPS = 24;
-        for (int li = 0; li < NLON; li++) {
-            float lam = grot + li * (float)M_PI / NLON;
-            // Draw both this meridian and its antipode
-            for (int half = 0; half < 2; half++) {
-                float L = lam + half * (float)M_PI;
-                bool front = (cosf(L) >= 0.0f);
-                if (front) continue;   // back pass only
-                int px0 = 0, py0 = 0;
-                for (int si = 0; si <= NSTEPS; si++) {
-                    float phi = -(float)M_PI / 2.0f + (float)si / NSTEPS * (float)M_PI;
-                    int px = rcx + (int)(GR * cosf(phi) * sinf(L));
-                    int py = rcy + (int)(GR * sinf(phi) * GT);
-                    if (si > 0) spr.drawLine(px0, py0, px, py, col_back);
-                    px0 = px; py0 = py;
-                }
-            }
+        const int HAT_TICKS = 20;
+        uint16_t hat_col = lgfx::color565(30, 60, 100);
+        for (int t = 0; t < HAT_TICKS; t++) {
+            float a  = (float)t / HAT_TICKS * (float)M_PI * 2.0f;
+            float ca = cosf(a), sa = sinf(a);
+            int ex = rcx + (int)(radar_r * ca);
+            int ey = rcy + (int)(radar_r * TILT * sa);
+            // Cylinder wall side: 3px tick downward from rim
+            spr.drawLine(ex, ey + 1, ex, ey + 4, hat_col);
+            // Top face side: 4px tick inward from rim toward center
+            int ix = rcx + (int)((radar_r - 4) * ca);
+            int iy = rcy + (int)((radar_r - 4) * TILT * sa);
+            spr.drawLine(ex, ey, ix, iy, hat_col);
         }
+    }
 
-        // --- Latitude circles (all visible, drawn mid-layer) ---
-        const int NLAT = 5;
-        const float lat_degs[NLAT] = { -60.0f, -30.0f, 0.0f, 30.0f, 60.0f };
-        for (int li = 0; li < NLAT; li++) {
-            float phi = lat_degs[li] * (float)M_PI / 180.0f;
-            int rx_lat  = (int)(GR * cosf(phi));
-            int ry_lat  = (int)(GR * cosf(phi) * GT);
-            int cy_lat  = rcy + (int)(GR * sinf(phi) * GT);
-            if (rx_lat > 1 && ry_lat > 0)
-                spr.drawEllipse(rcx, cy_lat, rx_lat, ry_lat, col_lat);
-        }
+    // Redraw bottom rim so it shows over the top face fill — doubled for thickness
+    spr.drawEllipse(rcx, rcy + THICKNESS,     radar_r, radar_r * TILT, DIM_COLOR);
+    spr.drawEllipse(rcx, rcy + THICKNESS + 1, radar_r, radar_r * TILT, DIM_COLOR);
+
+    // Structural ribs on left wall removed
+
+    spr.drawEllipse(rcx, rcy,     inner_r, inner_r * TILT, DIM_COLOR);
+    spr.drawEllipse(rcx, rcy - 1, inner_r, inner_r * TILT, DIM_COLOR);
 
     float sweep_rad = (millis() / 3000.0f) * (float)M_PI * 2.0f;
 
@@ -2179,26 +2171,6 @@ void draw_scanner_screen() {
             }
         }
     }
-        // --- Front longitude lines (bright, drawn on top of sweep) ---
-        for (int li = 0; li < NLON; li++) {
-            float lam = grot + li * (float)M_PI / NLON;
-            for (int half = 0; half < 2; half++) {
-                float L = lam + half * (float)M_PI;
-                if (cosf(L) < 0.0f) continue;   // front pass only
-                int px0 = 0, py0 = 0;
-                for (int si = 0; si <= NSTEPS; si++) {
-                    float phi = -(float)M_PI / 2.0f + (float)si / NSTEPS * (float)M_PI;
-                    int px = rcx + (int)(GR * cosf(phi) * sinf(L));
-                    int py = rcy + (int)(GR * sinf(phi) * GT);
-                    if (si > 0) spr.drawLine(px0, py0, px, py, col_front);
-                    px0 = px; py0 = py;
-                }
-            }
-        }
-        // Globe outline ellipse
-        spr.drawEllipse(rcx, rcy, GR, (int)(GR * GT), col_front);
-    }  // end globe block
-
     hud_rotation += 0.0033f;
     spr.clearClipRect();
 
@@ -2841,14 +2813,14 @@ void draw_gps_screen() {
     drawCard(4, 22, 114, 108);
     const int gx = 56, gy = 68, gr = 36;
 
-    // Axial tilt 32° + slow spin (12 s/rev)
+    // Axial tilt 32° + slow spin (18 s/rev)
     const float TILT = 0.56f;  // radians ~32°
-    float rot = fmodf((float)millis() / 12000.0f, 1.0f) * 2.0f * (float)M_PI;
+    float rot = fmodf((float)millis() / 18000.0f, 1.0f) * 2.0f * (float)M_PI;
 
     float sr = sinf(rot), cr = cosf(rot);
     float st = sinf(TILT), ct = cosf(TILT);
 
-    // Project a sphere point (lat_r, lon_r) → screen (px, py); return z-depth
+    // Project a sphere point (lat_r, lon_r) → screen (px, py); return z-depth [-1..1]
     auto proj = [&](float clat, float slat, float lon_r, int* px, int* py) -> float {
         float sx = clat * cosf(lon_r);
         float sy = slat;
@@ -2869,12 +2841,12 @@ void draw_gps_screen() {
     // Globe fill
     spr.fillCircle(gx, gy, gr, lgfx::color565(3, 10, 36));
 
-    // ─ Latitude circles (every 30°, 6 lines) ─
+    // ─ Latitude circles (every 30°, 5 lines) ─
+    // Back-facing segments drawn dim so full wireframe is visible
     const float lats[] = { -60.0f, -30.0f, 0.0f, 30.0f, 60.0f };
     for (int li = 0; li < 5; li++) {
         float lat_r = radians(lats[li]);
-        float clat = cosf(lat_r);
-        float slat = sinf(lat_r);
+        float clat = cosf(lat_r), slat = sinf(lat_r);
         bool  is_eq = (li == 2);
         const int STEPS = 72;
         int px0, py0, px1, py1;
@@ -2882,35 +2854,32 @@ void draw_gps_screen() {
         for (int s = 1; s <= STEPS; s++) {
             float lon = (float)s / STEPS * 2.0f * (float)M_PI;
             float pz1 = proj(clat, slat, lon, &px1, &py1);
-            float brt = (pz0 + pz1) * 0.5f * 0.45f + 0.15f;
-            if (brt > 0.05f) {
-                uint8_t rv = is_eq ? (uint8_t)(brt * 80)  : (uint8_t)(brt * 40);
-                uint8_t gv = is_eq ? (uint8_t)(brt * 80)  : (uint8_t)(brt * 55);
-                uint8_t bv = is_eq ? (uint8_t)(brt * 210) : (uint8_t)(brt * 160);
-                spr.drawLine(px0, py0, px1, py1, lgfx::color565(rv, gv, bv));
-            }
+            // brt: 0.10 at full-back, 1.0 at full-front; always drawn
+            float brt = (pz0 + pz1) * 0.5f * 0.45f + 0.55f;
+            if (brt < 0.10f) brt = 0.10f;
+            uint8_t rv = is_eq ? (uint8_t)(brt * 55)  : (uint8_t)(brt * 20);
+            uint8_t gv = is_eq ? (uint8_t)(brt * 100) : (uint8_t)(brt * 120);
+            uint8_t bv = is_eq ? (uint8_t)(brt * 255) : (uint8_t)(brt * 200);
+            spr.drawLine(px0, py0, px1, py1, lgfx::color565(rv, gv, bv));
             px0 = px1; py0 = py1; pz0 = pz1;
         }
     }
 
-    // ─ Longitude lines (every 45°, 8 meridians) ─
-    const int N_MER = 8, M_STEPS = 48;
+    // ─ Longitude lines (every 30°, 12 meridians) ─
+    const int N_MER = 12, M_STEPS = 48;
     for (int m = 0; m < N_MER; m++) {
         float lon = (float)m / N_MER * 2.0f * (float)M_PI;
         int px0, py0, px1, py1;
-        float clat = cosf(-1.5707f);
-        float slat = sinf(-1.5707f);
+        float clat = cosf(-1.5707f), slat = sinf(-1.5707f);
         float pz0 = proj(clat, slat, lon, &px0, &py0);
         for (int s = 1; s <= M_STEPS; s++) {
             float lat_r = -1.5707f + (float)s / M_STEPS * (float)M_PI;
-            clat = cosf(lat_r);
-            slat = sinf(lat_r);
-            float pz1   = proj(clat, slat, lon, &px1, &py1);
-            float brt   = (pz0 + pz1) * 0.5f * 0.40f + 0.10f;
-            if (brt > 0.05f) {
-                uint8_t mv = (uint8_t)(brt * 110);
-                spr.drawLine(px0, py0, px1, py1, lgfx::color565(mv/5, mv/3, mv));
-            }
+            clat = cosf(lat_r); slat = sinf(lat_r);
+            float pz1 = proj(clat, slat, lon, &px1, &py1);
+            float brt = (pz0 + pz1) * 0.5f * 0.40f + 0.50f;
+            if (brt < 0.10f) brt = 0.10f;
+            uint8_t mv = (uint8_t)(brt * 160);
+            spr.drawLine(px0, py0, px1, py1, lgfx::color565(mv/6, mv/3, mv));
             px0 = px1; py0 = py1; pz0 = pz1;
         }
     }
