@@ -1820,9 +1820,8 @@ void draw_header_spr(int screen_num) {
         }
     }
 
-    // Header divider — dotted line, same color as inactive scan indicator (CARD_BORDER)
-    for (int dx = 0; dx < DISP_W; dx += 4)
-        spr.drawPixel(dx, 18, CARD_BORDER);
+    // Header divider — solid line, matching locator grid color
+    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
 }
 
 void draw_toast_spr() {
@@ -2307,6 +2306,8 @@ void draw_locator_screen() {
         spr.drawLine(gx, 19, gx, DISP_H - 1, CARD_BORDER);
     for (int gy = 19 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
         if (gy >= 19) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
+    // Solid vertical separator on right edge of grid panel
+    spr.drawFastVLine(GRID_RIGHT, 19, DISP_H - 19, CARD_BORDER);
 
     const int cx = 40, cy = 65;
 
