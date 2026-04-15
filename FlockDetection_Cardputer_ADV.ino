@@ -84,6 +84,11 @@ static const uint8_t LED_COLORS[][3] = {
 };
 static int led_col_idx = 0;
 
+// Detection-flash state — overrides breathing color briefly on new detection
+static unsigned long led_detection_flash_until = 0;
+static uint8_t  led_detect_r = 0, led_detect_g = 0, led_detect_b = 0;
+static bool     led_detect_active = false;
+
 void apply_color_palette() {
     if (night_mode) {
         BG_COLOR      = lgfx::color565(  8,   0,   0);
@@ -427,13 +432,7 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    if (brightness_level < 2) {
-        M5Cardputer.Display.setBrightness(255);
-    }
     neopixelWrite(21, r, g, b);
-    if (brightness_level < 2) {
-        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
-    }
 }
 
 // ============================================================================
@@ -448,12 +447,19 @@ static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
     for (;;) {
-        if (led_breathing_on) {
+        if (led_detect_active) {
+            if (millis() < led_detection_flash_until) {
+                set_cardputer_led(led_detect_r, led_detect_g, led_detect_b);
+            } else {
+                led_detect_active = false;
+                set_cardputer_led(0, 0, 0);
+            }
+        } else if (led_breathing_on) {
             float phase = sinf((millis() / 1000.0f) * (float)M_PI);
             uint8_t val = (uint8_t)((phase + 1.0f) * 100.0f); // 0..200
             set_cardputer_led((led_r * val) / 200, (led_g * val) / 200, (led_b * val) / 200);
         } else {
-            set_cardputer_led(0, 0, 0); // Keep it dark if disabled
+            set_cardputer_led(0, 0, 0);
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -529,6 +535,8 @@ void dedicated_charging_loop() {
     int display_pct = -1;
     unsigned long boot_time = millis();
     led_breathing_on = true;
+    led_r = 0; led_g = 255; led_b = 0;
+    M5Cardputer.Display.setBrightness(255);
 
     const unsigned long CHARGE_AUTO_BOOT_MS = 30UL * 60UL * 1000UL;
     
@@ -590,13 +598,13 @@ void dedicated_charging_loop() {
         spr.pushSprite(0, 0);
 
         if (current_mv < 3200 && elapsed > 3000) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 0; led_g = 215; led_b = 235; led_breathing_on = false; return;
         }
         if (elapsed > 1500 && M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 0; led_g = 215; led_b = 235; led_breathing_on = false; return;
         }
         if (elapsed >= CHARGE_AUTO_BOOT_MS) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 0; led_g = 215; led_b = 235; led_breathing_on = false; return;
         }
         delay(15);
     }
@@ -1152,6 +1160,14 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         lifetime_flock_total++;
         add_to_capture_history(type, mac, name, rssi, confidence);
         trigger_toast(type, name, confidence);
+        // Flash LED: yellow for WiFi, purple for BLE
+        if (strcmp(proto, "WIFI") == 0) {
+            led_detect_r = 255; led_detect_g = 200; led_detect_b = 0;
+        } else {
+            led_detect_r = 180; led_detect_g = 0; led_detect_b = 255;
+        }
+        led_detection_flash_until = millis() + 15000;
+        led_detect_active = true;
         xSemaphoreGive(dataMutex);
         add_blip(blip_col, rssi);
         xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1785,7 +1801,7 @@ void draw_header_spr(int screen_num) {
     } else {
         bfill = (display_bat * 22) / 100;
     }
-    if (bfill > 0) spr.fillRect(DISP_W - 25, 5, bfill, 8, bcol);
+    if (bfill > 0) spr.fillRoundRect(DISP_W - 25, 5, bfill, 8, 2, bcol);
 
     // Lightning bolt overlay when charging
     if (chg) {
@@ -2379,26 +2395,32 @@ void draw_locator_screen() {
         smpl_prev = sc;
     }
 
-    const int BOX = 11, PAD = 2, XLEN = BOX - PAD*2 - 1;
-    const unsigned long X_MS = 320;
+    const int BOX = 11;
     const int by0 = 120;       // near bottom of left panel
     const int bx0 = cx - 22;  // = 34, centers 3 boxes under cx
 
     for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
         int bxi = bx0 + di * 17;
         bool filled = di < sc;
-        spr.drawRect(bxi, by0, BOX, BOX, GPS_COLOR);
+
+        uint16_t box_col;
         if (filled) {
-            unsigned long elapsed = (smpl_birth[di] > 0) ? (now_ms - smpl_birth[di]) : X_MS + 1;
-            float phase = min(1.0f, (float)elapsed / (float)X_MS);
-            float p1 = min(1.0f, phase * 2.0f);
-            for (int dy = 0; dy <= 1; dy++)
-                spr.drawLine(bxi+PAD,               by0+PAD+dy,
-                             bxi+PAD+(int)(XLEN*p1), by0+PAD+(int)(XLEN*p1)+dy, GPS_COLOR);
-            float p2 = max(0.0f, min(1.0f, (phase - 0.5f) * 2.0f));
-            for (int dy = 0; dy <= 1; dy++)
-                spr.drawLine(bxi+BOX-PAD-1,                by0+PAD+dy,
-                             bxi+BOX-PAD-1-(int)(XLEN*p2), by0+PAD+(int)(XLEN*p2)+dy, GPS_COLOR);
+            float ph = (sinf((float)now_ms / 600.0f) + 1.0f) * 0.5f;
+            uint8_t gv = (uint8_t)(160 + 95.0f * ph);  // 160..255
+            box_col = lgfx::color565(0, gv, 0);
+        } else {
+            box_col = GPS_COLOR;
+        }
+
+        spr.drawRect(bxi, by0, BOX, BOX, box_col);
+        if (filled) {
+            // Oversized static X — 2px thick, extends 1px outside box edges
+            int mx = bxi + BOX / 2, my = by0 + BOX / 2;
+            int xr = BOX / 2 + 1;
+            spr.drawLine(mx - xr, my - xr, mx + xr, my + xr, box_col);
+            spr.drawLine(mx - xr + 1, my - xr, mx + xr, my + xr - 1, box_col);
+            spr.drawLine(mx + xr, my - xr, mx - xr, my + xr, box_col);
+            spr.drawLine(mx + xr - 1, my - xr, mx - xr, my + xr - 1, box_col);
         }
     }
     // lock indicator: subtle glow on the last sample box instead of text
@@ -3024,6 +3046,8 @@ void setup() {
 
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
+    M5Cardputer.Display.setBrightness(255);
+    brightness_level = 2;
     apply_color_palette();
 
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
@@ -3242,6 +3266,12 @@ void loop() {
                 if (!stealth_mode) {
                     brightness_level = (brightness_level + 1) % 3;
                     M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+                    // Disable LED at dim levels, re-enable at full brightness
+                    if (brightness_level < 2) {
+                        led_breathing_on = false;
+                    } else {
+                        led_breathing_on = true;
+                    }
                 }
             }
             else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(0); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } } 
