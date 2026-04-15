@@ -2807,7 +2807,7 @@ void draw_gps_screen() {
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
     // Solid BG fill, tilt, fast spin
-    const int gx = 55, gy = 65, gr = 27;  // 15% smaller than previous 32
+    const int gx = 55, gy = 65, gr = 30;  // 10% larger than previous 27
 
     // Axial tilt — north pole tilted back, fast spin (8 s/rev)
     const float TILT = -0.52f;  // shallower tilt: more overhead view matching reference angle
@@ -2847,10 +2847,12 @@ void draw_gps_screen() {
         for (int s = 1; s <= STEPS; s++) {
             float lon = (float)s / STEPS * 2.0f * (float)M_PI;
             float pz1 = proj(clat, slat, lon, &px1, &py1);
-            float brt = (pz0 + pz1) * 0.5f * 0.45f + 0.55f;
-            if (brt < 0.10f) brt = 0.10f;
-            uint16_t base = is_eq ? GPS_COLOR : HEADER_COLOR;
-            spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, base, brt));
+            float avg_z = (pz0 + pz1) * 0.5f;
+            if (avg_z > 0.0f) {  // cull back-facing segments
+                float brt = avg_z * 0.45f + 0.55f;
+                uint16_t base = is_eq ? GPS_COLOR : HEADER_COLOR;
+                spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, base, brt));
+            }
             px0 = px1; py0 = py1; pz0 = pz1;
         }
     }
@@ -2866,9 +2868,11 @@ void draw_gps_screen() {
             float lat_r = -1.5707f + (float)s / M_STEPS * (float)M_PI;
             clat = cosf(lat_r); slat = sinf(lat_r);
             float pz1 = proj(clat, slat, lon, &px1, &py1);
-            float brt = (pz0 + pz1) * 0.5f * 0.40f + 0.50f;
-            if (brt < 0.10f) brt = 0.10f;
-            spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, HEADER_COLOR, brt));
+            float avg_z = (pz0 + pz1) * 0.5f;
+            if (avg_z > 0.0f) {  // cull back-facing segments
+                float brt = avg_z * 0.40f + 0.50f;
+                spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, HEADER_COLOR, brt));
+            }
             px0 = px1; py0 = py1; pz0 = pz1;
         }
     }
