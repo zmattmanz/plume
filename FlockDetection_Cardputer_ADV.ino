@@ -8,7 +8,7 @@
 #include <NimBLEScan.h>
 #include <NimBLEAdvertisedDevice.h>
 #include <vector>
-#include <algorithm> 
+#include <algorithm>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include <SPI.h>
@@ -17,6 +17,7 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <math.h>
+#include <Adafruit_NeoPixel.h>
 #include "ui_beep.h"  // PCM sound for screen transitions
 
 #ifndef M_PI
@@ -64,18 +65,23 @@ int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
 // RGB LED state — color cycles with C key, on/off with L when locator idle
-static uint8_t led_r = 0, led_g = 200, led_b = 0; // default green
+static uint8_t led_r = 0, led_g = 215, led_b = 235; // default scanner blue (matches HEADER_COLOR)
 static bool    led_breathing_on = true;
 static const uint8_t LED_COLORS[][3] = {
-    {0, 200,   0},   // green (default)
-    {80, 200, 255},  // cyan
-    {0,  160, 200},  // teal
-    {200, 100, 255}, // purple
-    {255, 255, 255}, // white
-    {255,  80,   0}, // orange
-    {255,  30,  30}, // red
+    {  0, 215, 235},  // scanner blue (matches HEADER_COLOR — default)
+    { 80, 200, 255},  // cyan
+    {  0, 200,   0},  // green
+    {  0, 160, 200},  // teal
+    {200, 100, 255},  // purple
+    {255, 255, 255},  // white
+    {255,  80,   0},  // orange
+    {255,  30,  30},  // red
 };
 static int led_col_idx = 0;
+
+// Hardware NeoPixel driver — uses ESP32 RMT peripheral (DMA-backed), immune to
+// PWM backlight interrupts that corrupted the old neopixelWrite() bit-timing.
+static Adafruit_NeoPixel led_strip(1, 21, NEO_GRB + NEO_KHZ800);
 
 void apply_color_palette() {
     if (night_mode) {
@@ -419,22 +425,25 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    // neopixelWrite is available from Arduino ESP32 Core 2.0 / IDF 4.4+
-    neopixelWrite(21, r, g, b);
+    // Adafruit_NeoPixel uses the ESP32 RMT peripheral with DMA so it is
+    // immune to PWM backlight timer interrupts at low brightness levels.
+    led_strip.setPixelColor(0, led_strip.Color(r, g, b));
+    led_strip.show();
 }
 
 // ============================================================================
 // CHARGE LED TASK — Bruce-style dedicated FreeRTOS task (50 ms fixed tick,
 // sine easing, full 0-255 range). Runs independently of the main loop so
 // BLE/WiFi scheduling jitter never disrupts the animation timing.
+// Uses Adafruit_NeoPixel (DMA-backed RMT) so screen PWM backlight interrupts
+// cannot corrupt the LED data — the old neopixelWrite() failed at <255 brightness
+// because the bit-banged timing was preempted by the PWM backlight timer.
 // Reference: BruceDevices/firmware src/core/led_control.cpp (ledEffectTask)
 // ============================================================================
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
     // millis()-based phase = always time-correct regardless of scheduling jitter.
-    // Pinned to Core 0 at priority 5 so display PWM on Core 1 cannot preempt
-    // the RMT write — this is why breathing was broken at low brightness levels.
     for (;;) {
         if (led_breathing_on) {
             float phase = sinf((millis() / 1000.0f) * (float)M_PI);
@@ -447,9 +456,8 @@ void chargeLedTask(void* pvParameters) {
 
 void start_charge_led() {
     if (chargeLedTaskHandle == NULL)
-        // Core 0 (PRO_CPU) keeps the LED task away from display/audio on Core 1.
-        // Priority 5 ensures RMT writes complete without preemption.
-        xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 2048, NULL, 5, &chargeLedTaskHandle, 0);
+        // Stack bumped to 4096 for Adafruit_NeoPixel RMT overhead.
+        xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
 }
 
 void stop_charge_led() {
@@ -2963,8 +2971,13 @@ void transition_screen(int new_screen, int dir) {
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
-    
-    M5Cardputer.Speaker.setVolume(0); 
+
+    // Init NeoPixel driver before any LED call (including dedicated_charging_loop)
+    led_strip.begin();
+    led_strip.setBrightness(255);
+    led_strip.show(); // off at start
+
+    M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
     apply_color_palette();
 
