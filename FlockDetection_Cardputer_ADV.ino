@@ -1,5 +1,5 @@
 // ============================================================================
-// FLOCK DETECTOR v8.13-ADV — Tactical Edition (Stable Release)
+// FLOCK DETECTOR v9.0-ADV — Tactical Edition (Stable Release)
 // ============================================================================
 
 #include <M5Cardputer.h>
@@ -188,7 +188,7 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 #define SD_CS_PIN       12
 
 // Version string — single source of truth
-#define VERSION_STRING "FLOCK DETECTOR v8.5 [ADV]"
+#define VERSION_STRING "FLOCK DETECTOR v9.0 [ADV]"
 
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
 #define NUM_SCREENS 6
@@ -1956,51 +1956,59 @@ void draw_scanner_screen() {
     float TILT = 0.55f;
     int rcx = radar_cx;
     int rcy = radar_cy;
-    int THICKNESS = 10;
 
-    // Shadow below cylinder
-    spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
-
-    // Cylinder wall: solid gradient fills from bottom to top (lighter toward top)
-    for (int i = THICKNESS; i >= 1; i--) {
-        uint8_t wall_v = 8 + (THICKNESS - i) * 2;
-        spr.fillEllipse(rcx, rcy + i, radar_r, radar_r * TILT,
-                        lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
-    }
-
-    // Left/right edge lines connecting top rim to bottom rim (removed)
-
-    // Top face fill and border — draw ellipse twice (y offset 1) for thicker rim
-    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(rcx, rcy - 1, radar_r, radar_r * TILT, HEADER_COLOR);
-    spr.drawEllipse(rcx, rcy,     radar_r, radar_r * TILT, HEADER_COLOR);
-
-    // Hatching on both sides of the cylinder rim seam
+    // ── Rotating wireframe globe ──
     {
-        const int HAT_TICKS = 20;
-        uint16_t hat_col = lgfx::color565(30, 60, 100);
-        for (int t = 0; t < HAT_TICKS; t++) {
-            float a  = (float)t / HAT_TICKS * (float)M_PI * 2.0f;
-            float ca = cosf(a), sa = sinf(a);
-            int ex = rcx + (int)(radar_r * ca);
-            int ey = rcy + (int)(radar_r * TILT * sa);
-            // Cylinder wall side: 3px tick downward from rim
-            spr.drawLine(ex, ey + 1, ex, ey + 4, hat_col);
-            // Top face side: 4px tick inward from rim toward center
-            int ix = rcx + (int)((radar_r - 4) * ca);
-            int iy = rcy + (int)((radar_r - 4) * TILT * sa);
-            spr.drawLine(ex, ey, ix, iy, hat_col);
+        // Slow rotation: one full revolution every 20 seconds
+        static float grot = 0.0f;
+        static unsigned long last_globe_ms = 0;
+        unsigned long cur_ms_g = millis();
+        float gdt = (last_globe_ms == 0) ? 0.0f : (float)(cur_ms_g - last_globe_ms);
+        if (gdt > 100.0f) gdt = 100.0f;
+        last_globe_ms = cur_ms_g;
+        grot += gdt * (2.0f * (float)M_PI) / 20000.0f;
+        if (grot > 2.0f * (float)M_PI) grot -= 2.0f * (float)M_PI;
+
+        const int  GR      = radar_r;
+        const float GT     = TILT;
+        uint16_t col_front = lgfx::color565(0, 180, 220);
+        uint16_t col_back  = lgfx::color565(0, 45,  70);
+        uint16_t col_lat   = lgfx::color565(0, 130, 170);
+
+        // Globe background
+        spr.fillEllipse(rcx, rcy, GR, (int)(GR * GT), lgfx::color565(4, 10, 22));
+
+        // --- Back longitude lines (dim, drawn first) ---
+        const int NLON = 6, NSTEPS = 24;
+        for (int li = 0; li < NLON; li++) {
+            float lam = grot + li * (float)M_PI / NLON;
+            // Draw both this meridian and its antipode
+            for (int half = 0; half < 2; half++) {
+                float L = lam + half * (float)M_PI;
+                bool front = (cosf(L) >= 0.0f);
+                if (front) continue;   // back pass only
+                int px0 = 0, py0 = 0;
+                for (int si = 0; si <= NSTEPS; si++) {
+                    float phi = -(float)M_PI / 2.0f + (float)si / NSTEPS * (float)M_PI;
+                    int px = rcx + (int)(GR * cosf(phi) * sinf(L));
+                    int py = rcy + (int)(GR * sinf(phi) * GT);
+                    if (si > 0) spr.drawLine(px0, py0, px, py, col_back);
+                    px0 = px; py0 = py;
+                }
+            }
         }
-    }
 
-    // Redraw bottom rim so it shows over the top face fill — doubled for thickness
-    spr.drawEllipse(rcx, rcy + THICKNESS,     radar_r, radar_r * TILT, DIM_COLOR);
-    spr.drawEllipse(rcx, rcy + THICKNESS + 1, radar_r, radar_r * TILT, DIM_COLOR);
-
-    // Structural ribs on left wall removed
-
-    spr.drawEllipse(rcx, rcy,     inner_r, inner_r * TILT, DIM_COLOR);
-    spr.drawEllipse(rcx, rcy - 1, inner_r, inner_r * TILT, DIM_COLOR);
+        // --- Latitude circles (all visible, drawn mid-layer) ---
+        const int NLAT = 5;
+        const float lat_degs[NLAT] = { -60.0f, -30.0f, 0.0f, 30.0f, 60.0f };
+        for (int li = 0; li < NLAT; li++) {
+            float phi = lat_degs[li] * (float)M_PI / 180.0f;
+            int rx_lat  = (int)(GR * cosf(phi));
+            int ry_lat  = (int)(GR * cosf(phi) * GT);
+            int cy_lat  = rcy + (int)(GR * sinf(phi) * GT);
+            if (rx_lat > 1 && ry_lat > 0)
+                spr.drawEllipse(rcx, cy_lat, rx_lat, ry_lat, col_lat);
+        }
 
     float sweep_rad = (millis() / 3000.0f) * (float)M_PI * 2.0f;
 
@@ -2171,6 +2179,26 @@ void draw_scanner_screen() {
             }
         }
     }
+        // --- Front longitude lines (bright, drawn on top of sweep) ---
+        for (int li = 0; li < NLON; li++) {
+            float lam = grot + li * (float)M_PI / NLON;
+            for (int half = 0; half < 2; half++) {
+                float L = lam + half * (float)M_PI;
+                if (cosf(L) < 0.0f) continue;   // front pass only
+                int px0 = 0, py0 = 0;
+                for (int si = 0; si <= NSTEPS; si++) {
+                    float phi = -(float)M_PI / 2.0f + (float)si / NSTEPS * (float)M_PI;
+                    int px = rcx + (int)(GR * cosf(phi) * sinf(L));
+                    int py = rcy + (int)(GR * sinf(phi) * GT);
+                    if (si > 0) spr.drawLine(px0, py0, px, py, col_front);
+                    px0 = px; py0 = py;
+                }
+            }
+        }
+        // Globe outline ellipse
+        spr.drawEllipse(rcx, rcy, GR, (int)(GR * GT), col_front);
+    }  // end globe block
+
     hud_rotation += 0.0033f;
     spr.clearClipRect();
 
@@ -2331,44 +2359,53 @@ void draw_locator_screen() {
     }
     float ang = ease_arrow;
 
-    // ── Arrow: BG_COLOR fill + GPS_COLOR outline triangle (~10% bigger) ──
+    // ── Arrow: cursor/pointer shape — 7-point polygon ──
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
         float ca = cosf(a), sa = sinf(a);
         *ox = cx + (int)roundf(lx * ca - ly * sa);
         *oy = cy + (int)roundf(lx * sa + ly * ca);
     };
-    // Arrow: tip=(0,-23), base=(±14,+15) — larger, ~20% bigger overall
-    int ax3[3], ay3[3];
-    rotpt(  0, -23, ang, &ax3[0], &ay3[0]);
-    rotpt( 14,  15, ang, &ax3[1], &ay3[1]);
-    rotpt(-14,  15, ang, &ax3[2], &ay3[2]);
+    // Local-space vertices (pointing up before rotation):
+    //   0=tip, 1=right-outer, 2=right-inner, 3=right-base, 4=left-base, 5=left-inner, 6=left-outer
+    const float A_TIP_Y   = -22.0f, A_SHLDR_Y = -6.0f, A_BASE_Y = 14.0f;
+    const float A_HEAD_HW =  12.0f, A_STEM_HW =  6.0f;
+    const float lx7[7] = {  0,          A_HEAD_HW,  A_STEM_HW,  A_STEM_HW, -A_STEM_HW, -A_STEM_HW, -A_HEAD_HW };
+    const float ly7[7] = { A_TIP_Y, A_SHLDR_Y, A_SHLDR_Y, A_BASE_Y,  A_BASE_Y, A_SHLDR_Y,  A_SHLDR_Y };
+    int ax7[7], ay7[7];
+    for (int vi = 0; vi < 7; vi++) rotpt(lx7[vi], ly7[vi], ang, &ax7[vi], &ay7[vi]);
 
-    // BG fill first — clears grid behind the arrow
-    spr.fillTriangle(ax3[0], ay3[0], ax3[1], ay3[1], ax3[2], ay3[2], BG_COLOR);
+    // BG fill: arrowhead triangle + stem rectangle (two triangles)
+    spr.fillTriangle(ax7[0], ay7[0], ax7[1], ay7[1], ax7[6], ay7[6], BG_COLOR);
+    spr.fillTriangle(ax7[2], ay7[2], ax7[3], ay7[3], ax7[4], ay7[4], BG_COLOR);
+    spr.fillTriangle(ax7[2], ay7[2], ax7[4], ay7[4], ax7[5], ay7[5], BG_COLOR);
 
-    // Hatching: base→tip(68%), quadratic spacing, half-width lines only.
-    // Each line runs from the left edge of the triangle to the centre axis —
-    // "cut in half" effect; lines taper shorter and spread further as tip approaches.
+    // Hatching: narrow spacing near tip, wider toward base (quadratic from tip)
     {
-        const float TIP_Y = -23.0f, BASE_Y = 15.0f, RANGE = 38.0f, HALF_W = 14.0f;
-        const float STOP_Y = -11.0f;  // ~68% from base toward tip
         uint16_t hatch_col = lgfx::color565(45, 135, 210);
-        for (int hi = 0; hi < 12; hi++) {
-            float ly = BASE_Y - 0.7f * (float)(hi * hi);  // quadratic: gaps widen toward tip
-            if (ly < STOP_Y) break;
-            float t  = (ly - TIP_Y) / RANGE;  // 0=tip, 1=base
-            float hw = HALF_W * t;
+        for (int hi = 1; hi < 16; hi++) {
+            float ly = A_TIP_Y + 0.4f * (float)(hi * hi);  // quadratic from tip → base
+            if (ly > A_BASE_Y) break;
+            // Half-width at this y level
+            float hw;
+            if (ly <= A_SHLDR_Y) {
+                float t = (ly - A_TIP_Y) / (A_SHLDR_Y - A_TIP_Y);
+                hw = A_HEAD_HW * t;
+            } else {
+                hw = A_STEM_HW;
+            }
+            if (hw < 0.5f) continue;
             int hx0, hy0, hx1, hy1;
-            rotpt(-hw, ly, ang, &hx0, &hy0);  // left edge
-            rotpt(  0, ly, ang, &hx1, &hy1);  // centre axis (stop halfway across)
+            rotpt(-hw, ly, ang, &hx0, &hy0);
+            rotpt( hw, ly, ang, &hx1, &hy1);
             spr.drawLine(hx0, hy0, hx1, hy1, hatch_col);
         }
     }
 
-    // Single GPS_COLOR outline
-    spr.drawLine(ax3[0], ay3[0], ax3[1], ay3[1], GPS_COLOR);
-    spr.drawLine(ax3[1], ay3[1], ax3[2], ay3[2], GPS_COLOR);
-    spr.drawLine(ax3[2], ay3[2], ax3[0], ay3[0], GPS_COLOR);
+    // GPS_COLOR outline — draw all 7 edges
+    for (int vi = 0; vi < 7; vi++) {
+        int ni = (vi + 1) % 7;
+        spr.drawLine(ax7[vi], ay7[vi], ax7[ni], ay7[ni], GPS_COLOR);
+    }
 
     // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : (demo ? 2 : 0);
@@ -2417,7 +2454,7 @@ void draw_locator_screen() {
     // lock indicator: subtle glow on the last sample box instead of text
 
     // ── Right panel ──
-    int rx = 90;
+    int rx = 68;
     int rpx = rx + 8;
 
     // Status — dynamic-width box
