@@ -64,10 +64,10 @@ int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
 // RGB LED state — color cycles with C key, on/off with L when locator idle
-static uint8_t led_r = 0, led_g = 215, led_b = 235; // default scanner blue (matches HEADER_COLOR)
+static uint8_t led_r = 50, led_g = 255, led_b = 100; // default green (matches ACCENT_COLOR)
 static bool    led_breathing_on = true;
 static const uint8_t LED_COLORS[][3] = {
-    {  0, 215, 235},  // scanner blue (matches HEADER_COLOR — default)
+    { 50, 255, 100},  // green (matches ACCENT_COLOR — default)
     { 80, 200, 255},  // cyan
     {  0, 200,   0},  // green
     {  0, 160, 200},  // teal
@@ -592,13 +592,13 @@ void dedicated_charging_loop() {
         spr.pushSprite(0, 0);
 
         if (current_mv < 3200 && elapsed > 3000) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 0; led_g = 215; led_b = 235; led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = false; return;
         }
         if (elapsed > 1500 && M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 0; led_g = 215; led_b = 235; led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = false; return;
         }
         if (elapsed >= CHARGE_AUTO_BOOT_MS) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 0; led_g = 215; led_b = 235; led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = false; return;
         }
         delay(15);
     }
@@ -2276,7 +2276,7 @@ void draw_locator_screen() {
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
     // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 76;
+    const int GRID_RIGHT = 88;
     const int GRID_STEP  = 14;
     unsigned long now_ms = millis();
 
@@ -2309,7 +2309,7 @@ void draw_locator_screen() {
     // Solid vertical separator on right edge of grid panel
     spr.drawFastVLine(GRID_RIGHT, 19, DISP_H - 19, CARD_BORDER);
 
-    const int cx = 40, cy = 65;
+    const int cx = 44, cy = 65;
 
     // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
@@ -2427,23 +2427,19 @@ void draw_locator_screen() {
     // lock indicator: subtle glow on the last sample box instead of text
 
     // ── Right panel ──
-    int rx = 80;
+    int rx = 92;
     int rpx = rx + 8;
 
     // Status — dynamic-width box
     const char* status_base; uint16_t status_col; bool status_anim = false;
     if (north_mode) {
-        status_base = "LOCATING NORTH";  status_col = GPS_COLOR;
+        status_base = "Pointing North";  status_col = GPS_COLOR;
     } else if (!has_loc && !gps_valid) {
-        status_base = "NO GPS SIGNAL";   status_col = GPS_COLOR;     status_anim = true;
-    } else if (gps_valid && !active) {
-        status_base = "Waiting...";      status_col = CAUTION_COLOR;
-    } else if (active && has_est && !est_stale) {
-        status_base = "TRACKING TARGET"; status_col = ACCENT_COLOR;
-    } else if (active && !has_est) {
-        status_base = "ACQUIRING";       status_col = CAUTION_COLOR; status_anim = true;
+        status_base = "GPS";             status_col = GPS_COLOR;     status_anim = true;
+    } else if (!active) {
+        status_base = "Need Target";     status_col = CAUTION_COLOR; status_anim = true;
     } else {
-        status_base = "SEARCHING GPS";   status_col = DIM_COLOR;     status_anim = true;
+        status_base = "Test Mode";       status_col = ACCENT_COLOR;
     }
     char status_str[26];
     if (status_anim) {
@@ -2783,7 +2779,7 @@ void draw_capture_history_screen() {
 
         // Footer hint
         spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(cx + 6, cy + ch - 11); spr.print("DEL to close");
+        spr.setCursor(cx + 6, cy + ch - 11); spr.print("ENTER to close");
     }
 }
 
@@ -2813,8 +2809,8 @@ void draw_gps_screen() {
     // Transparent fill, dramatic tilt, fast spin — no card background
     const int gx = 55, gy = 65, gr = 32;  // 10% smaller radius
 
-    // Dramatic axial tilt — north pole tilted back, fast spin (8 s/rev)
-    const float TILT = -0.88f;  // negative = north faces away from viewer
+    // Axial tilt — north pole tilted back, fast spin (8 s/rev)
+    const float TILT = -0.52f;  // shallower tilt: more overhead view matching reference angle
     float rot = fmodf((float)millis() / 8000.0f, 1.0f) * 2.0f * (float)M_PI;
 
     float sr = sinf(rot), cr = cosf(rot);
@@ -3284,8 +3280,14 @@ void loop() {
             }
             else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(0); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } } 
             else if (c == 'g') {
-                gps_page_toggle();
-                if (current_screen == 4) { draw_current_screen(); spr.pushSprite(0, 0); }
+                if (current_screen == 1) {
+                    // Locator screen: toggle Pointing North mode
+                    north_mode = !north_mode;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else {
+                    gps_page_toggle();
+                    if (current_screen == 4) { draw_current_screen(); spr.pushSprite(0, 0); }
+                }
             }
             else if (c == 'l') {
                 if (locator_active) {
