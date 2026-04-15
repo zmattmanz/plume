@@ -1,5 +1,5 @@
 // ============================================================================
-// FLOCK DETECTOR v9.0-ADV — Tactical Edition (Stable Release)
+// FLOCK DETECTOR v9.0-ADV — Tactical Edition (Build 2)
 // ============================================================================
 
 #include <M5Cardputer.h>
