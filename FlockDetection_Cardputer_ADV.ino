@@ -2,12 +2,6 @@
 // FLOCK DETECTOR v8.13-ADV — Tactical Edition (Stable Release)
 // ============================================================================
 
-#define FASTLED_RMT_BUILTIN_DRIVER 1
-#define FASTLED_RMT_MAX_CHANNELS 1
-#define FASTLED_ESP32_RMT_CHANNEL_0 0
-#include <FastLED.h>
-CRGB leds[1];
-
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <NimBLEDevice.h>
@@ -215,7 +209,7 @@ static unsigned long last_ble_scan = 0;
 static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
 #define BLE_MAX_CONCURRENT_TASKS 6
-static SemaphoreHandle_t ble_proc_sem = NULL;
+QueueHandle_t ble_event_queue;
 bool sd_available = false;
 bool littlefs_available = false;
 volatile int trigger_alarm_confidence = 0;
@@ -1485,10 +1479,12 @@ struct BleEventData {
     uint8_t  uuid_count;
 };
 
-static void ble_process_task(void* pvParameters) {
-    BleEventData* ev = (BleEventData*)pvParameters;
+static void ble_worker_task(void* pvParameters) {
+    BleEventData* ev;
+    for (;;) {
+        if (xQueueReceive(ble_event_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
 
-    if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); xSemaphoreGive(ble_proc_sem); vTaskDelete(NULL); return; }
+        if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); continue; }
     
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     session_ble_packets++;
@@ -1620,9 +1616,8 @@ static void ble_process_task(void* pvParameters) {
         xSemaphoreGive(dataMutex);
     }
 
-    free(ev);
-    xSemaphoreGive(ble_proc_sem);
-    vTaskDelete(NULL);
+        free(ev);
+    }
 }
 
 class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
@@ -1669,13 +1664,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
             }
         }
 
-        if (xSemaphoreTake(ble_proc_sem, 0) != pdTRUE) { free(ev); return; }
-        BaseType_t created = xTaskCreatePinnedToCore(
-            ble_process_task, "BLEProc", 6144, ev, 1, NULL, 1);
-        if (created != pdPASS) {
-            xSemaphoreGive(ble_proc_sem);
-            free(ev);
-        }
+        if (xQueueSend(ble_event_queue, &ev, 0) != pdTRUE) { free(ev); }
     }
 };
 
@@ -2821,10 +2810,10 @@ void draw_gps_screen() {
     float st = sinf(TILT), ct = cosf(TILT);
 
     // Project a sphere point (lat_r, lon_r) → screen (px, py); return z-depth
-    auto proj = [&](float lat_r, float lon_r, int* px, int* py) -> float {
-        float sx = cosf(lat_r) * cosf(lon_r);
-        float sy = sinf(lat_r);
-        float sz = cosf(lat_r) * sinf(lon_r);
+    auto proj = [&](float clat, float slat, float lon_r, int* px, int* py) -> float {
+        float sx = clat * cosf(lon_r);
+        float sy = slat;
+        float sz = clat * sinf(lon_r);
         // Spin around Y
         float rx =  sx * cr - sz * sr;
         float ry =  sy;
@@ -2845,13 +2834,15 @@ void draw_gps_screen() {
     const float lats[] = { -60.0f, -30.0f, 0.0f, 30.0f, 60.0f };
     for (int li = 0; li < 5; li++) {
         float lat_r = radians(lats[li]);
+        float clat = cosf(lat_r);
+        float slat = sinf(lat_r);
         bool  is_eq = (li == 2);
         const int STEPS = 72;
         int px0, py0, px1, py1;
-        float pz0 = proj(lat_r, 0.0f, &px0, &py0);
+        float pz0 = proj(clat, slat, 0.0f, &px0, &py0);
         for (int s = 1; s <= STEPS; s++) {
             float lon = (float)s / STEPS * 2.0f * (float)M_PI;
-            float pz1 = proj(lat_r, lon, &px1, &py1);
+            float pz1 = proj(clat, slat, lon, &px1, &py1);
             float brt = (pz0 + pz1) * 0.5f * 0.45f + 0.15f;
             if (brt > 0.05f) {
                 uint8_t rv = is_eq ? (uint8_t)(brt * 80)  : (uint8_t)(brt * 40);
@@ -2868,10 +2859,14 @@ void draw_gps_screen() {
     for (int m = 0; m < N_MER; m++) {
         float lon = (float)m / N_MER * 2.0f * (float)M_PI;
         int px0, py0, px1, py1;
-        float pz0 = proj(-1.5707f, lon, &px0, &py0);
+        float clat = cosf(-1.5707f);
+        float slat = sinf(-1.5707f);
+        float pz0 = proj(clat, slat, lon, &px0, &py0);
         for (int s = 1; s <= M_STEPS; s++) {
             float lat_r = -1.5707f + (float)s / M_STEPS * (float)M_PI;
-            float pz1   = proj(lat_r, lon, &px1, &py1);
+            clat = cosf(lat_r);
+            slat = sinf(lat_r);
+            float pz1   = proj(clat, slat, lon, &px1, &py1);
             float brt   = (pz0 + pz1) * 0.5f * 0.40f + 0.10f;
             if (brt > 0.05f) {
                 uint8_t mv = (uint8_t)(brt * 110);
@@ -3064,7 +3059,8 @@ void setup() {
     if (end_v > 3900 || (end_v - start_v >= 15)) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
-    setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex(); ble_proc_sem = xSemaphoreCreateCounting(BLE_MAX_CONCURRENT_TASKS, BLE_MAX_CONCURRENT_TASKS);
+    setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex(); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, NULL, 1);
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
