@@ -1820,9 +1820,8 @@ void draw_header_spr(int screen_num) {
         }
     }
 
-    // Header divider — dotted line, same color as inactive scan indicator (CARD_BORDER)
-    for (int dx = 0; dx < DISP_W; dx += 4)
-        spr.drawPixel(dx, 18, CARD_BORDER);
+    // Header divider — solid line, matching locator grid color
+    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
 }
 
 void draw_toast_spr() {
@@ -2307,6 +2306,8 @@ void draw_locator_screen() {
         spr.drawLine(gx, 19, gx, DISP_H - 1, CARD_BORDER);
     for (int gy = 19 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
         if (gy >= 19) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
+    // Solid vertical separator on right edge of grid panel
+    spr.drawFastVLine(GRID_RIGHT, 19, DISP_H - 19, CARD_BORDER);
 
     const int cx = 40, cy = 65;
 
@@ -2812,8 +2813,8 @@ void draw_gps_screen() {
     // Transparent fill, dramatic tilt, fast spin — no card background
     const int gx = 55, gy = 65, gr = 32;  // 10% smaller radius
 
-    // Dramatic axial tilt ~50° + faster spin (8 s/rev)
-    const float TILT = 0.88f;
+    // Dramatic axial tilt — north pole tilted back, fast spin (8 s/rev)
+    const float TILT = -0.88f;  // negative = north faces away from viewer
     float rot = fmodf((float)millis() / 8000.0f, 1.0f) * 2.0f * (float)M_PI;
 
     float sr = sinf(rot), cr = cosf(rot);
@@ -2851,10 +2852,8 @@ void draw_gps_screen() {
             float pz1 = proj(clat, slat, lon, &px1, &py1);
             float brt = (pz0 + pz1) * 0.5f * 0.45f + 0.55f;
             if (brt < 0.10f) brt = 0.10f;
-            uint8_t rv = is_eq ? (uint8_t)(brt * 55)  : (uint8_t)(brt * 20);
-            uint8_t gv = is_eq ? (uint8_t)(brt * 100) : (uint8_t)(brt * 120);
-            uint8_t bv = is_eq ? (uint8_t)(brt * 255) : (uint8_t)(brt * 200);
-            spr.drawLine(px0, py0, px1, py1, lgfx::color565(rv, gv, bv));
+            uint16_t base = is_eq ? GPS_COLOR : HEADER_COLOR;
+            spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, base, brt));
             px0 = px1; py0 = py1; pz0 = pz1;
         }
     }
@@ -2872,8 +2871,7 @@ void draw_gps_screen() {
             float pz1 = proj(clat, slat, lon, &px1, &py1);
             float brt = (pz0 + pz1) * 0.5f * 0.40f + 0.50f;
             if (brt < 0.10f) brt = 0.10f;
-            uint8_t mv = (uint8_t)(brt * 160);
-            spr.drawLine(px0, py0, px1, py1, lgfx::color565(mv/6, mv/3, mv));
+            spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, HEADER_COLOR, brt));
             px0 = px1; py0 = py1; pz0 = pz1;
         }
     }
@@ -2884,11 +2882,11 @@ void draw_gps_screen() {
     spr.drawCircle(gx, gy, gr,     rim_col);
     spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
 
-    // SAT count below globe
+    // SAT count below globe — label then value on next line, both size 1
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(gx - 10, gy + gr + 6); kprint(spr, "SATS");
-    spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(gx + 14, gy + gr + 4); spr.print(sats);
+    spr.setCursor(gx - 8, gy + gr + 5); kprint(spr, "SATS");
+    spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(gx - 3, gy + gr + 15); spr.print(sats);
 
     // ── Right panel: STATUS badge + LAT / LON / SPEED ───────────────────────
     const int RX = 122, RW = 114;
@@ -2901,7 +2899,7 @@ void draw_gps_screen() {
         bool        status_anim = false;
         if      (has_loc && !stale) { status_base = "GPS LOCKED";   status_col = GPS_COLOR; }
         else if (stale)             { status_base = "SIGNAL LOST";  status_col = CAUTION_COLOR; }
-        else                        { status_base = "SEARCHING GPS"; status_col = GPS_COLOR; status_anim = true; }
+        else                        { status_base = "GPS";           status_col = GPS_COLOR; status_anim = true; }
         char status_str[22];
         if (status_anim) {
             int nd = (int)(millis() / 500) % 4;
