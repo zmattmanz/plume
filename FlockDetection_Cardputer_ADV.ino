@@ -2335,20 +2335,21 @@ void draw_locator_screen() {
     // BG fill first — clears grid behind the arrow
     spr.fillTriangle(ax3[0], ay3[0], ax3[1], ay3[1], ax3[2], ay3[2], BG_COLOR);
 
-    // Hatching: base→midpoint, quadratic spacing so lines are dense at the base
-    // and progressively further apart + shorter as they approach the tip.
+    // Hatching: base→tip(68%), quadratic spacing, half-width lines only.
+    // Each line runs from the left edge of the triangle to the centre axis —
+    // "cut in half" effect; lines taper shorter and spread further as tip approaches.
     {
         const float TIP_Y = -23.0f, BASE_Y = 15.0f, RANGE = 38.0f, HALF_W = 14.0f;
-        const float MID_Y = (TIP_Y + BASE_Y) * 0.5f;  // -4.0
+        const float STOP_Y = -11.0f;  // ~68% from base toward tip
         uint16_t hatch_col = lgfx::color565(45, 135, 210);
         for (int hi = 0; hi < 12; hi++) {
             float ly = BASE_Y - 0.7f * (float)(hi * hi);  // quadratic: gaps widen toward tip
-            if (ly < MID_Y) break;
+            if (ly < STOP_Y) break;
             float t  = (ly - TIP_Y) / RANGE;  // 0=tip, 1=base
             float hw = HALF_W * t;
             int hx0, hy0, hx1, hy1;
-            rotpt(-hw, ly, ang, &hx0, &hy0);
-            rotpt( hw, ly, ang, &hx1, &hy1);
+            rotpt(-hw, ly, ang, &hx0, &hy0);  // left edge
+            rotpt(  0, ly, ang, &hx1, &hy1);  // centre axis (stop halfway across)
             spr.drawLine(hx0, hy0, hx1, hy1, hatch_col);
         }
     }
