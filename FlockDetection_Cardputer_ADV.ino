@@ -2806,29 +2806,33 @@ void draw_gps_screen() {
     xSemaphoreGive(dataMutex);
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
-    // Solid BG fill, tilt, fast spin
-    const int gx = 55, gy = 65, gr = 30;  // 10% larger than previous 27
+    // Solid BG fill, diagonal axis tilt like a real globe on a stand
+    const int gx = 55, gy = 76, gr = 30;  // gy=76 centres globe in content area (y 19–135)
 
-    // Axial tilt — north pole tilted back, fast spin (8 s/rev)
-    const float TILT = -0.52f;  // shallower tilt: more overhead view matching reference angle
+    // TILT: X-axis — north pole backward; ROLL: Z-axis — axis diagonal upper-left→lower-right
+    const float TILT  = -0.30f;
+    const float ROLL  =  0.45f;
     float rot = fmodf((float)millis() / 8000.0f, 1.0f) * 2.0f * (float)M_PI;
 
-    float sr = sinf(rot), cr = cosf(rot);
+    float sr = sinf(rot),  cr = cosf(rot);
     float st = sinf(TILT), ct = cosf(TILT);
+    float sroll = sinf(ROLL), croll = cosf(ROLL);
 
     // Project a sphere point → screen (px, py); return z-depth [-1..1]
     auto proj = [&](float clat, float slat, float lon_r, int* px, int* py) -> float {
         float sx = clat * cosf(lon_r);
         float sy = slat;
         float sz = clat * sinf(lon_r);
-        float rx =  sx * cr - sz * sr;
+        float rx =  sx * cr - sz * sr;   // Y-spin
         float ry =  sy;
         float rz =  sx * sr + sz * cr;
         float tx =  rx;
-        float ty =  ry * ct - rz * st;
+        float ty =  ry * ct - rz * st;   // X-tilt
         float tz =  ry * st + rz * ct;
-        *px = gx + (int)(gr * tx);
-        *py = gy - (int)(gr * ty);
+        float ux = tx * croll - ty * sroll;  // Z-roll (diagonal axis)
+        float uy = tx * sroll + ty * croll;
+        *px = gx + (int)(gr * ux);
+        *py = gy - (int)(gr * uy);
         return tz;
     };
 
@@ -2883,13 +2887,42 @@ void draw_gps_screen() {
     spr.drawCircle(gx, gy, gr,     rim_col);
     spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
 
-    // SAT count below globe — single line: label + value
+    // ── Orbiting satellite dots (one per satellite, max 12) ─────────────────
     {
-        int sat_y = gy + gr + 7;
-        int sat_x = gx - 24;  // centers "SATS 00" under globe
+        const int   orb_r   = gr + 8;         // orbit radius slightly outside globe rim
+        const float INC_ORB = 0.7854f;        // 45° orbit inclination from equatorial plane
+        float orbit_t = fmodf((float)millis() / 5000.0f, 1.0f) * 2.0f * (float)M_PI;
+        int n_sat = (sats < 12) ? sats : 12;
+
+        for (int si = 0; si < n_sat; si++) {
+            float ang = orbit_t + (float)si / (float)n_sat * 2.0f * (float)M_PI;
+            // 3D position on inclined orbit (X-axis inclination from XZ plane)
+            float ox = cosf(ang);
+            float oy = sinf(ang) * sinf(INC_ORB);
+            float oz = sinf(ang) * cosf(INC_ORB);
+            // Apply TILT (X rotation — same as globe, no Y-spin so orbit is camera-fixed)
+            float tx2 = ox;
+            float ty2 = oy * ct - oz * st;
+            float tz2 = oy * st + oz * ct;
+            // Apply ROLL (Z rotation — same as globe)
+            float ux = tx2 * croll - ty2 * sroll;
+            float uy = tx2 * sroll + ty2 * croll;
+            // Only draw front-facing dots (tz2 > 0)
+            if (tz2 > 0.0f) {
+                int dpx = gx + (int)(ux * orb_r);
+                int dpy = gy - (int)(uy * orb_r);
+                spr.fillCircle(dpx, dpy, 2, lgfx::color565(255, 255, 255));
+            }
+        }
+    }
+
+    // SAT count — single line below orbit, number in white
+    {
+        int sat_y = gy + gr + 17;  // pushed below orbit dots
+        int sat_x = gx - 24;
         spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
         spr.setCursor(sat_x, sat_y); kprint(spr, "SATS ");
-        spr.setTextColor(sats > 0 ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
+        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
         spr.setCursor(sat_x + 35, sat_y); spr.print(sats);
     }
 
