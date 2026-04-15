@@ -266,8 +266,8 @@ static uint32_t hash_mac(const char* mac) {
 
 static const int SEEN_MAC_TABLE_SIZE = MAX_SEEN_MACS * 2;
 
-bool is_mac_recently_seen(const String& mac) {
-    const char* key = mac.c_str();
+bool is_mac_recently_seen(const char* mac) {
+    const char* key = mac;
     uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
     unsigned long now = millis();
     for (int probe = 0; probe < SEEN_MAC_TABLE_SIZE; probe++) {
@@ -282,8 +282,8 @@ bool is_mac_recently_seen(const String& mac) {
     return false;
 }
 
-void add_seen_mac(const String& mac) {
-    const char* key = mac.c_str();
+void add_seen_mac(const char* mac) {
+    const char* key = mac;
     uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
     for (int probe = 0; probe < SEEN_MAC_TABLE_SIZE; probe++) {
         int slot = (idx + probe) % SEEN_MAC_TABLE_SIZE;
@@ -1139,10 +1139,10 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     format_time_buf((now_ms - session_start_time) / 1000, current_time, sizeof(current_time));
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    bool is_new = !is_mac_recently_seen(String(mac));
+    bool is_new = !is_mac_recently_seen(mac);
 
     if (is_new) {
-        add_seen_mac(String(mac));
+        add_seen_mac(mac);
         uint16_t blip_col = ACCENT_COLOR;
         if (strcmp(proto, "WIFI") == 0) {
             session_wifi++; lifetime_wifi++; session_flock_wifi++; blip_col = CAUTION_COLOR;
@@ -1701,10 +1701,13 @@ void ScannerLoopTask(void* pvParameters) {
 
 void GPSLoopTask(void* pvParameters) {
     for (;;) {
-        if (SerialGPS.available() > 0) {
+        int avail = SerialGPS.available();
+        if (avail > 0) {
+            uint8_t buf[128];
+            int bytes_read = SerialGPS.readBytes(buf, min(avail, 128));
             xSemaphoreTake(dataMutex, portMAX_DELAY);
-            while (SerialGPS.available() > 0) {
-                gps.encode(SerialGPS.read());
+            for(int i = 0; i < bytes_read; i++) {
+                gps.encode(buf[i]);
             }
             xSemaphoreGive(dataMutex);
         }
