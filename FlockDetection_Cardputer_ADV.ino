@@ -2,6 +2,12 @@
 // FLOCK DETECTOR v8.13-ADV — Tactical Edition (Stable Release)
 // ============================================================================
 
+// FastLED I2S mode — must be defined before any other includes so FastLED
+// selects the I2S driver instead of RMT, avoiding LEDC PWM bus contention
+// that corrupts WS2812 timing at sub-255 display brightness levels.
+#define FASTLED_ESP32_I2S true
+#include <FastLED.h>
+
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <NimBLEDevice.h>
@@ -78,7 +84,7 @@ static const uint8_t LED_COLORS[][3] = {
 };
 static int led_col_idx = 0;
 
-// LED driver: neopixelWrite (ESP32 Arduino core 3.x / IDF 5.x RMT, DMA-backed on S3).
+static CRGB leds[1];  // single WS2812 on GPIO 21; driven via FastLED I2S
 
 void apply_color_palette() {
     if (night_mode) {
@@ -423,7 +429,8 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    neopixelWrite(21, r, g, b);
+    leds[0] = CRGB(r, g, b);
+    FastLED.show();
 }
 
 // ============================================================================
@@ -2983,11 +2990,14 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
-    // LED: start dark, then spawn the persistent breathing task.
-    // Must happen before dedicated_charging_loop() which sets led_breathing_on=true.
+    // LED: register the FastLED I2S driver, then start dark, then spawn the
+    // persistent breathing task.  Must happen before dedicated_charging_loop()
+    // which sets led_breathing_on=true.
+    FastLED.addLeds<WS2812, 21, GRB>(leds, 1);
+    FastLED.setBrightness(255);
     set_cardputer_led(0, 0, 0);
     // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
-    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 2048, NULL, 5, &chargeLedTaskHandle, 0);
+    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
 
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
