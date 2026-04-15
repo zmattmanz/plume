@@ -32,7 +32,7 @@ void draw_vol_overlay();
 void drawCard(int x, int y, int w, int h);
 void draw_current_screen();
 void transition_screen(int new_screen, int dir);
-void play_escalated_alarm(int confidence);
+void play_escalated_alarm(int confidence, int source);
 void dedicated_charging_loop();
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
 void beep(int frequency, int duration_ms);
@@ -210,7 +210,8 @@ static SemaphoreHandle_t ble_proc_sem = NULL;
 bool sd_available = false;
 bool littlefs_available = false;
 volatile int trigger_alarm_confidence = 0;
-volatile bool is_alarming = false; 
+volatile int trigger_alarm_source = 0;   // 0 = WiFi, 1 = BLE
+volatile bool is_alarming = false;
 
 #define SD_LINE_LEN 512
 char sd_write_buffer[MAX_LOG_BUFFER][SD_LINE_LEN];
@@ -1432,6 +1433,7 @@ void process_wifi_event_queue() {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
                 trigger_alarm_confidence = confidence;
+                trigger_alarm_source = 0;  // WiFi
                 last_buzzer_time = millis();
             }
             xSemaphoreGive(dataMutex);
@@ -1586,6 +1588,7 @@ static void ble_process_task(void* pvParameters) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
             trigger_alarm_confidence = confidence;
+            trigger_alarm_source = 1;  // BLE
             last_buzzer_time = millis();
         }
         xSemaphoreGive(dataMutex);
@@ -1695,30 +1698,44 @@ void GPSLoopTask(void* pvParameters) {
 }
 
 void AlarmTask(void* pvParameters) {
-    int conf = (int)(intptr_t)pvParameters;
-    
+    // Pack: low 16 bits = confidence, bit 16 = source (0=WiFi, 1=BLE)
+    intptr_t param = (intptr_t)pvParameters;
+    int conf    = (int)(param & 0xFFFF);
+    bool is_ble = (bool)((param >> 16) & 0x1);
+
     if (conf >= CONFIDENCE_CERTAIN) {
-        M5Cardputer.Speaker.tone(523, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(659, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(880, 140); vTaskDelay(160 / portTICK_PERIOD_MS);
+        if (is_ble) {
+            // BLE: descending three-note (G → E → C) — soft "ping-down" feel
+            M5Cardputer.Speaker.tone(784, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+            M5Cardputer.Speaker.tone(659, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+            M5Cardputer.Speaker.tone(523, 140); vTaskDelay(160 / portTICK_PERIOD_MS);
+        } else {
+            // WiFi: ascending three-note (C → E → A)
+            M5Cardputer.Speaker.tone(523, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+            M5Cardputer.Speaker.tone(659, 90);  vTaskDelay(120 / portTICK_PERIOD_MS);
+            M5Cardputer.Speaker.tone(880, 140); vTaskDelay(160 / portTICK_PERIOD_MS);
+        }
     } else if (conf >= CONFIDENCE_HIGH) {
+        int freq = is_ble ? 698 : 740;  // BLE: F, WiFi: F#
         for (int i = 0; i < 2; i++) {
-            M5Cardputer.Speaker.tone(740, 110);
+            M5Cardputer.Speaker.tone(freq, 110);
             vTaskDelay(180 / portTICK_PERIOD_MS);
         }
     } else {
-        M5Cardputer.Speaker.tone(620, 90);
+        int freq = is_ble ? 587 : 620;  // BLE: D, WiFi: Eb
+        M5Cardputer.Speaker.tone(freq, 90);
         vTaskDelay(140 / portTICK_PERIOD_MS);
     }
-    
+
     is_alarming = false;
     vTaskDelete(NULL);
 }
 
-void play_escalated_alarm(int confidence) {
+void play_escalated_alarm(int confidence, int source) {
     if (stealth_mode || is_muted || is_alarming) return;
     is_alarming = true;
-    xTaskCreate(AlarmTask, "AlarmTask", 2048, (void*)(intptr_t)confidence, 2, NULL);
+    intptr_t param = ((intptr_t)confidence & 0xFFFF) | ((intptr_t)(source & 0x1) << 16);
+    xTaskCreate(AlarmTask, "AlarmTask", 2048, (void*)param, 2, NULL);
 }
 
 // ============================================================================
@@ -1763,8 +1780,9 @@ void draw_header_spr(int screen_num) {
         spr.fillCircle(px, py - 1, 1, BG_COLOR);
     }
 
-    // Header divider line — same color as inactive scan indicator (CARD_BORDER)
-    spr.drawLine(0, 18, DISP_W - 1, 18, CARD_BORDER);
+    // Header divider — dotted line, same color as inactive scan indicator (CARD_BORDER)
+    for (int dx = 0; dx < DISP_W; dx += 4)
+        spr.drawPixel(dx, 18, CARD_BORDER);
 }
 
 void draw_toast_spr() {
@@ -1912,9 +1930,10 @@ void draw_scanner_screen() {
 
     // Left/right edge lines connecting top rim to bottom rim (removed)
 
-    // Top face fill and border
+    // Top face fill and border — draw ellipse twice (y offset 1) for thicker rim
     spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(rcx, rcy, radar_r, radar_r * TILT, HEADER_COLOR);
+    spr.drawEllipse(rcx, rcy - 1, radar_r, radar_r * TILT, HEADER_COLOR);
+    spr.drawEllipse(rcx, rcy,     radar_r, radar_r * TILT, HEADER_COLOR);
 
     // Hatching on both sides of the cylinder rim seam
     {
@@ -1934,12 +1953,14 @@ void draw_scanner_screen() {
         }
     }
 
-    // Redraw bottom rim so it shows over the top face fill
-    spr.drawEllipse(rcx, rcy + THICKNESS, radar_r, radar_r * TILT, DIM_COLOR);
+    // Redraw bottom rim so it shows over the top face fill — doubled for thickness
+    spr.drawEllipse(rcx, rcy + THICKNESS,     radar_r, radar_r * TILT, DIM_COLOR);
+    spr.drawEllipse(rcx, rcy + THICKNESS + 1, radar_r, radar_r * TILT, DIM_COLOR);
 
     // Structural ribs on left wall removed
 
-    spr.drawEllipse(rcx, rcy, inner_r, inner_r * TILT, DIM_COLOR);
+    spr.drawEllipse(rcx, rcy,     inner_r, inner_r * TILT, DIM_COLOR);
+    spr.drawEllipse(rcx, rcy - 1, inner_r, inner_r * TILT, DIM_COLOR);
 
     float sweep_rad = (millis() / 3000.0f) * (float)M_PI * 2.0f;
 
@@ -2149,12 +2170,12 @@ void draw_scanner_screen() {
         spr.print(" L");
     }
 
-    // BLE badge — width snug to "BLE" text (3×6 + 10px padding = 28px)
+    // BLE badge — positioned 4px after WiFi badge ends (right_text_x-5+70+4 = right_text_x+69)
     uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
-    spr.fillRoundRect(right_text_x + 62, 24, 28, 16, 7, ble_fill);
-    spr.drawRoundRect(right_text_x + 62, 24, 28, 16, 7, ble_col);
+    spr.fillRoundRect(right_text_x + 69, 24, 28, 16, 7, ble_fill);
+    spr.drawRoundRect(right_text_x + 69, 24, 28, 16, 7, ble_col);
     spr.setTextColor(ble_col, ble_fill);
-    spr.setCursor(right_text_x + 67, 29);
+    spr.setCursor(right_text_x + 74, 29);
     spr.print("BLE");
 
     // Labels — extra gap below badges (badges bottom = y=40); kerned
@@ -2230,8 +2251,16 @@ void draw_locator_screen() {
     }
     grid_speed += (grid_spd_target - grid_speed) * 0.004f; // very slow ease
 
-    float raw_offset = grid_speed * (float)now_ms / (1500.0f / GRID_STEP);
-    int grid_o = (int)fmodf(raw_offset, (float)GRID_STEP);
+    // Accumulate offset per-frame so direction reversals ease smoothly (no jump)
+    static float  cumulative_grid_offset = 0.0f;
+    static unsigned long last_grid_ms = 0;
+    if (last_grid_ms == 0) last_grid_ms = now_ms;
+    unsigned long grid_dt = now_ms - last_grid_ms;
+    if (grid_dt > 100) grid_dt = 100;  // cap on first call or long gaps
+    last_grid_ms = now_ms;
+    cumulative_grid_offset += grid_speed * (float)grid_dt / (1500.0f / GRID_STEP);
+
+    int grid_o = (int)fmodf(cumulative_grid_offset, (float)GRID_STEP);
     if (grid_o < 0) grid_o += GRID_STEP;
 
     for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
@@ -2277,16 +2306,18 @@ void draw_locator_screen() {
     // BG fill first — clears grid behind the arrow
     spr.fillTriangle(ax3[0], ay3[0], ax3[1], ay3[1], ax3[2], ay3[2], BG_COLOR);
 
-    // Full-width horizontal hatching — dense and visible.
-    // Half-width at local y: HALF_W * (y - TIP_Y) / RANGE → tapers to 0 at tip.
+    // Hatching from tip toward midpoint — lines start narrow at tip, widen toward halfway mark.
+    // "Furthest most line is towards the base" = the widest line stops at the midpoint.
     {
         const float TIP_Y = -23.0f, BASE_Y = 15.0f, RANGE = 38.0f, HALF_W = 14.0f;
+        const float MID_Y  = (TIP_Y + BASE_Y) * 0.5f;  // -4.0f
         uint16_t hatch_col = lgfx::color565(45, 135, 210);  // brighter blue-cyan
-        for (int hi = 0; hi < 11; hi++) {
-            float ly = BASE_Y - hi * 3.4f;           // base → tip
-            float t  = (ly - TIP_Y) / RANGE;         // 0 at tip, 1 at base
-            if (t < 0.50f) break;                     // stop at midpoint — intentional half-fill
+        for (int hi = 0; hi < 14; hi++) {
+            float ly = TIP_Y + hi * 2.8f;             // tip → midpoint
+            if (ly > MID_Y) break;                     // stop at halfway
+            float t  = (ly - TIP_Y) / RANGE;          // 0 at tip, 1 at base
             float hw = HALF_W * t;
+            if (hw < 0.5f) continue;                   // skip near-zero lines at tip
             int hx0, hy0, hx1, hy1;
             rotpt(-hw, ly, ang, &hx0, &hy0);
             rotpt( hw, ly, ang, &hx1, &hy1);
@@ -2339,8 +2370,8 @@ void draw_locator_screen() {
     }
     // lock indicator: subtle glow on the last sample box instead of text
 
-    // ── Right panel ──
-    int rx = 82; spr.drawLine(rx, 22, rx, DISP_H - 1, CARD_BORDER);
+    // ── Right panel — rx moved right to add breathing room between grid and text ──
+    int rx = 90; spr.drawLine(rx, 22, rx, DISP_H - 1, CARD_BORDER);
     int rpx = rx + 8;
 
     // Status — dynamic-width box
@@ -3051,8 +3082,10 @@ void loop() {
     process_wifi_event_queue();
 
     if (trigger_alarm_confidence >= 50) {
-        int conf = trigger_alarm_confidence; trigger_alarm_confidence = 0; play_escalated_alarm(conf);
-    } else { trigger_alarm_confidence = 0; }
+        int conf = trigger_alarm_confidence; int src = trigger_alarm_source;
+        trigger_alarm_confidence = 0; trigger_alarm_source = 0;
+        play_escalated_alarm(conf, src);
+    } else { trigger_alarm_confidence = 0; trigger_alarm_source = 0; }
 
     if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
         int next_screen = current_screen + 1;
