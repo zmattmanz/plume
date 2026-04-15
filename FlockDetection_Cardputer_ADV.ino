@@ -2,6 +2,12 @@
 // FLOCK DETECTOR v8.13-ADV — Tactical Edition (Stable Release)
 // ============================================================================
 
+#define FASTLED_RMT_BUILTIN_DRIVER 1
+#define FASTLED_RMT_MAX_CHANNELS 1
+#define FASTLED_ESP32_RMT_CHANNEL_0 0
+#include <FastLED.h>
+CRGB leds[1];
+
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <NimBLEDevice.h>
