@@ -427,7 +427,13 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
+    if (brightness_level < 2) {
+        M5Cardputer.Display.setBrightness(255);
+    }
     neopixelWrite(21, r, g, b);
+    if (brightness_level < 2) {
+        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+    }
 }
 
 // ============================================================================
@@ -1770,8 +1776,27 @@ void draw_header_spr(int screen_num) {
 
     // Battery icon — slightly longer (24px) for better readability
     spr.drawRoundRect(DISP_W - 26, 4, 24, 10, 2, bcol);
-    int bfill = (display_bat * 22) / 100;
+    int bfill;
+    if (chg) {
+        // Charging animation: fill sweeps from current level up to 100%, cycling every 1.5s
+        float cphase = fmodf((float)millis() / 1500.0f, 1.0f);
+        int anim_pct = display_bat + (int)((100 - display_bat) * cphase);
+        bfill = (anim_pct * 22) / 100;
+    } else {
+        bfill = (display_bat * 22) / 100;
+    }
     if (bfill > 0) spr.fillRect(DISP_W - 25, 5, bfill, 8, bcol);
+
+    // Lightning bolt overlay when charging
+    if (chg) {
+        uint16_t bolt_col = lgfx::color565(255, 255, 120);  // bright yellow
+        int bx = DISP_W - 14, by = 9;  // center of battery icon
+        // Two-stroke zigzag bolt, drawn twice (1px apart) for 2px apparent thickness
+        spr.drawLine(bx + 2, by - 3, bx - 1, by,    bolt_col);
+        spr.drawLine(bx - 1, by,     bx + 2, by + 3, bolt_col);
+        spr.drawLine(bx + 1, by - 3, bx - 2, by,    bolt_col);
+        spr.drawLine(bx - 2, by,     bx + 1, by + 3, bolt_col);
+    }
 
     // GPS location-pin icon — shown when at least one satellite is locked
     if (gps.satellites.isValid() && gps.satellites.value() >= 1) {
@@ -2240,9 +2265,9 @@ void draw_locator_screen() {
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    // ── Diagonal-scrolling infinite grid — smaller (76px), with direction drift ──
-    const int GRID_RIGHT = 75;
-    const int GRID_STEP  = 18;
+    // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
+    const int GRID_RIGHT = 65;
+    const int GRID_STEP  = 14;
     unsigned long now_ms = millis();
 
     // Direction slowly reverses every ~10s for radar feel
@@ -2289,8 +2314,8 @@ void draw_locator_screen() {
         while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
         ease_arrow += 0.09f * d;
     } else {
-        // Slow clockwise drift: 1 rev per 20s
-        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 20000.0f);
+        // Clockwise drift: 1 rev per 12s
+        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 12000.0f);
         if (ease_arrow > 2.0f*(float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
     }
     float ang = ease_arrow;
@@ -2310,18 +2335,17 @@ void draw_locator_screen() {
     // BG fill first — clears grid behind the arrow
     spr.fillTriangle(ax3[0], ay3[0], ax3[1], ay3[1], ax3[2], ay3[2], BG_COLOR);
 
-    // Hatching from tip toward midpoint — lines start narrow at tip, widen toward halfway mark.
-    // "Furthest most line is towards the base" = the widest line stops at the midpoint.
+    // Hatching: base→midpoint, quadratic spacing so lines are dense at the base
+    // and progressively further apart + shorter as they approach the tip.
     {
         const float TIP_Y = -23.0f, BASE_Y = 15.0f, RANGE = 38.0f, HALF_W = 14.0f;
-        const float MID_Y  = (TIP_Y + BASE_Y) * 0.5f;  // -4.0f
-        uint16_t hatch_col = lgfx::color565(45, 135, 210);  // brighter blue-cyan
-        for (int hi = 0; hi < 14; hi++) {
-            float ly = TIP_Y + hi * 2.8f;             // tip → midpoint
-            if (ly > MID_Y) break;                     // stop at halfway
-            float t  = (ly - TIP_Y) / RANGE;          // 0 at tip, 1 at base
+        const float MID_Y = (TIP_Y + BASE_Y) * 0.5f;  // -4.0
+        uint16_t hatch_col = lgfx::color565(45, 135, 210);
+        for (int hi = 0; hi < 12; hi++) {
+            float ly = BASE_Y - 0.7f * (float)(hi * hi);  // quadratic: gaps widen toward tip
+            if (ly < MID_Y) break;
+            float t  = (ly - TIP_Y) / RANGE;  // 0=tip, 1=base
             float hw = HALF_W * t;
-            if (hw < 0.5f) continue;                   // skip near-zero lines at tip
             int hx0, hy0, hx1, hy1;
             rotpt(-hw, ly, ang, &hx0, &hy0);
             rotpt( hw, ly, ang, &hx1, &hy1);
@@ -2374,8 +2398,8 @@ void draw_locator_screen() {
     }
     // lock indicator: subtle glow on the last sample box instead of text
 
-    // ── Right panel — rx moved right to add breathing room between grid and text ──
-    int rx = 90; spr.drawLine(rx, 22, rx, DISP_H - 1, CARD_BORDER);
+    // ── Right panel ──
+    int rx = 90;
     int rpx = rx + 8;
 
     // Status — dynamic-width box
