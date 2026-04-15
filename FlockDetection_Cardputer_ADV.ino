@@ -2,11 +2,6 @@
 // FLOCK DETECTOR v8.13-ADV — Tactical Edition (Stable Release)
 // ============================================================================
 
-// Disable interrupts during LED pushes to prevent screen PWM contention
-#define FASTLED_ALLOW_INTERRUPTS 0
-#include <FastLED.h>
-CRGB leds[1];
-
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <NimBLEDevice.h>
@@ -426,8 +421,7 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    leds[0] = CRGB(r, g, b);
-    FastLED.show();
+    neopixelWrite(21, r, g, b);
 }
 
 // ============================================================================
@@ -2987,11 +2981,8 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
-    // LED: register the FastLED I2S driver, then start dark, then spawn the
-    // persistent breathing task.  Must happen before dedicated_charging_loop()
-    // which sets led_breathing_on=true.
-    FastLED.addLeds<WS2812, 21, GRB>(leds, 1);
-    FastLED.setBrightness(255);
+    // LED: start dark, then spawn the persistent breathing task.
+    // Must happen before dedicated_charging_loop() which sets led_breathing_on=true.
     set_cardputer_led(0, 0, 0);
     // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
     xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
