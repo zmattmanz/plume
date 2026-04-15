@@ -61,7 +61,21 @@ bool show_vol_overlay = false;
 bool show_locator_help = false;  // 'h' on locator screen
 bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
-static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};          // 'N' on locator screen = point to true north
+static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
+
+// RGB LED state — color cycles with C key, on/off with L when locator idle
+static uint8_t led_r = 0, led_g = 200, led_b = 0; // default green
+static bool    led_breathing_on = true;
+static const uint8_t LED_COLORS[][3] = {
+    {0, 200,   0},   // green (default)
+    {80, 200, 255},  // cyan
+    {0,  160, 200},  // teal
+    {200, 100, 255}, // purple
+    {255, 255, 255}, // white
+    {255,  80,   0}, // orange
+    {255,  30,  30}, // red
+};
+static int led_col_idx = 0;
 
 void apply_color_palette() {
     if (night_mode) {
@@ -418,24 +432,24 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
-    // Mirror Bruce firmware ledEffectTask exactly:
-    // phase = sinf(millis()/1000 * speed * PI), value = (phase+1)*127.5
-    // speed=1.0 → 2s period. 50ms tick = same as Bruce's vTaskDelay.
-    // Using millis() for the time base means scheduling jitter never
-    // accumulates phase error — it is always phase-correct.
+    // millis()-based phase = always time-correct regardless of scheduling jitter.
+    // Pinned to Core 0 at priority 5 so display PWM on Core 1 cannot preempt
+    // the RMT write — this is why breathing was broken at low brightness levels.
     for (;;) {
-        float phase = sinf((millis() / 1000.0f) * (float)M_PI);
-        uint8_t val = (uint8_t)((phase + 1.0f) * 100.0f); // 0..200, cap below 255
-        set_cardputer_led(0, val, 0);
+        if (led_breathing_on) {
+            float phase = sinf((millis() / 1000.0f) * (float)M_PI);
+            uint8_t val = (uint8_t)((phase + 1.0f) * 100.0f); // 0..200
+            set_cardputer_led((led_r * val) / 200, (led_g * val) / 200, (led_b * val) / 200);
+        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void start_charge_led() {
     if (chargeLedTaskHandle == NULL)
-        // Pin to Core 1 (APP_CPU) — same core as the Arduino loop and neopixelWrite,
-        // avoiding RMT channel conflicts that cause flickering from Core 0.
-        xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 2048, NULL, 1, &chargeLedTaskHandle, 1);
+        // Core 0 (PRO_CPU) keeps the LED task away from display/audio on Core 1.
+        // Priority 5 ensures RMT writes complete without preemption.
+        xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 2048, NULL, 5, &chargeLedTaskHandle, 0);
 }
 
 void stop_charge_led() {
@@ -2085,7 +2099,8 @@ void draw_scanner_screen() {
             bool is_strong = (local_spikes[i] > 0.8f);
 
             int spike_len = (int)((radar_r - inner_r) * local_spikes[i] * 0.7f);
-            if (spike_len < 2) spike_len = 2;
+            if (spike_len < 2)  spike_len = 2;
+            if (spike_len > 22) spike_len = 22; // cap — prevents jarring tall spike on first detection
 
             float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
             int blip_dist = inner_r + 4 + (int)((radar_r - inner_r - 6) * dist_ratio);
@@ -2131,11 +2146,10 @@ void draw_scanner_screen() {
     uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
-    // WiFi badge — dynamic width snug to content
+    // WiFi badge — fixed max width ("WiFi: 13 L" = widest case)
     char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi: %d", current_channel);
     bool wf_locked = (millis() < channel_lock_until);
-    int wf_text_w = (int)strlen(wf_label) * 6 + (wf_locked ? 12 : 0); // +12 for " L"
-    int wf_bw = wf_text_w + 10;  // 5px padding each side
+    const int wf_bw = 70;  // fixed: "WiFi: 13 L" = 10 chars × 6px + 10px padding
     uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
     spr.fillRoundRect(right_text_x - 5, 24, wf_bw, 16, 7, wf_fill);
     spr.drawRoundRect(right_text_x - 5, 24, wf_bw, 16, 7, wf_col);
@@ -2213,18 +2227,31 @@ void draw_locator_screen() {
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
-    // ── Diagonal-scrolling infinite grid (reduced to 96px, rest goes to text panel) ──
-    const int GRID_RIGHT = 95;
+    // ── Diagonal-scrolling infinite grid — smaller (76px), with direction drift ──
+    const int GRID_RIGHT = 75;
     const int GRID_STEP  = 18;
     unsigned long now_ms = millis();
-    int grid_o = (int)fmodf((float)now_ms / (1500.0f / GRID_STEP), (float)GRID_STEP);
+
+    // Direction slowly reverses every ~10s for radar feel
+    static float  grid_speed = 1.0f;   // +1 or -1, eases between
+    static float  grid_spd_target = 1.0f;
+    static unsigned long grid_dir_ms = 0;
+    if (now_ms - grid_dir_ms > 9500) {
+        grid_dir_ms = now_ms;
+        if ((now_ms / 9500) % 3 == 0) grid_spd_target = -grid_spd_target;
+    }
+    grid_speed += (grid_spd_target - grid_speed) * 0.004f; // very slow ease
+
+    float raw_offset = grid_speed * (float)now_ms / (1500.0f / GRID_STEP);
+    int grid_o = (int)fmodf(raw_offset, (float)GRID_STEP);
+    if (grid_o < 0) grid_o += GRID_STEP;
 
     for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
         spr.drawLine(gx, 19, gx, DISP_H - 1, CARD_BORDER);
     for (int gy = 19 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
         if (gy >= 19) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
 
-    const int cx = 47, cy = 65;
+    const int cx = 37, cy = 65;
 
     // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
@@ -2270,7 +2297,7 @@ void draw_locator_screen() {
         for (int hi = 0; hi < 11; hi++) {
             float ly = BASE_Y - hi * 3.4f;           // base → tip
             float t  = (ly - TIP_Y) / RANGE;         // 0 at tip, 1 at base
-            if (t < 0.09f) break;                     // nothing within 3px of tip
+            if (t < 0.50f) break;                     // stop at midpoint — intentional half-fill
             float hw = HALF_W * t;
             int hx0, hy0, hx1, hy1;
             rotpt(-hw, ly, ang, &hx0, &hy0);
@@ -2322,14 +2349,11 @@ void draw_locator_screen() {
                              bxi+BOX-PAD-1-(int)(XLEN*p2), by0+PAD+(int)(XLEN*p2)+dy, GPS_COLOR);
         }
     }
-    if (lock) {
-        spr.setTextColor(GPS_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(bx0 + LOC_MIN_SAMPLES_EST * 17 + 4, by0 + 2); spr.print("LOCK");
-    }
+    // lock indicator: subtle glow on the last sample box instead of text
 
     // ── Right panel ──
-    int rx = 96; spr.drawLine(rx, 22, rx, DISP_H - 1, CARD_BORDER);
-    int rpx = rx + 4;
+    int rx = 82; spr.drawLine(rx, 22, rx, DISP_H - 1, CARD_BORDER);
+    int rpx = rx + 8;
 
     // Status — dynamic-width box
     const char* status_base; uint16_t status_col; bool status_anim = false;
@@ -2338,7 +2362,7 @@ void draw_locator_screen() {
     } else if (!has_loc && !gps_valid) {
         status_base = "SEARCHING";       status_col = GPS_COLOR;     status_anim = true;
     } else if (gps_valid && !active) {
-        status_base = "AWAITING TARGET"; status_col = CAUTION_COLOR; status_anim = true;
+        status_base = "Waiting...";      status_col = CAUTION_COLOR;
     } else if (active && has_est && !est_stale) {
         status_base = "TRACKING TARGET"; status_col = ACCENT_COLOR;
     } else if (active && !has_est) {
@@ -3165,9 +3189,9 @@ void loop() {
                 gps_page_toggle();
                 if (current_screen == 4) { draw_current_screen(); spr.pushSprite(0, 0); }
             }
-            else if (c == 'l') { 
-                if (locator_active) { 
-                    locator_stop(); 
+            else if (c == 'l') {
+                if (locator_active) {
+                    locator_stop();
                 } else {
                     xSemaphoreTake(dataMutex, portMAX_DELAY);
                     char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
@@ -3176,10 +3200,23 @@ void loop() {
                     xSemaphoreGive(dataMutex);
                     if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
                         locator_start(l_mac, l_name, l_type);
-                        transition_screen(1, 1); 
-                    } 
-                } 
-            } 
+                        transition_screen(1, 1);
+                    } else {
+                        // No target — toggle LED breathing on/off
+                        led_breathing_on = !led_breathing_on;
+                        if (led_breathing_on) { start_charge_led(); }
+                        else { stop_charge_led(); set_cardputer_led(0, 0, 0); }
+                    }
+                }
+            }
+            else if (c == 'c') {
+                // Cycle LED color
+                led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+                led_r = LED_COLORS[led_col_idx][0];
+                led_g = LED_COLORS[led_col_idx][1];
+                led_b = LED_COLORS[led_col_idx][2];
+                if (!led_breathing_on) { led_breathing_on = true; start_charge_led(); }
+            }
             else if (c == '\n' || c == '\r') {
                 if (!stealth_mode) {
                     if (current_screen == 3) {
