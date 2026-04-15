@@ -17,7 +17,8 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <math.h>
-#include <Adafruit_NeoPixel.h>
+#define FASTLED_ESP32_I2S true
+#include <FastLED.h>
 #include "ui_beep.h"  // PCM sound for screen transitions
 
 #ifndef M_PI
@@ -79,9 +80,9 @@ static const uint8_t LED_COLORS[][3] = {
 };
 static int led_col_idx = 0;
 
-// Hardware NeoPixel driver — uses ESP32 RMT peripheral (DMA-backed), immune to
-// PWM backlight interrupts that corrupted the old neopixelWrite() bit-timing.
-static Adafruit_NeoPixel led_strip(1, 21, NEO_GRB + NEO_KHZ800);
+// FastLED in I2S mode — bypasses the RMT/APB bus entirely, immune to
+// LEDC PWM backlight DMA starvation that corrupted WS2812 timing at <255 brightness.
+CRGB leds[1];
 
 void apply_color_palette() {
     if (night_mode) {
@@ -425,47 +426,31 @@ void speaker_off() {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    // Adafruit_NeoPixel uses the ESP32 RMT peripheral with DMA so it is
-    // immune to PWM backlight timer interrupts at low brightness levels.
-    led_strip.setPixelColor(0, led_strip.Color(r, g, b));
-    led_strip.show();
+    leds[0] = CRGB(r, g, b);
+    FastLED.show();
 }
 
 // ============================================================================
-// CHARGE LED TASK — Bruce-style dedicated FreeRTOS task (50 ms fixed tick,
-// sine easing, full 0-255 range). Runs independently of the main loop so
-// BLE/WiFi scheduling jitter never disrupts the animation timing.
-// Uses Adafruit_NeoPixel (DMA-backed RMT) so screen PWM backlight interrupts
-// cannot corrupt the LED data — the old neopixelWrite() failed at <255 brightness
-// because the bit-banged timing was preempted by the PWM backlight timer.
+// CHARGE LED TASK — persistent FreeRTOS task (never created/deleted after boot).
+// Spawned once in setup(), lives on Core 0 at priority 5 forever.
+// led_breathing_on flag controls output; toggling it is the only lifecycle control.
+// FastLED I2S mode bypasses RMT/APB entirely — immune to LEDC PWM DMA starvation
+// that caused WS2812 corruption at any brightness < 255.
 // Reference: BruceDevices/firmware src/core/led_control.cpp (ledEffectTask)
 // ============================================================================
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
-    // millis()-based phase = always time-correct regardless of scheduling jitter.
     for (;;) {
         if (led_breathing_on) {
             float phase = sinf((millis() / 1000.0f) * (float)M_PI);
             uint8_t val = (uint8_t)((phase + 1.0f) * 100.0f); // 0..200
             set_cardputer_led((led_r * val) / 200, (led_g * val) / 200, (led_b * val) / 200);
+        } else {
+            set_cardputer_led(0, 0, 0); // Keep it dark if disabled
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-}
-
-void start_charge_led() {
-    if (chargeLedTaskHandle == NULL)
-        // Stack bumped to 4096 for Adafruit_NeoPixel RMT overhead.
-        xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
-}
-
-void stop_charge_led() {
-    if (chargeLedTaskHandle != NULL) {
-        vTaskDelete(chargeLedTaskHandle);
-        chargeLedTaskHandle = NULL;
-    }
-    set_cardputer_led(0, 0, 0);
 }
 
 // ============================================================================
@@ -537,7 +522,7 @@ void dedicated_charging_loop() {
     M5Cardputer.Speaker.stop();
     int display_pct = -1;
     unsigned long boot_time = millis();
-    start_charge_led();
+    led_breathing_on = true;
 
     const unsigned long CHARGE_AUTO_BOOT_MS = 30UL * 60UL * 1000UL;
     
@@ -599,13 +584,13 @@ void dedicated_charging_loop() {
         spr.pushSprite(0, 0);
 
         if (current_mv < 3200 && elapsed > 3000) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); stop_charge_led(); return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_breathing_on = false; return;
         }
         if (elapsed > 1500 && M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); stop_charge_led(); return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_breathing_on = false; return;
         }
         if (elapsed >= CHARGE_AUTO_BOOT_MS) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); stop_charge_led(); return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_breathing_on = false; return;
         }
         delay(15);
     }
@@ -2972,10 +2957,13 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
-    // Init NeoPixel driver before any LED call (including dedicated_charging_loop)
-    led_strip.begin();
-    led_strip.setBrightness(255);
-    led_strip.show(); // off at start
+    // FastLED I2S init — must happen before dedicated_charging_loop() or any LED call
+    FastLED.addLeds<WS2812, 21, GRB>(leds, 1);
+    FastLED.setBrightness(255); // dimming handled by sine-wave math, keep master at max
+    set_cardputer_led(0, 0, 0);
+
+    // Spawn LED task once — it runs forever; toggle led_breathing_on to control output
+    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
 
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
@@ -3217,8 +3205,6 @@ void loop() {
                     } else {
                         // No target — toggle LED breathing on/off
                         led_breathing_on = !led_breathing_on;
-                        if (led_breathing_on) { start_charge_led(); }
-                        else { stop_charge_led(); set_cardputer_led(0, 0, 0); }
                     }
                 }
             }
@@ -3228,7 +3214,7 @@ void loop() {
                 led_r = LED_COLORS[led_col_idx][0];
                 led_g = LED_COLORS[led_col_idx][1];
                 led_b = LED_COLORS[led_col_idx][2];
-                if (!led_breathing_on) { led_breathing_on = true; start_charge_led(); }
+                if (!led_breathing_on) { led_breathing_on = true; }
             }
             else if (c == '\n' || c == '\r') {
                 if (!stealth_mode) {
@@ -3292,7 +3278,7 @@ if (!stealth_mode) {
         static bool was_charging = false;
         bool now_charging = is_device_charging(loop_mv);
         if (now_charging != was_charging) {
-            if (now_charging) start_charge_led(); else stop_charge_led();
+            led_breathing_on = now_charging;
             was_charging = now_charging;
         }
         
