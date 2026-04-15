@@ -678,7 +678,6 @@ static const char* raven_standard_service_uuids[] = {
 };
 static const int NUM_RAVEN_STANDARD_UUIDS = sizeof(raven_standard_service_uuids) / sizeof(raven_standard_service_uuids[0]);
 
-#define MCAT(buf, str) strncat((buf), (str), sizeof(buf) - strlen(buf) - 1)
 #define FLOCK_MFG_COMPANY_ID 0x09C8
 
 int check_mac_prefix_tiered(const uint8_t* mac) {
@@ -1417,13 +1416,13 @@ void process_wifi_event_queue() {
         bool ssid_flock_fmt = (strlen(local.ssid) > 0 && is_flock_ssid_format(local.ssid));
 
         if (ssid_flock_fmt) {
-            confidence = SCORE_DEFINITIVE; MCAT(methods, "ssid_fmt ");
+            confidence = SCORE_DEFINITIVE; strlcat(methods, "ssid_fmt ", sizeof(methods));
         } else if (mac_score == 1) {
-            confidence = SCORE_STRONG; MCAT(methods, "mac_t1 ");
-            if (ssid_generic) { confidence = SCORE_DEFINITIVE; MCAT(methods, "ssid "); }
+            confidence = SCORE_STRONG; strlcat(methods, "mac_t1 ", sizeof(methods));
+            if (ssid_generic) { confidence = SCORE_DEFINITIVE; strlcat(methods, "ssid ", sizeof(methods)); }
         } else {
-            if (mac_score == 2) { confidence += SCORE_WEAK; MCAT(methods, "mac_t2 "); }
-            if (ssid_generic)   { confidence += SCORE_WEAK; MCAT(methods, "ssid "); }
+            if (mac_score == 2) { confidence += SCORE_WEAK; strlcat(methods, "mac_t2 ", sizeof(methods)); }
+            if (ssid_generic)   { confidence += SCORE_WEAK; strlcat(methods, "ssid ", sizeof(methods)); }
         }
         if (confidence > 0 && local.rssi > -50) confidence += SCORE_BONUS_RSSI;
 
@@ -1485,136 +1484,136 @@ static void ble_worker_task(void* pvParameters) {
         if (xQueueReceive(ble_event_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
 
         if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); continue; }
-    
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    session_ble_packets++;
-    xSemaphoreGive(dataMutex);
 
-    int  confidence   = 0;
-    char methods[64]  = {0};
-    char capture_type[16] = "FLOCK_BLE";
-    bool got_name = false, got_mfg = false, got_raven = false;
-
-    bool got_penguin_name = false;
-
-    int mac_score = check_mac_prefix_tiered(ev->mac);
-
-    char dev_name_char[65];
-    strncpy(dev_name_char, ev->dev_name, 64);
-    dev_name_char[64] = '\0';
-    if (ev->have_name) {
-        clean_device_name_char(dev_name_char);
-        if (check_device_name_pattern(dev_name_char)) {
-            MCAT(methods, "name "); got_name = true;
-        } else if (is_penguin_numeric_name(dev_name_char)) {
-            MCAT(methods, "penguin_num "); got_penguin_name = true;
-        }
-    }
-
-    std::string mfg_std((const char*)ev->mfg_data, ev->mfg_data_len);
-    if (ev->have_mfg) {
-        if (check_manufacturer_id(mfg_std)) {
-            MCAT(methods, "mfg_0x09C8 "); got_mfg = true;
-            if (has_tn_serial(mfg_std)) MCAT(methods, "tn_serial ");
-        }
-    }
-
-    int raven_custom_count = 0;
-    int raven_std_count = 0;
-    for (int i = 0; i < ev->uuid_count; i++) {
-        for (int j = 0; j < NUM_RAVEN_CUSTOM_UUIDS; j++) {
-            if (strcasecmp(ev->service_uuids[i], raven_custom_service_uuids[j]) == 0) {
-                raven_custom_count++; break;
-            }
-        }
-        for (int j = 0; j < NUM_RAVEN_STANDARD_UUIDS; j++) {
-            if (strcasecmp(ev->service_uuids[i], raven_standard_service_uuids[j]) == 0) {
-                raven_std_count++; break;
-            }
-        }
-    }
-    int raven_uuid_count = raven_custom_count + raven_std_count;
-
-    if (raven_custom_count > 0 || raven_uuid_count >= 2) {
-        strncpy(capture_type, "RAVEN_BLE", sizeof(capture_type)); got_raven = true;
-        if (raven_uuid_count >= 3)        MCAT(methods, "raven_multi ");
-        else if (raven_custom_count > 0)  MCAT(methods, "raven_custom ");
-        else                              MCAT(methods, "raven_uuid ");
-    }
-
-    if (got_raven || got_name || got_mfg) {
-        confidence = SCORE_DEFINITIVE;
-        if (mac_score == 1) MCAT(methods, "mac_t1 ");
-    } else if (mac_score == 1) {
-        confidence = SCORE_STRONG;
-        MCAT(methods, "mac_t1 ");
-        if (got_penguin_name) { confidence = SCORE_DEFINITIVE; }
-    } else {
-        if (mac_score == 2) { confidence += SCORE_WEAK; MCAT(methods, "mac_t2 "); }
-        if (got_penguin_name) { confidence += SCORE_WEAK; }
-        if ((mac_score == 2 || got_penguin_name) &&
-            (ev->addr_type == 0 || (ev->addr_type == 1 && (ev->mac[0] >> 6) == 0x03))) {
-            confidence += SCORE_WEAK; MCAT(methods, "static_addr ");
-        }
-    }
-    if (confidence > 0 && ev->rssi > -50) confidence += SCORE_BONUS_RSSI;
-
-    char mac_string[18];
-    snprintf(mac_string, sizeof(mac_string), "%02x:%02x:%02x:%02x:%02x:%02x",
-        ev->mac[0], ev->mac[1], ev->mac[2],
-        ev->mac[3], ev->mac[4], ev->mac[5]);
-
-    if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        channel_lock_until = millis() + 10000;
+        session_ble_packets++;
         xSemaphoreGive(dataMutex);
-        rssi_track_update(mac_string, ev->rssi);
-        if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
-        locator_add_sample(mac_string, ev->rssi);
-    }
-    if (confidence > 100) confidence = 100;
 
-    if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-        char extra_data[96] = "";
+        int  confidence   = 0;
+        char methods[64]  = {0};
+        char capture_type[16] = "FLOCK_BLE";
+        bool got_name = false, got_mfg = false, got_raven = false;
+
+        bool got_penguin_name = false;
+
+        int mac_score = check_mac_prefix_tiered(ev->mac);
+
+        char dev_name_char[65];
+        strncpy(dev_name_char, ev->dev_name, 64);
+        dev_name_char[64] = '\0';
+        if (ev->have_name) {
+            clean_device_name_char(dev_name_char);
+            if (check_device_name_pattern(dev_name_char)) {
+                strlcat(methods, "name ", sizeof(methods)); got_name = true;
+            } else if (is_penguin_numeric_name(dev_name_char)) {
+                strlcat(methods, "penguin_num ", sizeof(methods)); got_penguin_name = true;
+            }
+        }
+
+        std::string mfg_std((const char*)ev->mfg_data, ev->mfg_data_len);
         if (ev->have_mfg) {
-            static const char hx[] = "0123456789ABCDEF";
-            int out = 0;
-            for (int i = 0; i < ev->mfg_data_len && out < (int)sizeof(extra_data) - 2; i++) {
-                extra_data[out++] = hx[ev->mfg_data[i] >> 4];
-                extra_data[out++] = hx[ev->mfg_data[i] & 0x0F];
+            if (check_manufacturer_id(mfg_std)) {
+                strlcat(methods, "mfg_0x09C8 ", sizeof(methods)); got_mfg = true;
+                if (has_tn_serial(mfg_std)) strlcat(methods, "tn_serial ", sizeof(methods));
             }
-            extra_data[out] = '\0';
         }
-        if (strcmp(capture_type, "RAVEN_BLE") == 0) {
-            bool has_gps=false, has_power=false, has_net=false, has_up=false, has_err=false;
-            for (int i = 0; i < ev->uuid_count; i++) {
-                if (strcasestr(ev->service_uuids[i], "00003100")) has_gps   = true;
-                if (strcasestr(ev->service_uuids[i], "00003200")) has_power = true;
-                if (strcasestr(ev->service_uuids[i], "00003300")) has_net   = true;
-                if (strcasestr(ev->service_uuids[i], "00003400")) has_up    = true;
-                if (strcasestr(ev->service_uuids[i], "00003500")) has_err   = true;
+
+        int raven_custom_count = 0;
+        int raven_std_count = 0;
+        for (int i = 0; i < ev->uuid_count; i++) {
+            for (int j = 0; j < NUM_RAVEN_CUSTOM_UUIDS; j++) {
+                if (strcasecmp(ev->service_uuids[i], raven_custom_service_uuids[j]) == 0) {
+                    raven_custom_count++; break;
+                }
             }
-            const char* fw = (has_gps && has_power && has_net && has_up && has_err) ? "1.3.x"
-                           : (has_gps && has_power && has_net)                      ? "1.2.x"
-                           :                                                        "Unknown";
-            snprintf(extra_data, sizeof(extra_data), "FW:%s UUIDs:%d", fw, raven_uuid_count);
+            for (int j = 0; j < NUM_RAVEN_STANDARD_UUIDS; j++) {
+                if (strcasecmp(ev->service_uuids[i], raven_standard_service_uuids[j]) == 0) {
+                    raven_std_count++; break;
+                }
+            }
+        }
+        int raven_uuid_count = raven_custom_count + raven_std_count;
+
+        if (raven_custom_count > 0 || raven_uuid_count >= 2) {
+            strncpy(capture_type, "RAVEN_BLE", sizeof(capture_type)); got_raven = true;
+            if (raven_uuid_count >= 3)        strlcat(methods, "raven_multi ", sizeof(methods));
+            else if (raven_custom_count > 0)  strlcat(methods, "raven_custom ", sizeof(methods));
+            else                              strlcat(methods, "raven_uuid ", sizeof(methods));
         }
 
-        int mlen = strlen(methods);
-        if (mlen > 0 && methods[mlen - 1] == ' ') methods[mlen - 1] = '\0';
-
-        log_detection(capture_type, "BLE", ev->rssi, mac_string, dev_name_char,
-                      0, ev->have_tx_power ? ev->tx_power : 0,
-                      extra_data, methods, confidence, -1);
-
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
-            trigger_alarm_confidence = confidence;
-            trigger_alarm_source = 1;  // BLE
-            last_buzzer_time = millis();
+        if (got_raven || got_name || got_mfg) {
+            confidence = SCORE_DEFINITIVE;
+            if (mac_score == 1) strlcat(methods, "mac_t1 ", sizeof(methods));
+        } else if (mac_score == 1) {
+            confidence = SCORE_STRONG;
+            strlcat(methods, "mac_t1 ", sizeof(methods));
+            if (got_penguin_name) { confidence = SCORE_DEFINITIVE; }
+        } else {
+            if (mac_score == 2) { confidence += SCORE_WEAK; strlcat(methods, "mac_t2 ", sizeof(methods)); }
+            if (got_penguin_name) { confidence += SCORE_WEAK; }
+            if ((mac_score == 2 || got_penguin_name) &&
+                (ev->addr_type == 0 || (ev->addr_type == 1 && (ev->mac[0] >> 6) == 0x03))) {
+                confidence += SCORE_WEAK; strlcat(methods, "static_addr ", sizeof(methods));
+            }
         }
-        xSemaphoreGive(dataMutex);
-    }
+        if (confidence > 0 && ev->rssi > -50) confidence += SCORE_BONUS_RSSI;
+
+        char mac_string[18];
+        snprintf(mac_string, sizeof(mac_string), "%02x:%02x:%02x:%02x:%02x:%02x",
+            ev->mac[0], ev->mac[1], ev->mac[2],
+            ev->mac[3], ev->mac[4], ev->mac[5]);
+
+        if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            channel_lock_until = millis() + 10000;
+            xSemaphoreGive(dataMutex);
+            rssi_track_update(mac_string, ev->rssi);
+            if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
+            locator_add_sample(mac_string, ev->rssi);
+        }
+        if (confidence > 100) confidence = 100;
+
+        if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+            char extra_data[96] = "";
+            if (ev->have_mfg) {
+                static const char hx[] = "0123456789ABCDEF";
+                int out = 0;
+                for (int i = 0; i < ev->mfg_data_len && out < (int)sizeof(extra_data) - 2; i++) {
+                    extra_data[out++] = hx[ev->mfg_data[i] >> 4];
+                    extra_data[out++] = hx[ev->mfg_data[i] & 0x0F];
+                }
+                extra_data[out] = '\0';
+            }
+            if (strcmp(capture_type, "RAVEN_BLE") == 0) {
+                bool has_gps=false, has_power=false, has_net=false, has_up=false, has_err=false;
+                for (int i = 0; i < ev->uuid_count; i++) {
+                    if (strcasestr(ev->service_uuids[i], "00003100")) has_gps   = true;
+                    if (strcasestr(ev->service_uuids[i], "00003200")) has_power = true;
+                    if (strcasestr(ev->service_uuids[i], "00003300")) has_net   = true;
+                    if (strcasestr(ev->service_uuids[i], "00003400")) has_up    = true;
+                    if (strcasestr(ev->service_uuids[i], "00003500")) has_err   = true;
+                }
+                const char* fw = (has_gps && has_power && has_net && has_up && has_err) ? "1.3.x"
+                               : (has_gps && has_power && has_net)                      ? "1.2.x"
+                               :                                                        "Unknown";
+                snprintf(extra_data, sizeof(extra_data), "FW:%s UUIDs:%d", fw, raven_uuid_count);
+            }
+
+            int mlen = strlen(methods);
+            if (mlen > 0 && methods[mlen - 1] == ' ') methods[mlen - 1] = '\0';
+
+            log_detection(capture_type, "BLE", ev->rssi, mac_string, dev_name_char,
+                          0, ev->have_tx_power ? ev->tx_power : 0,
+                          extra_data, methods, confidence, -1);
+
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
+                trigger_alarm_confidence = confidence;
+                trigger_alarm_source = 1;  // BLE
+                last_buzzer_time = millis();
+            }
+            xSemaphoreGive(dataMutex);
+        }
 
         free(ev);
     }
