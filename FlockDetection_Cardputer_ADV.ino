@@ -2878,7 +2878,7 @@ void draw_locator_screen() {
     } else if (!active) {
         status_base = "Need Target";     status_col = CAUTION_COLOR; status_anim = true;
     } else {
-        status_base = "Test Mode";       status_col = ACCENT_COLOR;
+        status_base = "Hunting";         status_col = ACCENT_COLOR;
     }
     char status_str[26];
     if (status_anim) {
