@@ -93,14 +93,16 @@ void apply_color_palette() {
         BG_COLOR      = lgfx::color565(  8,   0,   0);
         CARD_COLOR    = lgfx::color565( 25,   0,   0);
         CARD_BORDER   = lgfx::color565( 60,   5,   5);
-        HEADER_COLOR  = lgfx::color565(255,  60,  60);
+        HEADER_COLOR  = lgfx::color565(255,  60,  60);  // bright red
         TEXT_COLOR    = lgfx::color565(220, 200, 200);
         DIM_COLOR     = lgfx::color565(150,  30,  30);
-        ACCENT_COLOR  = lgfx::color565(255,  90,  90);
-        TEAL_COLOR    = lgfx::color565(220,  60,  60);
-        PURPLE_COLOR  = lgfx::color565(255, 100, 255);
-        CAUTION_COLOR = lgfx::color565(255, 140,  20);
-        GPS_COLOR     = lgfx::color565( 80,  80, 220);
+        ACCENT_COLOR  = lgfx::color565(255,  90,  90);  // red (WiFi-neutral / UI)
+
+        // Category colors: distinct hues preserved, all low-blue for dark adaptation
+        CAUTION_COLOR = lgfx::color565(255, 140,  20);  // amber (WiFi / warnings)
+        TEAL_COLOR    = lgfx::color565(255,  70, 110);  // deep pink-red (Raven)
+        PURPLE_COLOR  = lgfx::color565(220,  60, 200);  // deep magenta (BLE)
+        GPS_COLOR     = lgfx::color565(180, 100,  40);  // dark amber-brown (GPS)
     } else {
         BG_COLOR      = lgfx::color565( 10,  20,  48);
         CARD_COLOR    = lgfx::color565( 18,  36,  80);
@@ -2901,8 +2903,12 @@ void draw_locator_screen() {
     const int by0 = 95;        // near bottom of left panel
     const int bx0 = cx - 22;  // = 34, centers 3 boxes under cx
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(bx0, by0 - 10); kprint(spr, "SAMPLES");
+    char samp_label[16];
+    snprintf(samp_label, sizeof(samp_label), "SAMPLES %d/%d", sc, LOC_MIN_SAMPLES_EST);
+    spr.setTextColor(sc >= LOC_MIN_SAMPLES_EST ? ACCENT_COLOR : DIM_COLOR, BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(bx0, by0 - 10);
+    kprint(spr, samp_label);
 
     for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
         int bxi = bx0 + di * 17;
