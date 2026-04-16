@@ -11,6 +11,7 @@
 #include <algorithm>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
+#include "esp_task_wdt.h"
 #include <SPI.h>
 #include <SD.h>
 #include <LittleFS.h>
@@ -61,6 +62,11 @@ bool show_locator_help = false;  // 'h' on locator screen
 bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
+
+static float ease_sd_ok = 0.0f;
+static float ease_gps_lock = 0.0f;
+static float ease_muted = 0.0f;
+static float ease_scanning = 0.0f;
 
 // RGB LED state — color cycles with C key, on/off with L when locator idle
 static uint8_t led_r = 50, led_g = 255, led_b = 100; // default green (matches ACCENT_COLOR)
@@ -186,10 +192,10 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 #define SD_CS_PIN       12
 
 // Version string — single source of truth
-#define VERSION_STRING "FLOCK DETECTOR v9.0 [ADV]"
+#define VERSION_STRING "FLOCK DETECTOR v9.2 [ADV]"
 
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
-#define NUM_SCREENS 6
+#define NUM_SCREENS 5
 
 // ============================================================================
 // GLOBALS & STRUCTS
@@ -338,11 +344,14 @@ struct SDHistEntry {
     int  rssi;
     int  confidence;
     char method[24];
+    char timestamp[9];
 };
 SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
+static int device_info_scroll = 0;
+static const int DEVICE_INFO_CONTENT_HEIGHT = 176;
 volatile bool sd_hist_dirty = false;
 
 char toast_text[32]       = "";
@@ -356,6 +365,8 @@ unsigned long last_persist_save = 0;
 unsigned long last_blip_time = 0;
 static unsigned long last_l_press_ms = 0;
 static const unsigned long DOUBLE_TAP_MS = 400;
+static unsigned long l_pending_until = 0;
+static bool l_pending_exists = false;
 
 struct RSSITrack { 
     char mac[18];
@@ -933,6 +944,10 @@ void load_sd_history() {
         copy_f(8, e.method, 24);
         e.rssi       = atoi(buf + fs[4]);
         e.confidence = atoi(buf + fs[9]);
+        {
+            unsigned long uptime = (unsigned long)strtoul(buf + fs[0], NULL, 10);
+            format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
+        }
 
         ri++;
         total++;
@@ -1921,7 +1936,9 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
 void ScannerLoopTask(void* pvParameters) {
+    esp_task_wdt_add(NULL);
     for (;;) {
+        esp_task_wdt_reset();
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
             if (now - last_channel_hop > CHANNEL_DWELL_MS) {
@@ -1953,7 +1970,9 @@ void ScannerLoopTask(void* pvParameters) {
 }
 
 void GPSLoopTask(void* pvParameters) {
+    esp_task_wdt_add(NULL);
     for (;;) {
+        esp_task_wdt_reset();
         int avail = SerialGPS.available();
         if (avail > 0) {
             uint8_t buf[128];
@@ -2002,6 +2021,15 @@ void AlarmTask(void* pvParameters) {
     vTaskDelete(NULL);
 }
 
+void LocatorChimeTask(void* pvParameters) {
+    if (!stealth_mode && !is_muted) {
+        M5Cardputer.Speaker.tone(660, 70);
+        vTaskDelay(80 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(880, 90);
+    }
+    vTaskDelete(NULL);
+}
+
 void play_escalated_alarm(int confidence, int source) {
     if (stealth_mode || is_muted || is_alarming) return;
     is_alarming = true;
@@ -2014,8 +2042,7 @@ void play_escalated_alarm(int confidence, int source) {
 // ============================================================================
 void draw_header_spr(int screen_num) {
     static const char* screen_names[NUM_SCREENS] = {
-        "SCANNER", "LOCATOR", "LAST DETECTION", "RECENT DETECTIONS", 
-        "GPS", "DEVICE INFO"
+        "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "DEVICE INFO"
     };
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
@@ -2041,9 +2068,84 @@ void draw_header_spr(int screen_num) {
 
     uint16_t bcol = chg ? ACCENT_COLOR : (render_bat > 50 ? ACCENT_COLOR : (render_bat > 20 ? CAUTION_COLOR : CAUTION_COLOR));
 
-    if (is_muted) {
-        spr.setTextColor(CAUTION_COLOR, BG_COLOR);
-        spr.setCursor(DISP_W - 55, 5); spr.print("MUTED");
+    // ── Status icon row ──────────────────────────────────────────────────────
+    const uint16_t ICON_COL = lgfx::color565(255, 255, 255);
+
+    bool sd_ok_now    = sd_available;
+    bool gps_lock_now;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
+    xSemaphoreGive(dataMutex);
+    bool muted_now    = is_muted;
+    bool scanning_now = !is_alarming;
+
+    ease_sd_ok    += ((sd_ok_now    ? 1.0f : 0.0f) - ease_sd_ok)    * 0.08f;
+    ease_gps_lock += ((gps_lock_now ? 1.0f : 0.0f) - ease_gps_lock) * 0.08f;
+    ease_muted    += ((muted_now    ? 1.0f : 0.0f) - ease_muted)    * 0.12f;
+    ease_scanning += ((scanning_now ? 1.0f : 0.0f) - ease_scanning) * 0.05f;
+
+    int icon_right = DISP_W - 32;
+    int icon_y = 4;
+
+    auto lerp_icon = [&](float t) -> uint16_t {
+        return lerp_col16(BG_COLOR, ICON_COL, t);
+    };
+    auto should_draw = [](float t) -> bool { return t > 0.05f; };
+
+    // Muted icon
+    if (should_draw(ease_muted)) {
+        int ix = icon_right - 24;
+        uint16_t c = lerp_icon(ease_muted);
+        spr.drawLine(ix + 1, icon_y + 4, ix + 1, icon_y + 6, c);
+        spr.drawLine(ix + 1, icon_y + 4, ix + 3, icon_y + 4, c);
+        spr.drawLine(ix + 1, icon_y + 6, ix + 3, icon_y + 6, c);
+        spr.drawLine(ix + 3, icon_y + 4, ix + 6, icon_y + 2, c);
+        spr.drawLine(ix + 3, icon_y + 6, ix + 6, icon_y + 8, c);
+        spr.drawLine(ix + 6, icon_y + 2, ix + 6, icon_y + 8, c);
+        spr.drawLine(ix + 0, icon_y + 1, ix + 8, icon_y + 9, c);
+        icon_right -= 14;
+    }
+
+    // GPS pin icon
+    if (should_draw(ease_gps_lock)) {
+        int ix = icon_right - 8;
+        uint16_t c = lerp_icon(ease_gps_lock);
+        spr.fillCircle(ix + 4, icon_y + 3, 3, c);
+        spr.fillTriangle(ix + 2, icon_y + 5, ix + 6, icon_y + 5, ix + 4, icon_y + 9, c);
+        spr.fillCircle(ix + 4, icon_y + 3, 1, BG_COLOR);
+        icon_right -= 14;
+    }
+
+    // Scanning pulse dot
+    if (should_draw(ease_scanning)) {
+        int ix = icon_right - 8;
+        uint16_t c = lerp_icon(ease_scanning);
+        float pulse_phase = (sinf((float)millis() / 400.0f) + 1.0f) * 0.5f;
+        int r = 1 + (int)(pulse_phase * 2.0f);
+        spr.fillCircle(ix + 4, icon_y + 5, r, c);
+        icon_right -= 14;
+    }
+
+    // SD card icon
+    if (should_draw(ease_sd_ok)) {
+        int ix = icon_right - 8;
+        uint16_t c = lerp_icon(ease_sd_ok);
+        spr.drawRect(ix + 1, icon_y + 1, 8, 9, c);
+        spr.drawPixel(ix + 8, icon_y + 1, BG_COLOR);
+        spr.drawPixel(ix + 7, icon_y + 1, BG_COLOR);
+        spr.drawPixel(ix + 8, icon_y + 2, c);
+        spr.drawPixel(ix + 3, icon_y + 3, c);
+        spr.drawPixel(ix + 5, icon_y + 3, c);
+        spr.drawPixel(ix + 7, icon_y + 3, c);
+        icon_right -= 14;
+    }
+
+    // SD missing indicator
+    if (system_fully_booted && !sd_available) {
+        int ix = icon_right + 14 - 8;
+        uint16_t c = lgfx::color565(180, 40, 40);
+        spr.drawRect(ix + 1, icon_y + 1, 8, 9, c);
+        spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
     }
 
     // Battery icon — pill shape (r=5) matching status indicator style
@@ -2071,24 +2173,6 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(bx - 2, by + 2, bx + 2, by + 2, bolt_col);
         spr.drawLine(bx + 1, by + 1, bx - 2, by + 3, bolt_col);
         spr.drawLine(bx + 2, by + 1, bx - 1, by + 3, bolt_col);
-    }
-
-    // GPS location-pin icon — matches battery height (y=4..14), eases in on lock
-    {
-        static float gps_ease = 0.0f;
-        bool gps_vis;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        gps_vis = gps.satellites.isValid() && gps.satellites.value() >= 1;
-        xSemaphoreGive(dataMutex);
-        gps_ease += ((gps_vis ? 1.0f : 0.0f) - gps_ease) * 0.08f;
-        if (gps_ease > 0.01f) {
-            uint16_t gc = lerp_col16(BG_COLOR, lgfx::color565(255, 255, 255), gps_ease);
-            int px = DISP_W - 40;   // 4px gap from battery left edge
-            int cy = 7;             // circle centre — radius 3 puts top at y=4
-            spr.fillCircle(px, cy, 3, gc);
-            spr.fillTriangle(px - 2, 9, px + 2, 9, px, 14, gc);  // point reaches y=14
-            spr.fillCircle(px, cy, 1, BG_COLOR);  // centre hole
-        }
     }
 
     // Header divider — solid line, matching locator grid color
@@ -2169,7 +2253,18 @@ void draw_vol_overlay() {
 }
 
 void drawCard(int x, int y, int w, int h) {
-    spr.fillRect(x, y, w, h, CARD_COLOR); spr.drawRect(x, y, w, h, CARD_BORDER); 
+    spr.fillRect(x, y, w, h, CARD_COLOR); spr.drawRect(x, y, w, h, CARD_BORDER);
+}
+
+void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
+    for (int i = 0; i < fade_height; i++) {
+        int y = top ? (region_y + i) : (region_y + region_h - 1 - i);
+        float t = 1.0f - ((float)i / (float)fade_height);
+        uint16_t fade_col = lerp_col16(BG_COLOR, lgfx::color565(0, 0, 0), t * 0.6f);
+        for (int x = 0; x < DISP_W; x += 2) {
+            if ((x + i) & 1) spr.drawPixel(x, y, fade_col);
+        }
+    }
 }
 
 void draw_help_overlay() {
@@ -2194,6 +2289,7 @@ void draw_help_overlay() {
     spr.setCursor(130,  46); spr.print("x again: BLE");
     spr.setCursor(130,  57); spr.print("TAB: Help");
     spr.setCursor(130,  68); spr.print("g: GPS page");
+    spr.setCursor(130,  79); spr.print("ESC: Home");
 }
 
 void draw_locator_help_overlay() {
@@ -2580,7 +2676,7 @@ void draw_locator_screen() {
     // Solid vertical separator on right edge of grid panel
     spr.drawFastVLine(GRID_RIGHT, 19, DISP_H - 19, CARD_BORDER);
 
-    const int cx = 44, cy = 65;
+    const int cx = 44, cy = 58;
 
     // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
@@ -2611,8 +2707,8 @@ void draw_locator_screen() {
     };
     // Local-space vertices (pointing up before rotation):
     //   0=tip, 1=right-outer, 2=right-inner, 3=right-base, 4=left-base, 5=left-inner, 6=left-outer
-    const float A_TIP_Y   = -23.1f, A_SHLDR_Y = -6.3f, A_BASE_Y = 14.7f;
-    const float A_HEAD_HW =  12.6f, A_STEM_HW =  6.3f;
+    const float A_TIP_Y   = -15.0f, A_SHLDR_Y = -4.0f, A_BASE_Y = 9.5f;
+    const float A_HEAD_HW =  8.0f,  A_STEM_HW =  4.0f;
     const float lx7[7] = {  0,          A_HEAD_HW,  A_STEM_HW,  A_STEM_HW, -A_STEM_HW, -A_STEM_HW, -A_HEAD_HW };
     const float ly7[7] = { A_TIP_Y, A_SHLDR_Y, A_SHLDR_Y, A_BASE_Y,  A_BASE_Y, A_SHLDR_Y,  A_SHLDR_Y };
     int ax7[7], ay7[7];
@@ -2651,6 +2747,10 @@ void draw_locator_screen() {
         spr.drawLine(ax7[vi], ay7[vi], ax7[ni], ay7[ni], GPS_COLOR);
     }
 
+    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(cx - 24, cy + 22);
+    kprint(spr, "DIRECTION");
+
     // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : 0;
     bool lock = active ? has_est : false;
@@ -2668,8 +2768,11 @@ void draw_locator_screen() {
     }
 
     const int BOX = 11;
-    const int by0 = 120;       // near bottom of left panel
+    const int by0 = 95;        // near bottom of left panel
     const int bx0 = cx - 22;  // = 34, centers 3 boxes under cx
+
+    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(bx0, by0 - 10); kprint(spr, "SAMPLES");
 
     for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
         int bxi = bx0 + di * 17;
@@ -2734,9 +2837,29 @@ void draw_locator_screen() {
     spr.setCursor(rpx + 6, 27); kprint(spr, status_str);
     spr.clearClipRect();
 
-    // TARGET — label y=50 (badge bottom=39, +11 gap), value y=64 (+14)
+    // DISTANCE (hero)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 50); kprint(spr, "TARGET");
+    spr.setCursor(rpx, 48); kprint(spr, "DISTANCE");
+    {
+        float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(3);
+        spr.setCursor(rpx, 58);
+        if (sd < 0) {
+            spr.print("--");
+        } else {
+            char db[12];
+            if (sd < 100) snprintf(db, sizeof(db), "%.0f", sd);
+            else          snprintf(db, sizeof(db), "%.1f", sd / 1000.0f);
+            spr.print(db);
+            spr.setTextSize(1);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.print(sd < 100 ? "m" : "km");
+        }
+    }
+
+    // TARGET (secondary)
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(rpx, 90); kprint(spr, "TARGET");
     {
         char tname[15];
         if (active) {
@@ -2745,122 +2868,19 @@ void draw_locator_screen() {
             strncpy(tname, src, 14); tname[14] = '\0';
         } else { strncpy(tname, demo_name, 14); tname[14] = '\0'; }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 64); spr.print(tname);  // bottom = 72
+        spr.setCursor(rpx, 100); spr.print(tname);
     }
 
-    // SIGNAL — label y=80 (72+8), value y=94 (+14)
+    // SIGNAL (secondary)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 80); kprint(spr, "SIGNAL");
+    spr.setCursor(rpx, 114); kprint(spr, "SIGNAL");
     {
         int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 94);
+        spr.setCursor(rpx, 124);
         if (sr == -999) { spr.print("--"); }
         else { spr.print(sr > -60 ? "STRONG" : sr > -80 ? "MEDIUM" : "WEAK"); }
     }
-
-    // DISTANCE — label y=110 (94+8+8), value y=124 (+14)
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 110); kprint(spr, "DISTANCE");
-    {
-        float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 124);
-        if (sd < 0) { spr.print("--"); }
-        else { char db[12]; if (sd < 100) snprintf(db,sizeof(db),"%.0fm",sd); else snprintf(db,sizeof(db),"%.1fkm",sd/1000.0f); spr.print(db); }
-    }
-}
-
-void draw_last_detect_screen() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    char t_type[16]; strncpy(t_type, last_cap_type,           sizeof(t_type)   - 1); t_type[sizeof(t_type)-1]     = '\0';
-    char t_time[9];  strncpy(t_time, last_cap_time,           sizeof(t_time)   - 1); t_time[sizeof(t_time)-1]     = '\0';
-    char t_mac[18];  strncpy(t_mac,  last_cap_mac,            sizeof(t_mac)    - 1); t_mac[sizeof(t_mac)-1]       = '\0';
-    char t_name[65]; strncpy(t_name, last_cap_name,           sizeof(t_name)   - 1); t_name[sizeof(t_name)-1]     = '\0';
-    char t_method[64]; strncpy(t_method, last_cap_det_method, sizeof(t_method) - 1); t_method[sizeof(t_method)-1] = '\0';
-    int t_rssi = last_cap_rssi;
-    int t_conf = last_cap_confidence;
-    xSemaphoreGive(dataMutex);
-
-    spr.fillSprite(BG_COLOR);
-    draw_header_spr(2);
-
-    if (strcmp(t_type, "None") == 0 || t_type[0] == '\0') {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(2);
-        spr.setCursor(20, 65); spr.print("No detections yet");
-        return;
-    }
-
-    bool is_active = false;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    for (int i = 0; i < rssi_tracker_count; i++) {
-        if (strncmp(rssi_tracker[i].mac, t_mac, 17) == 0
-            && millis() - rssi_tracker[i].last_seen < RSSI_TRACK_EXPIRY_MS) {
-            is_active = true; break;
-        }
-    }
-    xSemaphoreGive(dataMutex);
-
-    // Protocol
-    bool is_wifi     = (strstr(t_type, "WIFI") != nullptr);
-    uint16_t pcol    = is_wifi ? TEAL_COLOR : GPS_COLOR;
-    const char* plbl = is_wifi ? "WiFi" : "BLE";
-
-    bool use_name = (t_name[0] != '\0' &&
-                     strcmp(t_name, "Hidden")  != 0 &&
-                     strcmp(t_name, "Unknown") != 0);
-
-    // ── Row 1: protocol pill (left) + LIVE/LOST indicator (right) ──────────
-    int pill_w = (int)strlen(plbl) * 6 + 12;
-    spr.fillRoundRect(6, 21, pill_w, 14, 5, pcol);
-    spr.setTextColor(BG_COLOR, pcol); spr.setTextSize(1);
-    spr.setCursor(12, 26); spr.print(plbl);
-
-    uint16_t dot_col = is_active ? ((millis() % 800 < 400) ? HEADER_COLOR : DIM_COLOR) : CARD_BORDER;
-    spr.fillCircle(DISP_W - 12, 28, 4, dot_col);
-    spr.setTextColor(is_active ? HEADER_COLOR : DIM_COLOR, BG_COLOR);
-    spr.setCursor(DISP_W - 50, 24); spr.print(is_active ? "LIVE" : "LOST");
-
-    // ── Row 2: target name — large ───────────────────────────────────────────
-    char dname[17] = "";
-    if (use_name) { strncpy(dname, t_name, 16); dname[16] = '\0'; }
-    else          { strncpy(dname, t_mac,  16); dname[16] = '\0'; }
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(6, 39); spr.print(dname);
-
-    // ── Row 3: MAC + timestamp ───────────────────────────────────────────────
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(6, 59); spr.print(t_mac);
-    spr.setCursor(DISP_W - 48, 59); spr.print(t_time);
-
-    // Thin rule separating header from cards
-    spr.drawLine(6, 69, DISP_W - 6, 69, CARD_BORDER);
-
-    // ── Cards: signal (left) + confidence (right) ────────────────────────────
-    int cw = (DISP_W - 12) / 2;
-
-    drawCard(4, 72, cw, 48);
-    spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(8, 77); kprint(spr, "SIGNAL");
-    spr.setTextColor(pcol, CARD_COLOR); spr.setTextSize(3);
-    spr.setCursor(8, 88); spr.print(t_rssi);
-    spr.setTextSize(1); spr.setTextColor(DIM_COLOR, CARD_COLOR);
-    spr.print(" dBm");
-
-    drawCard(8 + cw, 72, cw, 48);
-    spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(12 + cw, 77); kprint(spr, "CONF");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(3);
-    spr.setCursor(12 + cw, 88); spr.print(t_conf);
-    spr.setTextSize(1); spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.print("%");
-    spr.setTextColor(pcol, CARD_COLOR);
-    spr.setCursor(12 + cw, 112); spr.print(confidence_label(t_conf));
-
-    // ── Bottom: detection method ──────────────────────────────────────────────
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(4, DISP_H - 8);
-    char mshort[36]; snprintf(mshort, sizeof(mshort), "%.35s", t_method);
-    spr.print(mshort);
 }
 
 static int history_scroll_offset = 0;
@@ -2897,7 +2917,7 @@ void draw_capture_history_screen() {
     }
 
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(3);
+    draw_header_spr(2);
 
     if (total == 0) {
         for (int i = 0; i < 4; i++) {
@@ -2952,27 +2972,42 @@ void draw_capture_history_screen() {
         spr.fillRect(0, y, 4, 27, proto_col);
         spr.fillRect(4, y, DISP_W - 4, 27, row_bg);
 
-        // Selection cursor: left border thicker
-        if (selected) spr.fillRect(0, y, 4, 27, HEADER_COLOR);
+        if (selected) {
+            spr.fillRect(0, y, 6, 27, HEADER_COLOR);
+            int ay_mid = y + 14;
+            for (int p = 0; p < 4; p++) {
+                spr.drawLine(7 + p, ay_mid - (3 - p), 7 + p, ay_mid + (3 - p), HEADER_COLOR);
+            }
+            spr.drawRect(0, y, DISP_W, 27, HEADER_COLOR);
+        }
+
+        int content_x = selected ? 14 : 10;
 
         // Protocol label in proto_col
         spr.setTextColor(proto_col, row_bg); spr.setTextSize(1);
-        spr.setCursor(10, y + 4); spr.print(proto_lbl);
+        spr.setCursor(content_x, y + 4); spr.print(proto_lbl);
 
         // Name (or last MAC octets)
         bool name_ok = (e_name[0] != '\0' &&
                         strcmp(e_name, "Hidden")  != 0 &&
                         strcmp(e_name, "Unknown") != 0);
-        char nom[17] = "";
-        if (name_ok) { strncpy(nom, e_name, 16); nom[16] = '\0'; }
-        else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 16); nom[16] = '\0'; }
+        char nom[13] = "";
+        if (name_ok) { strncpy(nom, e_name, 12); nom[12] = '\0'; }
+        else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 12); nom[12] = '\0'; }
 
         spr.setTextColor(TEXT_COLOR, row_bg); spr.setTextSize(1);
-        spr.setCursor(38, y + 4); spr.print(nom);
+        spr.setCursor(content_x + 28, y + 4); spr.print(nom);
+
+        // Right-aligned timestamp
+        const char* ts_src = use_sd ? sd_hist[i].timestamp : "";
+        if (ts_src[0]) {
+            spr.setTextColor(DIM_COLOR, row_bg);
+            spr.setCursor(DISP_W - 52, y + 4); spr.print(ts_src);
+        }
 
         // Second line: MAC + method for selected; stats otherwise
         spr.setTextColor(DIM_COLOR, row_bg);
-        spr.setCursor(10, y + 17);
+        spr.setCursor(content_x, y + 17);
         if (selected) {
             char det_buf[30];
             snprintf(det_buf, sizeof(det_buf), "%s  %s", e_mac, e_method[0] ? e_method : "");
@@ -2981,6 +3016,17 @@ void draw_capture_history_screen() {
             char stat_buf[22];
             snprintf(stat_buf, sizeof(stat_buf), "%d%%  %ddBm", e_conf, e_rssi);
             spr.print(stat_buf);
+        }
+    }
+
+    {
+        const int list_y = 20;
+        const int list_h = 4 * 28;
+        if (total > 4) {
+            if (history_scroll_offset > 0)
+                draw_scroll_fade(list_y, list_h, 5, true);
+            if (history_scroll_offset < total - 4)
+                draw_scroll_fade(list_y, list_h, 5, false);
         }
     }
 
@@ -3038,15 +3084,19 @@ void draw_capture_history_screen() {
         int fy = cy + 22;
         auto det_row = [&](const char* lbl, const char* val) {
             spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-            spr.setCursor(cx + 6, fy); spr.print(lbl);
-            spr.setTextColor(TEXT_COLOR,   CARD_COLOR);
-            spr.setCursor(cx + 6 + (int)strlen(lbl)*6 + 4, fy); spr.print(val);
+            spr.setCursor(cx + 6, fy);
+            kprint(spr, lbl);
+            spr.setTextColor(TEXT_COLOR, CARD_COLOR);
+            spr.setCursor(cx + 6 + (int)strlen(lbl) * 7 + 4, fy);
+            spr.print(val);
         };
         char tmp[32];
         det_row("MAC: ", d_mac); fy += 14;
         snprintf(tmp, sizeof(tmp), "%d dBm", d_rssi); det_row("RSSI: ", tmp); fy += 14;
         snprintf(tmp, sizeof(tmp), "%d%%", d_conf);   det_row("CONF: ", tmp); fy += 14;
         if (d_method[0]) { det_row("HOW:  ", d_method); fy += 14; }
+        const char* d_ts = use_sd ? sd_hist[di].timestamp : "";
+        if (d_ts[0]) { det_row("TIME: ", d_ts); fy += 14; }
 
         // Footer hint
         spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
@@ -3056,7 +3106,7 @@ void draw_capture_history_screen() {
 
 void draw_gps_screen() {
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(4);
+    draw_header_spr(3);
 
     bool has_loc, stale, speed_valid;
     int sats;
@@ -3271,41 +3321,106 @@ void draw_gps_screen() {
 
 void draw_device_info_screen() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    long lt=lifetime_flock_total;
-    long sr=session_raven; long sw=session_flock_wifi; long sb=session_flock_ble;
+    long lt = lifetime_flock_total;
+    long sr = session_raven;
+    long sw = session_flock_wifi;
+    long sb = session_flock_ble;
     long lb = lifetime_boots;
+    long lfw = lifetime_flash_writes;
     xSemaphoreGive(dataMutex);
+
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(5);
-    
-    drawCard(4, 22, DISP_W - 8, 20);
-    spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(10, 27); spr.print(VERSION_STRING);
-    
-    drawCard(4,  46, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, 50); spr.print("BOOTS");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, 60);
-    spr.print(lb);
-    
-    drawCard(82,  46, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, 50); spr.print("LIFETIME");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, 60);
-    { char _tbuf[9]; format_time_buf(lifetime_seconds, _tbuf, sizeof(_tbuf)); spr.print(_tbuf); }
-    
-    drawCard(160, 46, 76, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, 50); spr.print("ALL-TIME");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, 60); spr.print(lt);
-    
-    drawCard(4,   88, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, 92); spr.print("WIFI SESS");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, 102); spr.print(sw);
-    
-    drawCard(82,  88, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, 92); spr.print("BLE SESS");
-    spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(86, 102); spr.print(sb);
-    
-    drawCard(160, 88, 76, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, 92); spr.print("RAVEN");
-    spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, 102); spr.print(sr);
+    draw_header_spr(4);
+
+    const int content_top_y = 19;
+    const int content_bottom_y = DISP_H - 1;
+    spr.setClipRect(0, content_top_y, DISP_W - 6, content_bottom_y - content_top_y);
+
+    int yoff = 22 - device_info_scroll;
+
+    // Version card (full width)
+    drawCard(4, yoff, DISP_W - 8, 20);
+    spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(10, yoff + 5); spr.print(VERSION_STRING);
+
+    // Row 1: BOOTS, LIFETIME, ALL-TIME
+    int row1_y = yoff + 24;
+    drawCard(4, row1_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, row1_y + 4); kprint(spr, "BOOTS");
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, row1_y + 14); spr.print(lb);
+
+    drawCard(82, row1_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row1_y + 4); kprint(spr, "LIFETIME");
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row1_y + 14);
+    { char tb[9]; format_time_buf(lifetime_seconds, tb, sizeof(tb)); spr.print(tb); }
+
+    drawCard(160, row1_y, 76, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, row1_y + 4); kprint(spr, "ALL-TIME");
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, row1_y + 14); spr.print(lt);
+
+    // Row 2: WIFI SESS, BLE SESS, RAVEN
+    int row2_y = yoff + 66;
+    drawCard(4, row2_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, row2_y + 4); kprint(spr, "WIFI SESS");
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, row2_y + 14); spr.print(sw);
+
+    drawCard(82, row2_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row2_y + 4); kprint(spr, "BLE SESS");
+    spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(86, row2_y + 14); spr.print(sb);
+
+    drawCard(160, row2_y, 76, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, row2_y + 4); kprint(spr, "RAVEN");
+    spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, row2_y + 14); spr.print(sr);
+
+    // Row 3: FLASH WRITES (full width)
+    int row3_y = yoff + 108;
+    drawCard(4, row3_y, DISP_W - 8, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(8, row3_y + 4); kprint(spr, "FLASH WRITES");
+
+    int wear_pct = (int)((lfw * 100) / 100000);
+    if (wear_pct > 100) wear_pct = 100;
+    uint16_t wear_col = (wear_pct >= 80) ? CAUTION_COLOR
+                      : (wear_pct >= 50) ? CAUTION_COLOR
+                      : ACCENT_COLOR;
+
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
+    spr.setCursor(8, row3_y + 14); spr.print(lfw);
+    spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(8, row3_y + 30); spr.print("writes");
+
+    int bar_x = 110, bar_y = row3_y + 16, bar_w = 120, bar_h = 8;
+    spr.drawRect(bar_x, bar_y, bar_w, bar_h, CARD_BORDER);
+    int fill = (wear_pct * (bar_w - 2)) / 100;
+    if (fill > 0) spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, wear_col);
+    char pct_str[8]; snprintf(pct_str, sizeof(pct_str), "%d%%", wear_pct);
+    spr.setTextColor(wear_col, CARD_COLOR);
+    spr.setCursor(bar_x + bar_w - 28, bar_y + bar_h + 4); spr.print(pct_str);
+
+    spr.clearClipRect();
+
+    {
+        const int visible_h = (DISP_H - 1) - 19;
+        const int max_scroll_for_fade = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
+        if (max_scroll_for_fade > 0) {
+            if (device_info_scroll > 0)
+                draw_scroll_fade(19, visible_h, 6, true);
+            if (device_info_scroll < max_scroll_for_fade)
+                draw_scroll_fade(19, visible_h, 6, false);
+        }
+    }
+
+    const int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - (content_bottom_y - content_top_y);
+    if (max_scroll > 0) {
+        const int track_x = DISP_W - 4;
+        const int track_y = content_top_y + 2;
+        const int track_h = (content_bottom_y - content_top_y) - 4;
+        spr.drawFastVLine(track_x + 1, track_y, track_h, CARD_BORDER);
+        int thumb_h = (track_h * (content_bottom_y - content_top_y)) / DEVICE_INFO_CONTENT_HEIGHT;
+        if (thumb_h < 12) thumb_h = 12;
+        int thumb_y = track_y + ((track_h - thumb_h) * device_info_scroll) / max_scroll;
+        spr.fillRect(track_x, thumb_y, 3, thumb_h, HEADER_COLOR);
+    }
 }
 
 // ============================================================================
@@ -3315,10 +3430,9 @@ void draw_current_screen() {
     switch (current_screen) {
         case 0: draw_scanner_screen();         break;
         case 1: draw_locator_screen();         break;
-        case 2: draw_last_detect_screen();     break;
-        case 3: draw_capture_history_screen(); break;
-        case 4: draw_gps_screen();             break;
-        case 5: draw_device_info_screen();     break;
+        case 2: draw_capture_history_screen(); break;
+        case 3: draw_gps_screen();             break;
+        case 4: draw_device_info_screen();     break;
     }
     
     if (show_vol_overlay) draw_vol_overlay();
@@ -3335,12 +3449,15 @@ void transition_screen(int new_screen, int dir) {
         M5Cardputer.Speaker.playRaw(ui_beep_pcm, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
         M5Cardputer.Speaker.setVolume(prev_vol);
     }
-    if (new_screen == 3) {
+    if (new_screen == 2) {
         history_scroll_offset = 0;
         history_selected_idx = 0;
         hist_detail_open = false;
         load_sd_history();
         sd_hist_dirty = false;
+    }
+    if (new_screen == 4) {
+        device_info_scroll = 0;
     }
     if (new_screen != 1) show_locator_help = false;
     current_screen = new_screen;
@@ -3482,6 +3599,15 @@ void setup() {
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
 
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
+    // Task watchdog: 10-second timeout, panic on trigger
+    esp_task_wdt_deinit();
+    esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms = 10000,
+        .idle_core_mask = 0,
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt_cfg);
+    // Note: if the struct API causes a compile error, fallback is: esp_task_wdt_init(10, true);
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     system_fully_booted = true;
@@ -3532,17 +3658,28 @@ void loop() {
                 if (!is_muted) beep(600, 50); 
             }
             else if (c == '.') {
-                if (current_screen == 3) {
+                if (current_screen == 2) {
                     int hist_total = sd_available ? sd_hist_count : capture_history_count;
                     history_selected_idx++;
                     if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
                     draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (current_screen == 4) {
+                    int visible_h = DISP_H - 19;
+                    int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
+                    if (max_scroll < 0) max_scroll = 0;
+                    device_info_scroll += 12;
+                    if (device_info_scroll > max_scroll) device_info_scroll = max_scroll;
+                    draw_current_screen(); spr.pushSprite(0, 0);
                 }
             }
             else if (c == ';') {
-                if (current_screen == 3) {
+                if (current_screen == 2) {
                     history_selected_idx--;
                     if (history_selected_idx < 0) history_selected_idx = 0;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (current_screen == 4) {
+                    device_info_scroll -= 12;
+                    if (device_info_scroll < 0) device_info_scroll = 0;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
             }
@@ -3617,7 +3754,7 @@ void loop() {
                     transition_screen(prev, d);
                 }
             }
-            else if (c >= '1' && c <= '6') { 
+            else if (c >= '1' && c <= '5') {
                 if (!stealth_mode) { 
                     int target = c - '1'; 
                     if (target < NUM_SCREENS) transition_screen(target, (target >= current_screen) ? 1 : -1); 
@@ -3663,10 +3800,12 @@ void loop() {
             }
             else if (c == 'l') {
                 unsigned long now_ms = millis();
-                bool is_double_tap = (now_ms - last_l_press_ms) < DOUBLE_TAP_MS;
-                last_l_press_ms = now_ms;
 
-                if (is_double_tap) {
+                if (l_pending_exists && (now_ms - last_l_press_ms) < DOUBLE_TAP_MS) {
+                    // Second press within window → double-tap, cancel pending single-press
+                    l_pending_exists = false;
+                    l_pending_until = 0;
+
                     // Double-tap: cycle LED color
                     led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
                     led_r = LED_COLORS[led_col_idx][0];
@@ -3675,22 +3814,10 @@ void loop() {
                     if (!led_breathing_on) led_breathing_on = true;
                     beep(900, 40);
                 } else {
-                    // Single-press: locator logic (unchanged behavior)
-                    if (locator_active) {
-                        locator_stop();
-                    } else {
-                        xSemaphoreTake(dataMutex, portMAX_DELAY);
-                        char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
-                        char l_mac[18];  strncpy(l_mac,  last_cap_mac,  17); l_mac[17]  = '\0';
-                        char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
-                        xSemaphoreGive(dataMutex);
-                        if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
-                            locator_start(l_mac, l_name, l_type);
-                            transition_screen(1, 1);
-                        } else {
-                            led_breathing_on = !led_breathing_on;
-                        }
-                    }
+                    // First press → arm deferred single-press
+                    l_pending_exists = true;
+                    l_pending_until = now_ms + DOUBLE_TAP_MS;
+                    last_l_press_ms = now_ms;
                 }
             }
             else if (c == 'c') {
@@ -3703,7 +3830,7 @@ void loop() {
             }
             else if (c == '\n' || c == '\r') {
                 if (!stealth_mode) {
-                    if (current_screen == 3) {
+                    if (current_screen == 2) {
                         int hist_total = sd_available ? sd_hist_count : capture_history_count;
                         if (hist_total > 0) {
                             hist_detail_open = !hist_detail_open;
@@ -3719,7 +3846,7 @@ void loop() {
             }
         }
         if (status.del && !stealth_mode) {
-            if (current_screen == 3 && hist_detail_open) {
+            if (current_screen == 2 && hist_detail_open) {
                 hist_detail_open = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else {
@@ -3727,6 +3854,35 @@ void loop() {
                 int d = (prev < 0) ? 1 : -1;
                 if (prev < 0) prev = NUM_SCREENS - 1;
                 transition_screen(prev, d);
+            }
+        }
+        // ESC: jump to Scanner from anywhere (closes overlays first)
+        if (M5Cardputer.Keyboard.isKeyPressed(KEY_ESC) && !stealth_mode) {
+            if (show_help_overlay) { show_help_overlay = false; draw_current_screen(); spr.pushSprite(0, 0); }
+            else if (show_locator_help) { show_locator_help = false; draw_current_screen(); spr.pushSprite(0, 0); }
+            else if (current_screen == 2 && hist_detail_open) { hist_detail_open = false; draw_current_screen(); spr.pushSprite(0, 0); }
+            else if (current_screen != 0) { transition_screen(0, -1); }
+        }
+    }
+
+    // Fire pending 'l' single-press action if double-tap window expired
+    if (l_pending_exists && millis() >= l_pending_until) {
+        l_pending_exists = false;
+        l_pending_until = 0;
+
+        if (locator_active) {
+            locator_stop();
+        } else {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
+            char l_mac[18];  strncpy(l_mac,  last_cap_mac,  17); l_mac[17]  = '\0';
+            char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
+            xSemaphoreGive(dataMutex);
+            if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
+                locator_start(l_mac, l_name, l_type);
+                transition_screen(1, 1);
+            } else {
+                led_breathing_on = !led_breathing_on;
             }
         }
     }
@@ -3751,16 +3907,30 @@ void loop() {
         if (should_flush) flush_sd_buffer();
     }
 
-    if (locator_active && locator_has_estimate) {
+    {
+        bool need_update;
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (gps.location.isValid() && gps.location.age() < 2000) {
-            locator_est_distance = haversine_m(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
-            locator_bearing = bearing_to(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
+        need_update = locator_active && locator_has_estimate;
+        if (need_update && gps.location.isValid() && gps.location.age() < 2000) {
+            double my_lat = gps.location.lat();
+            double my_lng = gps.location.lng();
+            double tgt_lat = locator_est_lat;
+            double tgt_lng = locator_est_lng;
+            xSemaphoreGive(dataMutex);
+
+            float dist = (float)haversine_m(my_lat, my_lng, tgt_lat, tgt_lng);
+            float brng = bearing_to(my_lat, my_lng, tgt_lat, tgt_lng);
+
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            locator_est_distance = dist;
+            locator_bearing = brng;
+            xSemaphoreGive(dataMutex);
+        } else {
+            xSemaphoreGive(dataMutex);
         }
-        xSemaphoreGive(dataMutex);
     }
 
-    if (sd_hist_dirty && current_screen == 3 && !hist_detail_open) {
+    if (sd_hist_dirty && current_screen == 2 && !hist_detail_open) {
         sd_hist_dirty = false;
         load_sd_history();
     }
@@ -3769,16 +3939,14 @@ void loop() {
         locator_announce_pending = false;
         trigger_toast("TARGET", "Estimate ready", 100);
         if (!is_muted && !stealth_mode) {
-            M5Cardputer.Speaker.tone(660, 70);
-            delay(80);
-            M5Cardputer.Speaker.tone(880, 90);
+            xTaskCreate(LocatorChimeTask, "LocChime", 2048, NULL, 2, NULL);
         }
     }
 
     if (!stealth_mode) {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
-        if (current_screen == 0 || current_screen == 1 || current_screen == 2 || current_screen == 4 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
+        if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
             if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; } 
         } 
         else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
