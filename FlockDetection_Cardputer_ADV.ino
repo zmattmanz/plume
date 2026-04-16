@@ -2127,8 +2127,37 @@ void draw_header_spr(int screen_num) {
     ease_muted    += ((muted_now    ? 1.0f : 0.0f) - ease_muted)    * 0.12f;
     ease_scanning += ((scanning_now ? 1.0f : 0.0f) - ease_scanning) * 0.05f;
 
+    // Alarm cooldown state: fires during the 60s window after a detection alarm
+    bool cooldown_now;
+    unsigned long cooldown_elapsed = 0;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    cooldown_elapsed = millis() - last_buzzer_time;
+    cooldown_now = (last_buzzer_time > 0) && (cooldown_elapsed < BUZZER_COOLDOWN);
+    xSemaphoreGive(dataMutex);
+
+    static float ease_cooldown = 0.0f;
+    ease_cooldown += ((cooldown_now ? 1.0f : 0.0f) - ease_cooldown) * 0.08f;
+
     int icon_right = DISP_W - 32;
     int icon_y = 4;
+
+    // Detection counter FIRST — consumes space before status icons
+    long det_total;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    det_total = session_flock_wifi + session_flock_ble + session_raven;
+    xSemaphoreGive(dataMutex);
+
+    if (det_total > 0) {
+        char det_buf[16];
+        snprintf(det_buf, sizeof(det_buf), "D:%ld", det_total);
+        int det_w = (int)strlen(det_buf) * 6;
+        int det_x = icon_right - det_w - 4;
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(det_x, 6);
+        spr.print(det_buf);
+        icon_right = det_x - 6;  // icons continue left of counter
+    }
 
     auto lerp_icon = [&](float t) -> uint16_t {
         return lerp_col16(BG_COLOR, ICON_COL, t);
@@ -2146,6 +2175,22 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(ix + 3, icon_y + 6, ix + 6, icon_y + 8, c);
         spr.drawLine(ix + 6, icon_y + 2, ix + 6, icon_y + 8, c);
         spr.drawLine(ix + 0, icon_y + 1, ix + 8, icon_y + 9, c);
+        icon_right -= 14;
+    }
+
+    // Alarm cooldown icon — dim hourglass/bell when in cooldown window
+    if (should_draw(ease_cooldown) && cooldown_now) {
+        int ix = icon_right - 8;
+        // Pulse based on remaining cooldown time (faster pulse as time ends)
+        float progress = (float)cooldown_elapsed / (float)BUZZER_COOLDOWN;
+        float pulse_rate = 400.0f + progress * 1200.0f;  // pulse speeds up as cooldown ends
+        float pulse = (sinf((float)millis() / pulse_rate) + 1.0f) * 0.5f;
+        uint8_t intensity = (uint8_t)(120 + pulse * 80);
+        uint16_t c = lerp_col16(BG_COLOR, lgfx::color565(intensity, intensity, intensity), ease_cooldown);
+
+        // Small circle with slash — "alarm suppressed"
+        spr.drawCircle(ix + 4, icon_y + 5, 4, c);
+        spr.drawLine(ix + 1, icon_y + 2, ix + 7, icon_y + 8, c);
         icon_right -= 14;
     }
 
@@ -3118,6 +3163,16 @@ void draw_capture_history_screen() {
             spr.drawRect(0, y, DISP_W, 27, HEADER_COLOR);
         }
 
+        if (selected) {
+            // "Has detail" chevron in right gutter
+            int chevron_x = DISP_W - 8;
+            int chevron_y_mid = y + 14;
+            spr.drawLine(chevron_x,     chevron_y_mid - 3, chevron_x + 3, chevron_y_mid,     HEADER_COLOR);
+            spr.drawLine(chevron_x + 3, chevron_y_mid,     chevron_x,     chevron_y_mid + 3, HEADER_COLOR);
+            spr.drawLine(chevron_x - 1, chevron_y_mid - 3, chevron_x + 2, chevron_y_mid,     HEADER_COLOR);  // 2px thick
+            spr.drawLine(chevron_x + 2, chevron_y_mid,     chevron_x - 1, chevron_y_mid + 3, HEADER_COLOR);
+        }
+
         int content_x = selected ? 14 : 10;
 
         // Protocol label in proto_col
@@ -3139,7 +3194,8 @@ void draw_capture_history_screen() {
         const char* ts_src = use_sd ? sd_hist[i].timestamp : "";
         if (ts_src[0]) {
             spr.setTextColor(DIM_COLOR, row_bg);
-            spr.setCursor(DISP_W - 52, y + 4); spr.print(ts_src);
+            int ts_x = selected ? DISP_W - 62 : DISP_W - 52;
+            spr.setCursor(ts_x, y + 4); spr.print(ts_src);
         }
 
         // Second line: MAC + method for selected; stats otherwise
