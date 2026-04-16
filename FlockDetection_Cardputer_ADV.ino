@@ -561,11 +561,18 @@ void dedicated_charging_loop() {
     
     while (true) {
         M5Cardputer.update();
+        update_load_sag();
         int32_t current_mv = get_filtered_voltage();
         int calc_pct = get_unified_battery_pct(current_mv);
-        
-        if (display_pct == -1) display_pct = calc_pct;
-        else if (calc_pct > display_pct) display_pct = calc_pct;
+
+        if (display_pct == -1 || calc_pct == 255) {
+            display_pct = calc_pct;
+        } else if (calc_pct > display_pct) {
+            display_pct = calc_pct;
+        }
+
+        // Cap the display value at 100% so the UI doesn't draw a 255% bar
+        int render_pct = (display_pct == 255) ? 100 : display_pct;
 
         unsigned long elapsed = millis() - boot_time;
 
@@ -579,7 +586,7 @@ void dedicated_charging_loop() {
 
         // ── Battery percentage — large, white, centred below label ─────────
         char pct_str[8];
-        snprintf(pct_str, sizeof(pct_str), "%d%%", display_pct);
+        snprintf(pct_str, sizeof(pct_str), "%d%%", render_pct);
         spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
         spr.setTextSize(3);
         spr.drawString(pct_str, DISP_W / 2, 50);
@@ -588,7 +595,7 @@ void dedicated_charging_loop() {
         const int bar_w = 120, bar_h = 16;
         const int bar_x = (DISP_W - bar_w) / 2, bar_y = 82;
         spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
-        int fill_w = (display_pct * (bar_w - 2)) / 100;
+        int fill_w = (render_pct * (bar_w - 2)) / 100;
         if (fill_w > 0) {
             float ph = (sinf((float)millis() / 700.0f) + 1.0f) * 0.5f;
             uint8_t r1=(ACCENT_COLOR>>11)<<3, g1=((ACCENT_COLOR>>5)&0x3F)<<2, b1=(ACCENT_COLOR&0x1F)<<3;
@@ -3154,8 +3161,14 @@ void setup() {
     spr.setColorDepth(16);
     spr.createSprite(DISP_W, DISP_H);
     
-    int32_t start_v = get_filtered_voltage(); unsigned long trap_start = millis();
-    while (millis() - trap_start < 800) { M5Cardputer.update(); delay(15); }
+    int32_t start_v = get_filtered_voltage();
+    unsigned long trap_start = millis();
+    while (millis() - trap_start < 800) {
+        M5Cardputer.update();
+        update_load_sag();
+        get_filtered_voltage(); // Pump the EMA filter so it settles accurately
+        delay(15);
+    }
     int32_t end_v = get_filtered_voltage();
     if (end_v > 3900 || (end_v - start_v >= 15)) dedicated_charging_loop();
 
