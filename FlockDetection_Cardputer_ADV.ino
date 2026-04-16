@@ -2549,26 +2549,41 @@ void draw_scanner_screen() {
             if (noise_life[i] < 0) noise_life[i] = 0;
 
             float fade = (float)noise_life[i] / (float)noise_max_life[i];
-            int intensity = (int)(fade * 320.0f * noise_dimming);
-            if (intensity > 255) intensity = 255;
-            if (intensity < 12) continue;
+            int intensity = (int)(fade * 180.0f * noise_dimming);
+            if (intensity > 200) intensity = 200;
+            if (intensity < 20) continue;
+
+            // Sweep-tied brightness: particle brightens dramatically when sweep line
+            // passes over its angle, dims otherwise. Makes the sweep feel like it's
+            // "illuminating" the ambient RF environment.
+            float pa = fmodf(noise_a[i], TWO_PIf);
+            float diff_sweep = sweep_norm - pa;
+            if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
+            if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
+            float sweep_proximity = 1.0f - fminf(1.0f, fabsf(diff_sweep) / 0.5f);  // 1 at sweep, 0 at >0.5 rad away
+            int sweep_boost = (int)(sweep_proximity * 80);
+            int total_intensity = intensity + sweep_boost;
+            if (total_intensity > 255) total_intensity = 255;
 
             int px = rcx + (int)(noise_r[i] * cosf(noise_a[i]));
             int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
 
-            // Flat horizontal dash matching radar perspective
+            // Color based on intensity — cyan-green family for day, red-orange for night
             uint16_t p_col = night_mode
-                ? lgfx::color565(intensity, intensity / 6, 0)
-                : lgfx::color565(0, intensity * 2 / 3, intensity);
+                ? lgfx::color565(total_intensity, total_intensity / 5, 0)
+                : lgfx::color565(0, total_intensity * 2 / 3, total_intensity);
 
-            spr.drawLine(px - 1, py, px + 1, py, p_col);
+            // Draw small upward triangle (matches detection triangle vocabulary but smaller)
+            // Size 3: base 3px, height 3px
+            spr.drawTriangle(px - 1, py + 1,
+                             px + 1, py + 1,
+                             px,     py - 2,
+                             p_col);
 
-            if (intensity > 90) {
-                uint16_t glow = night_mode
-                    ? lgfx::color565(intensity / 2, 0, 0)
-                    : lgfx::color565(0, intensity / 3, intensity * 2 / 3);
-                spr.drawPixel(px - 2, py, glow);
-                spr.drawPixel(px + 2, py, glow);
+            // Extra bright near sweep: fill the triangle for emphasis
+            if (sweep_proximity > 0.5f) {
+                spr.drawPixel(px, py - 1, p_col);
+                spr.drawPixel(px, py, p_col);
             }
         }
     }
