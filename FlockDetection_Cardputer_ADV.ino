@@ -4,6 +4,7 @@
 
 #include <M5Cardputer.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <NimBLEDevice.h>
 #include <NimBLEScan.h>
 #include <NimBLEAdvertisedDevice.h>
@@ -196,6 +197,12 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 // Version string — single source of truth
 #define VERSION_STRING "FLOCK DETECTOR v9.3 [ADV]"
 
+// Pre-configure WiFi credentials for export mode. User edits these in source
+// once, then they're saved to flash on first boot. To change later, edit
+// source and re-flash. This is a hobby/field-tool compromise.
+#define EXPORT_WIFI_SSID "YOUR_SSID_HERE"
+#define EXPORT_WIFI_PASS "YOUR_PASSWORD_HERE"
+
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
 #define NUM_SCREENS 5
 
@@ -233,6 +240,15 @@ static int flash_write_fail_count = 0;
 String current_log_file = "/FlockLog.csv";
 String current_pcap_file = "/Threats.pcap";
 String current_ble_pcap_file = "/BLE_Threats.pcap";
+
+// Export server state
+static WebServer* export_server = nullptr;
+static bool export_mode_active = false;
+static unsigned long export_mode_started_at = 0;
+static const unsigned long EXPORT_MODE_MAX_MS = 600000UL;  // 10 min auto-exit
+static char export_ssid[33] = "";  // configured WiFi SSID (persisted)
+static char export_pass[65] = "";  // configured WiFi password (persisted)
+static char export_ip_str[20] = "0.0.0.0";
 
 int current_screen = 0;
 bool system_fully_booted = false;
@@ -872,6 +888,138 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
 }
 
 // ============================================================================
+// HTTP EXPORT SERVER
+// ============================================================================
+
+void export_server_setup_routes() {
+    if (!export_server) return;
+
+    // Index: simple HTML file list
+    export_server->on("/", HTTP_GET, []() {
+        String html = "<!DOCTYPE html><html><head><title>Flock Detector Export</title>"
+                      "<style>body{font-family:monospace;background:#0a1430;color:#dce8ff;padding:20px;}"
+                      "a{color:#00d7eb;text-decoration:none;display:block;padding:8px 0;}"
+                      "a:hover{color:#32ff64;}h1{color:#32ff64;}"
+                      ".meta{color:#6490b4;font-size:0.9em;}</style></head><body>";
+        html += "<h1>FLOCK DETECTOR EXPORT</h1>";
+        html += "<p class='meta'>" + String(VERSION_STRING) + "</p>";
+        html += "<hr><h2>Files</h2>";
+        if (sd_available) {
+            html += "<a href='/FlockLog.csv'>FlockLog.csv &nbsp; <span class='meta'>detections CSV</span></a>";
+            html += "<a href='/Threats.pcap'>Threats.pcap &nbsp; <span class='meta'>WiFi capture</span></a>";
+            html += "<a href='/BLE_Threats.pcap'>BLE_Threats.pcap &nbsp; <span class='meta'>BLE capture</span></a>";
+        } else {
+            html += "<p class='meta'>SD unavailable</p>";
+        }
+        html += "<hr><p class='meta'>Auto-exit in ";
+        unsigned long remaining = EXPORT_MODE_MAX_MS - (millis() - export_mode_started_at);
+        html += String(remaining / 60000UL) + "m " + String((remaining / 1000UL) % 60) + "s</p>";
+        html += "</body></html>";
+        export_server->send(200, "text/html", html);
+    });
+
+    auto serve_sd_file = [](const char* path, const char* mime) {
+        if (!sd_available) { export_server->send(503, "text/plain", "SD unavailable"); return; }
+        File f = SD.open(path, FILE_READ);
+        if (!f) { export_server->send(404, "text/plain", "Not found"); return; }
+        export_server->sendHeader("Content-Disposition",
+                                  String("attachment; filename=\"") + (path + 1) + "\"");
+        export_server->streamFile(f, mime);
+        f.close();
+    };
+
+    export_server->on("/FlockLog.csv", HTTP_GET, [serve_sd_file]() {
+        serve_sd_file("/FlockLog.csv", "text/csv");
+    });
+    export_server->on("/Threats.pcap", HTTP_GET, [serve_sd_file]() {
+        serve_sd_file("/Threats.pcap", "application/vnd.tcpdump.pcap");
+    });
+    export_server->on("/BLE_Threats.pcap", HTTP_GET, [serve_sd_file]() {
+        serve_sd_file("/BLE_Threats.pcap", "application/vnd.tcpdump.pcap");
+    });
+
+    export_server->onNotFound([]() {
+        export_server->send(404, "text/plain", "Not found");
+    });
+}
+
+bool export_mode_start() {
+    if (export_mode_active) return true;
+    if (strlen(export_ssid) == 0) {
+        strncpy(toast_text, "NO WIFI CONFIGURED", sizeof(toast_text) - 1);
+        toast_text[sizeof(toast_text) - 1] = '\0';
+        toast_accent_color = CAUTION_COLOR;
+        toast_start = millis();
+        toast_active = true;
+        return false;
+    }
+
+    // Shut down promiscuous sniffing before joining a network
+    esp_wifi_set_promiscuous(false);
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(export_ssid, export_pass);
+
+    unsigned long connect_start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - connect_start) < 15000) {
+        delay(100);
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        strncpy(toast_text, "WIFI CONNECT FAIL", sizeof(toast_text) - 1);
+        toast_text[sizeof(toast_text) - 1] = '\0';
+        toast_accent_color = CAUTION_COLOR;
+        toast_start = millis();
+        toast_active = true;
+        // Restore sniffing
+        WiFi.disconnect(true);
+        delay(100);
+        WiFi.mode(WIFI_STA);
+        esp_wifi_set_promiscuous(true);
+        return false;
+    }
+
+    IPAddress ip = WiFi.localIP();
+    snprintf(export_ip_str, sizeof(export_ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+
+    export_server = new WebServer(80);
+    export_server_setup_routes();
+    export_server->begin();
+
+    export_mode_active = true;
+    export_mode_started_at = millis();
+
+    snprintf(toast_text, sizeof(toast_text), "http://%s", export_ip_str);
+    toast_accent_color = ACCENT_COLOR;
+    toast_start = millis();
+    toast_active = true;
+    return true;
+}
+
+void export_mode_stop() {
+    if (!export_mode_active) return;
+    if (export_server) {
+        export_server->stop();
+        delete export_server;
+        export_server = nullptr;
+    }
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_filter(&(wifi_promiscuous_filter_t){WIFI_PROMIS_FILTER_MASK_MGMT});
+    esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+    export_mode_active = false;
+    strncpy(toast_text, "EXPORT MODE OFF", sizeof(toast_text) - 1);
+    toast_text[sizeof(toast_text) - 1] = '\0';
+    toast_accent_color = DIM_COLOR;
+    toast_start = millis();
+    toast_active = true;
+}
+
+// ============================================================================
 // PERSISTENCE & TRACKING
 // ============================================================================
 void save_detections_to_flash() {
@@ -999,8 +1147,9 @@ void save_session_to_flash() {
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
         File f = LittleFS.open(PERSIST_FILE, "w");
         if (!f) { delay(5); continue; }
-        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n",
-                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes);
+        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n",
+                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes,
+                                  export_ssid, export_pass);
         f.close();
         if (written > 10) write_ok = true;
     }
@@ -1043,6 +1192,16 @@ void load_session_from_flash() {
     line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt(); 
     line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
     line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
+    line = f.readStringUntil('\n');
+    if (line.length() > 0 && line.length() < sizeof(export_ssid)) {
+        strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
+        export_ssid[sizeof(export_ssid) - 1] = '\0';
+    }
+    line = f.readStringUntil('\n');
+    if (line.length() > 0 && line.length() < sizeof(export_pass)) {
+        strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
+        export_pass[sizeof(export_pass) - 1] = '\0';
+    }
     f.close();
 }
 
@@ -2236,6 +2395,17 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
     }
 
+    // Export mode indicator — orange "EXP" label when active
+    if (export_mode_active) {
+        uint16_t c = lgfx::color565(255, 140, 0);
+        spr.fillRoundRect(icon_right - 22, icon_y, 22, 10, 3, c);
+        spr.setTextColor(lgfx::color565(0, 0, 0), c);
+        spr.setTextSize(1);
+        spr.setCursor(icon_right - 19, icon_y + 2);
+        spr.print("EXP");
+        icon_right -= 26;
+    }
+
     // Rotation position dots — tight spacing, active is filled+larger, inactive is 2px line
     int title_len = (int)strlen(screen_names[screen_num]);
     int title_w = title_len * 7;
@@ -2437,6 +2607,7 @@ void draw_help_overlay() {
     spr.setCursor(130,  57); spr.print("TAB: Help");
     spr.setCursor(130,  68); spr.print("g: GPS page");
     spr.setCursor(130,  79); spr.print("ESC: Home");
+    spr.setCursor(130,  90); spr.print("e: Export HTTP");
 }
 
 void draw_locator_help_overlay() {
@@ -3824,11 +3995,21 @@ void setup() {
 
     if (!LittleFS.begin(true)) { littlefs_available = false; } 
     else { 
-        littlefs_available = true; 
+        littlefs_available = true;
         load_session_from_flash();
-        load_detections_from_flash(); 
+        load_detections_from_flash();
     }
-    
+
+    // First-boot WiFi credential initialization from #defines if flash is empty
+    if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
+        strncpy(export_ssid, EXPORT_WIFI_SSID, sizeof(export_ssid) - 1);
+        export_ssid[sizeof(export_ssid) - 1] = '\0';
+    }
+    if (strlen(export_pass) == 0 && strcmp(EXPORT_WIFI_PASS, "YOUR_PASSWORD_HERE") != 0) {
+        strncpy(export_pass, EXPORT_WIFI_PASS, sizeof(export_pass) - 1);
+        export_pass[sizeof(export_pass) - 1] = '\0';
+    }
+
     lifetime_boots++;
     save_session_to_flash();
 
@@ -3905,6 +4086,13 @@ void setup() {
 // ============================================================================
 void loop() {
     M5Cardputer.update(); yield();
+
+    if (export_mode_active) {
+        if (export_server) export_server->handleClient();
+        if ((millis() - export_mode_started_at) > EXPORT_MODE_MAX_MS) {
+            export_mode_stop();
+        }
+    }
 
     // Dynamically calculate expected hardware voltage sag for this loop iteration
     update_load_sag();
@@ -4151,6 +4339,17 @@ void loop() {
                 led_g = LED_COLORS[led_col_idx][1];
                 led_b = LED_COLORS[led_col_idx][2];
                 if (!led_breathing_on) { led_breathing_on = true; }
+            }
+            else if (c == 'e') {
+                if (!stealth_mode) {
+                    if (export_mode_active) {
+                        export_mode_stop();
+                    } else {
+                        export_mode_start();
+                    }
+                    draw_current_screen();
+                    spr.pushSprite(0, 0);
+                }
             }
             else if (c == '\n' || c == '\r') {
                 if (!stealth_mode) {
