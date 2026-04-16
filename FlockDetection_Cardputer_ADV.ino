@@ -4,6 +4,7 @@
 
 #include <M5Cardputer.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <NimBLEDevice.h>
 #include <NimBLEScan.h>
 #include <NimBLEAdvertisedDevice.h>
@@ -55,6 +56,8 @@ uint16_t ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
 uint16_t CAUTION_COLOR, GPS_COLOR;
 bool night_mode = false;
 bool show_help_overlay = false;
+static float help_ease = 0.0f;
+static unsigned long help_ease_start = 0;
 
 unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
@@ -93,14 +96,16 @@ void apply_color_palette() {
         BG_COLOR      = lgfx::color565(  8,   0,   0);
         CARD_COLOR    = lgfx::color565( 25,   0,   0);
         CARD_BORDER   = lgfx::color565( 60,   5,   5);
-        HEADER_COLOR  = lgfx::color565(255,  60,  60);
+        HEADER_COLOR  = lgfx::color565(255,  60,  60);  // bright red
         TEXT_COLOR    = lgfx::color565(220, 200, 200);
         DIM_COLOR     = lgfx::color565(150,  30,  30);
-        ACCENT_COLOR  = lgfx::color565(255,  90,  90);
-        TEAL_COLOR    = lgfx::color565(220,  60,  60);
-        PURPLE_COLOR  = lgfx::color565(255, 100, 255);
-        CAUTION_COLOR = lgfx::color565(255, 140,  20);
-        GPS_COLOR     = lgfx::color565( 80,  80, 220);
+        ACCENT_COLOR  = lgfx::color565(255,  90,  90);  // red (WiFi-neutral / UI)
+
+        // Category colors: distinct hues preserved, all low-blue for dark adaptation
+        CAUTION_COLOR = lgfx::color565(255, 140,  20);  // amber (WiFi / warnings)
+        TEAL_COLOR    = lgfx::color565(255,  70, 110);  // deep pink-red (Raven)
+        PURPLE_COLOR  = lgfx::color565(220,  60, 200);  // deep magenta (BLE)
+        GPS_COLOR     = lgfx::color565(180, 100,  40);  // dark amber-brown (GPS)
     } else {
         BG_COLOR      = lgfx::color565( 10,  20,  48);
         CARD_COLOR    = lgfx::color565( 18,  36,  80);
@@ -194,6 +199,12 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 // Version string — single source of truth
 #define VERSION_STRING "FLOCK DETECTOR v9.3 [ADV]"
 
+// Pre-configure WiFi credentials for export mode. User edits these in source
+// once, then they're saved to flash on first boot. To change later, edit
+// source and re-flash. This is a hobby/field-tool compromise.
+#define EXPORT_WIFI_SSID "YOUR_SSID_HERE"
+#define EXPORT_WIFI_PASS "YOUR_PASSWORD_HERE"
+
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
 #define NUM_SCREENS 5
 
@@ -231,6 +242,15 @@ static int flash_write_fail_count = 0;
 String current_log_file = "/FlockLog.csv";
 String current_pcap_file = "/Threats.pcap";
 String current_ble_pcap_file = "/BLE_Threats.pcap";
+
+// Export server state
+static WebServer* export_server = nullptr;
+static bool export_mode_active = false;
+static unsigned long export_mode_started_at = 0;
+static const unsigned long EXPORT_MODE_MAX_MS = 600000UL;  // 10 min auto-exit
+static char export_ssid[33] = "";  // configured WiFi SSID (persisted)
+static char export_pass[65] = "";  // configured WiFi password (persisted)
+static char export_ip_str[20] = "0.0.0.0";
 
 int current_screen = 0;
 bool system_fully_booted = false;
@@ -870,6 +890,138 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
 }
 
 // ============================================================================
+// HTTP EXPORT SERVER
+// ============================================================================
+
+void export_server_setup_routes() {
+    if (!export_server) return;
+
+    // Index: simple HTML file list
+    export_server->on("/", HTTP_GET, []() {
+        String html = "<!DOCTYPE html><html><head><title>Flock Detector Export</title>"
+                      "<style>body{font-family:monospace;background:#0a1430;color:#dce8ff;padding:20px;}"
+                      "a{color:#00d7eb;text-decoration:none;display:block;padding:8px 0;}"
+                      "a:hover{color:#32ff64;}h1{color:#32ff64;}"
+                      ".meta{color:#6490b4;font-size:0.9em;}</style></head><body>";
+        html += "<h1>FLOCK DETECTOR EXPORT</h1>";
+        html += "<p class='meta'>" + String(VERSION_STRING) + "</p>";
+        html += "<hr><h2>Files</h2>";
+        if (sd_available) {
+            html += "<a href='/FlockLog.csv'>FlockLog.csv &nbsp; <span class='meta'>detections CSV</span></a>";
+            html += "<a href='/Threats.pcap'>Threats.pcap &nbsp; <span class='meta'>WiFi capture</span></a>";
+            html += "<a href='/BLE_Threats.pcap'>BLE_Threats.pcap &nbsp; <span class='meta'>BLE capture</span></a>";
+        } else {
+            html += "<p class='meta'>SD unavailable</p>";
+        }
+        html += "<hr><p class='meta'>Auto-exit in ";
+        unsigned long remaining = EXPORT_MODE_MAX_MS - (millis() - export_mode_started_at);
+        html += String(remaining / 60000UL) + "m " + String((remaining / 1000UL) % 60) + "s</p>";
+        html += "</body></html>";
+        export_server->send(200, "text/html", html);
+    });
+
+    auto serve_sd_file = [](const char* path, const char* mime) {
+        if (!sd_available) { export_server->send(503, "text/plain", "SD unavailable"); return; }
+        File f = SD.open(path, FILE_READ);
+        if (!f) { export_server->send(404, "text/plain", "Not found"); return; }
+        export_server->sendHeader("Content-Disposition",
+                                  String("attachment; filename=\"") + (path + 1) + "\"");
+        export_server->streamFile(f, mime);
+        f.close();
+    };
+
+    export_server->on("/FlockLog.csv", HTTP_GET, [serve_sd_file]() {
+        serve_sd_file("/FlockLog.csv", "text/csv");
+    });
+    export_server->on("/Threats.pcap", HTTP_GET, [serve_sd_file]() {
+        serve_sd_file("/Threats.pcap", "application/vnd.tcpdump.pcap");
+    });
+    export_server->on("/BLE_Threats.pcap", HTTP_GET, [serve_sd_file]() {
+        serve_sd_file("/BLE_Threats.pcap", "application/vnd.tcpdump.pcap");
+    });
+
+    export_server->onNotFound([]() {
+        export_server->send(404, "text/plain", "Not found");
+    });
+}
+
+bool export_mode_start() {
+    if (export_mode_active) return true;
+    if (strlen(export_ssid) == 0) {
+        strncpy(toast_text, "NO WIFI CONFIGURED", sizeof(toast_text) - 1);
+        toast_text[sizeof(toast_text) - 1] = '\0';
+        toast_accent_color = CAUTION_COLOR;
+        toast_start = millis();
+        toast_active = true;
+        return false;
+    }
+
+    // Shut down promiscuous sniffing before joining a network
+    esp_wifi_set_promiscuous(false);
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(export_ssid, export_pass);
+
+    unsigned long connect_start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - connect_start) < 15000) {
+        delay(100);
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        strncpy(toast_text, "WIFI CONNECT FAIL", sizeof(toast_text) - 1);
+        toast_text[sizeof(toast_text) - 1] = '\0';
+        toast_accent_color = CAUTION_COLOR;
+        toast_start = millis();
+        toast_active = true;
+        // Restore sniffing
+        WiFi.disconnect(true);
+        delay(100);
+        WiFi.mode(WIFI_STA);
+        esp_wifi_set_promiscuous(true);
+        return false;
+    }
+
+    IPAddress ip = WiFi.localIP();
+    snprintf(export_ip_str, sizeof(export_ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+
+    export_server = new WebServer(80);
+    export_server_setup_routes();
+    export_server->begin();
+
+    export_mode_active = true;
+    export_mode_started_at = millis();
+
+    snprintf(toast_text, sizeof(toast_text), "http://%s", export_ip_str);
+    toast_accent_color = ACCENT_COLOR;
+    toast_start = millis();
+    toast_active = true;
+    return true;
+}
+
+void export_mode_stop() {
+    if (!export_mode_active) return;
+    if (export_server) {
+        export_server->stop();
+        delete export_server;
+        export_server = nullptr;
+    }
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_filter(&(wifi_promiscuous_filter_t){WIFI_PROMIS_FILTER_MASK_MGMT});
+    esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+    export_mode_active = false;
+    strncpy(toast_text, "EXPORT MODE OFF", sizeof(toast_text) - 1);
+    toast_text[sizeof(toast_text) - 1] = '\0';
+    toast_accent_color = DIM_COLOR;
+    toast_start = millis();
+    toast_active = true;
+}
+
+// ============================================================================
 // PERSISTENCE & TRACKING
 // ============================================================================
 void save_detections_to_flash() {
@@ -997,8 +1149,9 @@ void save_session_to_flash() {
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
         File f = LittleFS.open(PERSIST_FILE, "w");
         if (!f) { delay(5); continue; }
-        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n",
-                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes);
+        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n",
+                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes,
+                                  export_ssid, export_pass);
         f.close();
         if (written > 10) write_ok = true;
     }
@@ -1041,6 +1194,16 @@ void load_session_from_flash() {
     line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt(); 
     line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
     line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
+    line = f.readStringUntil('\n');
+    if (line.length() > 0 && line.length() < sizeof(export_ssid)) {
+        strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
+        export_ssid[sizeof(export_ssid) - 1] = '\0';
+    }
+    line = f.readStringUntil('\n');
+    if (line.length() > 0 && line.length() < sizeof(export_pass)) {
+        strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
+        export_pass[sizeof(export_pass) - 1] = '\0';
+    }
     f.close();
 }
 
@@ -2125,8 +2288,37 @@ void draw_header_spr(int screen_num) {
     ease_muted    += ((muted_now    ? 1.0f : 0.0f) - ease_muted)    * 0.12f;
     ease_scanning += ((scanning_now ? 1.0f : 0.0f) - ease_scanning) * 0.05f;
 
+    // Alarm cooldown state: fires during the 60s window after a detection alarm
+    bool cooldown_now;
+    unsigned long cooldown_elapsed = 0;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    cooldown_elapsed = millis() - last_buzzer_time;
+    cooldown_now = (last_buzzer_time > 0) && (cooldown_elapsed < BUZZER_COOLDOWN);
+    xSemaphoreGive(dataMutex);
+
+    static float ease_cooldown = 0.0f;
+    ease_cooldown += ((cooldown_now ? 1.0f : 0.0f) - ease_cooldown) * 0.08f;
+
     int icon_right = DISP_W - 32;
     int icon_y = 4;
+
+    // Detection counter FIRST — consumes space before status icons
+    long det_total;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    det_total = session_flock_wifi + session_flock_ble + session_raven;
+    xSemaphoreGive(dataMutex);
+
+    if (det_total > 0) {
+        char det_buf[16];
+        snprintf(det_buf, sizeof(det_buf), "D:%ld", det_total);
+        int det_w = (int)strlen(det_buf) * 6;
+        int det_x = icon_right - det_w - 4;
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(det_x, 6);
+        spr.print(det_buf);
+        icon_right = det_x - 6;  // icons continue left of counter
+    }
 
     auto lerp_icon = [&](float t) -> uint16_t {
         return lerp_col16(BG_COLOR, ICON_COL, t);
@@ -2144,6 +2336,22 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(ix + 3, icon_y + 6, ix + 6, icon_y + 8, c);
         spr.drawLine(ix + 6, icon_y + 2, ix + 6, icon_y + 8, c);
         spr.drawLine(ix + 0, icon_y + 1, ix + 8, icon_y + 9, c);
+        icon_right -= 14;
+    }
+
+    // Alarm cooldown icon — dim hourglass/bell when in cooldown window
+    if (should_draw(ease_cooldown) && cooldown_now) {
+        int ix = icon_right - 8;
+        // Pulse based on remaining cooldown time (faster pulse as time ends)
+        float progress = (float)cooldown_elapsed / (float)BUZZER_COOLDOWN;
+        float pulse_rate = 400.0f + progress * 1200.0f;  // pulse speeds up as cooldown ends
+        float pulse = (sinf((float)millis() / pulse_rate) + 1.0f) * 0.5f;
+        uint8_t intensity = (uint8_t)(120 + pulse * 80);
+        uint16_t c = lerp_col16(BG_COLOR, lgfx::color565(intensity, intensity, intensity), ease_cooldown);
+
+        // Small circle with slash — "alarm suppressed"
+        spr.drawCircle(ix + 4, icon_y + 5, 4, c);
+        spr.drawLine(ix + 1, icon_y + 2, ix + 7, icon_y + 8, c);
         icon_right -= 14;
     }
 
@@ -2187,6 +2395,17 @@ void draw_header_spr(int screen_num) {
         uint16_t c = lgfx::color565(180, 40, 40);
         spr.drawRect(ix + 1, icon_y + 1, 8, 9, c);
         spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
+    }
+
+    // Export mode indicator — orange "EXP" label when active
+    if (export_mode_active) {
+        uint16_t c = lgfx::color565(255, 140, 0);
+        spr.fillRoundRect(icon_right - 22, icon_y, 22, 10, 3, c);
+        spr.setTextColor(lgfx::color565(0, 0, 0), c);
+        spr.setTextSize(1);
+        spr.setCursor(icon_right - 19, icon_y + 2);
+        spr.print("EXP");
+        icon_right -= 26;
     }
 
     // Rotation position dots — tight spacing, active is filled+larger, inactive is 2px line
@@ -2368,28 +2587,144 @@ void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
 }
 
 void draw_help_overlay() {
-    spr.fillRoundRect(10, 15, DISP_W - 20, DISP_H - 30, 6, lgfx::color565(10, 15, 25));
-    spr.drawRoundRect(10, 15, DISP_W - 20, DISP_H - 30, 6, HEADER_COLOR);
-    spr.setTextColor(HEADER_COLOR); spr.setTextSize(1);
-    spr.setCursor(14, 20); spr.print("--- HOTKEYS ---");
-    spr.drawLine(10, 30, DISP_W - 10, 30, HEADER_COLOR);
+    // Ease the overlay in over 200ms
+    unsigned long elapsed = millis() - help_ease_start;
+    float target = 1.0f;
+    if (elapsed < 200) {
+        float t = (float)elapsed / 200.0f;
+        target = 1.0f - (1.0f - t) * (1.0f - t);  // quadratic ease-out
+    }
+    help_ease += (target - help_ease) * 0.25f;
+    if (help_ease > 1.0f) help_ease = 1.0f;
+    if (help_ease < 0.02f) return;
 
-    spr.setTextColor(TEXT_COLOR);
-    spr.setCursor(14,  35); spr.print("</> DEL : Prev/Next");
-    spr.setCursor(14,  46); spr.print("1-6     : Jump Screen");
-    spr.setCursor(14,  57); spr.print("0       : Go Locator");
-    spr.setCursor(14,  68); spr.print("m / q   : Mute Toggle");
-    spr.setCursor(14,  79); spr.print(";/.     : Vol Up/Down");
-    spr.setCursor(14,  90); spr.print("l       : Loc (2x=LED)");
-    spr.setCursor(14, 101); spr.print("t       : Cycle Target");
-    spr.setCursor(14, 112); spr.print("s / n   : Stealth/Night");
+    // Dimmed backdrop
+    for (int dy = 20; dy < DISP_H; dy += 2) {
+        uint16_t bg = lerp_col16(BG_COLOR, lgfx::color565(0, 0, 0), help_ease * 0.5f);
+        spr.drawFastHLine(0, dy, DISP_W, bg);
+    }
 
-    spr.setTextColor(DIM_COLOR);
-    spr.setCursor(130,  35); spr.print("x: WiFi sim");
-    spr.setCursor(130,  46); spr.print("x again: BLE");
-    spr.setCursor(130,  57); spr.print("TAB: Help");
-    spr.setCursor(130,  68); spr.print("g: GPS page");
-    spr.setCursor(130,  79); spr.print("ESC: Home");
+    // Panel geometry — eased from centerpoint outward
+    int full_w = DISP_W - 20;
+    int full_h = DISP_H - 30;
+    int panel_w = (int)(full_w * help_ease);
+    int panel_h = (int)(full_h * help_ease);
+    int panel_x = (DISP_W - panel_w) / 2;
+    int panel_y = 20 + (full_h - panel_h) / 2;
+
+    uint16_t panel_bg = lerp_col16(BG_COLOR, CARD_COLOR, help_ease);
+    uint16_t panel_border = lerp_col16(BG_COLOR, HEADER_COLOR, help_ease);
+    spr.fillRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_bg);
+    spr.drawRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_border);
+
+    if (help_ease < 0.7f) return;  // wait for panel to mostly open before drawing text
+
+    // Per-screen content
+    struct HelpKey { const char* key; const char* desc; };
+    const HelpKey* keys;
+    int key_count;
+    const char* title;
+
+    // Common keys shown on all screens
+    static const HelpKey global_keys[] = {
+        {"</>", "Prev/Next screen"},
+        {"1-5", "Jump to screen"},
+        {"ESC", "Home (Scanner)"},
+        {"TAB", "Close help"},
+        {"m/q", "Mute toggle"},
+        {";/.", "Vol / scroll"},
+        {"n",   "Night mode"},
+        {"s",   "Stealth mode"},
+        {"b",   "Brightness"},
+        {"c",   "LED color"},
+        {"e",   "Export mode"},
+        {"o",   "Reset session"},
+    };
+
+    // Per-screen key sets
+    static const HelpKey scanner_keys[] = {
+        {"x", "Simulate detection"},
+        {"t", "Locate last target"},
+    };
+    static const HelpKey locator_keys[] = {
+        {"l",  "Start/stop (2x=LED)"},
+        {"t",  "Cycle target"},
+        {"g",  "Toggle N-mode"},
+    };
+    static const HelpKey detections_keys[] = {
+        {";/.", "Navigate list"},
+        {"ENT", "Open detail"},
+        {"DEL", "Close detail"},
+    };
+    static const HelpKey gps_keys[] = {
+        {"(info display only)", ""},
+    };
+    static const HelpKey devinfo_keys[] = {
+        {";/.", "Scroll content"},
+    };
+
+    switch (current_screen) {
+        case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys) / sizeof(scanner_keys[0]);       title = "SCANNER KEYS"; break;
+        case 1: keys = locator_keys;    key_count = sizeof(locator_keys) / sizeof(locator_keys[0]);       title = "LOCATOR KEYS"; break;
+        case 2: keys = detections_keys; key_count = sizeof(detections_keys) / sizeof(detections_keys[0]); title = "DETECTIONS KEYS"; break;
+        case 3: keys = gps_keys;        key_count = sizeof(gps_keys) / sizeof(gps_keys[0]);               title = "GPS SCREEN"; break;
+        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys) / sizeof(devinfo_keys[0]);       title = "DEVICE INFO KEYS"; break;
+        default: keys = scanner_keys; key_count = 0; title = "HELP"; break;
+    }
+
+    spr.setTextSize(1);
+
+    // Title
+    spr.setTextColor(HEADER_COLOR, panel_bg);
+    spr.setCursor(panel_x + 8, panel_y + 6);
+    kprint(spr, title);
+
+    // Underline
+    spr.drawFastHLine(panel_x + 6, panel_y + 17, panel_w - 12, CARD_BORDER);
+
+    // Left column: screen-specific keys
+    int col_left_x  = panel_x + 8;
+    int col_right_x = panel_x + panel_w / 2 + 4;
+    int row_y = panel_y + 22;
+    const int ROW_H = 11;
+
+    spr.setTextColor(ACCENT_COLOR, panel_bg);
+    spr.setCursor(col_left_x, row_y);
+    kprint(spr, "SCREEN");
+    row_y += ROW_H;
+
+    for (int i = 0; i < key_count && row_y < panel_y + panel_h - 10; i++) {
+        spr.setTextColor(HEADER_COLOR, panel_bg);
+        spr.setCursor(col_left_x, row_y);
+        spr.print(keys[i].key);
+        spr.setTextColor(TEXT_COLOR, panel_bg);
+        spr.setCursor(col_left_x + 30, row_y);
+        spr.print(keys[i].desc);
+        row_y += ROW_H;
+    }
+
+    // Right column: global keys
+    row_y = panel_y + 22;
+    spr.setTextColor(ACCENT_COLOR, panel_bg);
+    spr.setCursor(col_right_x, row_y);
+    kprint(spr, "GLOBAL");
+    row_y += ROW_H;
+
+    int global_count = sizeof(global_keys) / sizeof(global_keys[0]);
+    for (int i = 0; i < global_count && row_y < panel_y + panel_h - 10; i++) {
+        spr.setTextColor(HEADER_COLOR, panel_bg);
+        spr.setCursor(col_right_x, row_y);
+        spr.print(global_keys[i].key);
+        spr.setTextColor(TEXT_COLOR, panel_bg);
+        spr.setCursor(col_right_x + 28, row_y);
+        spr.print(global_keys[i].desc);
+        row_y += ROW_H;
+    }
+
+    // Footer
+    spr.setTextColor(DIM_COLOR, panel_bg);
+    spr.setCursor(panel_x + 8, panel_y + panel_h - 10);
+    spr.print("TAB to close");
 }
 
 void draw_locator_help_overlay() {
@@ -2549,26 +2884,41 @@ void draw_scanner_screen() {
             if (noise_life[i] < 0) noise_life[i] = 0;
 
             float fade = (float)noise_life[i] / (float)noise_max_life[i];
-            int intensity = (int)(fade * 320.0f * noise_dimming);
-            if (intensity > 255) intensity = 255;
-            if (intensity < 12) continue;
+            int intensity = (int)(fade * 180.0f * noise_dimming);
+            if (intensity > 200) intensity = 200;
+            if (intensity < 20) continue;
+
+            // Sweep-tied brightness: particle brightens dramatically when sweep line
+            // passes over its angle, dims otherwise. Makes the sweep feel like it's
+            // "illuminating" the ambient RF environment.
+            float pa = fmodf(noise_a[i], TWO_PIf);
+            float diff_sweep = sweep_norm - pa;
+            if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
+            if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
+            float sweep_proximity = 1.0f - fminf(1.0f, fabsf(diff_sweep) / 0.5f);  // 1 at sweep, 0 at >0.5 rad away
+            int sweep_boost = (int)(sweep_proximity * 80);
+            int total_intensity = intensity + sweep_boost;
+            if (total_intensity > 255) total_intensity = 255;
 
             int px = rcx + (int)(noise_r[i] * cosf(noise_a[i]));
             int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
 
-            // Flat horizontal dash matching radar perspective
+            // Color based on intensity — cyan-green family for day, red-orange for night
             uint16_t p_col = night_mode
-                ? lgfx::color565(intensity, intensity / 6, 0)
-                : lgfx::color565(0, intensity * 2 / 3, intensity);
+                ? lgfx::color565(total_intensity, total_intensity / 5, 0)
+                : lgfx::color565(0, total_intensity * 2 / 3, total_intensity);
 
-            spr.drawLine(px - 1, py, px + 1, py, p_col);
+            // Draw small upward triangle (matches detection triangle vocabulary but smaller)
+            // Size 3: base 3px, height 3px
+            spr.drawTriangle(px - 1, py + 1,
+                             px + 1, py + 1,
+                             px,     py - 2,
+                             p_col);
 
-            if (intensity > 90) {
-                uint16_t glow = night_mode
-                    ? lgfx::color565(intensity / 2, 0, 0)
-                    : lgfx::color565(0, intensity / 3, intensity * 2 / 3);
-                spr.drawPixel(px - 2, py, glow);
-                spr.drawPixel(px + 2, py, glow);
+            // Extra bright near sweep: fill the triangle for emphasis
+            if (sweep_proximity > 0.5f) {
+                spr.drawPixel(px, py - 1, p_col);
+                spr.drawPixel(px, py, p_col);
             }
         }
     }
@@ -2886,8 +3236,12 @@ void draw_locator_screen() {
     const int by0 = 95;        // near bottom of left panel
     const int bx0 = cx - 22;  // = 34, centers 3 boxes under cx
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(bx0, by0 - 10); kprint(spr, "SAMPLES");
+    char samp_label[16];
+    snprintf(samp_label, sizeof(samp_label), "SAMPLES %d/%d", sc, LOC_MIN_SAMPLES_EST);
+    spr.setTextColor(sc >= LOC_MIN_SAMPLES_EST ? ACCENT_COLOR : DIM_COLOR, BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(bx0, by0 - 10);
+    kprint(spr, samp_label);
 
     for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
         int bxi = bx0 + di * 17;
@@ -3097,6 +3451,16 @@ void draw_capture_history_screen() {
             spr.drawRect(0, y, DISP_W, 27, HEADER_COLOR);
         }
 
+        if (selected) {
+            // "Has detail" chevron in right gutter
+            int chevron_x = DISP_W - 8;
+            int chevron_y_mid = y + 14;
+            spr.drawLine(chevron_x,     chevron_y_mid - 3, chevron_x + 3, chevron_y_mid,     HEADER_COLOR);
+            spr.drawLine(chevron_x + 3, chevron_y_mid,     chevron_x,     chevron_y_mid + 3, HEADER_COLOR);
+            spr.drawLine(chevron_x - 1, chevron_y_mid - 3, chevron_x + 2, chevron_y_mid,     HEADER_COLOR);  // 2px thick
+            spr.drawLine(chevron_x + 2, chevron_y_mid,     chevron_x - 1, chevron_y_mid + 3, HEADER_COLOR);
+        }
+
         int content_x = selected ? 14 : 10;
 
         // Protocol label in proto_col
@@ -3118,7 +3482,8 @@ void draw_capture_history_screen() {
         const char* ts_src = use_sd ? sd_hist[i].timestamp : "";
         if (ts_src[0]) {
             spr.setTextColor(DIM_COLOR, row_bg);
-            spr.setCursor(DISP_W - 52, y + 4); spr.print(ts_src);
+            int ts_x = selected ? DISP_W - 62 : DISP_W - 52;
+            spr.setCursor(ts_x, y + 4); spr.print(ts_src);
         }
 
         // Second line: MAC + method for selected; stats otherwise
@@ -3747,11 +4112,21 @@ void setup() {
 
     if (!LittleFS.begin(true)) { littlefs_available = false; } 
     else { 
-        littlefs_available = true; 
+        littlefs_available = true;
         load_session_from_flash();
-        load_detections_from_flash(); 
+        load_detections_from_flash();
     }
-    
+
+    // First-boot WiFi credential initialization from #defines if flash is empty
+    if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
+        strncpy(export_ssid, EXPORT_WIFI_SSID, sizeof(export_ssid) - 1);
+        export_ssid[sizeof(export_ssid) - 1] = '\0';
+    }
+    if (strlen(export_pass) == 0 && strcmp(EXPORT_WIFI_PASS, "YOUR_PASSWORD_HERE") != 0) {
+        strncpy(export_pass, EXPORT_WIFI_PASS, sizeof(export_pass) - 1);
+        export_pass[sizeof(export_pass) - 1] = '\0';
+    }
+
     lifetime_boots++;
     save_session_to_flash();
 
@@ -3829,6 +4204,13 @@ void setup() {
 void loop() {
     M5Cardputer.update(); yield();
 
+    if (export_mode_active) {
+        if (export_server) export_server->handleClient();
+        if ((millis() - export_mode_started_at) > EXPORT_MODE_MAX_MS) {
+            export_mode_stop();
+        }
+    }
+
     // Dynamically calculate expected hardware voltage sag for this loop iteration
     update_load_sag();
 
@@ -3882,9 +4264,13 @@ void loop() {
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         
-        if (status.tab && !stealth_mode) { 
-            show_help_overlay = !show_help_overlay; 
-            draw_current_screen(); spr.pushSprite(0,0); 
+        if (status.tab && !stealth_mode) {
+            show_help_overlay = !show_help_overlay;
+            if (show_help_overlay) {
+                help_ease = 0.0f;
+                help_ease_start = millis();
+            }
+            draw_current_screen(); spr.pushSprite(0,0);
         }
 
         for (auto c : status.word) {
@@ -4074,6 +4460,17 @@ void loop() {
                 led_g = LED_COLORS[led_col_idx][1];
                 led_b = LED_COLORS[led_col_idx][2];
                 if (!led_breathing_on) { led_breathing_on = true; }
+            }
+            else if (c == 'e') {
+                if (!stealth_mode) {
+                    if (export_mode_active) {
+                        export_mode_stop();
+                    } else {
+                        export_mode_start();
+                    }
+                    draw_current_screen();
+                    spr.pushSprite(0, 0);
+                }
             }
             else if (c == '\n' || c == '\r') {
                 if (!stealth_mode) {
