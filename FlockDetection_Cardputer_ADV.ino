@@ -465,13 +465,43 @@ void chargeLedTask(void* pvParameters) {
 static float ema_voltage = 0.0f;
 const float EMA_ALPHA = 0.05f;
 
+// Load-Aware Telemetry Variables
+static int32_t current_load_sag_mv = 0;
+const int32_t SAG_WIFI_PROMISC = 45; // Estimated mV drop for continuous Wi-Fi Rx
+const int32_t SAG_BLE_SCAN = 35;     // Estimated mV drop for active BLE scanning
+const int32_t SAG_SPEAKER = 80;      // Estimated mV drop during active PCM audio playback
+
 int32_t get_filtered_voltage() {
-    int32_t raw_mv = M5Cardputer.Power.getBatteryVoltage();
+    // Inject anticipated peripheral voltage sag before applying the EMA filter
+    int32_t raw_mv = M5Cardputer.Power.getBatteryVoltage() + current_load_sag_mv;
     if (ema_voltage == 0.0f) {
         ema_voltage = (float)raw_mv;
     }
     ema_voltage = (EMA_ALPHA * raw_mv) + ((1.0f - EMA_ALPHA) * ema_voltage);
     return (int32_t)ema_voltage;
+}
+
+void update_load_sag() {
+    int32_t total_sag = 0;
+
+    // 1. Wi-Fi Promiscuous Mode
+    // In this app, Wi-Fi is continuously monitoring packets, so we apply the baseline sag permanently.
+    total_sag += SAG_WIFI_PROMISC;
+
+    // 2. BLE Scanning
+    // BLE is cycled on and off by the ScannerLoopTask. Only add sag if it is actively scanning.
+    if (pBLEScan != nullptr && pBLEScan->isScanning()) {
+        total_sag += SAG_BLE_SCAN;
+    }
+
+    // 3. Audio / Alarms
+    // Check the global boolean to see if the speaker is currently being driven
+    if (is_alarming) {
+        total_sag += SAG_SPEAKER;
+    }
+
+    // Update global state for the battery thread
+    current_load_sag_mv = total_sag;
 }
 
 int get_unified_battery_pct(int32_t mv) {
@@ -3201,6 +3231,10 @@ void setup() {
 // ============================================================================
 void loop() {
     M5Cardputer.update(); yield();
+
+    // Dynamically calculate expected hardware voltage sag for this loop iteration
+    update_load_sag();
+
     int32_t loop_mv = get_filtered_voltage();
 
     process_wifi_event_queue();
