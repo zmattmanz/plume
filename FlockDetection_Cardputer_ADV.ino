@@ -1010,7 +1010,8 @@ void export_mode_stop() {
     delay(100);
     WiFi.mode(WIFI_STA);
     esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_filter(&(wifi_promiscuous_filter_t){WIFI_PROMIS_FILTER_MASK_MGMT});
+    wifi_promiscuous_filter_t pf = {WIFI_PROMIS_FILTER_MASK_MGMT};
+    esp_wifi_set_promiscuous_filter(&pf);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
     export_mode_active = false;
