@@ -530,19 +530,36 @@ int get_unified_battery_pct(int32_t mv) {
 }
 
 bool is_device_charging(int32_t current_mv) {
-    if (current_mv > 4350) return true;
+    if (current_mv > 4300) return true; // USB power rail detected
 
     static bool chg_state = false;
     static int32_t baseline_mv = 0;
     static unsigned long last_check = 0;
 
-    if (baseline_mv == 0) baseline_mv = current_mv;
-    if (current_mv > 4150) { chg_state = true; baseline_mv = current_mv; return true; }
+    if (baseline_mv == 0) { baseline_mv = current_mv; last_check = millis(); }
 
-    if (millis() - last_check > 2500) {
-        if (current_mv - baseline_mv >= 15) { chg_state = true; baseline_mv = current_mv; }
-        else if (baseline_mv - current_mv >= 15) { chg_state = false; baseline_mv = current_mv; }
-        else { baseline_mv = (baseline_mv + current_mv) / 2; }
+    // If voltage hits absolute top-end Li-Po charging limits, we are definitely charging
+    if (current_mv >= 4150) { chg_state = true; baseline_mv = current_mv; return true; }
+
+    // Evaluate every 4 seconds to ignore short spikes from EMA and load injection
+    if (millis() - last_check > 4000) {
+        int32_t delta = current_mv - baseline_mv;
+
+        // To be charging, voltage must strictly rise.
+        if (delta >= 10) {
+            chg_state = true;
+            baseline_mv = current_mv;
+        }
+        // To stop charging, voltage must strictly fall significantly (overcoming sag).
+        else if (delta <= -18) {
+            chg_state = false;
+            baseline_mv = current_mv;
+        }
+        // If delta is between -17 and +9, do nothing. It's stable.
+        // Slowly walk the baseline toward current_mv to prevent drifting apart
+        else {
+            baseline_mv = (baseline_mv + current_mv) / 2;
+        }
 
         last_check = millis();
     }
@@ -3170,7 +3187,9 @@ void setup() {
         delay(15);
     }
     int32_t end_v = get_filtered_voltage();
-    if (end_v > 3900 || (end_v - start_v >= 15)) dedicated_charging_loop();
+
+    // Only launch the dedicated charging UI if the battery is physically bypassed (USB ON, Switch OFF)
+    if (end_v > 4300) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
     setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex(); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
@@ -3482,15 +3501,9 @@ void loop() {
         xSemaphoreGive(dataMutex);
     }
 
-if (!stealth_mode) {
+    if (!stealth_mode) {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
-        static bool was_charging = false;
-        bool now_charging = is_device_charging(loop_mv);
-        if (now_charging != was_charging) {
-            led_breathing_on = now_charging;
-            was_charging = now_charging;
-        }
-        
+
         if (current_screen == 0 || current_screen == 1 || current_screen == 2 || current_screen == 4 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
             if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; } 
         } 
