@@ -460,65 +460,60 @@ void chargeLedTask(void* pvParameters) {
 }
 
 // ============================================================================
-// BATTERY ENGINE
+// BATTERY ENGINE (OPTIMIZED)
 // ============================================================================
-#define BATTERY_SAMPLE_SIZE 15
-int16_t battery_buffer[BATTERY_SAMPLE_SIZE] = {0};
-uint8_t battery_index = 0;
+static float ema_voltage = 0.0f;
+const float EMA_ALPHA = 0.05f;
 
-void update_battery_metrics() {
-    battery_buffer[battery_index] = M5Cardputer.Power.getBatteryVoltage();
-    battery_index = (battery_index + 1) % BATTERY_SAMPLE_SIZE;
-}
-
-static int32_t cached_median_mv = 0;
-static uint8_t last_median_battery_index = 255; 
-
-int32_t get_median_voltage() {
-    if (battery_index == last_median_battery_index && cached_median_mv != 0) {
-        return cached_median_mv;
+int32_t get_filtered_voltage() {
+    int32_t raw_mv = M5Cardputer.Power.getBatteryVoltage();
+    if (ema_voltage == 0.0f) {
+        ema_voltage = (float)raw_mv;
     }
-    int16_t sorted[BATTERY_SAMPLE_SIZE];
-    memcpy(sorted, battery_buffer, sizeof(battery_buffer));
-    std::sort(sorted, sorted + BATTERY_SAMPLE_SIZE);
-    cached_median_mv = (sorted[BATTERY_SAMPLE_SIZE / 2] == 0)
-        ? M5Cardputer.Power.getBatteryVoltage()
-        : (int32_t)sorted[BATTERY_SAMPLE_SIZE / 2];
-    last_median_battery_index = battery_index;
-    return cached_median_mv;
+    ema_voltage = (EMA_ALPHA * raw_mv) + ((1.0f - EMA_ALPHA) * ema_voltage);
+    return (int32_t)ema_voltage;
 }
 
-uint8_t get_unified_battery_pct(int16_t mv) {
-    const int16_t VOLT_MAX     = 4200;  // 100% — fully charged LiPo
-    const int16_t VOLT_HIGH    = 4000;  // ~80%
-    const int16_t VOLT_NOMINAL = 3700;  // ~50% — nominal voltage
-    const int16_t VOLT_LOW     = 3400;  // ~20%
-    const int16_t VOLT_MIN     = 3000;  // 0%  — cutoff
+int get_unified_battery_pct(int32_t mv) {
+    if (mv > 4350) return 255;
 
-    if (mv >= VOLT_MAX) return 100;
-    if (mv <= VOLT_MIN) return 0;
-    if (mv > VOLT_HIGH) return map(mv, VOLT_HIGH, VOLT_MAX, 80, 100);
-    else if (mv > VOLT_NOMINAL) return map(mv, VOLT_NOMINAL, VOLT_HIGH, 50, 80);
-    else if (mv > VOLT_LOW) return map(mv, VOLT_LOW, VOLT_NOMINAL, 20, 50);
-    else return map(mv, VOLT_MIN, VOLT_LOW, 0, 20);
+    const int32_t ocv_table[13][2] = {
+        {4200, 100}, {4150, 95}, {4110, 90}, {4020, 80}, {3930, 70},
+        {3870, 60}, {3820, 50}, {3790, 40}, {3750, 30}, {3700, 20},
+        {3600, 10}, {3450, 5},  {3000, 0}
+    };
+
+    if (mv >= 4200) return 100;
+    if (mv <= 3000) return 0;
+
+    for (int i = 0; i < 12; i++) {
+        if (mv <= ocv_table[i][0] && mv >= ocv_table[i+1][0]) {
+            int32_t v_upper = ocv_table[i][0];
+            int32_t v_lower = ocv_table[i+1][0];
+            int32_t p_upper = ocv_table[i][1];
+            int32_t p_lower = ocv_table[i+1][1];
+
+            return p_lower + ((mv - v_lower) * (p_upper - p_lower)) / (v_upper - v_lower);
+        }
+    }
+    return 0;
 }
 
 bool is_device_charging(int32_t current_mv) {
+    if (current_mv > 4350) return true;
+
     static bool chg_state = false;
     static int32_t baseline_mv = 0;
     static unsigned long last_check = 0;
-    
+
     if (baseline_mv == 0) baseline_mv = current_mv;
-    if (current_mv > 3900) { chg_state = true; baseline_mv = current_mv; }
-    
+    if (current_mv > 4150) { chg_state = true; baseline_mv = current_mv; return true; }
+
     if (millis() - last_check > 2500) {
         if (current_mv - baseline_mv >= 15) { chg_state = true; baseline_mv = current_mv; }
         else if (baseline_mv - current_mv >= 15) { chg_state = false; baseline_mv = current_mv; }
         else { baseline_mv = (baseline_mv + current_mv) / 2; }
-        
-        if (current_mv < 3800 && !chg_state && (baseline_mv - current_mv > 0)) chg_state = false; 
-        if (current_mv > 3900) chg_state = true;
-        
+
         last_check = millis();
     }
     return chg_state;
@@ -536,8 +531,7 @@ void dedicated_charging_loop() {
     
     while (true) {
         M5Cardputer.update();
-        update_battery_metrics(); 
-        int32_t current_mv = get_median_voltage();
+        int32_t current_mv = get_filtered_voltage();
         int calc_pct = get_unified_battery_pct(current_mv);
         
         if (display_pct == -1) display_pct = calc_pct;
@@ -1765,16 +1759,27 @@ void draw_header_spr(int screen_num) {
     };
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
-    int32_t med_mv = get_median_voltage(); int raw_bat = get_unified_battery_pct(med_mv); bool chg = is_device_charging(med_mv);
+    int32_t med_mv = get_filtered_voltage();
+    int raw_bat = get_unified_battery_pct(med_mv);
+    bool chg = is_device_charging(med_mv);
+
     static int display_bat = -1;
-    if (display_bat == -1) display_bat = raw_bat;
-    if (abs(raw_bat - display_bat) >= 2 || raw_bat == 100 || raw_bat == 0) display_bat = raw_bat; 
+
+    if (display_bat == -1 || raw_bat == 255) {
+        display_bat = raw_bat;
+    } else if (chg) {
+        if (raw_bat > display_bat) display_bat = raw_bat;
+    } else {
+        if (raw_bat < display_bat) display_bat = raw_bat;
+    }
+
+    int render_bat = (display_bat == 255) ? 100 : display_bat;
 
     spr.fillRect(0, 0, DISP_W, 18, BG_COLOR);
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
 
-    uint16_t bcol = chg ? ACCENT_COLOR : (display_bat > 50 ? ACCENT_COLOR : (display_bat > 20 ? CAUTION_COLOR : CAUTION_COLOR));
+    uint16_t bcol = chg ? ACCENT_COLOR : (render_bat > 50 ? ACCENT_COLOR : (render_bat > 20 ? CAUTION_COLOR : CAUTION_COLOR));
 
     if (is_muted) {
         spr.setTextColor(CAUTION_COLOR, BG_COLOR);
@@ -1787,10 +1792,10 @@ void draw_header_spr(int screen_num) {
     if (chg) {
         // Charging animation: fill sweeps from current level up to 100%, cycling every 1.5s
         float cphase = fmodf((float)millis() / 1500.0f, 1.0f);
-        int anim_pct = display_bat + (int)((100 - display_bat) * cphase);
+        int anim_pct = render_bat + (int)((100 - render_bat) * cphase);
         bfill = (anim_pct * 22) / 100;
     } else {
-        bfill = (display_bat * 22) / 100;
+        bfill = (render_bat * 22) / 100;
     }
     if (bfill > 0) spr.fillRoundRect(DISP_W - 25, 5, bfill, 8, 2, bcol);
 
@@ -3114,16 +3119,14 @@ void setup() {
     apply_color_palette();
 
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
-    int16_t init_v = M5Cardputer.Power.getBatteryVoltage();
-    for(int i = 0; i < BATTERY_SAMPLE_SIZE; i++) battery_buffer[i] = init_v;
     WiFi.mode(WIFI_STA); delay(50);
 
     spr.setColorDepth(16);
     spr.createSprite(DISP_W, DISP_H);
     
-    int32_t start_v = get_median_voltage(); unsigned long trap_start = millis();
-    while (millis() - trap_start < 800) { M5Cardputer.update(); update_battery_metrics(); delay(15); }
-    int32_t end_v = get_median_voltage();
+    int32_t start_v = get_filtered_voltage(); unsigned long trap_start = millis();
+    while (millis() - trap_start < 800) { M5Cardputer.update(); delay(15); }
+    int32_t end_v = get_filtered_voltage();
     if (end_v > 3900 || (end_v - start_v >= 15)) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
@@ -3197,8 +3200,8 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-    M5Cardputer.update(); yield(); update_battery_metrics();
-    int32_t loop_mv = get_median_voltage();
+    M5Cardputer.update(); yield();
+    int32_t loop_mv = get_filtered_voltage();
 
     process_wifi_event_queue();
 
