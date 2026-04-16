@@ -1010,7 +1010,12 @@ void export_mode_stop() {
     delay(100);
     WiFi.mode(WIFI_STA);
     esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_filter(&(wifi_promiscuous_filter_t){WIFI_PROMIS_FILTER_MASK_MGMT});
+    
+    // Create a named variable so it has a valid memory address
+    wifi_promiscuous_filter_t filter; 
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
+    
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
     export_mode_active = false;
@@ -1142,8 +1147,26 @@ void save_session_to_flash() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
-    l_writes = lifetime_flash_writes + 1;
+    l_writes = lifetime_flash_writes; // Don't increment just yet!
     xSemaphoreGive(dataMutex);
+
+    // --- NEW WEAR-LEVELING LOGIC ---
+    static long last_saved_wifi = -1;
+    static long last_saved_ble = -1;
+    static int  last_saved_vol = -1;
+    static long last_saved_sec = 0;
+
+    bool meaningful_change = (l_wifi != last_saved_wifi || l_ble != last_saved_ble || l_vol != last_saved_vol);
+    bool time_change = (l_sec - last_saved_sec) >= 900; // 900 seconds = 15 minutes of unsaved uptime
+
+    // If nothing important changed, and it hasn't been 15 minutes, abort the save to protect the flash.
+    if (!meaningful_change && !time_change && last_saved_wifi != -1) {
+        return; 
+    }
+    
+    // We are proceeding with a save, so officially increment the write counter
+    l_writes++;
+    // -------------------------------
 
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
@@ -1157,6 +1180,13 @@ void save_session_to_flash() {
     }
 
     if (write_ok) {
+        // --- UPDATE CACHE ---
+        last_saved_wifi = l_wifi;
+        last_saved_ble = l_ble;
+        last_saved_vol = l_vol;
+        last_saved_sec = l_sec;
+        // --------------------
+
         flash_write_fail_count = 0;
         last_persist_save = millis();
         save_detections_to_flash();
