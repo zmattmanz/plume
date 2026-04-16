@@ -355,10 +355,20 @@ static int device_info_scroll = 0;
 static const int DEVICE_INFO_CONTENT_HEIGHT = 260;
 volatile bool sd_hist_dirty = false;
 
-char toast_text[32]       = "";
-unsigned long toast_start = 0;
-bool toast_active         = false;
-uint16_t toast_accent_color = 0;
+#define TOAST_QUEUE_SIZE 3
+struct ToastEntry {
+    char text[32];
+    uint16_t accent;
+};
+static ToastEntry toast_queue[TOAST_QUEUE_SIZE];
+static int toast_queue_head = 0;
+static int toast_queue_count = 0;
+static unsigned long toast_start = 0;
+static bool toast_active = false;
+
+// Compatibility shims for direct-write sites (battery warnings, flash errors)
+static char toast_text[32] = "";
+static uint16_t toast_accent_color = 0;
 
 unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
@@ -1223,16 +1233,37 @@ void flush_sd_buffer() {
 }
 
 void trigger_toast(const char* type, const char* name, int confidence) {
-    if      (strncmp(type, "RAVEN",     5) == 0) toast_accent_color = TEAL_COLOR;
-    else if (strcmp (type, "FLOCK_BLE") == 0)    toast_accent_color = PURPLE_COLOR;
-    else if (strcmp (type, "TARGET")    == 0)    toast_accent_color = HEADER_COLOR;
-    else                                          toast_accent_color = CAUTION_COLOR;
+    uint16_t accent;
+    if      (strncmp(type, "RAVEN",     5) == 0) accent = TEAL_COLOR;
+    else if (strcmp (type, "FLOCK_BLE") == 0)    accent = PURPLE_COLOR;
+    else if (strcmp (type, "TARGET")    == 0)    accent = HEADER_COLOR;
+    else                                          accent = CAUTION_COLOR;
+
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
+    char full_text[32];
     char pct_str[6];
     snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
-    snprintf(toast_text, sizeof(toast_text), "%.14s%s", src, pct_str);
-    toast_start = millis();
-    toast_active = true;
+    snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
+
+    // Enqueue; if full, drop oldest to make room
+    if (toast_queue_count >= TOAST_QUEUE_SIZE) {
+        toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
+        toast_queue_count--;
+    }
+    int slot = (toast_queue_head + toast_queue_count) % TOAST_QUEUE_SIZE;
+    strncpy(toast_queue[slot].text, full_text, sizeof(toast_queue[slot].text) - 1);
+    toast_queue[slot].text[sizeof(toast_queue[slot].text) - 1] = '\0';
+    toast_queue[slot].accent = accent;
+    toast_queue_count++;
+
+    // If nothing currently showing, activate immediately
+    if (!toast_active) {
+        strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
+        toast_text[sizeof(toast_text) - 1] = '\0';
+        toast_accent_color = toast_queue[toast_queue_head].accent;
+        toast_start = millis();
+        toast_active = true;
+    }
 }
 
 void add_to_capture_history(const char* type, const char* mac, const char* name, int rssi, int confidence) {
@@ -2158,22 +2189,19 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
     }
 
-    // Screen position dots — 5 dots between title and icons
-    {
-        // Place dots centered in the space between title text end and icon area start
-        // Title ends roughly at 4 + len*7 pixels; icons start at icon_right
-        // We place dots in a fixed region, evenly spaced
-        const int DOT_REGION_LEFT  = 90;   // after title
-        const int DOT_REGION_RIGHT = icon_right - 4;
-        int dot_spacing = (DOT_REGION_RIGHT - DOT_REGION_LEFT) / NUM_SCREENS;
-        int dot_y = 10;  // vertically centered in 20px header
-        for (int di = 0; di < NUM_SCREENS; di++) {
-            int dot_x = DOT_REGION_LEFT + dot_spacing / 2 + di * dot_spacing;
-            if (di == screen_num) {
-                spr.fillCircle(dot_x, dot_y, 2, HEADER_COLOR);
-            } else {
-                spr.fillCircle(dot_x, dot_y, 1, CARD_BORDER);
-            }
+    // Rotation position dots — tight spacing, active is filled+larger, inactive is 2px line
+    int title_len = (int)strlen(screen_names[screen_num]);
+    int title_w = title_len * 7;
+    int dots_x = 4 + title_w + 8;
+    int dots_y = 9;
+    for (int d = 0; d < NUM_SCREENS; d++) {
+        int dx = dots_x + d * 5;
+        if (d == screen_num) {
+            // Active: small filled square (2x2)
+            spr.fillRect(dx - 1, dots_y - 1, 3, 3, HEADER_COLOR);
+        } else {
+            // Inactive: single pixel dot
+            spr.drawPixel(dx, dots_y, CARD_BORDER);
         }
     }
 
@@ -2231,7 +2259,23 @@ void draw_header_spr(int screen_num) {
 void draw_toast_spr() {
     if (!toast_active) return;
     unsigned long elapsed = millis() - toast_start;
-    if (elapsed > TOAST_DURATION_MS) { toast_active = false; return; }
+    if (elapsed > TOAST_DURATION_MS) {
+        // Advance queue
+        if (toast_queue_count > 0) {
+            toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
+            toast_queue_count--;
+        }
+        if (toast_queue_count > 0) {
+            strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
+            toast_text[sizeof(toast_text) - 1] = '\0';
+            toast_accent_color = toast_queue[toast_queue_head].accent;
+            toast_start = millis();
+            toast_active = true;
+        } else {
+            toast_active = false;
+        }
+        return;
+    }
 
     int y_pos = DISP_H - 34;
     if (elapsed < 150) y_pos = DISP_H - 10 - (int)((elapsed / 150.0f) * 24);
@@ -2247,6 +2291,13 @@ void draw_toast_spr() {
     spr.setCursor(t_x + 6, y_pos + 9); spr.print("[!]");
     spr.setTextColor(TEXT_COLOR, CARD_COLOR);
     spr.setCursor(t_x + 26, y_pos + 9); spr.print(toast_text);
+    if (toast_queue_count > 1) {
+        char qnum[6];
+        snprintf(qnum, sizeof(qnum), "+%d", toast_queue_count - 1);
+        spr.setTextColor(DIM_COLOR, CARD_COLOR);
+        spr.setCursor(t_x + t_w - 22, y_pos + 9);
+        spr.print(qnum);
+    }
 }
 
 void draw_vol_overlay() {
