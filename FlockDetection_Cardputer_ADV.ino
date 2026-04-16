@@ -224,6 +224,7 @@ static int flash_write_fail_count = 0;
 
 String current_log_file = "/FlockLog.csv";
 String current_pcap_file = "/Threats.pcap";
+String current_ble_pcap_file = "/BLE_Threats.pcap";
 
 int current_screen = 0;
 bool system_fully_booted = false;
@@ -236,8 +237,6 @@ long session_ble = 0;
 long session_flock_wifi = 0;
 long session_flock_ble = 0;
 long session_raven = 0;
-volatile long session_wifi_packets = 0;
-volatile long session_ble_packets  = 0;
 
 unsigned long session_start_time = 0;
 unsigned long lifetime_seconds = 0;
@@ -412,6 +411,8 @@ struct PcapQueueItem {
 };
 PcapQueueItem pcap_write_buffer[MAX_PCAP_BUFFER];
 int pcap_write_count = 0;
+PcapQueueItem ble_pcap_write_buffer[MAX_PCAP_BUFFER];
+int ble_pcap_write_count = 0;
 
 // ============================================================================
 // AUDIO & LED
@@ -814,6 +815,25 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
     xSemaphoreGive(dataMutex);
 }
 
+void write_ble_pcap(const uint8_t* payload, uint32_t length) {
+    if (!sd_available) return;
+    uint32_t capture_len = (length > 256) ? 256 : length;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (ble_pcap_write_count < MAX_PCAP_BUFFER) {
+        unsigned long now_ms = millis();
+        const uint32_t PCAP_EPOCH_BASE = 1700000000UL;
+        uint32_t elapsed_sec  = (uint32_t)(now_ms / 1000UL);
+        uint32_t elapsed_usec = (uint32_t)((now_ms % 1000UL) * 1000UL);
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = PCAP_EPOCH_BASE + elapsed_sec;
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = elapsed_usec;
+        ble_pcap_write_buffer[ble_pcap_write_count].incl_len = capture_len;
+        ble_pcap_write_buffer[ble_pcap_write_count].orig_len = length;
+        memcpy(ble_pcap_write_buffer[ble_pcap_write_count].payload, payload, capture_len);
+        ble_pcap_write_count++;
+    }
+    xSemaphoreGive(dataMutex);
+}
+
 // ============================================================================
 // PERSISTENCE & TRACKING
 // ============================================================================
@@ -1011,10 +1031,23 @@ bool rssi_track_is_stationary(const char* mac) {
             && !rssi_tracker[i].scored) {
             int n = rssi_tracker[i].sample_count;
             int* s = rssi_tracker[i].samples;
+
+            // Branch A: peak-shape (operator moving past stationary device)
             int peak_idx = 0;
             for (int j = 1; j < n; j++) if (s[j] > s[peak_idx]) peak_idx = j;
-            int range = s[peak_idx] - min(s[0], s[n - 1]);
-            if (peak_idx > 0 && peak_idx < n - 1 && range >= 6) {
+            int range_peak = s[peak_idx] - min(s[0], s[n - 1]);
+            bool peak_match = (peak_idx > 0 && peak_idx < n - 1 && range_peak >= 6);
+
+            // Branch B: flat variance (both device and operator stationary)
+            int s_min = s[0], s_max = s[0];
+            for (int j = 1; j < n; j++) {
+                if (s[j] < s_min) s_min = s[j];
+                if (s[j] > s_max) s_max = s[j];
+            }
+            int total_range = s_max - s_min;
+            bool flat_match = (total_range <= 3);
+
+            if (peak_match || flat_match) {
                 rssi_tracker[i].scored = true;
                 result = true;
             }
@@ -1076,9 +1109,11 @@ void add_blip(uint16_t blip_color, int rssi) {
 void flush_sd_buffer() {
     static char local_log_buf[MAX_LOG_BUFFER][SD_LINE_LEN];
     static PcapQueueItem local_pcap_buf[MAX_PCAP_BUFFER];
+    static PcapQueueItem local_ble_pcap_buf[MAX_PCAP_BUFFER];
 
     int log_count  = 0;
     int pcap_count = 0;
+    int ble_pcap_count = 0;
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     log_count = sd_write_count;
@@ -1087,24 +1122,29 @@ void flush_sd_buffer() {
         local_log_buf[i][SD_LINE_LEN - 1] = '\0';
     }
     sd_write_count = 0;
-    
+
     pcap_count = pcap_write_count;
     for (int i = 0; i < pcap_count; i++) {
         local_pcap_buf[i] = pcap_write_buffer[i];
     }
     pcap_write_count = 0;
+    ble_pcap_count = ble_pcap_write_count;
+    for (int i = 0; i < ble_pcap_count; i++) {
+        local_ble_pcap_buf[i] = ble_pcap_write_buffer[i];
+    }
+    ble_pcap_write_count = 0;
     xSemaphoreGive(dataMutex);
-    
+
     if (!sd_available) return;
 
     if (log_count > 0) {
         File file = SD.open(current_log_file.c_str(), FILE_APPEND);
         if (file) {
             for (int i = 0; i < log_count; i++) file.println(local_log_buf[i]);
-            file.close(); 
+            file.close();
         }
     }
-    
+
     if (pcap_count > 0) {
         File pfile = SD.open(current_pcap_file.c_str(), FILE_APPEND);
         if (pfile) {
@@ -1114,14 +1154,29 @@ void flush_sd_buffer() {
                 pph.ts_usec = local_pcap_buf[i].ts_usec;
                 pph.incl_len = local_pcap_buf[i].incl_len;
                 pph.orig_len = local_pcap_buf[i].orig_len;
-                pfile.write((const uint8_t*)&pph, sizeof(pph)); 
+                pfile.write((const uint8_t*)&pph, sizeof(pph));
                 pfile.write(local_pcap_buf[i].payload, local_pcap_buf[i].incl_len);
             }
             pfile.close();
         }
     }
-    
-    if (log_count > 0 || pcap_count > 0) {
+    if (ble_pcap_count > 0) {
+        File bfile = SD.open(current_ble_pcap_file.c_str(), FILE_APPEND);
+        if (bfile) {
+            for (int i = 0; i < ble_pcap_count; i++) {
+                pcap_packet_header pph;
+                pph.ts_sec = local_ble_pcap_buf[i].ts_sec;
+                pph.ts_usec = local_ble_pcap_buf[i].ts_usec;
+                pph.incl_len = local_ble_pcap_buf[i].incl_len;
+                pph.orig_len = local_ble_pcap_buf[i].orig_len;
+                bfile.write((const uint8_t*)&pph, sizeof(pph));
+                bfile.write(local_ble_pcap_buf[i].payload, local_ble_pcap_buf[i].incl_len);
+            }
+            bfile.close();
+        }
+    }
+
+    if (log_count > 0 || pcap_count > 0 || ble_pcap_count > 0) {
         last_sd_flush = millis();
     }
 }
@@ -1162,12 +1217,33 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     char current_time[9];
     format_time_buf((now_ms - session_start_time) / 1000, current_time, sizeof(current_time));
 
+    // Brief window 1: GPS epoch computation
+    uint32_t ts_epoch = 0;
+    bool ts_is_gps = false;
+    {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
+            struct tm t = {};
+            t.tm_year = gps.date.year() - 1900;
+            t.tm_mon  = gps.date.month() - 1;
+            t.tm_mday = gps.date.day();
+            t.tm_hour = gps.time.hour();
+            t.tm_min  = gps.time.minute();
+            t.tm_sec  = gps.time.second();
+            time_t epoch = mktime(&t);
+            if (epoch > 0) { ts_epoch = (uint32_t)epoch; ts_is_gps = true; }
+        }
+        xSemaphoreGive(dataMutex);
+    }
+
+    // Brief window 2: is_new check, counters, history, LED
+    bool is_new = false;
+    uint16_t blip_col = ACCENT_COLOR;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    bool is_new = !is_mac_recently_seen(mac);
+    is_new = !is_mac_recently_seen(mac);
 
     if (is_new) {
         add_seen_mac(mac);
-        uint16_t blip_col = ACCENT_COLOR;
         if (strcmp(proto, "WIFI") == 0) {
             session_wifi++; lifetime_wifi++; session_flock_wifi++; blip_col = CAUTION_COLOR;
         } else {
@@ -1186,9 +1262,6 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         }
         led_detection_flash_until = millis() + 15000;
         led_detect_active = true;
-        xSemaphoreGive(dataMutex);
-        add_blip(blip_col, rssi);
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
     }
 
     strncpy(last_cap_type,       type,             sizeof(last_cap_type) - 1);
@@ -1204,8 +1277,12 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     last_cap_rssi       = rssi;
     last_cap_confidence = confidence;
     last_cap_seq_num    = seq_num;
+    xSemaphoreGive(dataMutex);
 
-    if (is_new && sd_available && sd_write_count < MAX_LOG_BUFFER) {
+    if (is_new) add_blip(blip_col, rssi);
+
+    // Heavy work outside mutex
+    if (is_new && sd_available) {
         char clean_name[64];
         strncpy(clean_name, name, sizeof(clean_name) - 1);
         clean_name[sizeof(clean_name) - 1] = '\0';
@@ -1216,26 +1293,40 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         clean_extra[sizeof(clean_extra) - 1] = '\0';
         for (char* p = clean_extra; *p; p++) if (*p == ',') *p = ' ';
 
+        // Brief window: GPS snapshot
         char gps_fields[80];
-        bool gps_fresh = gps.location.isValid() && (gps.location.age() < 2000);
+        bool gps_fresh; double g_lat=0, g_lng=0; float g_spd=0, g_crs=0, g_alt=0;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        gps_fresh = gps.location.isValid() && (gps.location.age() < 2000);
         if (gps_fresh) {
-            snprintf(gps_fields, sizeof(gps_fields), "%.6f,%.6f,%.1f,%.1f,%.1f",
-                gps.location.lat(), gps.location.lng(),
-                gps.speed.isValid()  ? gps.speed.mph()       : 0.0,
-                gps.course.isValid() ? gps.course.deg()       : 0.0,
-                gps.altitude.isValid()? gps.altitude.meters() : 0.0);
-        } else {
-            strncpy(gps_fields, "0.000000,0.000000,0.0,0.0,0.0", sizeof(gps_fields));
+            g_lat = gps.location.lat(); g_lng = gps.location.lng();
+            g_spd = gps.speed.isValid()    ? gps.speed.mph()       : 0.0f;
+            g_crs = gps.course.isValid()   ? gps.course.deg()      : 0.0f;
+            g_alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0f;
         }
+        xSemaphoreGive(dataMutex);
 
-        snprintf(sd_write_buffer[sd_write_count], SD_LINE_LEN,
-            "%lu,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s",
-            now_ms, channel, type, proto, rssi, mac, clean_name,
+        if (gps_fresh)
+            snprintf(gps_fields, sizeof(gps_fields), "%.6f,%.6f,%.1f,%.1f,%.1f", g_lat, g_lng, g_spd, g_crs, g_alt);
+        else
+            strncpy(gps_fields, "0.000000,0.000000,0.0,0.0,0.0", sizeof(gps_fields));
+
+        char local_line[SD_LINE_LEN];
+        snprintf(local_line, SD_LINE_LEN,
+            "%lu,%u,%d,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s",
+            now_ms, ts_epoch, ts_is_gps ? 1 : 0, channel, type, proto, rssi, mac, clean_name,
             tx_power, detection_method, confidence,
             confidence_label(confidence), clean_extra, seq_num, gps_fields);
-        sd_write_count++;
+
+        // Brief window 3: commit line to sd_write_buffer
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (sd_write_count < MAX_LOG_BUFFER) {
+            strncpy(sd_write_buffer[sd_write_count], local_line, SD_LINE_LEN - 1);
+            sd_write_buffer[sd_write_count][SD_LINE_LEN - 1] = '\0';
+            sd_write_count++;
+        }
+        xSemaphoreGive(dataMutex);
     }
-    xSemaphoreGive(dataMutex);
 }
 
 // ============================================================================
@@ -1246,15 +1337,22 @@ double rssi_to_weight(int rssi) {
 }
 
 double haversine_m(double lat1, double lon1, double lat2, double lon2) {
-    double dLat = radians(lat2 - lat1); double dLon = radians(lon2 - lon1);
-    double a = sinf(dLat/2)*sinf(dLat/2) + cosf(radians(lat1))*cosf(radians(lat2))*sinf(dLon/2)*sinf(dLon/2);
+    double dLat = radians(lat2 - lat1);
+    double dLon = radians(lon2 - lon1);
+    double a = sin(dLat/2) * sin(dLat/2)
+             + cos(radians(lat1)) * cos(radians(lat2))
+             * sin(dLon/2) * sin(dLon/2);
     return 6371000.0 * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
 }
 
 float bearing_to(double lat1, double lon1, double lat2, double lon2) {
-    double dLon = radians(lon2 - lon1); double y = sinf(dLon) * cosf(radians(lat2));
-    double x = cosf(radians(lat1)) * sinf(radians(lat2)) - sinf(radians(lat1)) * cosf(radians(lat2)) * cosf(dLon);
-    float brng = degrees(atan2(y, x)); if (brng < 0) brng += 360.0; return brng;
+    double dLon = radians(lon2 - lon1);
+    double y = sin(dLon) * cos(radians(lat2));
+    double x = cos(radians(lat1)) * sin(radians(lat2))
+             - sin(radians(lat1)) * cos(radians(lat2)) * cos(dLon);
+    double brng = degrees(atan2(y, x));
+    if (brng < 0) brng += 360.0;
+    return (float)brng;
 }
 
 void locator_add_sample(const char* mac, int rssi) {
@@ -1360,7 +1458,7 @@ struct WifiEvent {
     uint16_t seq_num;
     char     ssid[33];
     bool     is_beacon;
-    uint8_t  payload_snap[64];
+    uint8_t  payload_snap[256];
     uint16_t payload_snap_len;
     uint16_t orig_len;
     volatile bool ready;
@@ -1416,7 +1514,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->seq_num          = (uint16_t)(hdr->sequence_ctrl >> 4);
     ev->is_beacon        = is_beacon;
     ev->orig_len         = (uint16_t)ppkt->rx_ctrl.sig_len;
-    ev->payload_snap_len = (ppkt->rx_ctrl.sig_len < 64) ? (uint16_t)ppkt->rx_ctrl.sig_len : 64;
+    ev->payload_snap_len = (ppkt->rx_ctrl.sig_len < 256) ? (uint16_t)ppkt->rx_ctrl.sig_len : 256;
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
 
     ev->is_wpa2_psk = false;
@@ -1477,7 +1575,6 @@ void process_wifi_event_queue() {
         wifi_eq_read_idx = (wifi_eq_read_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
         if (local.rssi < IGNORE_WEAK_RSSI) continue;
-        session_wifi_packets++;
 
         clean_device_name_char(local.ssid);
 
@@ -1576,10 +1673,6 @@ static void ble_worker_task(void* pvParameters) {
         if (xQueueReceive(ble_event_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
 
         if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); continue; }
-
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        session_ble_packets++;
-        xSemaphoreGive(dataMutex);
 
         int  confidence   = 0;
         char methods[64]  = {0};
@@ -1704,6 +1797,33 @@ static void ble_worker_task(void* pvParameters) {
             int mlen = strlen(methods);
             if (mlen > 0 && methods[mlen - 1] == ' ') methods[mlen - 1] = '\0';
 
+            // Build minimal BLE LL advertising PDU for pcap
+            uint8_t ble_pdu[64];
+            int pdu_off = 0;
+            ble_pdu[pdu_off++] = (ev->addr_type == 1) ? 0x40 : 0x00;
+            int len_idx = pdu_off++;
+            for (int i = 5; i >= 0; i--) ble_pdu[pdu_off++] = ev->mac[i];
+            if (ev->have_name) {
+                int nlen = strlen(ev->dev_name);
+                if (nlen > 29) nlen = 29;
+                if (pdu_off + nlen + 2 < (int)sizeof(ble_pdu)) {
+                    ble_pdu[pdu_off++] = nlen + 1;
+                    ble_pdu[pdu_off++] = 0x09;
+                    memcpy(ble_pdu + pdu_off, ev->dev_name, nlen);
+                    pdu_off += nlen;
+                }
+            }
+            if (ev->have_mfg && ev->mfg_data_len > 0) {
+                if (pdu_off + ev->mfg_data_len + 2 < (int)sizeof(ble_pdu)) {
+                    ble_pdu[pdu_off++] = ev->mfg_data_len + 1;
+                    ble_pdu[pdu_off++] = 0xFF;
+                    memcpy(ble_pdu + pdu_off, ev->mfg_data, ev->mfg_data_len);
+                    pdu_off += ev->mfg_data_len;
+                }
+            }
+            ble_pdu[len_idx] = pdu_off - 2;
+            write_ble_pcap(ble_pdu, pdu_off);
+
             log_detection(capture_type, "BLE", ev->rssi, mac_string, dev_name_char,
                           0, ev->have_tx_power ? ev->tx_power : 0,
                           extra_data, methods, confidence, -1);
@@ -1775,7 +1895,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 void ScannerLoopTask(void* pvParameters) {
     for (;;) {
         unsigned long now = millis();
-        if (now > channel_lock_until) {
+        if ((long)(now - channel_lock_until) > 0) {
             if (now - last_channel_hop > CHANNEL_DWELL_MS) {
                 current_channel++; 
                 if (current_channel > MAX_CHANNEL) current_channel = 1;
@@ -1784,7 +1904,7 @@ void ScannerLoopTask(void* pvParameters) {
             }
         }
 
-        unsigned long ble_interval = (now < channel_lock_until)
+        unsigned long ble_interval = ((long)(now - channel_lock_until) < 0)
             ? BLE_SCAN_INTERVAL_LOCK
             : BLE_SCAN_INTERVAL;
 
@@ -3284,13 +3404,20 @@ void setup() {
         sd_available = true; current_log_file = "/FlockLog.csv";
         if (!SD.exists(current_log_file.c_str())) {
             File file = SD.open(current_log_file.c_str(), FILE_WRITE);
-            if (file) { file.println("Uptime_ms,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
+            if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
         }
         if (!SD.exists(current_pcap_file.c_str())) {
             File pfile = SD.open(current_pcap_file.c_str(), FILE_WRITE);
             if (pfile) {
                 uint32_t pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x00000069};
                 pfile.write((const uint8_t*)pcap_header, 24); pfile.close();
+            }
+        }
+        if (!SD.exists(current_ble_pcap_file.c_str())) {
+            File bfile = SD.open(current_ble_pcap_file.c_str(), FILE_WRITE);
+            if (bfile) {
+                uint32_t ble_pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x000000fb};
+                bfile.write((const uint8_t*)ble_pcap_header, 24); bfile.close();
             }
         }
     }
@@ -3551,8 +3678,10 @@ void loop() {
         bool should_flush = false; 
         
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (sd_write_count >= MAX_LOG_BUFFER || pcap_write_count >= MAX_PCAP_BUFFER || 
-           (millis() - last_sd_flush > SD_FLUSH_INTERVAL && (sd_write_count > 0 || pcap_write_count > 0))) {
+        if (sd_write_count >= MAX_LOG_BUFFER || pcap_write_count >= MAX_PCAP_BUFFER ||
+            ble_pcap_write_count >= MAX_PCAP_BUFFER ||
+            (millis() - last_sd_flush > SD_FLUSH_INTERVAL &&
+             (sd_write_count > 0 || pcap_write_count > 0 || ble_pcap_write_count > 0))) {
             should_flush = true;
         }
         xSemaphoreGive(dataMutex); 
