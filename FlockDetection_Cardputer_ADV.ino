@@ -226,6 +226,7 @@ String current_log_file = "/FlockLog.csv";
 String current_pcap_file = "/Threats.pcap";
 
 int current_screen = 0;
+bool system_fully_booted = false;
 bool stealth_mode = false;
 bool is_muted = false;       
 int current_volume = 150;    
@@ -485,8 +486,10 @@ void update_load_sag() {
     int32_t total_sag = 0;
 
     // 1. Wi-Fi Promiscuous Mode
-    // In this app, Wi-Fi is continuously monitoring packets, so we apply the baseline sag permanently.
-    total_sag += SAG_WIFI_PROMISC;
+    // Only apply the Wi-Fi baseline sag if the boot sequence has finished and the radio is actually on.
+    if (system_fully_booted) {
+        total_sag += SAG_WIFI_PROMISC;
+    }
 
     // 2. BLE Scanning
     // BLE is cycled on and off by the ScannerLoopTask. Only add sag if it is actively scanning.
@@ -638,14 +641,20 @@ void dedicated_charging_loop() {
 
         spr.pushSprite(0, 0);
 
+        bool currently_charging = is_device_charging(current_mv);
+
+        // Exit and boot normally if the user unplugs the device
+        if (elapsed > 3000 && !currently_charging) {
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
+        }
         if (current_mv < 3200 && elapsed > 3000) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
         }
         if (elapsed > 1500 && M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
         }
         if (elapsed >= CHARGE_AUTO_BOOT_MS) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = false; return;
+            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
         }
         delay(15);
     }
@@ -3177,12 +3186,19 @@ void setup() {
     spr.setColorDepth(16);
     spr.createSprite(DISP_W, DISP_H);
     
+    // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
+    for (int i = 0; i < 20; i++) {
+        update_load_sag();
+        get_filtered_voltage();
+        delay(2);
+    }
+
     int32_t start_v = get_filtered_voltage();
     unsigned long trap_start = millis();
     while (millis() - trap_start < 800) {
         M5Cardputer.update();
         update_load_sag();
-        get_filtered_voltage(); // Pump the EMA filter so it settles accurately
+        get_filtered_voltage();
         delay(15);
     }
     int32_t end_v = get_filtered_voltage();
@@ -3255,6 +3271,7 @@ void setup() {
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
+    system_fully_booted = true;
 }
 
 // ============================================================================
