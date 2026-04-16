@@ -3648,8 +3648,15 @@ void loop() {
         }
 
         for (auto c : status.word) {
-            
-            if (c == 'n') { 
+
+            if (c == 0x1B && !stealth_mode) {  // ASCII Escape → jump to Scanner
+                if (show_help_overlay) { show_help_overlay = false; }
+                else if (show_locator_help) { show_locator_help = false; }
+                else if (current_screen == 2 && hist_detail_open) { hist_detail_open = false; }
+                else if (current_screen != 0) { transition_screen(0, -1); continue; }
+                draw_current_screen(); spr.pushSprite(0, 0);
+            }
+            else if (c == 'n') {
                 night_mode = !night_mode; apply_color_palette();
                 draw_current_screen(); spr.pushSprite(0,0);
             } 
@@ -3855,13 +3862,6 @@ void loop() {
                 if (prev < 0) prev = NUM_SCREENS - 1;
                 transition_screen(prev, d);
             }
-        }
-        // ESC: jump to Scanner from anywhere (closes overlays first)
-        if (M5Cardputer.Keyboard.isKeyPressed(KEY_ESC) && !stealth_mode) {
-            if (show_help_overlay) { show_help_overlay = false; draw_current_screen(); spr.pushSprite(0, 0); }
-            else if (show_locator_help) { show_locator_help = false; draw_current_screen(); spr.pushSprite(0, 0); }
-            else if (current_screen == 2 && hist_detail_open) { hist_detail_open = false; draw_current_screen(); spr.pushSprite(0, 0); }
-            else if (current_screen != 0) { transition_screen(0, -1); }
         }
     }
 
