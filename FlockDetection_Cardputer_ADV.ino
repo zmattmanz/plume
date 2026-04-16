@@ -1848,8 +1848,7 @@ void draw_header_spr(int screen_num) {
         spr.setCursor(DISP_W - 55, 5); spr.print("MUTED");
     }
 
-    // Battery icon — slightly longer (24px) for better readability
-    spr.drawRoundRect(DISP_W - 26, 4, 24, 10, 2, bcol);
+    // Battery icon — pill shape (r=5) matching status indicator style
     int bfill;
     if (chg) {
         // Charging animation: fill sweeps from current level up to 100%, cycling every 1.5s
@@ -1859,17 +1858,18 @@ void draw_header_spr(int screen_num) {
     } else {
         bfill = (render_bat * 22) / 100;
     }
-    if (bfill > 0) spr.fillRoundRect(DISP_W - 25, 5, bfill, 8, 2, bcol);
+    spr.fillRoundRect(DISP_W - 26, 4, 24, 10, 5, BG_COLOR);           // clear interior
+    if (bfill > 0) spr.fillRect(DISP_W - 25, 5, bfill, 8, bcol);      // charge fill bar
+    spr.drawRoundRect(DISP_W - 26, 4, 24, 10, 5, bcol);                // pill outline caps fill corners
 
-    // Lightning bolt overlay when charging
+    // Lightning bolt stencil centered in pill when charging
     if (chg) {
-        uint16_t bolt_col = BG_COLOR;  // Stencil effect matching the screen background
-        int bx = DISP_W - 14, by = 9;  // center of battery icon
-        // Two-stroke zigzag bolt, drawn twice (1px apart) for 2px apparent thickness
-        spr.drawLine(bx + 2, by - 3, bx - 1, by,    bolt_col);
-        spr.drawLine(bx - 1, by,     bx + 2, by + 3, bolt_col);
-        spr.drawLine(bx + 1, by - 3, bx - 2, by,    bolt_col);
-        spr.drawLine(bx - 2, by,     bx + 1, by + 3, bolt_col);
+        uint16_t bolt_col = BG_COLOR;
+        int bx = DISP_W - 14, by = 9;
+        spr.drawLine(bx + 2, by - 3, bx - 1, by,     bolt_col);
+        spr.drawLine(bx - 1, by,     bx + 2, by + 3,  bolt_col);
+        spr.drawLine(bx + 1, by - 3, bx - 2, by,      bolt_col);
+        spr.drawLine(bx - 2, by,     bx + 1, by + 3,  bolt_col);
     }
 
     // GPS location-pin icon — matches battery height (y=4..14), eases in on lock
