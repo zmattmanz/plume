@@ -11,6 +11,7 @@
 #include <algorithm>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
+#include "esp_task_wdt.h"
 #include <SPI.h>
 #include <SD.h>
 #include <LittleFS.h>
@@ -343,6 +344,8 @@ SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
+static int device_info_scroll = 0;
+static const int DEVICE_INFO_CONTENT_HEIGHT = 176;
 volatile bool sd_hist_dirty = false;
 
 char toast_text[32]       = "";
@@ -356,6 +359,8 @@ unsigned long last_persist_save = 0;
 unsigned long last_blip_time = 0;
 static unsigned long last_l_press_ms = 0;
 static const unsigned long DOUBLE_TAP_MS = 400;
+static unsigned long l_pending_until = 0;
+static bool l_pending_exists = false;
 
 struct RSSITrack { 
     char mac[18];
@@ -1921,7 +1926,9 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
 void ScannerLoopTask(void* pvParameters) {
+    esp_task_wdt_add(NULL);
     for (;;) {
+        esp_task_wdt_reset();
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
             if (now - last_channel_hop > CHANNEL_DWELL_MS) {
@@ -1953,7 +1960,9 @@ void ScannerLoopTask(void* pvParameters) {
 }
 
 void GPSLoopTask(void* pvParameters) {
+    esp_task_wdt_add(NULL);
     for (;;) {
+        esp_task_wdt_reset();
         int avail = SerialGPS.available();
         if (avail > 0) {
             uint8_t buf[128];
@@ -1999,6 +2008,15 @@ void AlarmTask(void* pvParameters) {
     }
 
     is_alarming = false;
+    vTaskDelete(NULL);
+}
+
+void LocatorChimeTask(void* pvParameters) {
+    if (!stealth_mode && !is_muted) {
+        M5Cardputer.Speaker.tone(660, 70);
+        vTaskDelay(80 / portTICK_PERIOD_MS);
+        M5Cardputer.Speaker.tone(880, 90);
+    }
     vTaskDelete(NULL);
 }
 
@@ -3271,41 +3289,95 @@ void draw_gps_screen() {
 
 void draw_device_info_screen() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    long lt=lifetime_flock_total;
-    long sr=session_raven; long sw=session_flock_wifi; long sb=session_flock_ble;
+    long lt = lifetime_flock_total;
+    long sr = session_raven;
+    long sw = session_flock_wifi;
+    long sb = session_flock_ble;
     long lb = lifetime_boots;
+    long lfw = lifetime_flash_writes;
     xSemaphoreGive(dataMutex);
+
     spr.fillSprite(BG_COLOR);
     draw_header_spr(5);
-    
-    drawCard(4, 22, DISP_W - 8, 20);
-    spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(10, 27); spr.print(VERSION_STRING);
-    
-    drawCard(4,  46, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, 50); spr.print("BOOTS");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, 60);
-    spr.print(lb);
-    
-    drawCard(82,  46, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, 50); spr.print("LIFETIME");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, 60);
-    { char _tbuf[9]; format_time_buf(lifetime_seconds, _tbuf, sizeof(_tbuf)); spr.print(_tbuf); }
-    
-    drawCard(160, 46, 76, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, 50); spr.print("ALL-TIME");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, 60); spr.print(lt);
-    
-    drawCard(4,   88, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, 92); spr.print("WIFI SESS");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, 102); spr.print(sw);
-    
-    drawCard(82,  88, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, 92); spr.print("BLE SESS");
-    spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(86, 102); spr.print(sb);
-    
-    drawCard(160, 88, 76, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, 92); spr.print("RAVEN");
-    spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, 102); spr.print(sr);
+
+    const int content_top_y = 19;
+    const int content_bottom_y = DISP_H - 1;
+    spr.setClipRect(0, content_top_y, DISP_W - 6, content_bottom_y - content_top_y);
+
+    int yoff = 22 - device_info_scroll;
+
+    // Version card (full width)
+    drawCard(4, yoff, DISP_W - 8, 20);
+    spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(10, yoff + 5); spr.print(VERSION_STRING);
+
+    // Row 1: BOOTS, LIFETIME, ALL-TIME
+    int row1_y = yoff + 24;
+    drawCard(4, row1_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, row1_y + 4); spr.print("BOOTS");
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, row1_y + 14); spr.print(lb);
+
+    drawCard(82, row1_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row1_y + 4); spr.print("LIFETIME");
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row1_y + 14);
+    { char tb[9]; format_time_buf(lifetime_seconds, tb, sizeof(tb)); spr.print(tb); }
+
+    drawCard(160, row1_y, 76, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, row1_y + 4); spr.print("ALL-TIME");
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, row1_y + 14); spr.print(lt);
+
+    // Row 2: WIFI SESS, BLE SESS, RAVEN
+    int row2_y = yoff + 66;
+    drawCard(4, row2_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, row2_y + 4); spr.print("WIFI SESS");
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, row2_y + 14); spr.print(sw);
+
+    drawCard(82, row2_y, 72, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row2_y + 4); spr.print("BLE SESS");
+    spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(86, row2_y + 14); spr.print(sb);
+
+    drawCard(160, row2_y, 76, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, row2_y + 4); spr.print("RAVEN");
+    spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, row2_y + 14); spr.print(sr);
+
+    // Row 3: FLASH WRITES (full width)
+    int row3_y = yoff + 108;
+    drawCard(4, row3_y, DISP_W - 8, 38);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(8, row3_y + 4); spr.print("FLASH WRITES");
+
+    int wear_pct = (int)((lfw * 100) / 100000);
+    if (wear_pct > 100) wear_pct = 100;
+    uint16_t wear_col = (wear_pct >= 80) ? CAUTION_COLOR
+                      : (wear_pct >= 50) ? CAUTION_COLOR
+                      : ACCENT_COLOR;
+
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
+    spr.setCursor(8, row3_y + 14); spr.print(lfw);
+    spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(8, row3_y + 30); spr.print("writes");
+
+    int bar_x = 110, bar_y = row3_y + 16, bar_w = 120, bar_h = 8;
+    spr.drawRect(bar_x, bar_y, bar_w, bar_h, CARD_BORDER);
+    int fill = (wear_pct * (bar_w - 2)) / 100;
+    if (fill > 0) spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, wear_col);
+    char pct_str[8]; snprintf(pct_str, sizeof(pct_str), "%d%%", wear_pct);
+    spr.setTextColor(wear_col, CARD_COLOR);
+    spr.setCursor(bar_x + bar_w - 28, bar_y + bar_h + 4); spr.print(pct_str);
+
+    spr.clearClipRect();
+
+    const int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - (content_bottom_y - content_top_y);
+    if (max_scroll > 0) {
+        const int track_x = DISP_W - 4;
+        const int track_y = content_top_y + 2;
+        const int track_h = (content_bottom_y - content_top_y) - 4;
+        spr.drawFastVLine(track_x + 1, track_y, track_h, CARD_BORDER);
+        int thumb_h = (track_h * (content_bottom_y - content_top_y)) / DEVICE_INFO_CONTENT_HEIGHT;
+        if (thumb_h < 12) thumb_h = 12;
+        int thumb_y = track_y + ((track_h - thumb_h) * device_info_scroll) / max_scroll;
+        spr.fillRect(track_x, thumb_y, 3, thumb_h, HEADER_COLOR);
+    }
 }
 
 // ============================================================================
@@ -3341,6 +3413,9 @@ void transition_screen(int new_screen, int dir) {
         hist_detail_open = false;
         load_sd_history();
         sd_hist_dirty = false;
+    }
+    if (new_screen == 5) {
+        device_info_scroll = 0;
     }
     if (new_screen != 1) show_locator_help = false;
     current_screen = new_screen;
@@ -3482,6 +3557,15 @@ void setup() {
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
 
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
+    // Task watchdog: 10-second timeout, panic on trigger
+    esp_task_wdt_deinit();
+    esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms = 10000,
+        .idle_core_mask = 0,
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt_cfg);
+    // Note: if the struct API causes a compile error, fallback is: esp_task_wdt_init(10, true);
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     system_fully_booted = true;
@@ -3537,12 +3621,23 @@ void loop() {
                     history_selected_idx++;
                     if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
                     draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (current_screen == 5) {
+                    int visible_h = DISP_H - 19;
+                    int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
+                    if (max_scroll < 0) max_scroll = 0;
+                    device_info_scroll += 12;
+                    if (device_info_scroll > max_scroll) device_info_scroll = max_scroll;
+                    draw_current_screen(); spr.pushSprite(0, 0);
                 }
             }
             else if (c == ';') {
                 if (current_screen == 3) {
                     history_selected_idx--;
                     if (history_selected_idx < 0) history_selected_idx = 0;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (current_screen == 5) {
+                    device_info_scroll -= 12;
+                    if (device_info_scroll < 0) device_info_scroll = 0;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
             }
@@ -3663,10 +3758,12 @@ void loop() {
             }
             else if (c == 'l') {
                 unsigned long now_ms = millis();
-                bool is_double_tap = (now_ms - last_l_press_ms) < DOUBLE_TAP_MS;
-                last_l_press_ms = now_ms;
 
-                if (is_double_tap) {
+                if (l_pending_exists && (now_ms - last_l_press_ms) < DOUBLE_TAP_MS) {
+                    // Second press within window → double-tap, cancel pending single-press
+                    l_pending_exists = false;
+                    l_pending_until = 0;
+
                     // Double-tap: cycle LED color
                     led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
                     led_r = LED_COLORS[led_col_idx][0];
@@ -3675,22 +3772,10 @@ void loop() {
                     if (!led_breathing_on) led_breathing_on = true;
                     beep(900, 40);
                 } else {
-                    // Single-press: locator logic (unchanged behavior)
-                    if (locator_active) {
-                        locator_stop();
-                    } else {
-                        xSemaphoreTake(dataMutex, portMAX_DELAY);
-                        char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
-                        char l_mac[18];  strncpy(l_mac,  last_cap_mac,  17); l_mac[17]  = '\0';
-                        char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
-                        xSemaphoreGive(dataMutex);
-                        if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
-                            locator_start(l_mac, l_name, l_type);
-                            transition_screen(1, 1);
-                        } else {
-                            led_breathing_on = !led_breathing_on;
-                        }
-                    }
+                    // First press → arm deferred single-press
+                    l_pending_exists = true;
+                    l_pending_until = now_ms + DOUBLE_TAP_MS;
+                    last_l_press_ms = now_ms;
                 }
             }
             else if (c == 'c') {
@@ -3731,6 +3816,28 @@ void loop() {
         }
     }
 
+    // Fire pending 'l' single-press action if double-tap window expired
+    if (l_pending_exists && millis() >= l_pending_until) {
+        l_pending_exists = false;
+        l_pending_until = 0;
+
+        if (locator_active) {
+            locator_stop();
+        } else {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
+            char l_mac[18];  strncpy(l_mac,  last_cap_mac,  17); l_mac[17]  = '\0';
+            char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
+            xSemaphoreGive(dataMutex);
+            if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
+                locator_start(l_mac, l_name, l_type);
+                transition_screen(1, 1);
+            } else {
+                led_breathing_on = !led_breathing_on;
+            }
+        }
+    }
+
     if (millis() - last_time_save >= 1000) { xSemaphoreTake(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGive(dataMutex); last_time_save = millis(); }
     if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) save_session_to_flash();
     rssi_track_expire();
@@ -3751,13 +3858,27 @@ void loop() {
         if (should_flush) flush_sd_buffer();
     }
 
-    if (locator_active && locator_has_estimate) {
+    {
+        bool need_update;
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (gps.location.isValid() && gps.location.age() < 2000) {
-            locator_est_distance = haversine_m(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
-            locator_bearing = bearing_to(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
+        need_update = locator_active && locator_has_estimate;
+        if (need_update && gps.location.isValid() && gps.location.age() < 2000) {
+            double my_lat = gps.location.lat();
+            double my_lng = gps.location.lng();
+            double tgt_lat = locator_est_lat;
+            double tgt_lng = locator_est_lng;
+            xSemaphoreGive(dataMutex);
+
+            float dist = (float)haversine_m(my_lat, my_lng, tgt_lat, tgt_lng);
+            float brng = bearing_to(my_lat, my_lng, tgt_lat, tgt_lng);
+
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            locator_est_distance = dist;
+            locator_bearing = brng;
+            xSemaphoreGive(dataMutex);
+        } else {
+            xSemaphoreGive(dataMutex);
         }
-        xSemaphoreGive(dataMutex);
     }
 
     if (sd_hist_dirty && current_screen == 3 && !hist_detail_open) {
@@ -3769,9 +3890,7 @@ void loop() {
         locator_announce_pending = false;
         trigger_toast("TARGET", "Estimate ready", 100);
         if (!is_muted && !stealth_mode) {
-            M5Cardputer.Speaker.tone(660, 70);
-            delay(80);
-            M5Cardputer.Speaker.tone(880, 90);
+            xTaskCreate(LocatorChimeTask, "LocChime", 2048, NULL, 2, NULL);
         }
     }
 
