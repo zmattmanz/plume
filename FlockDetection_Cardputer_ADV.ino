@@ -544,21 +544,21 @@ bool is_device_charging(int32_t current_mv) {
     // If voltage hits absolute top-end Li-Po charging limits, we are definitely charging
     if (current_mv >= 4150) { chg_state = true; baseline_mv = current_mv; return true; }
 
-    // Check every 2 seconds
-    if (millis() - last_check > 2000) {
+    // Check every 3 seconds to ignore short spikes from EMA and load injection
+    if (millis() - last_check > 3000) {
         int32_t delta = current_mv - baseline_mv;
 
-        // TP4057 plug-in pushes ~500mA, causing an instant ESR jump of ~25mV+
-        if (delta >= 20) {
+        // Widened deadband: Must jump by >= 45mV to outpace any load-aware mis-estimations
+        if (delta >= 45) {
             chg_state = true;
             baseline_mv = current_mv;
         }
-        // Unplugging removes the 500mA load, dropping the voltage instantly
-        else if (delta <= -20) {
+        // Must drop by >= 45mV to definitively confirm unplug
+        else if (delta <= -45) {
             chg_state = false;
             baseline_mv = current_mv;
         }
-        // If stable, slowly drift the baseline to track normal discharge without triggering false state changes
+        // If stable, drift the baseline to track normal discharge without triggering false states
         else {
             baseline_mv = (baseline_mv * 3 + current_mv) / 4;
         }
@@ -1848,8 +1848,7 @@ void draw_header_spr(int screen_num) {
         spr.setCursor(DISP_W - 55, 5); spr.print("MUTED");
     }
 
-    // Battery icon — slightly longer (24px) for better readability
-    spr.drawRoundRect(DISP_W - 26, 4, 24, 10, 2, bcol);
+    // Battery icon — pill shape (r=5) matching status indicator style
     int bfill;
     if (chg) {
         // Charging animation: fill sweeps from current level up to 100%, cycling every 1.5s
@@ -1859,17 +1858,21 @@ void draw_header_spr(int screen_num) {
     } else {
         bfill = (render_bat * 22) / 100;
     }
-    if (bfill > 0) spr.fillRoundRect(DISP_W - 25, 5, bfill, 8, 2, bcol);
+    spr.fillRoundRect(DISP_W - 26, 4, 24, 10, 5, BG_COLOR);           // clear interior
+    if (bfill > 0) spr.fillRect(DISP_W - 25, 5, bfill, 8, bcol);      // charge fill bar
+    spr.drawRoundRect(DISP_W - 26, 4, 24, 10, 5, bcol);                // pill outline caps fill corners
 
-    // Lightning bolt overlay when charging
+    // Lightning bolt stencil centered in pill when charging
     if (chg) {
-        uint16_t bolt_col = BG_COLOR;  // Stencil effect matching the screen background
-        int bx = DISP_W - 14, by = 9;  // center of battery icon
-        // Two-stroke zigzag bolt, drawn twice (1px apart) for 2px apparent thickness
-        spr.drawLine(bx + 2, by - 3, bx - 1, by,    bolt_col);
-        spr.drawLine(bx - 1, by,     bx + 2, by + 3, bolt_col);
-        spr.drawLine(bx + 1, by - 3, bx - 2, by,    bolt_col);
-        spr.drawLine(bx - 2, by,     bx + 1, by + 3, bolt_col);
+        uint16_t bolt_col = BG_COLOR;
+        int bx = DISP_W - 14, by = 9;
+        // Classic lightning bolt geometry
+        spr.drawLine(bx + 1, by - 3, bx - 2, by + 1, bolt_col);
+        spr.drawLine(bx + 2, by - 3, bx - 1, by + 1, bolt_col);
+        spr.drawLine(bx - 2, by + 1, bx + 2, by + 1, bolt_col);
+        spr.drawLine(bx - 2, by + 2, bx + 2, by + 2, bolt_col);
+        spr.drawLine(bx + 1, by + 1, bx - 2, by + 4, bolt_col);
+        spr.drawLine(bx + 2, by + 1, bx - 1, by + 4, bolt_col);
     }
 
     // GPS location-pin icon — matches battery height (y=4..14), eases in on lock
@@ -3203,8 +3206,9 @@ void setup() {
     }
     int32_t end_v = get_filtered_voltage();
 
-    // Launch the charging loop if running on USB power (>4300mV) OR if the voltage spiked by >10mV in 800ms (plugged in)
-    if (end_v > 4300 || (end_v - start_v >= 10)) dedicated_charging_loop();
+    // Only launch the dedicated charging UI if the battery is physically bypassed (USB ON, Switch OFF)
+    // Otherwise, boot normally and let the UI header handle the charging animation.
+    if (end_v > 4300) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
     setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex(); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
