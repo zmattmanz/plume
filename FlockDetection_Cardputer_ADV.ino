@@ -2189,22 +2189,19 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
     }
 
-    // Screen position dots — 5 dots between title and icons
-    {
-        // Place dots centered in the space between title text end and icon area start
-        // Title ends roughly at 4 + len*7 pixels; icons start at icon_right
-        // We place dots in a fixed region, evenly spaced
-        const int DOT_REGION_LEFT  = 90;   // after title
-        const int DOT_REGION_RIGHT = icon_right - 4;
-        int dot_spacing = (DOT_REGION_RIGHT - DOT_REGION_LEFT) / NUM_SCREENS;
-        int dot_y = 10;  // vertically centered in 20px header
-        for (int di = 0; di < NUM_SCREENS; di++) {
-            int dot_x = DOT_REGION_LEFT + dot_spacing / 2 + di * dot_spacing;
-            if (di == screen_num) {
-                spr.fillCircle(dot_x, dot_y, 2, HEADER_COLOR);
-            } else {
-                spr.fillCircle(dot_x, dot_y, 1, CARD_BORDER);
-            }
+    // Rotation position dots — tight spacing, active is filled+larger, inactive is 2px line
+    int title_len = (int)strlen(screen_names[screen_num]);
+    int title_w = title_len * 7;
+    int dots_x = 4 + title_w + 8;
+    int dots_y = 9;
+    for (int d = 0; d < NUM_SCREENS; d++) {
+        int dx = dots_x + d * 5;
+        if (d == screen_num) {
+            // Active: small filled square (2x2)
+            spr.fillRect(dx - 1, dots_y - 1, 3, 3, HEADER_COLOR);
+        } else {
+            // Inactive: single pixel dot
+            spr.drawPixel(dx, dots_y, CARD_BORDER);
         }
     }
 
