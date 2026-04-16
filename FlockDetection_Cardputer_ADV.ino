@@ -541,24 +541,23 @@ bool is_device_charging(int32_t current_mv) {
     // If voltage hits absolute top-end Li-Po charging limits, we are definitely charging
     if (current_mv >= 4150) { chg_state = true; baseline_mv = current_mv; return true; }
 
-    // Evaluate every 4 seconds to ignore short spikes from EMA and load injection
-    if (millis() - last_check > 4000) {
+    // Check every 2 seconds
+    if (millis() - last_check > 2000) {
         int32_t delta = current_mv - baseline_mv;
 
-        // To be charging, voltage must strictly rise.
-        if (delta >= 10) {
+        // TP4057 plug-in pushes ~500mA, causing an instant ESR jump of ~25mV+
+        if (delta >= 20) {
             chg_state = true;
             baseline_mv = current_mv;
         }
-        // To stop charging, voltage must strictly fall significantly (overcoming sag).
-        else if (delta <= -18) {
+        // Unplugging removes the 500mA load, dropping the voltage instantly
+        else if (delta <= -20) {
             chg_state = false;
             baseline_mv = current_mv;
         }
-        // If delta is between -17 and +9, do nothing. It's stable.
-        // Slowly walk the baseline toward current_mv to prevent drifting apart
+        // If stable, slowly drift the baseline to track normal discharge without triggering false state changes
         else {
-            baseline_mv = (baseline_mv + current_mv) / 2;
+            baseline_mv = (baseline_mv * 3 + current_mv) / 4;
         }
 
         last_check = millis();
@@ -1855,7 +1854,7 @@ void draw_header_spr(int screen_num) {
 
     // Lightning bolt overlay when charging
     if (chg) {
-        uint16_t bolt_col = lgfx::color565(255, 255, 120);  // bright yellow
+        uint16_t bolt_col = BG_COLOR;  // Stencil effect matching the screen background
         int bx = DISP_W - 14, by = 9;  // center of battery icon
         // Two-stroke zigzag bolt, drawn twice (1px apart) for 2px apparent thickness
         spr.drawLine(bx + 2, by - 3, bx - 1, by,    bolt_col);
@@ -3188,8 +3187,8 @@ void setup() {
     }
     int32_t end_v = get_filtered_voltage();
 
-    // Only launch the dedicated charging UI if the battery is physically bypassed (USB ON, Switch OFF)
-    if (end_v > 4300) dedicated_charging_loop();
+    // Launch the charging loop if running on USB power (>4300mV) OR if the voltage spiked by >10mV in 800ms (plugged in)
+    if (end_v > 4300 || (end_v - start_v >= 10)) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
     setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex(); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
