@@ -40,7 +40,6 @@ void apply_color_palette();
 void draw_help_overlay();
 void draw_locator_help_overlay();
 void draw_gps_screen();
-void gps_page_toggle();
 void load_sd_history();
 
 // ============================================================================
@@ -245,6 +244,7 @@ long lifetime_wifi = 0;
 long lifetime_ble = 0;
 long lifetime_flock_total = 0;
 long lifetime_boots = 0;
+long lifetime_flash_writes = 0;
 
 #define MAX_SEEN_MACS 200
 
@@ -343,6 +343,7 @@ SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
+volatile bool sd_hist_dirty = false;
 
 char toast_text[32]       = "";
 unsigned long toast_start = 0;
@@ -353,6 +354,8 @@ unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
 unsigned long last_persist_save = 0;
 unsigned long last_blip_time = 0;
+static unsigned long last_l_press_ms = 0;
+static const unsigned long DOUBLE_TAP_MS = 400;
 
 struct RSSITrack { 
     char mac[18];
@@ -388,6 +391,8 @@ float locator_bearing = 0.0;
 float locator_confidence_radius = 0.0;
 bool locator_has_estimate = false;
 int locator_peak_rssi = -120;
+bool locator_estimate_announced = false;
+volatile bool locator_announce_pending = false;
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
@@ -946,19 +951,20 @@ void load_sd_history() {
 void save_session_to_flash() {
     if (!littlefs_available) return;
     
-    long l_wifi, l_ble, l_sec, l_flock, l_boots;
+    long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes;
     int l_vol;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds; 
+    l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
+    l_writes = lifetime_flash_writes + 1;
     xSemaphoreGive(dataMutex);
 
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
         File f = LittleFS.open(PERSIST_FILE, "w");
         if (!f) { delay(5); continue; }
-        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n",
-                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots);
+        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n",
+                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes);
         f.close();
         if (written > 10) write_ok = true;
     }
@@ -967,6 +973,16 @@ void save_session_to_flash() {
         flash_write_fail_count = 0;
         last_persist_save = millis();
         save_detections_to_flash();
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        lifetime_flash_writes = l_writes;
+        xSemaphoreGive(dataMutex);
+        if (l_writes == 80000) {
+            strncpy(toast_text, "FLASH WEAR HIGH", sizeof(toast_text) - 1);
+            toast_text[sizeof(toast_text) - 1] = '\0';
+            toast_accent_color = CAUTION_COLOR;
+            toast_start = millis();
+            toast_active = true;
+        }
     } else {
         flash_write_fail_count++;
         if (flash_write_fail_count >= FLASH_FAIL_TOAST_THRESHOLD) {
@@ -989,7 +1005,8 @@ void load_session_from_flash() {
     line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_seconds = line.toInt();
     line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flock_total = line.toInt();
     line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt(); 
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt(); 
+    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
+    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
     f.close();
 }
 
@@ -1262,6 +1279,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         }
         led_detection_flash_until = millis() + 15000;
         led_detect_active = true;
+        sd_hist_dirty = true;
     }
 
     strncpy(last_cap_type,       type,             sizeof(last_cap_type) - 1);
@@ -1415,6 +1433,10 @@ void locator_add_sample(const char* mac, int rssi) {
                 double w = rssi_to_weight(locator_samples[i].rssi); sum_wd2 += w * d * d;
             }
             locator_confidence_radius = sqrt(sum_wd2 / sum_w);
+            if (!locator_estimate_announced) {
+                locator_estimate_announced = true;
+                locator_announce_pending = true;
+            }
         }
     }
     xSemaphoreGive(dataMutex);
@@ -1427,6 +1449,7 @@ void locator_start(const char* mac, const char* name, const char* type = "") {
     strncpy(locator_target_name, name, sizeof(locator_target_name) - 1); locator_target_name[64] = '\0';
     strncpy(locator_target_type, type, sizeof(locator_target_type) - 1); locator_target_type[7]  = '\0';
     locator_sample_count = 0; locator_has_estimate = false; locator_peak_rssi = -120;
+    locator_estimate_announced = false;
     locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
     locator_start_time = millis(); locator_newest_sample_ms = 0;
     xSemaphoreGive(dataMutex);
@@ -1436,6 +1459,7 @@ void locator_stop() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     locator_active = false; locator_has_estimate = false; locator_sample_count = 0;
     locator_newest_sample_ms = 0;
+    locator_estimate_announced = false;
     xSemaphoreGive(dataMutex);
 }
 
@@ -1665,6 +1689,7 @@ struct BleEventData {
     bool     have_mfg;
     char     service_uuids[8][37];
     uint8_t  uuid_count;
+    uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
 };
 
 static void ble_worker_task(void* pvParameters) {
@@ -1825,7 +1850,7 @@ static void ble_worker_task(void* pvParameters) {
             write_ble_pcap(ble_pdu, pdu_off);
 
             log_detection(capture_type, "BLE", ev->rssi, mac_string, dev_name_char,
-                          0, ev->have_tx_power ? ev->tx_power : 0,
+                          ev->adv_channel, ev->have_tx_power ? ev->tx_power : 0,
                           extra_data, methods, confidence, -1);
 
             xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1884,6 +1909,9 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
                 ev->service_uuids[i][36] = '\0';
             }
         }
+
+        // NimBLE does not reliably expose advertising channel on ESP32.
+        ev->adv_channel = 0;
 
         if (xQueueSend(ble_event_queue, &ev, 0) != pdTRUE) { free(ev); }
     }
@@ -2048,7 +2076,10 @@ void draw_header_spr(int screen_num) {
     // GPS location-pin icon — matches battery height (y=4..14), eases in on lock
     {
         static float gps_ease = 0.0f;
-        bool gps_vis = gps.satellites.isValid() && gps.satellites.value() >= 1;
+        bool gps_vis;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        gps_vis = gps.satellites.isValid() && gps.satellites.value() >= 1;
+        xSemaphoreGive(dataMutex);
         gps_ease += ((gps_vis ? 1.0f : 0.0f) - gps_ease) * 0.08f;
         if (gps_ease > 0.01f) {
             uint16_t gc = lerp_col16(BG_COLOR, lgfx::color565(255, 255, 255), gps_ease);
@@ -2154,7 +2185,7 @@ void draw_help_overlay() {
     spr.setCursor(14,  57); spr.print("0       : Go Locator");
     spr.setCursor(14,  68); spr.print("m / q   : Mute Toggle");
     spr.setCursor(14,  79); spr.print(";/.     : Vol Up/Down");
-    spr.setCursor(14,  90); spr.print("l       : Locate Last");
+    spr.setCursor(14,  90); spr.print("l       : Loc (2x=LED)");
     spr.setCursor(14, 101); spr.print("t       : Cycle Target");
     spr.setCursor(14, 112); spr.print("s / n   : Stealth/Night");
 
@@ -3023,9 +3054,6 @@ void draw_capture_history_screen() {
     }
 }
 
-static int gps_page = 0;
-void gps_page_toggle() { gps_page = (gps_page + 1) % 2; }  // kept for key-handler compat, unused
-
 void draw_gps_screen() {
     spr.fillSprite(BG_COLOR);
     draw_header_spr(4);
@@ -3307,7 +3335,13 @@ void transition_screen(int new_screen, int dir) {
         M5Cardputer.Speaker.playRaw(ui_beep_pcm, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
         M5Cardputer.Speaker.setVolume(prev_vol);
     }
-    if (new_screen == 3) { history_scroll_offset = 0; history_selected_idx = 0; hist_detail_open = false; load_sd_history(); }
+    if (new_screen == 3) {
+        history_scroll_offset = 0;
+        history_selected_idx = 0;
+        hist_detail_open = false;
+        load_sd_history();
+        sd_hist_dirty = false;
+    }
     if (new_screen != 1) show_locator_help = false;
     current_screen = new_screen;
     draw_current_screen();
@@ -3602,32 +3636,60 @@ void loop() {
                     }
                 }
             }
-            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(0); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } } 
+            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(0); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } }
+            else if (c == 'o') {
+                if (!stealth_mode) {
+                    xSemaphoreTake(dataMutex, portMAX_DELAY);
+                    session_wifi = 0;
+                    session_ble = 0;
+                    session_flock_wifi = 0;
+                    session_flock_ble = 0;
+                    session_raven = 0;
+                    session_start_time = millis();
+                    xSemaphoreGive(dataMutex);
+                    trigger_toast("TARGET", "Session reset", 0);
+                    beep(800, 60);
+                    draw_current_screen();
+                    spr.pushSprite(0, 0);
+                }
+            }
             else if (c == 'g') {
                 if (current_screen == 1) {
                     // Locator screen: toggle Pointing North mode
                     north_mode = !north_mode;
                     draw_current_screen(); spr.pushSprite(0, 0);
-                } else {
-                    gps_page_toggle();
-                    if (current_screen == 4) { draw_current_screen(); spr.pushSprite(0, 0); }
                 }
+                // On other screens, 'g' is currently a no-op.
             }
             else if (c == 'l') {
-                if (locator_active) {
-                    locator_stop();
+                unsigned long now_ms = millis();
+                bool is_double_tap = (now_ms - last_l_press_ms) < DOUBLE_TAP_MS;
+                last_l_press_ms = now_ms;
+
+                if (is_double_tap) {
+                    // Double-tap: cycle LED color
+                    led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+                    led_r = LED_COLORS[led_col_idx][0];
+                    led_g = LED_COLORS[led_col_idx][1];
+                    led_b = LED_COLORS[led_col_idx][2];
+                    if (!led_breathing_on) led_breathing_on = true;
+                    beep(900, 40);
                 } else {
-                    xSemaphoreTake(dataMutex, portMAX_DELAY);
-                    char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
-                    char l_mac[18];  strncpy(l_mac,  last_cap_mac,  17); l_mac[17]  = '\0';
-                    char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
-                    xSemaphoreGive(dataMutex);
-                    if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
-                        locator_start(l_mac, l_name, l_type);
-                        transition_screen(1, 1);
+                    // Single-press: locator logic (unchanged behavior)
+                    if (locator_active) {
+                        locator_stop();
                     } else {
-                        // No target — toggle LED breathing on/off
-                        led_breathing_on = !led_breathing_on;
+                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
+                        char l_mac[18];  strncpy(l_mac,  last_cap_mac,  17); l_mac[17]  = '\0';
+                        char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
+                        xSemaphoreGive(dataMutex);
+                        if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
+                            locator_start(l_mac, l_name, l_type);
+                            transition_screen(1, 1);
+                        } else {
+                            led_breathing_on = !led_breathing_on;
+                        }
                     }
                 }
             }
@@ -3696,6 +3758,21 @@ void loop() {
             locator_bearing = bearing_to(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
         }
         xSemaphoreGive(dataMutex);
+    }
+
+    if (sd_hist_dirty && current_screen == 3 && !hist_detail_open) {
+        sd_hist_dirty = false;
+        load_sd_history();
+    }
+
+    if (locator_announce_pending) {
+        locator_announce_pending = false;
+        trigger_toast("TARGET", "Estimate ready", 100);
+        if (!is_muted && !stealth_mode) {
+            M5Cardputer.Speaker.tone(660, 70);
+            delay(80);
+            M5Cardputer.Speaker.tone(880, 90);
+        }
     }
 
     if (!stealth_mode) {
