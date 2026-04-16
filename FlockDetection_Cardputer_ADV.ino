@@ -56,6 +56,8 @@ uint16_t ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
 uint16_t CAUTION_COLOR, GPS_COLOR;
 bool night_mode = false;
 bool show_help_overlay = false;
+static float help_ease = 0.0f;
+static unsigned long help_ease_start = 0;
 
 unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
@@ -2585,29 +2587,144 @@ void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
 }
 
 void draw_help_overlay() {
-    spr.fillRoundRect(10, 15, DISP_W - 20, DISP_H - 30, 6, lgfx::color565(10, 15, 25));
-    spr.drawRoundRect(10, 15, DISP_W - 20, DISP_H - 30, 6, HEADER_COLOR);
-    spr.setTextColor(HEADER_COLOR); spr.setTextSize(1);
-    spr.setCursor(14, 20); spr.print("--- HOTKEYS ---");
-    spr.drawLine(10, 30, DISP_W - 10, 30, HEADER_COLOR);
+    // Ease the overlay in over 200ms
+    unsigned long elapsed = millis() - help_ease_start;
+    float target = 1.0f;
+    if (elapsed < 200) {
+        float t = (float)elapsed / 200.0f;
+        target = 1.0f - (1.0f - t) * (1.0f - t);  // quadratic ease-out
+    }
+    help_ease += (target - help_ease) * 0.25f;
+    if (help_ease > 1.0f) help_ease = 1.0f;
+    if (help_ease < 0.02f) return;
 
-    spr.setTextColor(TEXT_COLOR);
-    spr.setCursor(14,  35); spr.print("</> DEL : Prev/Next");
-    spr.setCursor(14,  46); spr.print("1-6     : Jump Screen");
-    spr.setCursor(14,  57); spr.print("0       : Go Locator");
-    spr.setCursor(14,  68); spr.print("m / q   : Mute Toggle");
-    spr.setCursor(14,  79); spr.print(";/.     : Vol Up/Down");
-    spr.setCursor(14,  90); spr.print("l       : Loc (2x=LED)");
-    spr.setCursor(14, 101); spr.print("t       : Cycle Target");
-    spr.setCursor(14, 112); spr.print("s / n   : Stealth/Night");
+    // Dimmed backdrop
+    for (int dy = 20; dy < DISP_H; dy += 2) {
+        uint16_t bg = lerp_col16(BG_COLOR, lgfx::color565(0, 0, 0), help_ease * 0.5f);
+        spr.drawFastHLine(0, dy, DISP_W, bg);
+    }
 
-    spr.setTextColor(DIM_COLOR);
-    spr.setCursor(130,  35); spr.print("x: WiFi sim");
-    spr.setCursor(130,  46); spr.print("x again: BLE");
-    spr.setCursor(130,  57); spr.print("TAB: Help");
-    spr.setCursor(130,  68); spr.print("g: GPS page");
-    spr.setCursor(130,  79); spr.print("ESC: Home");
-    spr.setCursor(130,  90); spr.print("e: Export HTTP");
+    // Panel geometry — eased from centerpoint outward
+    int full_w = DISP_W - 20;
+    int full_h = DISP_H - 30;
+    int panel_w = (int)(full_w * help_ease);
+    int panel_h = (int)(full_h * help_ease);
+    int panel_x = (DISP_W - panel_w) / 2;
+    int panel_y = 20 + (full_h - panel_h) / 2;
+
+    uint16_t panel_bg = lerp_col16(BG_COLOR, CARD_COLOR, help_ease);
+    uint16_t panel_border = lerp_col16(BG_COLOR, HEADER_COLOR, help_ease);
+    spr.fillRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_bg);
+    spr.drawRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_border);
+
+    if (help_ease < 0.7f) return;  // wait for panel to mostly open before drawing text
+
+    // Per-screen content
+    struct HelpKey { const char* key; const char* desc; };
+    const HelpKey* keys;
+    int key_count;
+    const char* title;
+
+    // Common keys shown on all screens
+    static const HelpKey global_keys[] = {
+        {"</>", "Prev/Next screen"},
+        {"1-5", "Jump to screen"},
+        {"ESC", "Home (Scanner)"},
+        {"TAB", "Close help"},
+        {"m/q", "Mute toggle"},
+        {";/.", "Vol / scroll"},
+        {"n",   "Night mode"},
+        {"s",   "Stealth mode"},
+        {"b",   "Brightness"},
+        {"c",   "LED color"},
+        {"e",   "Export mode"},
+        {"o",   "Reset session"},
+    };
+
+    // Per-screen key sets
+    static const HelpKey scanner_keys[] = {
+        {"x", "Simulate detection"},
+        {"t", "Locate last target"},
+    };
+    static const HelpKey locator_keys[] = {
+        {"l",  "Start/stop (2x=LED)"},
+        {"t",  "Cycle target"},
+        {"g",  "Toggle N-mode"},
+    };
+    static const HelpKey detections_keys[] = {
+        {";/.", "Navigate list"},
+        {"ENT", "Open detail"},
+        {"DEL", "Close detail"},
+    };
+    static const HelpKey gps_keys[] = {
+        {"(info display only)", ""},
+    };
+    static const HelpKey devinfo_keys[] = {
+        {";/.", "Scroll content"},
+    };
+
+    switch (current_screen) {
+        case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys) / sizeof(scanner_keys[0]);       title = "SCANNER KEYS"; break;
+        case 1: keys = locator_keys;    key_count = sizeof(locator_keys) / sizeof(locator_keys[0]);       title = "LOCATOR KEYS"; break;
+        case 2: keys = detections_keys; key_count = sizeof(detections_keys) / sizeof(detections_keys[0]); title = "DETECTIONS KEYS"; break;
+        case 3: keys = gps_keys;        key_count = sizeof(gps_keys) / sizeof(gps_keys[0]);               title = "GPS SCREEN"; break;
+        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys) / sizeof(devinfo_keys[0]);       title = "DEVICE INFO KEYS"; break;
+        default: keys = scanner_keys; key_count = 0; title = "HELP"; break;
+    }
+
+    spr.setTextSize(1);
+
+    // Title
+    spr.setTextColor(HEADER_COLOR, panel_bg);
+    spr.setCursor(panel_x + 8, panel_y + 6);
+    kprint(spr, title);
+
+    // Underline
+    spr.drawFastHLine(panel_x + 6, panel_y + 17, panel_w - 12, CARD_BORDER);
+
+    // Left column: screen-specific keys
+    int col_left_x  = panel_x + 8;
+    int col_right_x = panel_x + panel_w / 2 + 4;
+    int row_y = panel_y + 22;
+    const int ROW_H = 11;
+
+    spr.setTextColor(ACCENT_COLOR, panel_bg);
+    spr.setCursor(col_left_x, row_y);
+    kprint(spr, "SCREEN");
+    row_y += ROW_H;
+
+    for (int i = 0; i < key_count && row_y < panel_y + panel_h - 10; i++) {
+        spr.setTextColor(HEADER_COLOR, panel_bg);
+        spr.setCursor(col_left_x, row_y);
+        spr.print(keys[i].key);
+        spr.setTextColor(TEXT_COLOR, panel_bg);
+        spr.setCursor(col_left_x + 30, row_y);
+        spr.print(keys[i].desc);
+        row_y += ROW_H;
+    }
+
+    // Right column: global keys
+    row_y = panel_y + 22;
+    spr.setTextColor(ACCENT_COLOR, panel_bg);
+    spr.setCursor(col_right_x, row_y);
+    kprint(spr, "GLOBAL");
+    row_y += ROW_H;
+
+    int global_count = sizeof(global_keys) / sizeof(global_keys[0]);
+    for (int i = 0; i < global_count && row_y < panel_y + panel_h - 10; i++) {
+        spr.setTextColor(HEADER_COLOR, panel_bg);
+        spr.setCursor(col_right_x, row_y);
+        spr.print(global_keys[i].key);
+        spr.setTextColor(TEXT_COLOR, panel_bg);
+        spr.setCursor(col_right_x + 28, row_y);
+        spr.print(global_keys[i].desc);
+        row_y += ROW_H;
+    }
+
+    // Footer
+    spr.setTextColor(DIM_COLOR, panel_bg);
+    spr.setCursor(panel_x + 8, panel_y + panel_h - 10);
+    spr.print("TAB to close");
 }
 
 void draw_locator_help_overlay() {
@@ -4147,9 +4264,13 @@ void loop() {
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         
-        if (status.tab && !stealth_mode) { 
-            show_help_overlay = !show_help_overlay; 
-            draw_current_screen(); spr.pushSprite(0,0); 
+        if (status.tab && !stealth_mode) {
+            show_help_overlay = !show_help_overlay;
+            if (show_help_overlay) {
+                help_ease = 0.0f;
+                help_ease_start = millis();
+            }
+            draw_current_screen(); spr.pushSprite(0,0);
         }
 
         for (auto c : status.word) {
