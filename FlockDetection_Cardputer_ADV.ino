@@ -2261,10 +2261,10 @@ void draw_scanner_screen() {
     uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
-    // WiFi badge — fixed max width ("WiFi: 13 L" = widest case)
+    // WiFi badge — width wraps to actual text content (5px padding each side, 6px per char at size 1)
     char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi: %d", current_channel);
     bool wf_locked = (millis() < channel_lock_until);
-    const int wf_bw = 70;  // fixed: "WiFi: 13 L" = 10 chars × 6px + 10px padding
+    int wf_bw = (strlen(wf_label) + (wf_locked ? 2 : 0)) * 6 + 10;
     uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
     spr.fillRoundRect(right_text_x - 5, 24, wf_bw, 16, 7, wf_fill);
     spr.drawRoundRect(right_text_x - 5, 24, wf_bw, 16, 7, wf_col);
@@ -2276,12 +2276,12 @@ void draw_scanner_screen() {
         spr.print(" L");
     }
 
-    // BLE badge — positioned 4px after WiFi badge ends (right_text_x-5+70+4 = right_text_x+69)
+    // BLE badge — positioned 4px after WiFi badge ends
     uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
-    spr.fillRoundRect(right_text_x + 69, 24, 28, 16, 7, ble_fill);
-    spr.drawRoundRect(right_text_x + 69, 24, 28, 16, 7, ble_col);
+    spr.fillRoundRect(right_text_x + wf_bw - 1, 24, 28, 16, 7, ble_fill);
+    spr.drawRoundRect(right_text_x + wf_bw - 1, 24, 28, 16, 7, ble_col);
     spr.setTextColor(ble_col, ble_fill);
-    spr.setCursor(right_text_x + 74, 29);
+    spr.setCursor(right_text_x + wf_bw + 4, 29);
     spr.print("BLE");
 
     // Labels — extra gap below badges (badges bottom = y=40); kerned
