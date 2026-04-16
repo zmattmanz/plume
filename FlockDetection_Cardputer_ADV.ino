@@ -1865,7 +1865,7 @@ void draw_header_spr(int screen_num) {
     // Lightning bolt stencil centered in pill when charging
     if (chg) {
         uint16_t bolt_col = BG_COLOR;
-        int bx = DISP_W - 14, by = 9;
+        int bx = DISP_W - 14, by = 8;
         // Classic lightning bolt geometry
         spr.drawLine(bx + 1, by - 3, bx - 2, by + 1, bolt_col);
         spr.drawLine(bx + 2, by - 3, bx - 1, by + 1, bolt_col);
