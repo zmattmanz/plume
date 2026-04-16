@@ -192,7 +192,7 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 #define SD_CS_PIN       12
 
 // Version string — single source of truth
-#define VERSION_STRING "FLOCK DETECTOR v9.2 [ADV]"
+#define VERSION_STRING "FLOCK DETECTOR v9.3 [ADV]"
 
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
 #define NUM_SCREENS 5
@@ -213,6 +213,7 @@ static unsigned long last_ble_scan = 0;
 static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
 static uint32_t ble_scan_cycle = 0;
+static volatile uint32_t ambient_packet_count = 0;
 #define BLE_MAX_CONCURRENT_TASKS 6
 QueueHandle_t ble_event_queue;
 bool sd_available = false;
@@ -351,7 +352,7 @@ int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
 static int device_info_scroll = 0;
-static const int DEVICE_INFO_CONTENT_HEIGHT = 176;
+static const int DEVICE_INFO_CONTENT_HEIGHT = 260;
 volatile bool sd_hist_dirty = false;
 
 char toast_text[32]       = "";
@@ -490,8 +491,16 @@ const int32_t SAG_BLE_SCAN = 35;     // Estimated mV drop for active BLE scannin
 const int32_t SAG_SPEAKER = 80;      // Estimated mV drop during active PCM audio playback
 
 int32_t get_filtered_voltage() {
+    static uint32_t last_adc_ms = 0;
+    static int32_t cached_raw_mv = 0;
+    uint32_t now_adc = (uint32_t)millis();
+    if (cached_raw_mv != 0 && (now_adc - last_adc_ms) < 250) {
+        return (int32_t)ema_voltage;
+    }
     // Inject anticipated peripheral voltage sag before applying the EMA filter
     int32_t raw_mv = M5Cardputer.Power.getBatteryVoltage() + current_load_sag_mv;
+    cached_raw_mv = raw_mv;
+    last_adc_ms = now_adc;
     if (ema_voltage == 0.0f) {
         ema_voltage = (float)raw_mv;
     }
@@ -1514,6 +1523,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
     const wifi_promiscuous_pkt_t* ppkt = (wifi_promiscuous_pkt_t*)buff;
     if (ppkt->rx_ctrl.sig_len < 24) return;
+    ambient_packet_count++;
 
     const wifi_ieee80211_packet_t* ipkt = (wifi_ieee80211_packet_t*)ppkt->payload;
     const wifi_ieee80211_mac_hdr_t* hdr = &ipkt->hdr;
@@ -2062,7 +2072,7 @@ void draw_header_spr(int screen_num) {
 
     int render_bat = (display_bat == 255) ? 100 : display_bat;
 
-    spr.fillRect(0, 0, DISP_W, 18, BG_COLOR);
+    spr.fillRect(0, 0, DISP_W, 20, BG_COLOR);
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
 
@@ -2148,19 +2158,47 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
     }
 
-    // Battery icon — pill shape (r=5) matching status indicator style
-    int bfill;
-    if (chg) {
-        // Charging animation: fill sweeps from current level up to 100%, cycling every 1.5s
-        float cphase = fmodf((float)millis() / 1500.0f, 1.0f);
-        int anim_pct = render_bat + (int)((100 - render_bat) * cphase);
-        bfill = (anim_pct * 22) / 100;
-    } else {
-        bfill = (render_bat * 22) / 100;
+    // Screen position dots — 5 dots between title and icons
+    {
+        // Place dots centered in the space between title text end and icon area start
+        // Title ends roughly at 4 + len*7 pixels; icons start at icon_right
+        // We place dots in a fixed region, evenly spaced
+        const int DOT_REGION_LEFT  = 90;   // after title
+        const int DOT_REGION_RIGHT = icon_right - 4;
+        int dot_spacing = (DOT_REGION_RIGHT - DOT_REGION_LEFT) / NUM_SCREENS;
+        int dot_y = 10;  // vertically centered in 20px header
+        for (int di = 0; di < NUM_SCREENS; di++) {
+            int dot_x = DOT_REGION_LEFT + dot_spacing / 2 + di * dot_spacing;
+            if (di == screen_num) {
+                spr.fillCircle(dot_x, dot_y, 2, HEADER_COLOR);
+            } else {
+                spr.fillCircle(dot_x, dot_y, 1, CARD_BORDER);
+            }
+        }
     }
-    spr.fillRoundRect(DISP_W - 26, 4, 24, 10, 5, BG_COLOR);           // clear interior
-    if (bfill > 0) spr.fillRect(DISP_W - 25, 5, bfill, 8, bcol);      // charge fill bar
-    spr.drawRoundRect(DISP_W - 26, 4, 24, 10, 5, bcol);                // pill outline caps fill corners
+
+    // Battery icon — pill shape (r=5) matching status indicator style
+    const int pill_x = DISP_W - 26;
+    const int pill_y = 4;
+    const int pill_w = 24;
+    const int pill_h = 10;
+    const int pill_interior_w = pill_w - 2;  // 22px interior
+    int bfill = (render_bat * pill_interior_w) / 100;
+    spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, 5, BG_COLOR);   // clear interior
+    if (bfill > 0) spr.fillRect(pill_x + 1, pill_y + 1, bfill, pill_h - 2, bcol);  // static fill
+    if (chg && bfill < pill_interior_w) {
+        // Climbing wave: bright highlight band sweeping left-to-right across fill+empty area
+        int wave_x = (int)((millis() / 800) % (uint32_t)pill_interior_w);
+        const int wave_w = 4;
+        uint16_t wave_col = lerp_col16(bcol, lgfx::color565(255, 255, 255), 0.6f);
+        for (int wi = 0; wi < wave_w; wi++) {
+            int wx = pill_x + 1 + wave_x + wi;
+            if (wx < pill_x + 1 + pill_interior_w) {
+                spr.drawFastVLine(wx, pill_y + 1, pill_h - 2, wave_col);
+            }
+        }
+    }
+    spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, 5, bcol);        // pill outline
 
     // Lightning bolt stencil centered in pill when charging
     if (chg) {
@@ -2175,8 +2213,19 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(bx + 2, by + 1, bx - 1, by + 3, bolt_col);
     }
 
+    // Voltage readout below battery pill
+    {
+        char volt_str[8];
+        snprintf(volt_str, sizeof(volt_str), "%.2fV", med_mv / 1000.0f);
+        spr.setTextSize(1);
+        spr.setTextColor(CARD_BORDER, BG_COLOR);
+        // Center below battery pill (pill is at DISP_W-26..DISP_W-2, y=4..14)
+        spr.setCursor(DISP_W - 26, 14);
+        spr.print(volt_str);
+    }
+
     // Header divider — solid line, matching locator grid color
-    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+    spr.drawFastHLine(0, 20, DISP_W, CARD_BORDER);
 }
 
 void draw_toast_spr() {
@@ -2317,7 +2366,7 @@ void draw_scanner_screen() {
     int divider_x = 132;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
-    spr.setClipRect(0, 19, divider_x, DISP_H - 19);
+    spr.setClipRect(0, 21, divider_x, DISP_H - 21);
     
     float TILT = 0.55f;
     int rcx = radar_cx;
@@ -2381,17 +2430,27 @@ void draw_scanner_screen() {
         p_init = true;
     }
 
-    const float TRIGGER_ARC  = 0.25f;
     const float TWO_PIf      = (float)M_PI * 2.0f;
     float sweep_norm = fmodf(sweep_rad, TWO_PIf);
 
-    for (int i = 0; i < NUM_PARTICLES; i++) {
-        float pa = fmodf(noise_a[i], TWO_PIf);
-        float diff = sweep_norm - pa;
-        if (diff >  (float)M_PI) diff -= TWO_PIf;
-        if (diff < -(float)M_PI) diff += TWO_PIf;
-        if (diff >= 0.0f && diff < TRIGGER_ARC) {
-            noise_life[i] = noise_max_life[i];
+    // Drive particles from real ambient packet activity
+    {
+        static uint32_t last_ambient_count = 0;
+        static int particle_pending = 0;
+        uint32_t cur_ambient = ambient_packet_count;
+        uint32_t delta = cur_ambient - last_ambient_count;
+        last_ambient_count = cur_ambient;
+        // Each packet contributes 1–3 particles (clamped)
+        particle_pending += (int)delta * 2;
+        if (particle_pending > NUM_PARTICLES * 3) particle_pending = NUM_PARTICLES * 3;
+        // Activate up to particle_pending idle particles this frame
+        for (int i = 0; i < NUM_PARTICLES && particle_pending > 0; i++) {
+            if (noise_life[i] <= 0) {
+                noise_r[i]    = (float)random(inner_r + 4, radar_r - 4);
+                noise_a[i]    = random(0, 628) * 0.01f;
+                noise_life[i] = noise_max_life[i];
+                particle_pending--;
+            }
         }
     }
 
@@ -2577,10 +2636,15 @@ void draw_scanner_screen() {
     }
 
     // BLE badge — positioned 4px after WiFi badge ends
-    uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
+    // Pulse at ~2Hz only during active BLE scan window; dim/static otherwise
+    bool ble_scan_window_active = (pBLEScan != nullptr && pBLEScan->isScanning());
+    bool ble_pulse_on = ble_scan_window_active && (((millis() / 500) % 2) == 0);
+    float ble_pulse_t = ble_scan_window_active ? (ble_pulse_on ? 1.0f : 0.35f) : 0.18f;
+    uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR, ble_ease * 0.22f);
+    uint16_t ble_badge_col = lerp_col16(CARD_BORDER, ble_col, ble_pulse_t);
     spr.fillRoundRect(right_text_x + wf_bw - 1, 24, 28, 16, 7, ble_fill);
-    spr.drawRoundRect(right_text_x + wf_bw - 1, 24, 28, 16, 7, ble_col);
-    spr.setTextColor(ble_col, ble_fill);
+    spr.drawRoundRect(right_text_x + wf_bw - 1, 24, 28, 16, 7, ble_badge_col);
+    spr.setTextColor(ble_badge_col, ble_fill);
     spr.setCursor(right_text_x + wf_bw + 4, 29);
     spr.print("BLE");
 
@@ -2670,11 +2734,11 @@ void draw_locator_screen() {
     if (grid_o < 0) grid_o += GRID_STEP;
 
     for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
-        spr.drawLine(gx, 19, gx, DISP_H - 1, CARD_BORDER);
-    for (int gy = 19 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
-        if (gy >= 19) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
+        spr.drawLine(gx, 21, gx, DISP_H - 1, CARD_BORDER);
+    for (int gy = 21 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
+        if (gy >= 21) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
     // Solid vertical separator on right edge of grid panel
-    spr.drawFastVLine(GRID_RIGHT, 19, DISP_H - 19, CARD_BORDER);
+    spr.drawFastVLine(GRID_RIGHT, 21, DISP_H - 21, CARD_BORDER);
 
     const int cx = 44, cy = 58;
 
@@ -2780,11 +2844,12 @@ void draw_locator_screen() {
 
         uint16_t box_col;
         if (filled) {
-            float ph = (sinf((float)now_ms / 600.0f) + 1.0f) * 0.5f;
-            uint8_t gv = (uint8_t)(160 + 95.0f * ph);  // 160..255
-            box_col = lgfx::color565(0, gv, 0);
+            // Pulse ACCENT_COLOR using sin wave
+            float pulse_t = sinf((float)now_ms * 0.004f) * 0.5f + 0.5f;
+            uint16_t dark_accent = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.4f);
+            box_col = lerp_col16(dark_accent, ACCENT_COLOR, pulse_t);
         } else {
-            box_col = GPS_COLOR;
+            box_col = DIM_COLOR;
         }
 
         spr.drawRect(bxi, by0, BOX, BOX, box_col);
@@ -2921,7 +2986,7 @@ void draw_capture_history_screen() {
 
     if (total == 0) {
         for (int i = 0; i < 4; i++) {
-            int y = 20 + i * 28;
+            int y = 22 + i * 28;
             spr.fillRect(0, y, 3, 27, CARD_BORDER);
             spr.fillRect(3, y, DISP_W - 3, 27, (i % 2 == 0) ? CARD_COLOR : BG_COLOR);
             spr.setTextColor(CARD_BORDER, (i % 2 == 0) ? CARD_COLOR : BG_COLOR); spr.setTextSize(1);
@@ -2940,7 +3005,7 @@ void draw_capture_history_screen() {
 
     int rows_shown = 0;
     for (int i = history_scroll_offset; i < total && rows_shown < 4; i++, rows_shown++) {
-        int y = 20 + rows_shown * 28;
+        int y = 22 + rows_shown * 28;
         bool selected = (i == history_selected_idx);
 
         // Pull fields from whichever source
@@ -3020,7 +3085,7 @@ void draw_capture_history_screen() {
     }
 
     {
-        const int list_y = 20;
+        const int list_y = 22;
         const int list_h = 4 * 28;
         if (total > 4) {
             if (history_scroll_offset > 0)
@@ -3064,7 +3129,7 @@ void draw_capture_history_screen() {
         hist_type_info(d_type, &proto_lbl, &proto_col);
 
         // Dim backdrop
-        for (int dy = 19; dy < DISP_H; dy += 2)
+        for (int dy = 21; dy < DISP_H; dy += 2)
             spr.drawFastHLine(0, dy, DISP_W, lgfx::color565(8, 8, 14));
 
         // Card
@@ -3205,50 +3270,89 @@ void draw_gps_screen() {
     spr.drawCircle(gx, gy, gr,     rim_col);
     spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
 
-    // ── Orbiting satellite dots ──────────────────────────────────────────────
+    // ── Multi-plane orbital satellite animation ──────────────────────────────
     {
-        const int   orb_r   = gr + 14;  // clearly outside globe (44 vs 30px)
-        const float INC_ORB = 0.7854f;  // 45° inclination
-
-        // Shared lambda: project a point on the orbit ring to screen; returns tz depth
-        auto orb_proj = [&](float ang, int* px, int* py) -> float {
-            float ox = cosf(ang);
-            float oy = sinf(ang) * sinf(INC_ORB);
-            float oz = sinf(ang) * cosf(INC_ORB);
-            float tx2 = ox;
-            float ty2 = oy * ct - oz * st;   // X-tilt (same as globe)
-            float tz2 = oy * st + oz * ct;
-            float ux  = tx2 * croll - ty2 * sroll;  // Z-roll (same as globe)
-            float uy  = tx2 * sroll + ty2 * croll;
-            *px = gx + (int)(ux * orb_r);
-            *py = gy - (int)(uy * orb_r);
-            return tz2;
+        // 3 orbital planes: inclinations, radii, speeds, satellite counts
+        struct OrbPlane {
+            float inc;       // inclination (radians)
+            float radius;    // screen pixels from globe center
+            float speed;     // angular speed factor (applied to millis)
+            int   n_sats;    // satellites in this plane
+            float phase_off; // phase offset for plane
+        };
+        const OrbPlane planes[3] = {
+            { radians(55.0f), (float)(gr + 12), 0.0003f,  3, 0.0f },
+            { radians(55.0f), (float)(gr + 16), 0.00025f, 2, 2.09f },
+            { radians(80.0f), (float)(gr + 10), 0.0004f,  2, 1.05f },
         };
 
-        // 1. Faint dashed orbit ring — front half only, every other segment
-        {
-            const int N_RING = 60;
+        // Per-plane projection lambda — applies globe tilt/roll then inclination
+        for (int pi = 0; pi < 3; pi++) {
+            const OrbPlane& pl = planes[pi];
+            float ci = cosf(pl.inc), si2 = sinf(pl.inc);
+
+            auto orb_proj_p = [&](float ang, int* px, int* py) -> float {
+                // Orbit in tilted plane
+                float ox = cosf(ang);
+                float oy = sinf(ang) * ci;
+                float oz = sinf(ang) * si2;
+                // Apply globe rotation + tilt + roll (same transforms as globe wireframe)
+                float rx2 = ox * cr - oz * sr;
+                float ry2 = oy;
+                float rz2 = ox * sr + oz * cr;
+                float tx2 = rx2;
+                float ty2 = ry2 * ct - rz2 * st;
+                float tz2 = ry2 * st + rz2 * ct;
+                float ux  = tx2 * croll - ty2 * sroll;
+                float uy  = tx2 * sroll + ty2 * croll;
+                *px = gx + (int)(ux * pl.radius);
+                *py = gy - (int)(uy * pl.radius);
+                return tz2;
+            };
+
+            // Draw dashed orbit ring for this plane
+            const int N_RING = 48;
             for (int ri = 0; ri < N_RING; ri++) {
-                if (ri % 2 != 0) continue;  // dashed
+                if (ri % 2 != 0) continue;
                 float a0 = (float)ri       / N_RING * 2.0f * (float)M_PI;
                 float a1 = (float)(ri + 1) / N_RING * 2.0f * (float)M_PI;
                 int px0, py0, px1, py1;
-                float tz0 = orb_proj(a0, &px0, &py0);
-                float tz1 = orb_proj(a1, &px1, &py1);
+                float tz0 = orb_proj_p(a0, &px0, &py0);
+                float tz1 = orb_proj_p(a1, &px1, &py1);
                 if ((tz0 + tz1) * 0.5f > 0.0f)
-                    spr.drawLine(px0, py0, px1, py1, lgfx::color565(18, 45, 80));
+                    spr.drawLine(px0, py0, px1, py1, lgfx::color565(18, 40, 72));
             }
-        }
 
-        // 2. Satellite dots — evenly spaced, orbiting at 5 s/rev
-        float orbit_t = fmodf((float)millis() / 5000.0f, 1.0f) * 2.0f * (float)M_PI;
-        int n_sat = (sats < 12) ? sats : 12;
-        for (int si = 0; si < n_sat; si++) {
-            float ang = orbit_t + (float)si / (float)n_sat * 2.0f * (float)M_PI;
-            int dpx, dpy;
-            float tz2 = orb_proj(ang, &dpx, &dpy);
-            if (tz2 > 0.0f)
-                spr.fillCircle(dpx, dpy, 2, lgfx::color565(255, 255, 255));
+            // Draw satellite dots with motion trails
+            float orbit_t = (float)millis() * pl.speed + pl.phase_off;
+            for (int si = 0; si < pl.n_sats; si++) {
+                float base_ang = orbit_t + (float)si / (float)pl.n_sats * 2.0f * (float)M_PI;
+                // Motion trail: 4 ghost dots fading behind
+                for (int tr = 3; tr >= 0; tr--) {
+                    float trail_ang = base_ang - (float)(tr + 1) * 0.12f;
+                    int tpx, tpy;
+                    float ttz = orb_proj_p(trail_ang, &tpx, &tpy);
+                    if (ttz > 0.0f) {
+                        float fade = 1.0f - (float)(tr + 1) / 5.0f;
+                        // Brighter for acquired sats, dimmer for ghost
+                        bool acquired = (si < sats);
+                        uint16_t trail_col = acquired
+                            ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.5f)
+                            : lerp_col16(BG_COLOR, DIM_COLOR, fade * 0.3f);
+                        spr.drawPixel(tpx, tpy, trail_col);
+                    }
+                }
+                // Main satellite dot
+                int dpx, dpy;
+                float tz2 = orb_proj_p(base_ang, &dpx, &dpy);
+                if (tz2 > 0.0f) {
+                    bool acquired = (si < sats);
+                    uint16_t sat_col = acquired
+                        ? lgfx::color565(255, 255, 255)
+                        : lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
+                    spr.fillCircle(dpx, dpy, acquired ? 2 : 1, sat_col);
+                }
+            }
         }
     }
 
@@ -3332,51 +3436,59 @@ void draw_device_info_screen() {
     spr.fillSprite(BG_COLOR);
     draw_header_spr(4);
 
-    const int content_top_y = 19;
+    const int content_top_y = 21;
     const int content_bottom_y = DISP_H - 1;
     spr.setClipRect(0, content_top_y, DISP_W - 6, content_bottom_y - content_top_y);
 
     int yoff = 22 - device_info_scroll;
 
+    // 2-column grid layout
+    const int CARD_W = 112;
+    const int COL_L  = 4;
+    const int COL_R  = 124;
+    const int CARD_H = 38;
+
     // Version card (full width)
-    drawCard(4, yoff, DISP_W - 8, 20);
+    drawCard(COL_L, yoff, DISP_W - 8, 20);
     spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
     spr.setCursor(10, yoff + 5); spr.print(VERSION_STRING);
 
-    // Row 1: BOOTS, LIFETIME, ALL-TIME
+    // Row 1: BOOTS (left), LIFETIME (right)
     int row1_y = yoff + 24;
-    drawCard(4, row1_y, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, row1_y + 4); kprint(spr, "BOOTS");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, row1_y + 14); spr.print(lb);
+    drawCard(COL_L, row1_y, CARD_W, CARD_H);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row1_y + 4); kprint(spr, "BOOTS");
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row1_y + 14); spr.print(lb);
 
-    drawCard(82, row1_y, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row1_y + 4); kprint(spr, "LIFETIME");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row1_y + 14);
+    drawCard(COL_R, row1_y, CARD_W, CARD_H);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row1_y + 4); kprint(spr, "LIFETIME");
+    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row1_y + 16);
     { char tb[9]; format_time_buf(lifetime_seconds, tb, sizeof(tb)); spr.print(tb); }
 
-    drawCard(160, row1_y, 76, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, row1_y + 4); kprint(spr, "ALL-TIME");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, row1_y + 14); spr.print(lt);
-
-    // Row 2: WIFI SESS, BLE SESS, RAVEN
+    // Row 2: ALL-TIME (left), RAVEN (right)
     int row2_y = yoff + 66;
-    drawCard(4, row2_y, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(8, row2_y + 4); kprint(spr, "WIFI SESS");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(8, row2_y + 14); spr.print(sw);
+    drawCard(COL_L, row2_y, CARD_W, CARD_H);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row2_y + 4); kprint(spr, "ALL-TIME");
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row2_y + 14); spr.print(lt);
 
-    drawCard(82, row2_y, 72, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(86, row2_y + 4); kprint(spr, "BLE SESS");
-    spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(86, row2_y + 14); spr.print(sb);
+    drawCard(COL_R, row2_y, CARD_W, CARD_H);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row2_y + 4); kprint(spr, "RAVEN");
+    spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_R + 4, row2_y + 14); spr.print(sr);
 
-    drawCard(160, row2_y, 76, 38);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(164, row2_y + 4); kprint(spr, "RAVEN");
-    spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(164, row2_y + 14); spr.print(sr);
-
-    // Row 3: FLASH WRITES (full width)
+    // Row 3: WIFI SESS (left), BLE SESS (right)
     int row3_y = yoff + 108;
-    drawCard(4, row3_y, DISP_W - 8, 38);
+    drawCard(COL_L, row3_y, CARD_W, CARD_H);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row3_y + 4); kprint(spr, "WIFI SESS");
+    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row3_y + 14); spr.print(sw);
+
+    drawCard(COL_R, row3_y, CARD_W, CARD_H);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row3_y + 4); kprint(spr, "BLE SESS");
+    spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_R + 4, row3_y + 14); spr.print(sb);
+
+    // Row 4 label area: FLASH WRITES (full width)
+    int row4fw_y = yoff + 150;
+    drawCard(COL_L, row4fw_y, DISP_W - 8, CARD_H);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(8, row3_y + 4); kprint(spr, "FLASH WRITES");
+    spr.setCursor(COL_L + 4, row4fw_y + 4); kprint(spr, "FLASH WRITES");
 
     int wear_pct = (int)((lfw * 100) / 100000);
     if (wear_pct > 100) wear_pct = 100;
@@ -3385,11 +3497,11 @@ void draw_device_info_screen() {
                       : ACCENT_COLOR;
 
     spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
-    spr.setCursor(8, row3_y + 14); spr.print(lfw);
+    spr.setCursor(COL_L + 4, row4fw_y + 14); spr.print(lfw);
     spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(8, row3_y + 30); spr.print("writes");
+    spr.setCursor(COL_L + 4, row4fw_y + 30); spr.print("writes");
 
-    int bar_x = 110, bar_y = row3_y + 16, bar_w = 120, bar_h = 8;
+    int bar_x = 110, bar_y = row4fw_y + 16, bar_w = 116, bar_h = 8;
     spr.drawRect(bar_x, bar_y, bar_w, bar_h, CARD_BORDER);
     int fill = (wear_pct * (bar_w - 2)) / 100;
     if (fill > 0) spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, wear_col);
@@ -3397,16 +3509,63 @@ void draw_device_info_screen() {
     spr.setTextColor(wear_col, CARD_COLOR);
     spr.setCursor(bar_x + bar_w - 28, bar_y + bar_h + 4); spr.print(pct_str);
 
+    // Row 5: BATTERY (left) + RUNTIME (right) — 2-column
+    int row5_y = yoff + 192;
+    {
+        int32_t bat_mv_snap = get_filtered_voltage();
+        int bat_pct_snap = get_unified_battery_pct(bat_mv_snap);
+        if (bat_pct_snap == 255) bat_pct_snap = 100;
+
+        // Battery card (left)
+        drawCard(COL_L, row5_y, CARD_W, CARD_H);
+        spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+        spr.setCursor(COL_L + 4, row5_y + 4); kprint(spr, "BATTERY");
+        spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
+        spr.setCursor(COL_L + 4, row5_y + 14);
+        char bat_str[8]; snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct_snap);
+        spr.print(bat_str);
+        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
+        char mv_str[10]; snprintf(mv_str, sizeof(mv_str), " %dmV", (int)bat_mv_snap);
+        spr.print(mv_str);
+
+        // Runtime estimate card (right) — based on ~180mA average consumption, 500mAh battery
+        drawCard(COL_R, row5_y, CARD_W, CARD_H);
+        spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+        spr.setCursor(COL_R + 4, row5_y + 4); kprint(spr, "RUNTIME");
+        const int BATT_MAH = 500;
+        const int AVG_MA   = 180;
+        int runtime_min = (bat_pct_snap * BATT_MAH) / AVG_MA; // minutes approx
+        int rt_h = runtime_min / 60;
+        int rt_m = runtime_min % 60;
+        char rt_str[12]; snprintf(rt_str, sizeof(rt_str), "~%dh%02dm", rt_h, rt_m);
+        spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1);
+        spr.setCursor(COL_R + 4, row5_y + 16); spr.print(rt_str);
+        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
+        spr.setCursor(COL_R + 4, row5_y + 28); spr.print("est @180mA");
+    }
+
+    // Row 6: SD STATUS card (full width)
+    int row6_y = yoff + 234;
+    drawCard(COL_L, row6_y, DISP_W - 8, 24);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(COL_L + 4, row6_y + 4); kprint(spr, "SD CARD");
+    spr.setTextColor(sd_available ? ACCENT_COLOR : DIM_COLOR, CARD_COLOR);
+    spr.setCursor(70, row6_y + 4);
+    spr.print(sd_available ? "MOUNTED" : "NOT FOUND");
+    spr.setTextColor(DIM_COLOR, CARD_COLOR);
+    spr.setCursor(150, row6_y + 4);
+    spr.print(littlefs_available ? "FS OK" : "FS ERR");
+
     spr.clearClipRect();
 
     {
-        const int visible_h = (DISP_H - 1) - 19;
+        const int visible_h = (DISP_H - 1) - 21;
         const int max_scroll_for_fade = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
         if (max_scroll_for_fade > 0) {
             if (device_info_scroll > 0)
-                draw_scroll_fade(19, visible_h, 6, true);
+                draw_scroll_fade(21, visible_h, 6, true);
             if (device_info_scroll < max_scroll_for_fade)
-                draw_scroll_fade(19, visible_h, 6, false);
+                draw_scroll_fade(21, visible_h, 6, false);
         }
     }
 
@@ -3624,6 +3783,36 @@ void loop() {
 
     int32_t loop_mv = get_filtered_voltage();
 
+    // Low-battery threshold warnings (20%, 10%, 5%) — once per crossing
+    {
+        static int last_battery_warning_pct = 100;
+        int loop_bat_pct = get_unified_battery_pct(loop_mv);
+        if (loop_bat_pct != 255) {
+            if (loop_bat_pct <= 5 && last_battery_warning_pct > 5) {
+                strncpy(toast_text, "BATT CRITICAL 5%", sizeof(toast_text) - 1);
+                toast_text[sizeof(toast_text) - 1] = '\0';
+                toast_accent_color = CAUTION_COLOR;
+                toast_start = millis(); toast_active = true;
+                last_battery_warning_pct = 5;
+            } else if (loop_bat_pct <= 10 && last_battery_warning_pct > 10) {
+                strncpy(toast_text, "BATT LOW 10%", sizeof(toast_text) - 1);
+                toast_text[sizeof(toast_text) - 1] = '\0';
+                toast_accent_color = CAUTION_COLOR;
+                toast_start = millis(); toast_active = true;
+                last_battery_warning_pct = 10;
+            } else if (loop_bat_pct <= 20 && last_battery_warning_pct > 20) {
+                strncpy(toast_text, "BATT LOW 20%", sizeof(toast_text) - 1);
+                toast_text[sizeof(toast_text) - 1] = '\0';
+                toast_accent_color = CAUTION_COLOR;
+                toast_start = millis(); toast_active = true;
+                last_battery_warning_pct = 20;
+            } else if (loop_bat_pct > last_battery_warning_pct + 5) {
+                // Reset thresholds if battery level has risen (e.g., charging)
+                last_battery_warning_pct = loop_bat_pct;
+            }
+        }
+    }
+
     process_wifi_event_queue();
 
     if (trigger_alarm_confidence >= 50) {
@@ -3671,7 +3860,7 @@ void loop() {
                     if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (current_screen == 4) {
-                    int visible_h = DISP_H - 19;
+                    int visible_h = DISP_H - 21;
                     int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
                     if (max_scroll < 0) max_scroll = 0;
                     device_info_scroll += 12;
