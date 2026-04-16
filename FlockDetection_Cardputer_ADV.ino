@@ -152,8 +152,7 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 #define MAX_LOG_BUFFER 10
 #define MAX_PCAP_BUFFER 5
 #define SD_FLUSH_INTERVAL 10000
-#define DWELL_PRIMARY   650  
-#define DWELL_SECONDARY 200
+#define CHANNEL_DWELL_MS 400
 
 #define REDETECT_WINDOW_MS 300000
 
@@ -208,6 +207,7 @@ static volatile unsigned long channel_lock_until = 0;
 static unsigned long last_ble_scan = 0;
 static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
+static uint32_t ble_scan_cycle = 0;
 #define BLE_MAX_CONCURRENT_TASKS 6
 QueueHandle_t ble_event_queue;
 bool sd_available = false;
@@ -658,13 +658,13 @@ void clean_device_name_char(char* str) {
 // SIGNATURE DATABASE
 // ============================================================================
 static const char* wifi_ssid_patterns[] = {
-    "flock", "Flock", "FLOCK", "FS Ext Battery", "FS_", 
-    "Penguin", "Pigvision", "FlockOS", "flocksafety", "OFS_IoT", "PFS_",
-    "test_flck"  // CVE-2025-59409
+    "FS Ext Battery", "Penguin", "Pigvision", "FlockOS",
+    "flocksafety", "OFS_IoT", "PFS_", "test_flck"
 };
 static const int NUM_SSID_PATTERNS = sizeof(wifi_ssid_patterns) / sizeof(wifi_ssid_patterns[0]);
 
 static const char* mac_prefixes_tier1[] = {
+    "8c:1f:64", "4c:6e:44",
     "ec:1b:bd", "58:8e:81", "d8:a0:d8",
     "dc:54:75", "e0:e2:e6", "f0:9f:c2", "68:b6:b3", "a0:b7:65", "24:0a:c4",
     "a4:e5:7c", "78:e3:6d", "fc:f5:c4", "b0:b2:1c",
@@ -764,8 +764,8 @@ bool check_manufacturer_id(const std::string& mfg_data) {
 }
 
 bool has_tn_serial(const std::string& mfg_data) {
-    if (mfg_data.length() < 10) return false;
-    for (size_t i = 8; i < mfg_data.length() - 1; i++) {
+    if (mfg_data.length() < 4) return false;
+    for (size_t i = 2; i < mfg_data.length() - 1; i++) {
         if (mfg_data[i] == 'T' && mfg_data[i + 1] == 'N') return true;
     }
     return false;
@@ -1364,6 +1364,9 @@ struct WifiEvent {
     uint16_t payload_snap_len;
     uint16_t orig_len;
     volatile bool ready;
+    bool     is_wpa2_psk;
+    uint8_t  vendor_ouis[4][3];
+    uint8_t  vendor_oui_count;
 };
 
 static WifiEvent wifi_event_queue[WIFI_EVENT_QUEUE_SIZE];
@@ -1416,6 +1419,50 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->payload_snap_len = (ppkt->rx_ctrl.sig_len < 64) ? (uint16_t)ppkt->rx_ctrl.sig_len : 64;
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
 
+    ev->is_wpa2_psk = false;
+    ev->vendor_oui_count = 0;
+    if (is_beacon) {
+        uint8_t* p = tagged_params;
+        int rem = remaining;
+        while (rem >= 2) {
+            uint8_t tag_id = p[0];
+            uint8_t tag_len = p[1];
+            if (tag_len > rem - 2) break;
+            if (tag_id == 48 && tag_len >= 20) {
+                uint8_t* rsn = p + 2;
+                int rsn_len = tag_len;
+                if (rsn_len >= 8) {
+                    uint16_t pw_count = rsn[6] | (rsn[7] << 8);
+                    int akm_off = 8 + pw_count * 4;
+                    if (akm_off + 2 <= rsn_len) {
+                        uint16_t akm_count = rsn[akm_off] | (rsn[akm_off + 1] << 8);
+                        int akm_list = akm_off + 2;
+                        for (uint16_t a = 0; a < akm_count && akm_list + 4 <= rsn_len; a++) {
+                            if (rsn[akm_list] == 0x00 && rsn[akm_list+1] == 0x0F
+                                && rsn[akm_list+2] == 0xAC && rsn[akm_list+3] == 0x02) {
+                                ev->is_wpa2_psk = true;
+                                break;
+                            }
+                            akm_list += 4;
+                        }
+                    }
+                }
+            }
+            if (tag_id == 221 && tag_len >= 4 && ev->vendor_oui_count < 4) {
+                bool seen = false;
+                for (int k = 0; k < ev->vendor_oui_count; k++) {
+                    if (memcmp(ev->vendor_ouis[k], p + 2, 3) == 0) { seen = true; break; }
+                }
+                if (!seen) {
+                    memcpy(ev->vendor_ouis[ev->vendor_oui_count], p + 2, 3);
+                    ev->vendor_oui_count++;
+                }
+            }
+            p += 2 + tag_len;
+            rem -= 2 + tag_len;
+        }
+    }
+
     ev->ready = true;
     wifi_eq_write_idx = next;
 }
@@ -1450,6 +1497,10 @@ void process_wifi_event_queue() {
             if (ssid_generic)   { confidence += SCORE_WEAK; strlcat(methods, "ssid ", sizeof(methods)); }
         }
         if (confidence > 0 && local.rssi > -50) confidence += SCORE_BONUS_RSSI;
+        if (ssid_flock_fmt && local.is_wpa2_psk) {
+            strlcat(methods, "wpa2_psk ", sizeof(methods));
+            confidence += 10;
+        }
 
         char mac_str[18];
         snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -1470,8 +1521,24 @@ void process_wifi_event_queue() {
             int mlen = strlen(methods);
             if (mlen > 0 && methods[mlen - 1] == ' ') methods[mlen - 1] = '\0';
 
+            char vendor_str[48] = "";
+            if (local.vendor_oui_count > 0) {
+                int off = 0;
+                for (int k = 0; k < local.vendor_oui_count && off < (int)sizeof(vendor_str) - 12; k++) {
+                    off += snprintf(vendor_str + off, sizeof(vendor_str) - off,
+                                    "%sv%d:%02X-%02X-%02X",
+                                    k == 0 ? "" : " ",
+                                    k + 1,
+                                    local.vendor_ouis[k][0],
+                                    local.vendor_ouis[k][1],
+                                    local.vendor_ouis[k][2]);
+                }
+            }
+            char extra_combined[80];
+            snprintf(extra_combined, sizeof(extra_combined), "%s %s", frame_type_str, vendor_str);
+
             log_detection("FLOCK_WIFI", "WIFI", local.rssi, mac_str, name_str,
-                          local.channel, 0, frame_type_str, methods, confidence, local.seq_num);
+                          local.channel, 0, extra_combined, methods, confidence, local.seq_num);
             write_threat_pcap(local.payload_snap, local.payload_snap_len);
 
             xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1611,16 +1678,26 @@ static void ble_worker_task(void* pvParameters) {
             }
             if (strcmp(capture_type, "RAVEN_BLE") == 0) {
                 bool has_gps=false, has_power=false, has_net=false, has_up=false, has_err=false;
+                bool has_legacy_health=false, has_legacy_loc=false;
                 for (int i = 0; i < ev->uuid_count; i++) {
                     if (strcasestr(ev->service_uuids[i], "00003100")) has_gps   = true;
                     if (strcasestr(ev->service_uuids[i], "00003200")) has_power = true;
                     if (strcasestr(ev->service_uuids[i], "00003300")) has_net   = true;
                     if (strcasestr(ev->service_uuids[i], "00003400")) has_up    = true;
                     if (strcasestr(ev->service_uuids[i], "00003500")) has_err   = true;
+                    if (strcasestr(ev->service_uuids[i], "00001809")) has_legacy_health = true;
+                    if (strcasestr(ev->service_uuids[i], "00001819")) has_legacy_loc    = true;
                 }
-                const char* fw = (has_gps && has_power && has_net && has_up && has_err) ? "1.3.x"
-                               : (has_gps && has_power && has_net)                      ? "1.2.x"
-                               :                                                        "Unknown";
+                const char* fw;
+                if (has_legacy_health || has_legacy_loc) {
+                    fw = "1.1.x-LEGACY";
+                } else if (has_gps && has_power && has_net && has_up && has_err) {
+                    fw = "1.3.x";
+                } else if (has_gps && has_power && has_net) {
+                    fw = "1.2.x";
+                } else {
+                    fw = "Unknown";
+                }
                 snprintf(extra_data, sizeof(extra_data), "FW:%s UUIDs:%d", fw, raven_uuid_count);
             }
 
@@ -1699,9 +1776,7 @@ void ScannerLoopTask(void* pvParameters) {
     for (;;) {
         unsigned long now = millis();
         if (now > channel_lock_until) {
-            bool is_primary = (current_channel == 1 || current_channel == 6 || current_channel == 11);
-            unsigned long dwell = is_primary ? DWELL_PRIMARY : DWELL_SECONDARY;
-            if (now - last_channel_hop > dwell) {
+            if (now - last_channel_hop > CHANNEL_DWELL_MS) {
                 current_channel++; 
                 if (current_channel > MAX_CHANNEL) current_channel = 1;
                 esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); 
@@ -1714,7 +1789,13 @@ void ScannerLoopTask(void* pvParameters) {
             : BLE_SCAN_INTERVAL;
 
         if (millis() - last_ble_scan >= ble_interval) {
-            if (!pBLEScan->isScanning()) { pBLEScan->start(BLE_SCAN_DURATION, false); last_ble_scan = millis(); }
+            if (!pBLEScan->isScanning()) {
+                bool active = (ble_scan_cycle % 3 == 0);
+                pBLEScan->setActiveScan(active);
+                pBLEScan->start(BLE_SCAN_DURATION, false);
+                last_ble_scan = millis();
+                ble_scan_cycle++;
+            }
         }
         if (!pBLEScan->isScanning() && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
             pBLEScan->clearResults();
