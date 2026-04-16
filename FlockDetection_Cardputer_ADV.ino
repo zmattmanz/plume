@@ -192,7 +192,7 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 #define SD_CS_PIN       12
 
 // Version string — single source of truth
-#define VERSION_STRING "FLOCK DETECTOR v9.0 [ADV]"
+#define VERSION_STRING "FLOCK DETECTOR v9.2 [ADV]"
 
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
 #define NUM_SCREENS 5
