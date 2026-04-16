@@ -2807,7 +2807,7 @@ void draw_gps_screen() {
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
     // Solid BG fill, diagonal axis tilt like a real globe on a stand
-    const int gx = 55, gy = 76, gr = 30;  // gy=76 centres globe in content area (y 19–135)
+    const int gx = 55, gy = 72, gr = 30;  // gy=72 leaves room below for orbit+SATS
 
     // TILT: X-axis — north pole backward; ROLL: Z-axis — axis diagonal upper-left→lower-right
     const float TILT  = -0.30f;
@@ -2887,38 +2887,56 @@ void draw_gps_screen() {
     spr.drawCircle(gx, gy, gr,     rim_col);
     spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
 
-    // ── Orbiting satellite dots (one per satellite, max 12) ─────────────────
+    // ── Orbiting satellite dots ──────────────────────────────────────────────
     {
-        const int   orb_r   = gr + 8;         // orbit radius slightly outside globe rim
-        const float INC_ORB = 0.7854f;        // 45° orbit inclination from equatorial plane
-        float orbit_t = fmodf((float)millis() / 5000.0f, 1.0f) * 2.0f * (float)M_PI;
-        int n_sat = (sats < 12) ? sats : 12;
+        const int   orb_r   = gr + 14;  // clearly outside globe (44 vs 30px)
+        const float INC_ORB = 0.7854f;  // 45° inclination
 
-        for (int si = 0; si < n_sat; si++) {
-            float ang = orbit_t + (float)si / (float)n_sat * 2.0f * (float)M_PI;
-            // 3D position on inclined orbit (X-axis inclination from XZ plane)
+        // Shared lambda: project a point on the orbit ring to screen; returns tz depth
+        auto orb_proj = [&](float ang, int* px, int* py) -> float {
             float ox = cosf(ang);
             float oy = sinf(ang) * sinf(INC_ORB);
             float oz = sinf(ang) * cosf(INC_ORB);
-            // Apply TILT (X rotation — same as globe, no Y-spin so orbit is camera-fixed)
             float tx2 = ox;
-            float ty2 = oy * ct - oz * st;
+            float ty2 = oy * ct - oz * st;   // X-tilt (same as globe)
             float tz2 = oy * st + oz * ct;
-            // Apply ROLL (Z rotation — same as globe)
-            float ux = tx2 * croll - ty2 * sroll;
-            float uy = tx2 * sroll + ty2 * croll;
-            // Only draw front-facing dots (tz2 > 0)
-            if (tz2 > 0.0f) {
-                int dpx = gx + (int)(ux * orb_r);
-                int dpy = gy - (int)(uy * orb_r);
-                spr.fillCircle(dpx, dpy, 2, lgfx::color565(255, 255, 255));
+            float ux  = tx2 * croll - ty2 * sroll;  // Z-roll (same as globe)
+            float uy  = tx2 * sroll + ty2 * croll;
+            *px = gx + (int)(ux * orb_r);
+            *py = gy - (int)(uy * orb_r);
+            return tz2;
+        };
+
+        // 1. Faint dashed orbit ring — front half only, every other segment
+        {
+            const int N_RING = 60;
+            for (int ri = 0; ri < N_RING; ri++) {
+                if (ri % 2 != 0) continue;  // dashed
+                float a0 = (float)ri       / N_RING * 2.0f * (float)M_PI;
+                float a1 = (float)(ri + 1) / N_RING * 2.0f * (float)M_PI;
+                int px0, py0, px1, py1;
+                float tz0 = orb_proj(a0, &px0, &py0);
+                float tz1 = orb_proj(a1, &px1, &py1);
+                if ((tz0 + tz1) * 0.5f > 0.0f)
+                    spr.drawLine(px0, py0, px1, py1, lgfx::color565(18, 45, 80));
             }
+        }
+
+        // 2. Satellite dots — evenly spaced, orbiting at 5 s/rev
+        float orbit_t = fmodf((float)millis() / 5000.0f, 1.0f) * 2.0f * (float)M_PI;
+        int n_sat = (sats < 12) ? sats : 12;
+        for (int si = 0; si < n_sat; si++) {
+            float ang = orbit_t + (float)si / (float)n_sat * 2.0f * (float)M_PI;
+            int dpx, dpy;
+            float tz2 = orb_proj(ang, &dpx, &dpy);
+            if (tz2 > 0.0f)
+                spr.fillCircle(dpx, dpy, 2, lgfx::color565(255, 255, 255));
         }
     }
 
-    // SAT count — single line below orbit, number in white
+    // SAT count — single line below the full orbit extent, number in white
     {
-        int sat_y = gy + gr + 17;  // pushed below orbit dots
+        int sat_y = gy + (gr + 14) + 9;  // below orbit (orb_r = gr+14)
         int sat_x = gx - 24;
         spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
         spr.setCursor(sat_x, sat_y); kprint(spr, "SATS ");
