@@ -61,6 +61,12 @@ bool show_help_overlay = false;
 static float help_ease = 0.0f;
 static unsigned long help_ease_start = 0;
 
+// Ambient mode: dim minimal UI after sustained idle
+static unsigned long last_user_input_ms = 0;
+static const unsigned long AMBIENT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+static const uint8_t AMBIENT_BRIGHTNESS = 8;
+static bool ambient_mode = false;
+
 unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
 bool show_locator_help = false;  // 'h' on locator screen
@@ -382,6 +388,7 @@ volatile bool sd_hist_dirty = false;
 struct ToastEntry {
     char text[32];
     uint16_t accent;
+    bool is_action;
 };
 static ToastEntry toast_queue[TOAST_QUEUE_SIZE];
 static int toast_queue_head = 0;
@@ -392,6 +399,7 @@ static bool toast_active = false;
 // Compatibility shims for direct-write sites (battery warnings, flash errors)
 static char toast_text[32] = "";
 static uint16_t toast_accent_color = 0;
+static bool toast_is_action = false;
 
 unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
@@ -437,6 +445,13 @@ float locator_confidence_radius = 0.0;
 bool locator_has_estimate = false;
 int locator_peak_rssi = -120;
 bool locator_estimate_announced = false;
+
+// Trend tracking: last N distance samples for "getting warmer" arrow
+#define LOC_TREND_SAMPLES 8
+static float locator_dist_history[LOC_TREND_SAMPLES] = {0};
+static int locator_dist_history_count = 0;
+static int locator_dist_history_head = 0;
+static unsigned long locator_last_trend_sample_ms = 0;
 volatile bool locator_announce_pending = false;
 
 TinyGPSPlus gps;
@@ -873,6 +888,68 @@ void format_time_buf(unsigned long total_sec, char* buf, size_t buf_len) {
     unsigned long m = (total_sec / 60) % 60;
     unsigned long s = total_sec % 60;
     snprintf(buf, buf_len, "%02lu:%02lu:%02lu", h, m, s);
+}
+
+// Translate detection method codes into a plain-English summary.
+static void methods_to_human(const char* methods, char* out, size_t out_len) {
+    if (!methods || methods[0] == '\0' || out_len < 4) {
+        if (out_len > 0) out[0] = '\0';
+        return;
+    }
+    struct Token { const char* code; const char* human; };
+    static const Token tokens[] = {
+        {"raven_multi",  "3+ Raven UUIDs"},
+        {"raven_custom", "Raven custom UUID"},
+        {"raven_uuid",   "Raven UUID"},
+        {"mfg_0x09C8",   "Flock mfg ID"},
+        {"tn_serial",    "TN serial"},
+        {"ssid_fmt",     "Flock SSID format"},
+        {"wpa2_psk",     "WPA2-PSK"},
+        {"penguin_num",  "Penguin name"},
+        {"name",         "Known name"},
+        {"mac_t1",       "Known MAC"},
+        {"mac_t2",       "Similar MAC"},
+        {"ssid",         "SSID pattern"},
+        {"static_addr",  "Static addr"},
+    };
+    static const int N_TOKENS = (int)(sizeof(tokens) / sizeof(tokens[0]));
+
+    out[0] = '\0';
+    int off = 0;
+    int matches = 0;
+
+    for (int i = 0; i < N_TOKENS; i++) {
+        const char* p = methods;
+        bool found = false;
+        size_t code_len = strlen(tokens[i].code);
+        while ((p = strstr(p, tokens[i].code)) != NULL) {
+            bool start_ok = (p == methods) || (*(p - 1) == ' ');
+            const char* end = p + code_len;
+            bool end_ok = (*end == '\0') || (*end == ' ');
+            if (start_ok && end_ok) { found = true; break; }
+            p++;
+        }
+        if (!found) continue;
+
+        if (matches > 0) {
+            if (off + 3 >= (int)out_len) break;
+            out[off++] = ','; out[off++] = ' ';
+        }
+        int hlen = (int)strlen(tokens[i].human);
+        if (off + hlen + 1 > (int)out_len) {
+            if (off + 4 < (int)out_len) { out[off++] = '.'; out[off++] = '.'; out[off++] = '.'; }
+            break;
+        }
+        memcpy(out + off, tokens[i].human, hlen);
+        off += hlen;
+        out[off] = '\0';
+        matches++;
+    }
+
+    if (matches == 0) {
+        strncpy(out, methods, out_len - 1);
+        out[out_len - 1] = '\0';
+    }
 }
 
 const char* confidence_label(int score) {
@@ -1441,6 +1518,7 @@ static void set_toast_direct(const char* text, uint16_t accent) {
     strncpy(toast_text, text, sizeof(toast_text) - 1);
     toast_text[sizeof(toast_text) - 1] = '\0';
     toast_accent_color = accent;
+    toast_is_action = true;
     toast_start = millis();
     toast_active = true;
     xSemaphoreGive(dataMutex);
@@ -1454,10 +1532,15 @@ void trigger_toast(const char* type, const char* name, int confidence) {
     else                                          accent = CAUTION_COLOR;
 
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
+    bool is_action = (confidence == 0);
     char full_text[32];
-    char pct_str[6];
-    snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
-    snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
+    if (is_action) {
+        snprintf(full_text, sizeof(full_text), "%.30s", src);
+    } else {
+        char pct_str[6];
+        snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
+        snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
+    }
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
 
@@ -1470,6 +1553,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
     strncpy(toast_queue[slot].text, full_text, sizeof(toast_queue[slot].text) - 1);
     toast_queue[slot].text[sizeof(toast_queue[slot].text) - 1] = '\0';
     toast_queue[slot].accent = accent;
+    toast_queue[slot].is_action = is_action;
     toast_queue_count++;
 
     // If nothing currently showing, activate immediately
@@ -1477,6 +1561,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
         strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
         toast_text[sizeof(toast_text) - 1] = '\0';
         toast_accent_color = toast_queue[toast_queue_head].accent;
+        toast_is_action = toast_queue[toast_queue_head].is_action;
         toast_start = millis();
         toast_active = true;
     }
@@ -1645,6 +1730,26 @@ float bearing_to(double lat1, double lon1, double lat2, double lon2) {
     return (float)brng;
 }
 
+// Returns -1 if distance is decreasing (closer), +1 if increasing (farther), 0 if stable.
+static int locator_distance_trend() {
+    if (locator_dist_history_count < 4) return 0;
+    int n = locator_dist_history_count;
+    int half = n / 2;
+    float old_avg = 0, new_avg = 0;
+    for (int i = 0; i < half; i++) {
+        int idx_old = (locator_dist_history_head - n + i + LOC_TREND_SAMPLES * 2) % LOC_TREND_SAMPLES;
+        int idx_new = (locator_dist_history_head - half + i + LOC_TREND_SAMPLES * 2) % LOC_TREND_SAMPLES;
+        old_avg += locator_dist_history[idx_old];
+        new_avg += locator_dist_history[idx_new];
+    }
+    old_avg /= half;
+    new_avg /= half;
+    float diff = new_avg - old_avg;
+    if (diff < -2.0f) return -1;
+    if (diff >  2.0f) return  1;
+    return 0;
+}
+
 void locator_add_sample(const char* mac, int rssi) {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (!locator_active || strncmp(mac, locator_target_mac, 17) != 0) {
@@ -1724,6 +1829,9 @@ void locator_start(const char* mac, const char* name, const char* type = "") {
     locator_estimate_announced = false;
     locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
     locator_start_time = millis(); locator_newest_sample_ms = 0;
+    locator_dist_history_count = 0;
+    locator_dist_history_head = 0;
+    locator_last_trend_sample_ms = 0;
     xSemaphoreGive(dataMutex);
 }
 
@@ -1732,6 +1840,9 @@ void locator_stop() {
     locator_active = false; locator_has_estimate = false; locator_sample_count = 0;
     locator_newest_sample_ms = 0;
     locator_estimate_announced = false;
+    locator_dist_history_count = 0;
+    locator_dist_history_head = 0;
+    locator_last_trend_sample_ms = 0;
     xSemaphoreGive(dataMutex);
 }
 
@@ -2502,6 +2613,7 @@ void draw_toast_spr() {
             strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
             toast_text[sizeof(toast_text) - 1] = '\0';
             toast_accent_color = toast_queue[toast_queue_head].accent;
+            toast_is_action = toast_queue[toast_queue_head].is_action;
             toast_start = millis();
             toast_active = true;
         } else {
@@ -2522,7 +2634,7 @@ void draw_toast_spr() {
     spr.drawRect(t_x, y_pos, t_w, 26, CARD_BORDER);
 
     spr.setTextColor(accent, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(t_x + 6, y_pos + 9); spr.print("[!]");
+    spr.setCursor(t_x + 6, y_pos + 9); spr.print(toast_is_action ? "[i]" : "[!]");
     spr.setTextColor(TEXT_COLOR, CARD_COLOR);
     spr.setCursor(t_x + 26, y_pos + 9); spr.print(toast_text);
     if (toast_queue_count > 1) {
@@ -3316,6 +3428,20 @@ void draw_locator_screen() {
     // DISTANCE (hero)
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(rpx, 48); kprint(spr, "DISTANCE");
+
+    // Trend arrow next to DISTANCE label — green ↓ closer, amber ↑ farther
+    {
+        int trend = (active && has_est) ? locator_distance_trend() : 0;
+        if (trend != 0) {
+            int tx = rpx + 58;
+            int ty = 48;
+            if (trend < 0) {
+                spr.fillTriangle(tx, ty, tx + 6, ty, tx + 3, ty + 6, ACCENT_COLOR);
+            } else {
+                spr.fillTriangle(tx, ty + 6, tx + 6, ty + 6, tx + 3, ty, CAUTION_COLOR);
+            }
+        }
+    }
     {
         float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(3);
@@ -3580,8 +3706,22 @@ void draw_capture_history_screen() {
         char tmp[32];
         det_row("MAC: ", d_mac); fy += 14;
         snprintf(tmp, sizeof(tmp), "%d dBm", d_rssi); det_row("RSSI: ", tmp); fy += 14;
-        snprintf(tmp, sizeof(tmp), "%d%%", d_conf);   det_row("CONF: ", tmp); fy += 14;
-        if (d_method[0]) { det_row("HOW:  ", d_method); fy += 14; }
+        {
+            const char* band;
+            if      (d_conf >= CONFIDENCE_CERTAIN)         band = "CERTAIN";
+            else if (d_conf >= CONFIDENCE_HIGH)            band = "HIGH";
+            else if (d_conf >= CONFIDENCE_ALARM_THRESHOLD) band = "MEDIUM";
+            else                                           band = "below alarm";
+            snprintf(tmp, sizeof(tmp), "%d%% (%s)", d_conf, band);
+            det_row("CONF: ", tmp);
+            fy += 14;
+        }
+        if (d_method[0]) {
+            char human[48];
+            methods_to_human(d_method, human, sizeof(human));
+            det_row("MATCH:", human);
+            fy += 14;
+        }
         const char* d_ts = use_sd ? sd_hist[di].timestamp : "";
         if (d_ts[0]) { det_row("TIME: ", d_ts); fy += 14; }
 
@@ -4213,6 +4353,7 @@ void setup() {
     // Note: if the struct API causes a compile error, fallback is: esp_task_wdt_init(10, true);
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
+    last_user_input_ms = millis();
     system_fully_booted = true;
 }
 
@@ -4274,14 +4415,23 @@ void loop() {
         play_escalated_alarm(conf_snapshot, src_snapshot);
     }
 
+    bool input_happened = false;
+
     if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
-        int next_screen = current_screen + 1;
-        int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
-        if (next_screen >= NUM_SCREENS) next_screen = 0;
-        transition_screen(next_screen, dir);
+        input_happened = true;
+        if (!ambient_mode) {
+            int next_screen = current_screen + 1;
+            int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
+            if (next_screen >= NUM_SCREENS) next_screen = 0;
+            transition_screen(next_screen, dir);
+        }
     }
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+        input_happened = true;
+        if (ambient_mode) {
+            // Skip processing; ambient wake handled below
+        } else {
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         
         if (status.tab && !stealth_mode) {
@@ -4395,7 +4545,7 @@ void loop() {
                     trigger_toast("TARGET", t_name, t_conf);
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
-                    trigger_toast("TARGET", "No history", 0);
+                    trigger_toast("INFO", "No targets yet", 0);
                 }
             }
             else if (c == '/' || c == '>') {
@@ -4444,7 +4594,7 @@ void loop() {
                     session_raven = 0;
                     session_start_time = millis();
                     xSemaphoreGive(dataMutex);
-                    trigger_toast("TARGET", "Session reset", 0);
+                    trigger_toast("INFO", "Session reset", 0);
                     beep(800, 60);
                     draw_current_screen();
                     spr.pushSprite(0, 0);
@@ -4527,7 +4677,17 @@ void loop() {
                 transition_screen(prev, d);
             }
         }
+        }  // closes the else wrapping the keyboard handler body
     }
+
+    // Handle ambient wake — input occurred while ambient was active
+    if (input_happened && ambient_mode) {
+        ambient_mode = false;
+        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+        draw_current_screen();
+        spr.pushSprite(0, 0);
+    }
+    if (input_happened) last_user_input_ms = millis();
 
     // Fire pending 'l' single-press action if double-tap window expired
     if (l_pending_exists && millis() >= l_pending_until) {
@@ -4588,6 +4748,14 @@ void loop() {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             locator_est_distance = dist;
             locator_bearing = brng;
+            // Sample the distance into the trend history (every ~500ms)
+            unsigned long now_t = millis();
+            if (now_t - locator_last_trend_sample_ms > 500) {
+                locator_dist_history[locator_dist_history_head] = dist;
+                locator_dist_history_head = (locator_dist_history_head + 1) % LOC_TREND_SAMPLES;
+                if (locator_dist_history_count < LOC_TREND_SAMPLES) locator_dist_history_count++;
+                locator_last_trend_sample_ms = now_t;
+            }
             xSemaphoreGive(dataMutex);
         } else {
             xSemaphoreGive(dataMutex);
@@ -4609,18 +4777,46 @@ void loop() {
 
     if (locator_announce_pending) {
         locator_announce_pending = false;
-        trigger_toast("TARGET", "Estimate ready", 100);
+        trigger_toast("INFO", "Estimate ready", 0);
         if (!is_muted && !stealth_mode) {
             xTaskCreate(LocatorChimeTask, "LocChime", 2048, NULL, 2, NULL);
         }
     }
 
-    if (!stealth_mode) {
+    // Enter ambient mode after sustained idle
+    if (!ambient_mode && !stealth_mode && !toast_active && !locator_active && !export_mode_active &&
+        (millis() - last_user_input_ms) > AMBIENT_TIMEOUT_MS) {
+        ambient_mode = true;
+        M5Cardputer.Display.setBrightness(AMBIENT_BRIGHTNESS);
+    }
+
+    if (ambient_mode) {
+        static unsigned long last_ambient_draw = 0;
+        if (millis() - last_ambient_draw > 2000) {
+            long det_total;
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            det_total = session_flock_wifi + session_flock_ble + session_raven;
+            xSemaphoreGive(dataMutex);
+
+            spr.fillSprite(BG_COLOR);
+            char det_buf[16];
+            snprintf(det_buf, sizeof(det_buf), "%ld", det_total);
+            spr.setTextDatum(MC_DATUM);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(3);
+            spr.drawString(det_buf, DISP_W / 2, DISP_H / 2 - 6);
+            spr.setTextSize(1);
+            spr.drawString("DETECTIONS", DISP_W / 2, DISP_H / 2 + 16);
+            spr.setTextDatum(TL_DATUM);
+            spr.pushSprite(0, 0);
+            last_ambient_draw = millis();
+        }
+    } else if (!stealth_mode) {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; } 
-        } 
+            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; }
+        }
         else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
