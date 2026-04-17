@@ -830,6 +830,26 @@ bool has_tn_serial(const std::string& mfg_data) {
 // ============================================================================
 // HELPER FUNCTIONS & PCAP
 // ============================================================================
+
+// Convert a UTC Y/M/D h:m:s to Unix epoch seconds without depending on
+// the system timezone. Valid for years 1970..2099.
+static uint32_t utc_to_epoch(int year, int mon, int day,
+                             int hour, int min, int sec) {
+    static const int days_before_month[12] = {
+        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+    };
+    if (year < 1970) return 0;
+    long y = year;
+    long days = (y - 1970) * 365 + (y - 1969) / 4
+              - (y - 1901) / 100 + (y - 1601) / 400;
+    days += days_before_month[mon - 1];
+    // Add leap day if this year is a leap year AND we're past February
+    bool is_leap = ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
+    if (is_leap && mon > 2) days += 1;
+    days += (day - 1);
+    return (uint32_t)(days * 86400L + hour * 3600L + min * 60L + sec);
+}
+
 void format_time_buf(unsigned long total_sec, char* buf, size_t buf_len) {
     unsigned long h = total_sec / 3600;
     unsigned long m = (total_sec / 60) % 60;
@@ -1090,13 +1110,14 @@ void load_sd_history() {
         buf[len] = '\0';
         if (len < 10) continue;
 
-        // CSV: 0=ts,1=chan,2=type,3=proto,4=rssi,5=mac,6=name,7=txpwr,8=method,9=conf,...
-        int fs[11]; int fc = 0;
+        // CSV: 0=Uptime_ms,1=EpochUTC,2=EpochIsGPS,3=Channel,4=Type,5=Proto,
+        //      6=RSSI,7=MAC,8=Name,9=TXPower,10=Method,11=Conf,...
+        int fs[21]; int fc = 0;
         fs[0] = 0;
-        for (int ci = 0; ci < len && fc < 10; ci++) {
+        for (int ci = 0; ci < len && fc < 20; ci++) {
             if (buf[ci] == ',') fs[++fc] = ci + 1;
         }
-        if (fc < 9) { total++; continue; }
+        if (fc < 11) { total++; continue; }
 
         // Extract a field: from fs[n] up to the next comma (or end of buf)
         auto copy_f = [&](int n, char* dest, int maxlen) {
@@ -1110,12 +1131,12 @@ void load_sd_history() {
         };
 
         SDHistEntry& e = ring[ri % SD_HIST_SIZE];
-        copy_f(2, e.type,   16);
-        copy_f(5, e.mac,    18);
-        copy_f(6, e.name,   32);
-        copy_f(8, e.method, 24);
-        e.rssi       = atoi(buf + fs[4]);
-        e.confidence = atoi(buf + fs[9]);
+        copy_f(4,  e.type,   16);
+        copy_f(7,  e.mac,    18);
+        copy_f(8,  e.name,   32);
+        copy_f(10, e.method, 24);
+        e.rssi       = atoi(buf + fs[6]);
+        e.confidence = atoi(buf + fs[11]);
         {
             unsigned long uptime = (unsigned long)strtoul(buf + fs[0], NULL, 10);
             format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
@@ -1459,15 +1480,10 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
-            struct tm t = {};
-            t.tm_year = gps.date.year() - 1900;
-            t.tm_mon  = gps.date.month() - 1;
-            t.tm_mday = gps.date.day();
-            t.tm_hour = gps.time.hour();
-            t.tm_min  = gps.time.minute();
-            t.tm_sec  = gps.time.second();
-            time_t epoch = mktime(&t);
-            if (epoch > 0) { ts_epoch = (uint32_t)epoch; ts_is_gps = true; }
+            uint32_t epoch = utc_to_epoch(
+                gps.date.year(), gps.date.month(), gps.date.day(),
+                gps.time.hour(), gps.time.minute(), gps.time.second());
+            if (epoch > 0) { ts_epoch = epoch; ts_is_gps = true; }
         }
         xSemaphoreGive(dataMutex);
     }
@@ -1805,6 +1821,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
         }
     }
 
+    __sync_synchronize();   // release: publish all field writes before `ready`
     ev->ready = true;
     wifi_eq_write_idx = next;
 }
@@ -1812,6 +1829,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
 void process_wifi_event_queue() {
     while (wifi_event_queue[wifi_eq_read_idx].ready) {
         WifiEvent* ev = &wifi_event_queue[wifi_eq_read_idx];
+        __sync_synchronize();   // acquire: pair with producer's release below
 
         WifiEvent local;
         memcpy(&local, ev, sizeof(WifiEvent));
