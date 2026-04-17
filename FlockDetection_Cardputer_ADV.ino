@@ -282,6 +282,7 @@ struct SeenMacEntry {
     bool   occupied;
 };
 static SeenMacEntry seen_mac_table[MAX_SEEN_MACS * 2];
+static uint32_t seen_mac_evict_cursor = 0;
 
 static uint32_t hash_mac(const char* mac) {
     uint32_t h = 2166136261u;
@@ -324,14 +325,15 @@ void add_seen_mac(const char* mac) {
             return;
         }
     }
-    int oldest = 0;
-    for (int i = 1; i < SEEN_MAC_TABLE_SIZE; i++) {
-        if (seen_mac_table[i].ts < seen_mac_table[oldest].ts) oldest = i;
-    }
-    strncpy(seen_mac_table[oldest].mac, key, 17);
-    seen_mac_table[oldest].mac[17] = '\0';
-    seen_mac_table[oldest].ts       = millis();
-    seen_mac_table[oldest].occupied = true;
+    // Round-robin eviction: O(1), approximates LRU well enough given the
+    // 5-minute redetect window and 400-slot capacity. The cursor advances
+    // monotonically so we don't repeatedly evict the same slot.
+    int evict = (int)(seen_mac_evict_cursor % SEEN_MAC_TABLE_SIZE);
+    seen_mac_evict_cursor++;
+    strncpy(seen_mac_table[evict].mac, key, 17);
+    seen_mac_table[evict].mac[17] = '\0';
+    seen_mac_table[evict].ts       = millis();
+    seen_mac_table[evict].occupied = true;
 }
 
 char last_cap_type[16]       = "None";
@@ -1003,6 +1005,20 @@ bool export_mode_start() {
     snprintf(export_ip_str, sizeof(export_ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 
     export_server = new WebServer(80);
+    if (!export_server) {
+        set_toast_direct("EXPORT ALLOC FAIL", CAUTION_COLOR);
+        // Restore promiscuous sniffing — same restoration the connect-fail path does.
+        WiFi.disconnect(true);
+        delay(100);
+        WiFi.mode(WIFI_STA);
+        wifi_promiscuous_filter_t pf_restore;
+        pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+        esp_wifi_set_promiscuous_filter(&pf_restore);
+        esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+        return false;
+    }
     export_server_setup_routes();
     export_server->begin();
 
@@ -4253,20 +4269,31 @@ void loop() {
             } else if (loop_bat_pct <= 20 && last_battery_warning_pct > 20) {
                 set_toast_direct("BATT LOW 20%", CAUTION_COLOR);
                 last_battery_warning_pct = 20;
-            } else if (loop_bat_pct > last_battery_warning_pct + 5) {
-                // Reset thresholds if battery level has risen (e.g., charging)
-                last_battery_warning_pct = loop_bat_pct;
+            } else if (last_battery_warning_pct < 100
+                       && loop_bat_pct >= last_battery_warning_pct + 10) {
+                // Battery has genuinely recovered (10+ points above last fired
+                // threshold) — fully re-arm all thresholds for the next discharge.
+                last_battery_warning_pct = 100;
             }
         }
     }
 
     process_wifi_event_queue();
 
+    int conf_snapshot = 0;
+    int src_snapshot = 0;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (trigger_alarm_confidence >= 50) {
-        int conf = trigger_alarm_confidence; int src = trigger_alarm_source;
-        trigger_alarm_confidence = 0; trigger_alarm_source = 0;
-        play_escalated_alarm(conf, src);
-    } else { trigger_alarm_confidence = 0; trigger_alarm_source = 0; }
+        conf_snapshot = trigger_alarm_confidence;
+        src_snapshot = trigger_alarm_source;
+    }
+    trigger_alarm_confidence = 0;
+    trigger_alarm_source = 0;
+    xSemaphoreGive(dataMutex);
+
+    if (conf_snapshot >= 50) {
+        play_escalated_alarm(conf_snapshot, src_snapshot);
+    }
 
     if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
         int next_screen = current_screen + 1;
