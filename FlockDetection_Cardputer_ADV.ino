@@ -701,7 +701,7 @@ void dedicated_charging_loop() {
         if (elapsed >= CHARGE_AUTO_BOOT_MS) {
             M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
         }
-        delay(15);
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 }
 
@@ -874,7 +874,10 @@ uint16_t confidence_color(int score) {
     return TEXT_COLOR;
 }
 
-// Returns current UTC epoch from GPS if valid, else falls back to anchored uptime.
+// Compute pcap-ready UTC timestamp (seconds + microseconds).
+// Prefer calling this once per detection event and passing results through
+// to write_threat_pcap / write_ble_pcap, rather than having those functions
+// call this helper internally (avoids duplicate mutex acquisition).
 // Caller must NOT hold dataMutex — this function takes it internally.
 static uint32_t get_pcap_epoch_now(uint32_t* out_usec) {
     static const uint32_t PCAP_EPOCH_BASE = 1700000000UL;
@@ -909,18 +912,15 @@ static uint32_t get_pcap_epoch_now(uint32_t* out_usec) {
     return PCAP_EPOCH_BASE + (uint32_t)(now_ms / 1000UL);
 }
 
-void write_threat_pcap(const uint8_t* payload, uint32_t length) {
+void write_threat_pcap(const uint8_t* payload, uint32_t length,
+                       uint32_t ts_sec, uint32_t ts_usec) {
     if (!sd_available) return;
     uint32_t capture_len = (length > 256) ? 256 : length;
 
-    // Compute timestamp BEFORE taking dataMutex (helper takes it internally)
-    uint32_t pcap_usec;
-    uint32_t pcap_sec = get_pcap_epoch_now(&pcap_usec);
-
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (pcap_write_count < MAX_PCAP_BUFFER) {
-        pcap_write_buffer[pcap_write_count].ts_sec  = pcap_sec;
-        pcap_write_buffer[pcap_write_count].ts_usec = pcap_usec;
+        pcap_write_buffer[pcap_write_count].ts_sec  = ts_sec;
+        pcap_write_buffer[pcap_write_count].ts_usec = ts_usec;
         pcap_write_buffer[pcap_write_count].incl_len = capture_len;
         pcap_write_buffer[pcap_write_count].orig_len = length;
         memcpy(pcap_write_buffer[pcap_write_count].payload, payload, capture_len);
@@ -929,18 +929,15 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
     xSemaphoreGive(dataMutex);
 }
 
-void write_ble_pcap(const uint8_t* payload, uint32_t length) {
+void write_ble_pcap(const uint8_t* payload, uint32_t length,
+                    uint32_t ts_sec, uint32_t ts_usec) {
     if (!sd_available) return;
     uint32_t capture_len = (length > 256) ? 256 : length;
 
-    // Compute timestamp BEFORE taking dataMutex (helper takes it internally)
-    uint32_t pcap_usec;
-    uint32_t pcap_sec = get_pcap_epoch_now(&pcap_usec);
-
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (ble_pcap_write_count < MAX_PCAP_BUFFER) {
-        ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = pcap_sec;
-        ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = pcap_usec;
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = ts_sec;
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = ts_usec;
         ble_pcap_write_buffer[ble_pcap_write_count].incl_len = capture_len;
         ble_pcap_write_buffer[ble_pcap_write_count].orig_len = length;
         memcpy(ble_pcap_write_buffer[ble_pcap_write_count].payload, payload, capture_len);
@@ -2056,9 +2053,11 @@ void process_wifi_event_queue() {
             char extra_combined[80];
             snprintf(extra_combined, sizeof(extra_combined), "%s %s", frame_type_str, vendor_str);
 
+            uint32_t pcap_usec;
+            uint32_t pcap_sec = get_pcap_epoch_now(&pcap_usec);
             log_detection("FLOCK_WIFI", "WIFI", local.rssi, mac_str, name_str,
                           local.channel, 0, extra_combined, methods, confidence, local.seq_num);
-            write_threat_pcap(local.payload_snap, local.payload_snap_len);
+            write_threat_pcap(local.payload_snap, local.payload_snap_len, pcap_sec, pcap_usec);
 
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
@@ -2276,7 +2275,9 @@ static void ble_worker_task(void* pvParameters) {
                 }
             }
             ble_pdu[len_idx] = pdu_off - 2;
-            write_ble_pcap(ble_pdu, pdu_off);
+            uint32_t pcap_usec;
+            uint32_t pcap_sec = get_pcap_epoch_now(&pcap_usec);
+            write_ble_pcap(ble_pdu, pdu_off, pcap_sec, pcap_usec);
 
             log_detection(capture_type, "BLE", ev->rssi, mac_string, dev_name_char,
                           ev->adv_channel, ev->have_tx_power ? ev->tx_power : 0,
@@ -4264,6 +4265,8 @@ void transition_screen(int new_screen, int dir) {
     if (!is_muted) {
         int prev_vol = current_volume;
         M5Cardputer.Speaker.setVolume(max(prev_vol, 35));
+        // playRaw is async: enqueues to M5Unified's internal Speaker task and returns.
+        // If a detection alarm fires during the transition, AlarmTask can still preempt.
         M5Cardputer.Speaker.playRaw(ui_beep_pcm, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
         M5Cardputer.Speaker.setVolume(prev_vol);
     }
@@ -4371,7 +4374,10 @@ void setup() {
     }
 
     lifetime_boots++;
-    save_session_to_flash();
+    // Do NOT call save_session_to_flash() here — the periodic save
+    // (PERSIST_INTERVAL_MS) will pick up the incremented counter within 60s.
+    // Trade-off: a boot that dies within 60s won't be counted in flash.
+    // Acceptable for a boot counter; reduces flash wear by one write per boot.
 
     bool mount_success = false;
     SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
@@ -4703,12 +4709,21 @@ void loop() {
             else if (c == 'l') {
                 unsigned long now_ms = millis();
 
+                // Key-bounce debounce: reject repeated events within 50ms.
+                // No human can physically tap twice in <50ms, so anything faster
+                // is either isChange() bouncing or a held-key edge case.
+                // This prevents repeated fires from resetting l_pending_until
+                // and starving the deferred single-press action.
+                if (last_l_press_ms != 0 && (now_ms - last_l_press_ms) < 50) {
+                    continue;  // skip this character in the word loop
+                }
+
                 if (l_pending_exists && (now_ms - last_l_press_ms) < DOUBLE_TAP_MS) {
-                    // Second press within window → double-tap, cancel pending single-press
+                    // Second press within window → double-tap; cancel pending single
                     l_pending_exists = false;
                     l_pending_until = 0;
+                    last_l_press_ms = now_ms;  // update so next tap starts fresh window
 
-                    // Double-tap: cycle LED color
                     led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
                     led_r = LED_COLORS[led_col_idx][0];
                     led_g = LED_COLORS[led_col_idx][1];
