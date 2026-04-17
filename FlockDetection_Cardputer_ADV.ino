@@ -273,6 +273,12 @@ long lifetime_flock_total = 0;
 long lifetime_boots = 0;
 long lifetime_flash_writes = 0;
 
+// Hash table for MAC dedup. Sized 2× expected capacity to keep load factor < 0.5
+// for cheap linear probing. With a 5-minute REDETECT_WINDOW_MS and realistic
+// detection rates (~1-10 unique MACs/sec in dense environments), the table
+// rarely fills. When it does fill, eviction picks the oldest slot via O(N) scan
+// — acceptable because eviction is rare and detection latency is non-critical
+// at that point.
 #define MAX_SEEN_MACS 200
 
 struct SeenMacEntry {
@@ -1277,24 +1283,72 @@ void load_session_from_flash() {
     if (!LittleFS.exists(PERSIST_FILE)) return;
     File f = LittleFS.open(PERSIST_FILE, "r");
     if (!f) return;
+
+    // Helper: parse a long with sanity bounds. Returns true on success, leaving
+    // *out untouched on parse failure (preserves existing default).
+    auto parse_long = [](const String& line, long min_val, long max_val, long* out) -> bool {
+        if (line.length() == 0) return false;
+        for (size_t i = 0; i < line.length(); i++) {
+            char c = line[i];
+            if (i == 0 && (c == '-' || c == '+')) continue;
+            if (c < '0' || c > '9') return false;
+        }
+        long parsed = line.toInt();
+        if (parsed < min_val || parsed > max_val) return false;
+        *out = parsed;
+        return true;
+    };
+
     String line;
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_wifi = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_ble = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_seconds = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flock_total = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt(); 
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
+    long parsed;
+
+    line = f.readStringUntil('\n');
+    if (parse_long(line, 0, 100000000L, &parsed)) lifetime_wifi = parsed;
+
+    line = f.readStringUntil('\n');
+    if (parse_long(line, 0, 100000000L, &parsed)) lifetime_ble = parsed;
+
+    line = f.readStringUntil('\n');
+    if (parse_long(line, 0, 100000000L, &parsed)) lifetime_seconds = (unsigned long)parsed;
+
+    line = f.readStringUntil('\n');
+    if (parse_long(line, 0, 100000000L, &parsed)) lifetime_flock_total = parsed;
+
+    line = f.readStringUntil('\n');
+    if (parse_long(line, 0, 255, &parsed)) current_volume = (int)parsed;
+
+    line = f.readStringUntil('\n');
+    if (parse_long(line, 0, 1000000L, &parsed)) lifetime_boots = parsed;
+
+    line = f.readStringUntil('\n');
+    if (parse_long(line, 0, 100000000L, &parsed)) lifetime_flash_writes = parsed;
+
     line = f.readStringUntil('\n');
     if (line.length() > 0 && line.length() < sizeof(export_ssid)) {
-        strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
-        export_ssid[sizeof(export_ssid) - 1] = '\0';
+        bool valid = true;
+        for (size_t i = 0; i < line.length(); i++) {
+            char c = line[i];
+            if (c < 32 || c > 126) { valid = false; break; }
+        }
+        if (valid) {
+            strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
+            export_ssid[sizeof(export_ssid) - 1] = '\0';
+        }
     }
+
     line = f.readStringUntil('\n');
     if (line.length() > 0 && line.length() < sizeof(export_pass)) {
-        strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
-        export_pass[sizeof(export_pass) - 1] = '\0';
+        bool valid = true;
+        for (size_t i = 0; i < line.length(); i++) {
+            char c = line[i];
+            if (c < 32 || c > 126) { valid = false; break; }
+        }
+        if (valid) {
+            strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
+            export_pass[sizeof(export_pass) - 1] = '\0';
+        }
     }
+
     f.close();
 }
 
@@ -1440,7 +1494,12 @@ void flush_sd_buffer() {
     ble_pcap_write_count = 0;
     xSemaphoreGive(dataMutex);
 
-    if (!sd_available) return;
+    if (!sd_available) {
+        // SD became unavailable; we've already drained the buffers (data is lost).
+        // Update last_sd_flush so the throttle stops firing every 500ms.
+        last_sd_flush = millis();
+        return;
+    }
 
     if (log_count > 0) {
         File file = SD.open(current_log_file.c_str(), FILE_APPEND);
@@ -1495,9 +1554,11 @@ void trigger_toast(const char* type, const char* name, int confidence) {
 
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
     char full_text[32];
-    char pct_str[6];
-    snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
-    snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
+    if (confidence > 0) {
+        snprintf(full_text, sizeof(full_text), "%.14s %d%%", src, confidence);
+    } else {
+        snprintf(full_text, sizeof(full_text), "%.20s", src);
+    }
 
     // Enqueue; if full, drop oldest to make room
     if (toast_queue_count >= TOAST_QUEUE_SIZE) {
@@ -1530,6 +1591,18 @@ void add_to_capture_history(const char* type, const char* mac, const char* name,
     capture_history[0].name[sizeof(capture_history[0].name) - 1] = '\0';
     capture_history[0].rssi       = rssi;
     capture_history[0].confidence = confidence;
+
+    // Initialize lat/lng to current GPS position (or 0,0 if no fix).
+    // Caller already holds dataMutex (invoked from log_detection's mutex-protected
+    // block), so reading gps directly is safe.
+    if (gps.location.isValid() && gps.location.age() < 5000) {
+        capture_history[0].lat = gps.location.lat();
+        capture_history[0].lng = gps.location.lng();
+    } else {
+        capture_history[0].lat = 0.0;
+        capture_history[0].lng = 0.0;
+    }
+
     format_time_buf((millis() - session_start_time) / 1000,
                     capture_history[0].time, sizeof(capture_history[0].time));
     if (capture_history_count < CAPTURE_HISTORY_SIZE) capture_history_count++;
@@ -1940,6 +2013,10 @@ void process_wifi_event_queue() {
         const char* name_str       = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
         const char* frame_type_str = local.is_beacon ? "Beacon" : "ProbeReq";
 
+        // IMPORTANT: rssi_track_update, rssi_track_is_stationary, and
+        // locator_add_sample each take dataMutex internally. Do NOT wrap this
+        // block in an outer xSemaphoreTake(dataMutex) — that would deadlock.
+        // Each helper takes and releases the mutex independently.
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             channel_lock_until = millis() + 10000;
@@ -2111,6 +2188,9 @@ static void ble_worker_task(void* pvParameters) {
             ev->mac[0], ev->mac[1], ev->mac[2],
             ev->mac[3], ev->mac[4], ev->mac[5]);
 
+        // IMPORTANT: rssi_track_update, rssi_track_is_stationary, and
+        // locator_add_sample each take dataMutex internally. Do NOT wrap this
+        // block in an outer xSemaphoreTake(dataMutex) — that would deadlock.
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             channel_lock_until = millis() + 10000;
@@ -2374,13 +2454,27 @@ void draw_header_spr(int screen_num) {
     bool chg = is_device_charging(med_mv);
 
     static int display_bat = -1;
+    static unsigned long last_bat_recover_ms = 0;
 
     if (display_bat == -1 || raw_bat == 255) {
         display_bat = raw_bat;
     } else if (chg) {
+        // Charging: allow upward movement immediately
         if (raw_bat > display_bat) display_bat = raw_bat;
     } else {
-        if (raw_bat < display_bat) display_bat = raw_bat;
+        // Discharging: ratchet down immediately
+        if (raw_bat < display_bat) {
+            display_bat = raw_bat;
+        }
+        // Allow slow upward recovery: if raw is meaningfully higher than displayed
+        // (>5% gap), step up by 1% every 10 seconds. Prevents stuck-low readings
+        // after transient load spikes (alarm fires, BLE active scan, etc.) without
+        // making the gauge bounce during normal use.
+        else if (raw_bat > display_bat + 5 &&
+                 (millis() - last_bat_recover_ms) > 10000UL) {
+            display_bat++;
+            last_bat_recover_ms = millis();
+        }
     }
 
     int render_bat = (display_bat == 255) ? 100 : display_bat;
