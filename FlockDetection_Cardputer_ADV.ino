@@ -4123,6 +4123,10 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
+    // dataMutex MUST be created before any task that uses it is spawned.
+    // chargeLedTask (started just below) takes this mutex on every loop iteration.
+    dataMutex = xSemaphoreCreateMutex();
+
     // LED: start dark, then spawn the persistent breathing task.
     // Must happen before dedicated_charging_loop() which sets led_breathing_on=true.
     set_cardputer_led(0, 0, 0);
@@ -4161,7 +4165,7 @@ void setup() {
     if (M5Cardputer.Power.isCharging() || end_v > 4300) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
-    setCpuFrequencyMhz(240); dataMutex = xSemaphoreCreateMutex(); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
+    setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, NULL, 1);
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
