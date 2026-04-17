@@ -44,6 +44,7 @@ void draw_locator_help_overlay();
 void draw_gps_screen();
 void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
+static void set_toast_direct(const char* text, uint16_t accent);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -493,13 +494,28 @@ static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
     for (;;) {
-        if (led_detect_active) {
-            if (millis() < led_detection_flash_until) {
-                set_cardputer_led(led_detect_r, led_detect_g, led_detect_b);
-            } else {
-                led_detect_active = false;
-                set_cardputer_led(0, 0, 0);
-            }
+        // Snapshot detection-flash state under mutex
+        bool   active_snap;
+        unsigned long until_snap;
+        uint8_t r_snap, g_snap, b_snap;
+        bool   expired_clear = false;
+
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        active_snap = led_detect_active;
+        until_snap  = led_detection_flash_until;
+        r_snap      = led_detect_r;
+        g_snap      = led_detect_g;
+        b_snap      = led_detect_b;
+        if (active_snap && millis() >= until_snap) {
+            led_detect_active = false;
+            expired_clear = true;
+        }
+        xSemaphoreGive(dataMutex);
+
+        if (active_snap && !expired_clear) {
+            set_cardputer_led(r_snap, g_snap, b_snap);
+        } else if (expired_clear) {
+            set_cardputer_led(0, 0, 0);
         } else if (led_breathing_on) {
             float phase = sinf((millis() / 1000.0f) * (float)M_PI);
             uint8_t val = (uint8_t)((phase + 1.0f) * 100.0f); // 0..200
@@ -1851,6 +1867,7 @@ void process_wifi_event_queue() {
 
         WifiEvent local;
         memcpy(&local, ev, sizeof(WifiEvent));
+        __sync_synchronize();   // release: ensure memcpy of *ev completes before producer can reuse slot
         ev->ready = false;
         wifi_eq_read_idx = (wifi_eq_read_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
@@ -4608,9 +4625,17 @@ void loop() {
         }
     }
 
-    if (sd_hist_dirty && current_screen == 2 && !hist_detail_open) {
-        sd_hist_dirty = false;
-        load_sd_history();
+    {
+        bool was_dirty = false;
+        if (current_screen == 2 && !hist_detail_open) {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            if (sd_hist_dirty) {
+                sd_hist_dirty = false;
+                was_dirty = true;
+            }
+            xSemaphoreGive(dataMutex);
+        }
+        if (was_dirty) load_sd_history();
     }
 
     if (locator_announce_pending) {
