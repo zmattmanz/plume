@@ -68,10 +68,7 @@ bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
-static float ease_sd_ok = 0.0f;
-static float ease_gps_lock = 0.0f;
 static float ease_muted = 0.0f;
-static float ease_scanning = 0.0f;
 
 // RGB LED state — color cycles with C key, on/off with L when locator idle
 static uint8_t led_r = 50, led_g = 255, led_b = 100; // default green (matches ACCENT_COLOR)
@@ -98,16 +95,18 @@ void apply_color_palette() {
         BG_COLOR      = lgfx::color565(  8,   0,   0);
         CARD_COLOR    = lgfx::color565( 25,   0,   0);
         CARD_BORDER   = lgfx::color565( 60,   5,   5);
-        HEADER_COLOR  = lgfx::color565(255,  60,  60);  // bright red
-        TEXT_COLOR    = lgfx::color565(220, 200, 200);
-        DIM_COLOR     = lgfx::color565(150,  30,  30);
-        ACCENT_COLOR  = lgfx::color565(255,  90,  90);  // red (WiFi-neutral / UI)
+        HEADER_COLOR  = lgfx::color565(255,  60,  60);
+        TEXT_COLOR    = lgfx::color565(220, 180, 180);
+        DIM_COLOR     = lgfx::color565(140,  30,  30);
+        ACCENT_COLOR  = lgfx::color565(255, 100, 100);  // bright red — primary
 
-        // Category colors: distinct hues preserved, all low-blue for dark adaptation
-        CAUTION_COLOR = lgfx::color565(255, 140,  20);  // amber (WiFi / warnings)
-        TEAL_COLOR    = lgfx::color565(255,  70, 110);  // deep pink-red (Raven)
-        PURPLE_COLOR  = lgfx::color565(220,  60, 200);  // deep magenta (BLE)
-        GPS_COLOR     = lgfx::color565(180, 100,  40);  // dark amber-brown (GPS)
+        // Three-tier night palette: bright, warning, dim.
+        // Categories that were distinct in day mode (Raven, BLE, GPS) collapse
+        // toward ACCENT in night mode — geometry/position carries the meaning.
+        CAUTION_COLOR = lgfx::color565(255, 140,  20);  // amber — warnings only
+        TEAL_COLOR    = lgfx::color565(255, 100, 100);  // = ACCENT (Raven)
+        PURPLE_COLOR  = lgfx::color565(200,  60,  80);  // dim red-pink (BLE)
+        GPS_COLOR     = lgfx::color565(255, 100, 100);  // = ACCENT (GPS)
     } else {
         BG_COLOR      = lgfx::color565( 10,  20,  48);
         CARD_COLOR    = lgfx::color565( 18,  36,  80);
@@ -376,7 +375,7 @@ int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
 static int device_info_scroll = 0;
-static const int DEVICE_INFO_CONTENT_HEIGHT = 260;
+static const int DEVICE_INFO_CONTENT_HEIGHT = 320;
 volatile bool sd_hist_dirty = false;
 
 #define TOAST_QUEUE_SIZE 3
@@ -1539,7 +1538,8 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         else if (strcmp(proto, "BLE") == 0) { session_flock_ble++; }
         lifetime_flock_total++;
         add_to_capture_history(type, mac, name, rssi, confidence);
-        trigger_toast(type, name, confidence);
+        // NOTE: trigger_toast() is deferred until after we release dataMutex —
+        // it takes dataMutex internally and our mutex is non-recursive.
         // Flash LED: yellow for WiFi, purple for BLE
         if (strcmp(proto, "WIFI") == 0) {
             led_detect_r = 255; led_detect_g = 200; led_detect_b = 0;
@@ -1566,7 +1566,10 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     last_cap_seq_num    = seq_num;
     xSemaphoreGive(dataMutex);
 
-    if (is_new) add_blip(blip_col, rssi);
+    if (is_new) {
+        trigger_toast(type, name, confidence);
+        add_blip(blip_col, rssi);
+    }
 
     // Heavy work outside mutex
     if (is_new && sd_available) {
@@ -2329,18 +2332,13 @@ void draw_header_spr(int screen_num) {
     // ── Status icon row ──────────────────────────────────────────────────────
     const uint16_t ICON_COL = lgfx::color565(255, 255, 255);
 
-    bool sd_ok_now    = sd_available;
     bool gps_lock_now;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
     xSemaphoreGive(dataMutex);
-    bool muted_now    = is_muted;
-    bool scanning_now = !is_alarming;
+    bool muted_now = is_muted;
 
-    ease_sd_ok    += ((sd_ok_now    ? 1.0f : 0.0f) - ease_sd_ok)    * 0.08f;
-    ease_gps_lock += ((gps_lock_now ? 1.0f : 0.0f) - ease_gps_lock) * 0.08f;
-    ease_muted    += ((muted_now    ? 1.0f : 0.0f) - ease_muted)    * 0.12f;
-    ease_scanning += ((scanning_now ? 1.0f : 0.0f) - ease_scanning) * 0.05f;
+    ease_muted += ((muted_now ? 1.0f : 0.0f) - ease_muted) * 0.12f;
 
     // Alarm cooldown state: fires during the 60s window after a detection alarm
     bool cooldown_now;
@@ -2353,113 +2351,87 @@ void draw_header_spr(int screen_num) {
     static float ease_cooldown = 0.0f;
     ease_cooldown += ((cooldown_now ? 1.0f : 0.0f) - ease_cooldown) * 0.08f;
 
+    static float ease_gps_missing = 0.0f;
+    ease_gps_missing += ((!gps_lock_now ? 1.0f : 0.0f) - ease_gps_missing) * 0.08f;
+
     int icon_right = DISP_W - 32;
     int icon_y = 4;
-
-    // Detection counter FIRST — consumes space before status icons
-    long det_total;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    det_total = session_flock_wifi + session_flock_ble + session_raven;
-    xSemaphoreGive(dataMutex);
-
-    if (det_total > 0) {
-        char det_buf[16];
-        snprintf(det_buf, sizeof(det_buf), "D:%ld", det_total);
-        int det_w = (int)strlen(det_buf) * 6;
-        int det_x = icon_right - det_w - 4;
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(det_x, 6);
-        spr.print(det_buf);
-        icon_right = det_x - 6;  // icons continue left of counter
-    }
 
     auto lerp_icon = [&](float t) -> uint16_t {
         return lerp_col16(BG_COLOR, ICON_COL, t);
     };
     auto should_draw = [](float t) -> bool { return t > 0.05f; };
 
-    // Muted icon
+    // Muted icon — larger 10×10 speaker with slash
     if (should_draw(ease_muted)) {
-        int ix = icon_right - 24;
+        int ix = icon_right - 12;
         uint16_t c = lerp_icon(ease_muted);
-        spr.drawLine(ix + 1, icon_y + 4, ix + 1, icon_y + 6, c);
-        spr.drawLine(ix + 1, icon_y + 4, ix + 3, icon_y + 4, c);
-        spr.drawLine(ix + 1, icon_y + 6, ix + 3, icon_y + 6, c);
-        spr.drawLine(ix + 3, icon_y + 4, ix + 6, icon_y + 2, c);
-        spr.drawLine(ix + 3, icon_y + 6, ix + 6, icon_y + 8, c);
-        spr.drawLine(ix + 6, icon_y + 2, ix + 6, icon_y + 8, c);
-        spr.drawLine(ix + 0, icon_y + 1, ix + 8, icon_y + 9, c);
-        icon_right -= 14;
+        // Speaker body (rectangle + triangle cone)
+        spr.fillRect(ix + 1, icon_y + 4, 3, 4, c);
+        spr.fillTriangle(ix + 4, icon_y + 2, ix + 8, icon_y, ix + 8, icon_y + 10, c);
+        // Slash through it
+        spr.drawLine(ix, icon_y, ix + 10, icon_y + 10, c);
+        spr.drawLine(ix + 1, icon_y, ix + 10, icon_y + 9, c);
+        icon_right -= 16;
     }
 
-    // Alarm cooldown icon — dim hourglass/bell when in cooldown window
-    if (should_draw(ease_cooldown) && cooldown_now) {
-        int ix = icon_right - 8;
-        // Pulse based on remaining cooldown time (faster pulse as time ends)
-        float progress = (float)cooldown_elapsed / (float)BUZZER_COOLDOWN;
-        float pulse_rate = 400.0f + progress * 1200.0f;  // pulse speeds up as cooldown ends
-        float pulse = (sinf((float)millis() / pulse_rate) + 1.0f) * 0.5f;
-        uint8_t intensity = (uint8_t)(120 + pulse * 80);
-        uint16_t c = lerp_col16(BG_COLOR, lgfx::color565(intensity, intensity, intensity), ease_cooldown);
-
-        // Small circle with slash — "alarm suppressed"
-        spr.drawCircle(ix + 4, icon_y + 5, 4, c);
-        spr.drawLine(ix + 1, icon_y + 2, ix + 7, icon_y + 8, c);
-        icon_right -= 14;
-    }
-
-    // GPS pin icon
-    if (should_draw(ease_gps_lock)) {
-        int ix = icon_right - 8;
-        uint16_t c = lerp_icon(ease_gps_lock);
-        spr.fillCircle(ix + 4, icon_y + 3, 3, c);
-        spr.fillTriangle(ix + 2, icon_y + 5, ix + 6, icon_y + 5, ix + 4, icon_y + 9, c);
-        spr.fillCircle(ix + 4, icon_y + 3, 1, BG_COLOR);
-        icon_right -= 14;
-    }
-
-    // Scanning pulse dot
-    if (should_draw(ease_scanning)) {
-        int ix = icon_right - 8;
-        uint16_t c = lerp_icon(ease_scanning);
-        float pulse_phase = (sinf((float)millis() / 400.0f) + 1.0f) * 0.5f;
-        int r = 1 + (int)(pulse_phase * 2.0f);
-        spr.fillCircle(ix + 4, icon_y + 5, r, c);
-        icon_right -= 14;
-    }
-
-    // SD card icon
-    if (should_draw(ease_sd_ok)) {
-        int ix = icon_right - 8;
-        uint16_t c = lerp_icon(ease_sd_ok);
-        spr.drawRect(ix + 1, icon_y + 1, 8, 9, c);
-        spr.drawPixel(ix + 8, icon_y + 1, BG_COLOR);
-        spr.drawPixel(ix + 7, icon_y + 1, BG_COLOR);
-        spr.drawPixel(ix + 8, icon_y + 2, c);
-        spr.drawPixel(ix + 3, icon_y + 3, c);
-        spr.drawPixel(ix + 5, icon_y + 3, c);
-        spr.drawPixel(ix + 7, icon_y + 3, c);
-        icon_right -= 14;
-    }
-
-    // SD missing indicator
+    // SD missing indicator (always occupies the slot; does not consume ease)
     if (system_fully_booted && !sd_available) {
-        int ix = icon_right + 14 - 8;
+        int ix = icon_right - 8;
         uint16_t c = lgfx::color565(180, 40, 40);
         spr.drawRect(ix + 1, icon_y + 1, 8, 9, c);
         spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
+        icon_right -= 14;
     }
 
-    // Export mode indicator — orange "EXP" label when active
+    // GPS-missing amber pin (ease_gps_missing fades in when lock is lost)
+    if (should_draw(ease_gps_missing)) {
+        int ix = icon_right - 8;
+        uint16_t c = lerp_col16(BG_COLOR, CAUTION_COLOR, ease_gps_missing);
+        spr.fillCircle(ix + 4, icon_y + 3, 3, c);
+        spr.fillTriangle(ix + 2, icon_y + 5, ix + 6, icon_y + 5, ix + 4, icon_y + 9, c);
+        spr.fillCircle(ix + 4, icon_y + 3, 1, BG_COLOR);
+        icon_right -= 16;
+    }
+
+    // Detection counter pill
+    {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        uint32_t det_total = lifetime_flock_total;
+        xSemaphoreGive(dataMutex);
+
+        char det_str[8];
+        snprintf(det_str, sizeof(det_str), "%lu", det_total);
+        int det_w = (int)strlen(det_str) * 6 + 6;
+        uint16_t pill_bg = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.18f);
+        spr.fillRoundRect(icon_right - det_w, icon_y, det_w, 11, 3, pill_bg);
+        spr.setTextColor(ACCENT_COLOR, pill_bg);
+        spr.setTextSize(1);
+        spr.setCursor(icon_right - det_w + 3, icon_y + 2);
+        spr.print(det_str);
+        icon_right -= det_w + 2;
+    }
+
+    // Alert slot: EXP takes priority over cooldown
     if (export_mode_active) {
         uint16_t c = lgfx::color565(255, 140, 0);
-        spr.fillRoundRect(icon_right - 22, icon_y, 22, 10, 3, c);
+        spr.fillRoundRect(icon_right - 22, icon_y, 22, 11, 3, c);
         spr.setTextColor(lgfx::color565(0, 0, 0), c);
         spr.setTextSize(1);
         spr.setCursor(icon_right - 19, icon_y + 2);
         spr.print("EXP");
         icon_right -= 26;
+    } else if (should_draw(ease_cooldown) && cooldown_now) {
+        int ix = icon_right - 8;
+        float progress = (float)cooldown_elapsed / (float)BUZZER_COOLDOWN;
+        float pulse_rate = 400.0f + progress * 1200.0f;
+        float pulse = (sinf((float)millis() / pulse_rate) + 1.0f) * 0.5f;
+        uint8_t intensity = (uint8_t)(120 + pulse * 80);
+        uint16_t c = lerp_col16(BG_COLOR, lgfx::color565(intensity, intensity, intensity), ease_cooldown);
+        spr.drawCircle(ix + 4, icon_y + 5, 4, c);
+        spr.drawCircle(ix + 4, icon_y + 5, 5, lerp_col16(BG_COLOR, c, 0.4f));
+        spr.drawLine(ix + 1, icon_y + 2, ix + 7, icon_y + 8, c);
+        icon_right -= 14;
     }
 
     // Rotation position dots — tight spacing, active is filled+larger, inactive is 2px line
@@ -2514,19 +2486,6 @@ void draw_header_spr(int screen_num) {
         spr.drawLine(bx + 2, by + 1, bx - 1, by + 3, bolt_col);
     }
 
-    // Voltage readout below battery pill
-    {
-        char volt_str[8];
-        snprintf(volt_str, sizeof(volt_str), "%.2fV", med_mv / 1000.0f);
-        spr.setTextSize(1);
-        spr.setTextColor(CARD_BORDER, BG_COLOR);
-        // Center below battery pill (pill is at DISP_W-26..DISP_W-2, y=4..14)
-        spr.setCursor(DISP_W - 26, 14);
-        spr.print(volt_str);
-    }
-
-    // Header divider — solid line, matching locator grid color
-    spr.drawFastHLine(0, 20, DISP_W, CARD_BORDER);
 }
 
 void draw_toast_spr() {
@@ -2643,144 +2602,129 @@ void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
 }
 
 void draw_help_overlay() {
-    // Ease the overlay in over 200ms
     unsigned long elapsed = millis() - help_ease_start;
     float target = 1.0f;
-    if (elapsed < 200) {
-        float t = (float)elapsed / 200.0f;
-        target = 1.0f - (1.0f - t) * (1.0f - t);  // quadratic ease-out
+    if (elapsed < 80) {
+        float t = (float)elapsed / 80.0f;
+        target = 1.0f - (1.0f - t) * (1.0f - t);
     }
-    help_ease += (target - help_ease) * 0.25f;
+    help_ease += (target - help_ease) * 0.5f;
     if (help_ease > 1.0f) help_ease = 1.0f;
     if (help_ease < 0.02f) return;
 
-    // Dimmed backdrop
-    for (int dy = 20; dy < DISP_H; dy += 2) {
+    for (int dy = 18; dy < DISP_H; dy += 2) {
         uint16_t bg = lerp_col16(BG_COLOR, lgfx::color565(0, 0, 0), help_ease * 0.5f);
         spr.drawFastHLine(0, dy, DISP_W, bg);
     }
 
-    // Panel geometry — eased from centerpoint outward
     int full_w = DISP_W - 20;
-    int full_h = DISP_H - 30;
+    int full_h = DISP_H - 28;
     int panel_w = (int)(full_w * help_ease);
     int panel_h = (int)(full_h * help_ease);
     int panel_x = (DISP_W - panel_w) / 2;
-    int panel_y = 20 + (full_h - panel_h) / 2;
+    int panel_y = 18 + (full_h - panel_h) / 2;
 
     uint16_t panel_bg = lerp_col16(BG_COLOR, CARD_COLOR, help_ease);
     uint16_t panel_border = lerp_col16(BG_COLOR, HEADER_COLOR, help_ease);
     spr.fillRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_bg);
     spr.drawRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_border);
 
-    if (help_ease < 0.7f) return;  // wait for panel to mostly open before drawing text
+    if (help_ease < 0.3f) return;
 
-    // Per-screen content
     struct HelpKey { const char* key; const char* desc; };
     const HelpKey* keys;
     int key_count;
     const char* title;
 
-    // Common keys shown on all screens
     static const HelpKey global_keys[] = {
-        {"</>", "Prev/Next screen"},
-        {"1-5", "Jump to screen"},
-        {"ESC", "Home (Scanner)"},
-        {"TAB", "Close help"},
-        {"m/q", "Mute toggle"},
-        {";/.", "Vol / scroll"},
-        {"n",   "Night mode"},
-        {"s",   "Stealth mode"},
-        {"b",   "Brightness"},
-        {"c",   "LED color"},
-        {"e",   "Export mode"},
-        {"o",   "Reset session"},
+        {"</>",  "Prev/Next"},
+        {"1-5",  "Jump screen"},
+        {"ESC",  "Scanner"},
+        {"TAB",  "Close help"},
+        {"m/q",  "Mute"},
+        {";/.",  "Vol/scroll"},
+        {"n",    "Night"},
+        {"s",    "Stealth"},
+        {"b",    "Brightness"},
+        {"c",    "LED color"},
+        {"e",    "Export"},
+        {"o",    "Reset sess"},
     };
 
-    // Per-screen key sets
     static const HelpKey scanner_keys[] = {
-        {"x", "Simulate detection"},
-        {"t", "Locate last target"},
+        {"x", "Simulate"},
+        {"t", "Locate"},
     };
     static const HelpKey locator_keys[] = {
-        {"l",  "Start/stop (2x=LED)"},
-        {"t",  "Cycle target"},
-        {"g",  "Toggle N-mode"},
+        {"l", "Start/stop"},
+        {"t", "Cycle target"},
+        {"g", "N-mode"},
     };
     static const HelpKey detections_keys[] = {
-        {";/.", "Navigate list"},
-        {"ENT", "Open detail"},
-        {"DEL", "Close detail"},
+        {";/.", "Navigate"},
+        {"ENT", "Detail"},
+        {"DEL", "Close"},
     };
     static const HelpKey gps_keys[] = {
-        {"(info display only)", ""},
+        {"(info)", ""},
     };
     static const HelpKey devinfo_keys[] = {
-        {";/.", "Scroll content"},
+        {";/.", "Scroll"},
     };
 
     switch (current_screen) {
-        case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys) / sizeof(scanner_keys[0]);       title = "SCANNER KEYS"; break;
-        case 1: keys = locator_keys;    key_count = sizeof(locator_keys) / sizeof(locator_keys[0]);       title = "LOCATOR KEYS"; break;
-        case 2: keys = detections_keys; key_count = sizeof(detections_keys) / sizeof(detections_keys[0]); title = "DETECTIONS KEYS"; break;
-        case 3: keys = gps_keys;        key_count = sizeof(gps_keys) / sizeof(gps_keys[0]);               title = "GPS SCREEN"; break;
-        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys) / sizeof(devinfo_keys[0]);       title = "DEVICE INFO KEYS"; break;
+        case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys) / sizeof(scanner_keys[0]);       title = "SCANNER"; break;
+        case 1: keys = locator_keys;    key_count = sizeof(locator_keys) / sizeof(locator_keys[0]);       title = "LOCATOR"; break;
+        case 2: keys = detections_keys; key_count = sizeof(detections_keys) / sizeof(detections_keys[0]); title = "DETECT"; break;
+        case 3: keys = gps_keys;        key_count = sizeof(gps_keys) / sizeof(gps_keys[0]);               title = "GPS"; break;
+        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys) / sizeof(devinfo_keys[0]);       title = "INFO"; break;
         default: keys = scanner_keys; key_count = 0; title = "HELP"; break;
     }
 
     spr.setTextSize(1);
-
-    // Title
     spr.setTextColor(HEADER_COLOR, panel_bg);
-    spr.setCursor(panel_x + 8, panel_y + 6);
+    spr.setCursor(panel_x + 6, panel_y + 5);
     kprint(spr, title);
+    spr.drawFastHLine(panel_x + 4, panel_y + 14, panel_w - 8, CARD_BORDER);
 
-    // Underline
-    spr.drawFastHLine(panel_x + 6, panel_y + 17, panel_w - 12, CARD_BORDER);
-
-    // Left column: screen-specific keys
-    int col_left_x  = panel_x + 8;
-    int col_right_x = panel_x + panel_w / 2 + 4;
-    int row_y = panel_y + 22;
-    const int ROW_H = 11;
+    const int ROW_H = 10;
+    int col_left_x  = panel_x + 6;
+    int col_right_x = panel_x + panel_w / 2 + 2;
+    int row_y = panel_y + 18;
 
     spr.setTextColor(ACCENT_COLOR, panel_bg);
-    spr.setCursor(col_left_x, row_y);
-    kprint(spr, "SCREEN");
+    spr.setCursor(col_left_x, row_y); kprint(spr, "SCREEN");
     row_y += ROW_H;
 
-    for (int i = 0; i < key_count && row_y < panel_y + panel_h - 10; i++) {
+    for (int i = 0; i < key_count && row_y < panel_y + panel_h - 8; i++) {
         spr.setTextColor(HEADER_COLOR, panel_bg);
         spr.setCursor(col_left_x, row_y);
         spr.print(keys[i].key);
         spr.setTextColor(TEXT_COLOR, panel_bg);
-        spr.setCursor(col_left_x + 30, row_y);
+        spr.setCursor(col_left_x + 26, row_y);
         spr.print(keys[i].desc);
         row_y += ROW_H;
     }
 
-    // Right column: global keys
-    row_y = panel_y + 22;
+    row_y = panel_y + 18;
     spr.setTextColor(ACCENT_COLOR, panel_bg);
-    spr.setCursor(col_right_x, row_y);
-    kprint(spr, "GLOBAL");
+    spr.setCursor(col_right_x, row_y); kprint(spr, "GLOBAL");
     row_y += ROW_H;
 
     int global_count = sizeof(global_keys) / sizeof(global_keys[0]);
-    for (int i = 0; i < global_count && row_y < panel_y + panel_h - 10; i++) {
+    for (int i = 0; i < global_count && row_y < panel_y + panel_h - 8; i++) {
         spr.setTextColor(HEADER_COLOR, panel_bg);
         spr.setCursor(col_right_x, row_y);
         spr.print(global_keys[i].key);
         spr.setTextColor(TEXT_COLOR, panel_bg);
-        spr.setCursor(col_right_x + 28, row_y);
+        spr.setCursor(col_right_x + 26, row_y);
         spr.print(global_keys[i].desc);
         row_y += ROW_H;
     }
 
-    // Footer
     spr.setTextColor(DIM_COLOR, panel_bg);
-    spr.setCursor(panel_x + 8, panel_y + panel_h - 10);
-    spr.print("TAB to close");
+    spr.setCursor(panel_x + 6, panel_y + panel_h - 8);
+    spr.print("TAB=close");
 }
 
 void draw_locator_help_overlay() {
@@ -2808,7 +2752,7 @@ void draw_scanner_screen() {
     int divider_x = 132;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
-    spr.setClipRect(0, 21, divider_x, DISP_H - 21);
+    spr.setClipRect(0, 18, divider_x, DISP_H - 18);
     
     float TILT = 0.55f;
     int rcx = radar_cx;
@@ -3106,13 +3050,15 @@ void draw_scanner_screen() {
     spr.print("BLE");
 
     // Labels — extra gap below badges (badges bottom = y=40); kerned
+    spr.fillCircle(right_text_x + 2, 51, 2, CAUTION_COLOR);
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 48); kprint(spr, "WIFI");
+    spr.setCursor(right_text_x + 8, 48); kprint(spr, "WIFI");
     spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 58); spr.print(sw);
 
+    spr.fillCircle(right_text_x + 2, 83, 2, PURPLE_COLOR);
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 80); kprint(spr, "BLE");
+    spr.setCursor(right_text_x + 8, 80); kprint(spr, "BLE");
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 90); spr.print(sb);
 
@@ -3164,7 +3110,7 @@ void draw_locator_screen() {
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
     // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 88;
+    const int GRID_RIGHT = 110;
     const int GRID_STEP  = 14;
     unsigned long now_ms = millis();
 
@@ -3191,13 +3137,13 @@ void draw_locator_screen() {
     if (grid_o < 0) grid_o += GRID_STEP;
 
     for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
-        spr.drawLine(gx, 21, gx, DISP_H - 1, CARD_BORDER);
-    for (int gy = 21 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
-        if (gy >= 21) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
+        spr.drawLine(gx, 18, gx, DISP_H - 1, CARD_BORDER);
+    for (int gy = 18 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
+        if (gy >= 18) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
     // Solid vertical separator on right edge of grid panel
-    spr.drawFastVLine(GRID_RIGHT, 21, DISP_H - 21, CARD_BORDER);
+    spr.drawFastVLine(GRID_RIGHT, 18, DISP_H - 18, CARD_BORDER);
 
-    const int cx = 44, cy = 58;
+    const int cx = 55, cy = 62;
 
     // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
@@ -3219,6 +3165,10 @@ void draw_locator_screen() {
         if (ease_arrow > 2.0f*(float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
     }
     float ang = ease_arrow;
+
+    // ── Compass rose ring ──
+    spr.drawCircle(cx, cy, 18, CARD_BORDER);
+    spr.drawCircle(cx, cy, 19, BG_COLOR);  // thin separation from arrow
 
     // ── Arrow: cursor/pointer shape — 7-point polygon ──
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
@@ -3290,7 +3240,7 @@ void draw_locator_screen() {
 
     const int BOX = 11;
     const int by0 = 95;        // near bottom of left panel
-    const int bx0 = cx - 22;  // = 34, centers 3 boxes under cx
+    const int bx0 = cx - 25;  // centers 3 boxes under cx
 
     char samp_label[16];
     snprintf(samp_label, sizeof(samp_label), "SAMPLES %d/%d", sc, LOC_MIN_SAMPLES_EST);
@@ -3327,7 +3277,7 @@ void draw_locator_screen() {
     // lock indicator: subtle glow on the last sample box instead of text
 
     // ── Right panel ──
-    int rx = 92;
+    int rx = 114;
     int rpx = rx + 8;
 
     // Status — dynamic-width box
@@ -3447,7 +3397,7 @@ void draw_capture_history_screen() {
 
     if (total == 0) {
         for (int i = 0; i < 4; i++) {
-            int y = 22 + i * 28;
+            int y = 19 + i * 28;
             spr.fillRect(0, y, 3, 27, CARD_BORDER);
             spr.fillRect(3, y, DISP_W - 3, 27, (i % 2 == 0) ? CARD_COLOR : BG_COLOR);
             spr.setTextColor(CARD_BORDER, (i % 2 == 0) ? CARD_COLOR : BG_COLOR); spr.setTextSize(1);
@@ -3466,7 +3416,7 @@ void draw_capture_history_screen() {
 
     int rows_shown = 0;
     for (int i = history_scroll_offset; i < total && rows_shown < 4; i++, rows_shown++) {
-        int y = 22 + rows_shown * 28;
+        int y = 19 + rows_shown * 28;
         bool selected = (i == history_selected_idx);
 
         // Pull fields from whichever source
@@ -3557,7 +3507,7 @@ void draw_capture_history_screen() {
     }
 
     {
-        const int list_y = 22;
+        const int list_y = 19;
         const int list_h = 4 * 28;
         if (total > 4) {
             if (history_scroll_offset > 0)
@@ -3605,7 +3555,7 @@ void draw_capture_history_screen() {
             spr.drawFastHLine(0, dy, DISP_W, lgfx::color565(8, 8, 14));
 
         // Card
-        int cx = 6, cy = 22, cw = DISP_W - 12, ch = DISP_H - 28;
+        int cx = 6, cy = 19, cw = DISP_W - 12, ch = DISP_H - 25;
         spr.fillRoundRect(cx, cy, cw, ch, 6, CARD_COLOR);
         spr.drawRoundRect(cx, cy, cw, ch, 6, proto_col);
 
@@ -3840,7 +3790,7 @@ void draw_gps_screen() {
 
     // ── Right panel: STATUS badge + LAT / LON / SPEED ───────────────────────
     const int RX = 122, RW = 114;
-    int ry = 28;  // extra gap below header separator
+    int ry = 25;
 
     // STATUS badge (top-right, matches scanner/locator badge style)
     {
@@ -3908,11 +3858,11 @@ void draw_device_info_screen() {
     spr.fillSprite(BG_COLOR);
     draw_header_spr(4);
 
-    const int content_top_y = 21;
+    const int content_top_y = 18;
     const int content_bottom_y = DISP_H - 1;
     spr.setClipRect(0, content_top_y, DISP_W - 6, content_bottom_y - content_top_y);
 
-    int yoff = 22 - device_info_scroll;
+    int yoff = 19 - device_info_scroll;
 
     // 2-column grid layout
     const int CARD_W = 112;
@@ -3981,14 +3931,13 @@ void draw_device_info_screen() {
     spr.setTextColor(wear_col, CARD_COLOR);
     spr.setCursor(bar_x + bar_w - 28, bar_y + bar_h + 4); spr.print(pct_str);
 
-    // Row 5: BATTERY (left) + RUNTIME (right) — 2-column
+    // Row 5: BATTERY % (left) + VOLTAGE (right) — side-by-side
     int row5_y = yoff + 192;
     {
         int32_t bat_mv_snap = get_filtered_voltage();
         int bat_pct_snap = get_unified_battery_pct(bat_mv_snap);
         if (bat_pct_snap == 255) bat_pct_snap = 100;
 
-        // Battery card (left)
         drawCard(COL_L, row5_y, CARD_W, CARD_H);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
         spr.setCursor(COL_L + 4, row5_y + 4); kprint(spr, "BATTERY");
@@ -3996,42 +3945,48 @@ void draw_device_info_screen() {
         spr.setCursor(COL_L + 4, row5_y + 14);
         char bat_str[8]; snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct_snap);
         spr.print(bat_str);
-        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-        char mv_str[10]; snprintf(mv_str, sizeof(mv_str), " %dmV", (int)bat_mv_snap);
-        spr.print(mv_str);
 
-        // Runtime estimate card (right) — based on ~180mA average consumption, 500mAh battery
         drawCard(COL_R, row5_y, CARD_W, CARD_H);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 4); kprint(spr, "RUNTIME");
-        const int BATT_MAH = 500;
-        const int AVG_MA   = 180;
-        int runtime_min = (bat_pct_snap * BATT_MAH) / AVG_MA; // minutes approx
-        int rt_h = runtime_min / 60;
-        int rt_m = runtime_min % 60;
-        char rt_str[12]; snprintf(rt_str, sizeof(rt_str), "~%dh%02dm", rt_h, rt_m);
+        spr.setCursor(COL_R + 4, row5_y + 4); kprint(spr, "VOLTAGE");
         spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 16); spr.print(rt_str);
-        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 28); spr.print("est @180mA");
+        char mv_str[10]; snprintf(mv_str, sizeof(mv_str), "%.2fV", bat_mv_snap / 1000.0f);
+        spr.setCursor(COL_R + 4, row5_y + 16); spr.print(mv_str);
     }
 
-    // Row 6: SD STATUS card (full width)
+    // Row 6: RUNTIME — full width
     int row6_y = yoff + 234;
-    drawCard(COL_L, row6_y, DISP_W - 8, 24);
+    {
+        int32_t bat_mv_snap = get_filtered_voltage();
+        int bat_pct_snap = get_unified_battery_pct(bat_mv_snap);
+        if (bat_pct_snap == 255) bat_pct_snap = 100;
+        const int BATT_MAH = 500, AVG_MA = 180;
+        int runtime_min = (bat_pct_snap * BATT_MAH) / AVG_MA;
+        int rt_h = runtime_min / 60, rt_m = runtime_min % 60;
+        char rt_str[16]; snprintf(rt_str, sizeof(rt_str), "~%dh%02dm  est @180mA", rt_h, rt_m);
+        drawCard(COL_L, row6_y, DISP_W - 8, CARD_H);
+        spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+        spr.setCursor(COL_L + 4, row6_y + 4); kprint(spr, "RUNTIME");
+        spr.setTextColor(TEXT_COLOR, CARD_COLOR);
+        spr.setCursor(COL_L + 58, row6_y + 4); spr.print(rt_str);
+    }
+
+    // Row 7: SD STATUS — full width
+    int row7_y = yoff + 276;
+    drawCard(COL_L, row7_y, DISP_W - 8, CARD_H);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(COL_L + 4, row6_y + 4); kprint(spr, "SD CARD");
+    spr.setCursor(COL_L + 4, row7_y + 4); kprint(spr, "SD CARD");
     spr.setTextColor(sd_available ? ACCENT_COLOR : DIM_COLOR, CARD_COLOR);
-    spr.setCursor(70, row6_y + 4);
+    spr.setCursor(COL_L + 58, row7_y + 4);
     spr.print(sd_available ? "MOUNTED" : "NOT FOUND");
     spr.setTextColor(DIM_COLOR, CARD_COLOR);
-    spr.setCursor(150, row6_y + 4);
+    spr.setCursor(150, row7_y + 4);
     spr.print(littlefs_available ? "FS OK" : "FS ERR");
 
     spr.clearClipRect();
 
     {
-        const int visible_h = (DISP_H - 1) - 21;
+        const int visible_h = (DISP_H - 1) - 18;
         const int max_scroll_for_fade = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
         if (max_scroll_for_fade > 0) {
             if (device_info_scroll > 0)
@@ -4192,9 +4147,12 @@ void setup() {
 
     bool mount_success = false;
     SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
-    for (int i = 0; i < 3; i++) { 
-        if (SD.begin(SD_CS_PIN, SPI, 25000000)) { mount_success = true; break; } 
-        delay(100); 
+    static const uint32_t sd_speeds[] = {4000000, 10000000, 20000000};
+    for (int si = 0; si < 3 && !mount_success; si++) {
+        for (int attempt = 0; attempt < 3 && !mount_success; attempt++) {
+            if (SD.begin(SD_CS_PIN, SPI, sd_speeds[si])) { mount_success = true; }
+            else { SD.end(); delay(80); }
+        }
     }
     if (mount_success) {
         sd_available = true; current_log_file = "/FlockLog.csv";
@@ -4359,7 +4317,7 @@ void loop() {
                     if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (current_screen == 4) {
-                    int visible_h = DISP_H - 21;
+                    int visible_h = DISP_H - 18;
                     int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
                     if (max_scroll < 0) max_scroll = 0;
                     device_info_scroll += 12;
@@ -4411,8 +4369,15 @@ void loop() {
                     } else {
                         log_detection("SIMULATION", "BLE", random(-90, -40), fake_mac, "Test_BLE", 0, 0, "Adv", "manual_test", 100, 1);
                     }
+                    // Set alarm trigger under mutex — both fields together,
+                    // matching the producer pattern in process_wifi_event_queue
+                    // and ble_worker_task.
+                    xSemaphoreTake(dataMutex, portMAX_DELAY);
+                    trigger_alarm_confidence = 100;
+                    trigger_alarm_source = sim_wifi ? 0 : 1;  // 0=WiFi, 1=BLE
+                    xSemaphoreGive(dataMutex);
+
                     sim_wifi = !sim_wifi;
-                    trigger_alarm_confidence = 100; 
                 }
             }
             else if (c == 't') { 
