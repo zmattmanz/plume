@@ -43,6 +43,7 @@ void draw_help_overlay();
 void draw_locator_help_overlay();
 void draw_gps_screen();
 void load_sd_history();
+void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -968,11 +969,7 @@ void export_server_setup_routes() {
 bool export_mode_start() {
     if (export_mode_active) return true;
     if (strlen(export_ssid) == 0) {
-        strncpy(toast_text, "NO WIFI CONFIGURED", sizeof(toast_text) - 1);
-        toast_text[sizeof(toast_text) - 1] = '\0';
-        toast_accent_color = CAUTION_COLOR;
-        toast_start = millis();
-        toast_active = true;
+        set_toast_direct("NO WIFI CONFIGURED", CAUTION_COLOR);
         return false;
     }
 
@@ -989,16 +986,16 @@ bool export_mode_start() {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-        strncpy(toast_text, "WIFI CONNECT FAIL", sizeof(toast_text) - 1);
-        toast_text[sizeof(toast_text) - 1] = '\0';
-        toast_accent_color = CAUTION_COLOR;
-        toast_start = millis();
-        toast_active = true;
+        set_toast_direct("WIFI CONNECT FAIL", CAUTION_COLOR);
         // Restore sniffing
         WiFi.disconnect(true);
         delay(100);
         WiFi.mode(WIFI_STA);
+        wifi_promiscuous_filter_t pf_restore; pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+        esp_wifi_set_promiscuous_filter(&pf_restore);
+        esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
         esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
         return false;
     }
 
@@ -1012,10 +1009,9 @@ bool export_mode_start() {
     export_mode_active = true;
     export_mode_started_at = millis();
 
-    snprintf(toast_text, sizeof(toast_text), "http://%s", export_ip_str);
-    toast_accent_color = ACCENT_COLOR;
-    toast_start = millis();
-    toast_active = true;
+    char ip_toast[32];
+    snprintf(ip_toast, sizeof(ip_toast), "http://%s", export_ip_str);
+    set_toast_direct(ip_toast, ACCENT_COLOR);
     return true;
 }
 
@@ -1029,17 +1025,13 @@ void export_mode_stop() {
     WiFi.disconnect(true);
     delay(100);
     WiFi.mode(WIFI_STA);
-    esp_wifi_set_promiscuous(true);
     wifi_promiscuous_filter_t pf; pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&pf);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
+    esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
     export_mode_active = false;
-    strncpy(toast_text, "EXPORT MODE OFF", sizeof(toast_text) - 1);
-    toast_text[sizeof(toast_text) - 1] = '\0';
-    toast_accent_color = DIM_COLOR;
-    toast_start = millis();
-    toast_active = true;
+    set_toast_direct("EXPORT MODE OFF", DIM_COLOR);
 }
 
 // ============================================================================
@@ -1186,19 +1178,12 @@ void save_session_to_flash() {
         lifetime_flash_writes = l_writes;
         xSemaphoreGive(dataMutex);
         if (l_writes == 80000) {
-            strncpy(toast_text, "FLASH WEAR HIGH", sizeof(toast_text) - 1);
-            toast_text[sizeof(toast_text) - 1] = '\0';
-            toast_accent_color = CAUTION_COLOR;
-            toast_start = millis();
-            toast_active = true;
+            set_toast_direct("FLASH WEAR HIGH", CAUTION_COLOR);
         }
     } else {
         flash_write_fail_count++;
         if (flash_write_fail_count >= FLASH_FAIL_TOAST_THRESHOLD) {
-            strncpy(toast_text, "FLASH WRITE FAIL", sizeof(toast_text) - 1);
-            toast_text[sizeof(toast_text) - 1] = '\0';
-            toast_start = millis();
-            toast_active = true;
+            set_toast_direct("FLASH WRITE FAIL", CAUTION_COLOR);
             last_persist_save = millis();
         }
     }
@@ -1417,6 +1402,19 @@ void flush_sd_buffer() {
     }
 }
 
+// Thread-safe direct toast setter. Used for single-message notifications
+// (battery warnings, flash errors, export-mode messages) that bypass the queue.
+// Does NOT touch the queue — it only sets the currently-displayed toast.
+static void set_toast_direct(const char* text, uint16_t accent) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    strncpy(toast_text, text, sizeof(toast_text) - 1);
+    toast_text[sizeof(toast_text) - 1] = '\0';
+    toast_accent_color = accent;
+    toast_start = millis();
+    toast_active = true;
+    xSemaphoreGive(dataMutex);
+}
+
 void trigger_toast(const char* type, const char* name, int confidence) {
     uint16_t accent;
     if      (strncmp(type, "RAVEN",     5) == 0) accent = TEAL_COLOR;
@@ -1429,6 +1427,8 @@ void trigger_toast(const char* type, const char* name, int confidence) {
     char pct_str[6];
     snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
     snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
 
     // Enqueue; if full, drop oldest to make room
     if (toast_queue_count >= TOAST_QUEUE_SIZE) {
@@ -1449,6 +1449,8 @@ void trigger_toast(const char* type, const char* name, int confidence) {
         toast_start = millis();
         toast_active = true;
     }
+
+    xSemaphoreGive(dataMutex);
 }
 
 void add_to_capture_history(const char* type, const char* mac, const char* name, int rssi, int confidence) {
@@ -2498,6 +2500,7 @@ void draw_toast_spr() {
     if (!toast_active) return;
     unsigned long elapsed = millis() - toast_start;
     if (elapsed > TOAST_DURATION_MS) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
         // Advance queue
         if (toast_queue_count > 0) {
             toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
@@ -2512,6 +2515,7 @@ void draw_toast_spr() {
         } else {
             toast_active = false;
         }
+        xSemaphoreGive(dataMutex);
         return;
     }
 
@@ -4241,22 +4245,13 @@ void loop() {
         int loop_bat_pct = get_unified_battery_pct(loop_mv);
         if (loop_bat_pct != 255) {
             if (loop_bat_pct <= 5 && last_battery_warning_pct > 5) {
-                strncpy(toast_text, "BATT CRITICAL 5%", sizeof(toast_text) - 1);
-                toast_text[sizeof(toast_text) - 1] = '\0';
-                toast_accent_color = CAUTION_COLOR;
-                toast_start = millis(); toast_active = true;
+                set_toast_direct("BATT CRITICAL 5%", CAUTION_COLOR);
                 last_battery_warning_pct = 5;
             } else if (loop_bat_pct <= 10 && last_battery_warning_pct > 10) {
-                strncpy(toast_text, "BATT LOW 10%", sizeof(toast_text) - 1);
-                toast_text[sizeof(toast_text) - 1] = '\0';
-                toast_accent_color = CAUTION_COLOR;
-                toast_start = millis(); toast_active = true;
+                set_toast_direct("BATT LOW 10%", CAUTION_COLOR);
                 last_battery_warning_pct = 10;
             } else if (loop_bat_pct <= 20 && last_battery_warning_pct > 20) {
-                strncpy(toast_text, "BATT LOW 20%", sizeof(toast_text) - 1);
-                toast_text[sizeof(toast_text) - 1] = '\0';
-                toast_accent_color = CAUTION_COLOR;
-                toast_start = millis(); toast_active = true;
+                set_toast_direct("BATT LOW 20%", CAUTION_COLOR);
                 last_battery_warning_pct = 20;
             } else if (loop_bat_pct > last_battery_warning_pct + 5) {
                 // Reset thresholds if battery level has risen (e.g., charging)
