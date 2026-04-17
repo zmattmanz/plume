@@ -28,6 +28,7 @@
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
+struct BleEventData;  // defined in BLE section; forward-declared so Arduino prototype injection can reference it
 void draw_header_spr(int screen_num);
 void draw_toast_spr();
 void draw_vol_overlay();
