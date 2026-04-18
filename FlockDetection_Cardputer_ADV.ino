@@ -40,6 +40,7 @@ void beep(int frequency, int duration_ms);
 void apply_color_palette();
 void draw_help_overlay();
 void draw_locator_help_overlay();
+void draw_feed_expanded_overlay();
 void draw_gps_screen();
 void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
@@ -69,6 +70,7 @@ static bool ambient_mode = false;
 unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
 bool show_locator_help = false;  // 'h' on locator screen
+static bool show_feed_expanded = false;
 bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
@@ -1300,8 +1302,8 @@ void rssi_track_expire() {
 // ============================================================================
 // THREAT EQUALIZER DATA
 // ============================================================================
-#define radar_cx 62
-#define radar_cy 63
+#define radar_cx 58
+#define radar_cy 70
 #define radar_r  46
 #define inner_r  18
 
@@ -2424,7 +2426,7 @@ void draw_header_spr(int screen_num) {
     static float ease_gps_missing = 0.0f;
     ease_gps_missing += ((!gps_lock_now ? 1.0f : 0.0f) - ease_gps_missing) * 0.08f;
 
-    int icon_right = DISP_W - 32;
+    int icon_right = DISP_W - 6;
     int icon_y = 4;
 
     auto lerp_icon = [&](float t) -> uint16_t {
@@ -2717,6 +2719,7 @@ void draw_help_overlay() {
         {"b",    "Brightness"},
         {"\\",   "LED"},
         {"e",    "Export"},
+        {"f",    "Feed view"},
         {"o",    "Reset sess"},
     };
 
@@ -2818,7 +2821,7 @@ void draw_locator_help_overlay() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
-    int divider_x = 132;
+    int divider_x = 118;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
     spr.setClipRect(0, 18, divider_x, DISP_H - 18);
@@ -3153,49 +3156,57 @@ void draw_scanner_screen() {
     spr.setCursor(badge_x + wf_seg_w + 6, 29);
     spr.print("BLE");
 
-    // ── Compressed stats row — label above, symbol+value below (size 1) ──
-    int stats_y = 46;
+    // ── Combined stats divider ──
+    // Horizontal line through the right column; WIFI ▲ N on left, BLE ◆ N on right.
+    // Text blocks overdraw (clear) the line behind each block.
+    {
+        const int sd_y      = 44;
+        const int sd_line_y = 47;
+        const int sd_left   = right_text_x;
+        const int sd_right  = DISP_W - 4;
+        uint16_t  line_col  = lerp_col16(BG_COLOR, CARD_BORDER, 0.7f);
 
-    // ─ WIFI block ─
-    int wf_x = right_text_x;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(wf_x, stats_y);
-    kprint(spr, "WIFI");
+        spr.drawFastHLine(sd_left, sd_line_y, sd_right - sd_left, line_col);
 
-    int wf_sx = wf_x, wf_sy = stats_y + 11;
-    spr.fillTriangle(wf_sx, wf_sy + 6, wf_sx + 6, wf_sy + 6, wf_sx + 3, wf_sy, CAUTION_COLOR);
-    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(wf_x + 10, stats_y + 12);
-    spr.print(sw);
+        // WIFI block (left)
+        char wifi_num[6]; snprintf(wifi_num, sizeof(wifi_num), "%ld", (long)sw);
+        int wifi_block_w = 24 + 5 + 7 + 4 + (int)strlen(wifi_num) * 6;
+        spr.fillRect(sd_left + 2, sd_line_y - 1, wifi_block_w + 4, 3, BG_COLOR);
 
-    // ─ BLE block ─
-    int ble_x = right_text_x + 48;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(ble_x, stats_y);
-    kprint(spr, "BLE");
+        int wx = sd_left + 4;
+        spr.setTextSize(1);
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setCursor(wx, sd_y); kprint(spr, "WIFI");
+        wx += 24 + 5;
+        spr.fillTriangle(wx, sd_y + 6, wx + 6, sd_y + 6, wx + 3, sd_y, CAUTION_COLOR);
+        wx += 7 + 4;
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(wx, sd_y); spr.print(wifi_num);
 
-    int ble_sx = ble_x, ble_sy = stats_y + 11;
-    spr.fillTriangle(ble_sx, ble_sy + 3, ble_sx + 3, ble_sy,     ble_sx + 6, ble_sy + 3, PURPLE_COLOR);
-    spr.fillTriangle(ble_sx, ble_sy + 3, ble_sx + 3, ble_sy + 6, ble_sx + 6, ble_sy + 3, PURPLE_COLOR);
-    spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(ble_x + 10, stats_y + 12);
-    spr.print(sb);
+        // BLE block (right-aligned)
+        char ble_num[6]; snprintf(ble_num, sizeof(ble_num), "%ld", (long)sb);
+        int ble_block_w = 18 + 5 + 7 + 4 + (int)strlen(ble_num) * 6;
+        int bx_start = sd_right - 4 - ble_block_w;
+        spr.fillRect(bx_start - 2, sd_line_y - 1, ble_block_w + 4, 3, BG_COLOR);
+
+        int bx = bx_start;
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setCursor(bx, sd_y); kprint(spr, "BLE");
+        bx += 18 + 5;
+        spr.fillTriangle(bx, sd_y + 3, bx + 3, sd_y,     bx + 6, sd_y + 3, PURPLE_COLOR);
+        spr.fillTriangle(bx, sd_y + 3, bx + 3, sd_y + 6, bx + 6, sd_y + 3, PURPLE_COLOR);
+        bx += 7 + 4;
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(bx, sd_y); spr.print(ble_num);
+    }
 
     // ── Live device feed (right column) ──
     {
         const int feed_col_left  = right_text_x;
         const int feed_col_right = DISP_W - 4;
-        const int feed_top_y     = 66;
+        const int feed_top_y     = 54;
         const int feed_row_h     = 11;
-        const int max_visible    = 6;
-
-        // Subtle divider + ACTIVITY label
-        uint16_t divider_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.6f);
-        spr.drawFastHLine(feed_col_left, feed_top_y - 4, feed_col_right - feed_col_left, divider_col);
-        spr.setTextColor(divider_col, BG_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(feed_col_left + 2, feed_top_y - 9);
-        spr.print("ACTIVITY");
+        const int max_visible    = 7;
 
         FeedEntry local_feed[FEED_SIZE];
         int local_count, local_head;
@@ -4250,6 +4261,116 @@ void draw_device_info_screen() {
 }
 
 // ============================================================================
+// EXPANDED FEED OVERLAY — fullscreen activity feed view
+// ============================================================================
+void draw_feed_expanded_overlay() {
+    FeedEntry local_feed[FEED_SIZE];
+    int local_count, local_head;
+    unsigned long local_now;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    local_count = feed_count;
+    local_head  = feed_head;
+    for (int i = 0; i < local_count; i++) local_feed[i] = feed_entries[i];
+    local_now = millis();
+    xSemaphoreGive(dataMutex);
+
+    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
+
+    // Title bar
+    spr.fillRect(0, 18, DISP_W, 14, CARD_COLOR);
+    spr.drawFastHLine(0, 32, DISP_W, CARD_BORDER);
+    spr.setTextSize(1);
+    spr.setTextColor(HEADER_COLOR, CARD_COLOR);
+    spr.setCursor(4, 22);
+    kprint(spr, "ACTIVITY FEED");
+
+    char count_str[16];
+    snprintf(count_str, sizeof(count_str), "%d %s",
+             local_count, local_count == 1 ? "entry" : "entries");
+    int count_w = (int)strlen(count_str) * 6;
+    spr.setTextColor(DIM_COLOR, CARD_COLOR);
+    spr.setCursor(DISP_W - count_w - 4, 22);
+    spr.print(count_str);
+
+    if (local_count == 0) {
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        const char* msg = "no activity yet";
+        int mw = (int)strlen(msg) * 6;
+        spr.setCursor((DISP_W - mw) / 2, DISP_H / 2 - 4);
+        spr.print(msg);
+    } else {
+        const int row_h    = 11;
+        const int row_top  = 36;
+        const int max_rows = (DISP_H - row_top - 12) / row_h;
+
+        int rendered = 0;
+        for (int i = 0; i < local_count && rendered < max_rows; i++) {
+            int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+            FeedEntry& e = local_feed[idx];
+            int row_y = row_top + rendered * row_h;
+
+            unsigned long age = local_now - e.timestamp;
+            int age_sec = (int)(age / 1000UL);
+
+            uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
+            if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
+
+            const char* strength_str;
+            uint16_t strength_col;
+            if (e.rssi > -60)      { strength_str = "STR"; strength_col = ACCENT_COLOR; }
+            else if (e.rssi > -80) { strength_str = "MED"; strength_col = CAUTION_COLOR; }
+            else                   { strength_str = "WK";  strength_col = DIM_COLOR; }
+
+            spr.setTextSize(1);
+
+            char prefix[6];
+            snprintf(prefix, sizeof(prefix), "[%c%s]",
+                     e.proto == 0 ? 'W' : 'B', e.is_flock ? "*" : "");
+            spr.setTextColor(proto_col, BG_COLOR);
+            spr.setCursor(4, row_y);
+            spr.print(prefix);
+
+            char name_disp[13];
+            strncpy(name_disp, e.name, 12); name_disp[12] = '\0';
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(32, row_y);
+            spr.print(name_disp);
+
+            int mac_len = (int)strlen(e.mac);
+            const char* mac_tail = (mac_len > 5) ? e.mac + (mac_len - 5) : e.mac;
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setCursor(108, row_y);
+            spr.print(mac_tail);
+
+            char rssi_str[8];
+            snprintf(rssi_str, sizeof(rssi_str), "%d", e.rssi);
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(144, row_y);
+            spr.print(rssi_str);
+
+            spr.setTextColor(strength_col, BG_COLOR);
+            spr.setCursor(174, row_y);
+            spr.print(strength_str);
+
+            char age_str[8];
+            if (age_sec < 60) snprintf(age_str, sizeof(age_str), "%ds", age_sec);
+            else              snprintf(age_str, sizeof(age_str), "%dm", age_sec / 60);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setCursor(200, row_y);
+            spr.print(age_str);
+
+            rendered++;
+        }
+    }
+
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(4, DISP_H - 9);
+    spr.print("f or ESC to close");
+}
+
+// ============================================================================
 // MAIN UI CONTROLLER
 // ============================================================================
 void draw_current_screen() {
@@ -4261,6 +4382,7 @@ void draw_current_screen() {
         case 4: draw_device_info_screen();     break;
     }
     
+    if (show_feed_expanded) draw_feed_expanded_overlay();
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
     if (show_locator_help && current_screen == 1) draw_locator_help_overlay();
@@ -4527,7 +4649,8 @@ void loop() {
         for (auto c : status.word) {
 
             if (c == 0x1B && !stealth_mode) {  // ASCII Escape → jump to Scanner
-                if (show_help_overlay) { show_help_overlay = false; }
+                if (show_feed_expanded) { show_feed_expanded = false; }
+                else if (show_help_overlay) { show_help_overlay = false; }
                 else if (show_locator_help) { show_locator_help = false; }
                 else if (current_screen == 2 && hist_detail_open) { hist_detail_open = false; }
                 else if (current_screen != 0) { transition_screen(0, -1); continue; }
@@ -4740,6 +4863,13 @@ void loop() {
                     } else {
                         export_mode_start();
                     }
+                    draw_current_screen();
+                    spr.pushSprite(0, 0);
+                }
+            }
+            else if (c == 'f') {
+                if (!stealth_mode) {
+                    show_feed_expanded = !show_feed_expanded;
                     draw_current_screen();
                     spr.pushSprite(0, 0);
                 }
