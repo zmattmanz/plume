@@ -4512,7 +4512,6 @@ void loop() {
                 transition_screen(prev, d);
             }
         }
-        }
     }
 
     // Fire pending 'l' single-press action if double-tap window expired
