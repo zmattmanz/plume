@@ -404,10 +404,10 @@ unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
 unsigned long last_persist_save = 0;
 unsigned long last_blip_time = 0;
-static unsigned long last_l_press_ms = 0;
 static const unsigned long DOUBLE_TAP_MS = 400;
-static unsigned long l_pending_until = 0;
-static bool l_pending_exists = false;
+static bool bs_pending_exists = false;
+static unsigned long bs_pending_until = 0;
+static unsigned long last_bs_press_ms = 0;
 
 struct RSSITrack { 
     char mac[18];
@@ -1280,7 +1280,7 @@ void rssi_track_expire() {
 // THREAT EQUALIZER DATA
 // ============================================================================
 #define radar_cx 66
-#define radar_cy 71
+#define radar_cy 63
 #define radar_r  50
 #define inner_r  20
 
@@ -2339,20 +2339,38 @@ void draw_header_spr(int screen_num) {
     };
     auto should_draw = [](float t) -> bool { return t > 0.05f; };
 
-    // Locator-active indicator — pulsing crosshair when tracking
-    static float ease_locator = 0.0f;
-    bool locator_now = locator_active;
-    ease_locator += ((locator_now ? 1.0f : 0.0f) - ease_locator) * 0.10f;
-    if (ease_locator > 0.05f) {
-        int ix = icon_right - 12;
-        float pulse = (sinf((float)millis() / 600.0f) + 1.0f) * 0.5f;
-        uint16_t base_col = lerp_col16(BG_COLOR, HEADER_COLOR, ease_locator);
-        uint16_t pulse_col = lerp_col16(base_col, ACCENT_COLOR, pulse * 0.6f);
-        spr.drawCircle(ix + 5, icon_y + 5, 4, pulse_col);
-        spr.drawFastHLine(ix + 1, icon_y + 5, 9, pulse_col);
-        spr.drawFastVLine(ix + 5, icon_y + 1, 9, pulse_col);
-        spr.drawPixel(ix + 5, icon_y + 5, ACCENT_COLOR);
-        icon_right -= 16;
+    // Unified mode indicators — N / S / L text pills
+    {
+        struct ModeBadge {
+            bool active;
+            const char* letter;
+            uint16_t color;
+            bool pulse;
+        };
+        ModeBadge badges[3] = {
+            { night_mode,     "N", HEADER_COLOR, false },
+            { stealth_mode,   "S", DIM_COLOR,    false },
+            { locator_active, "L", HEADER_COLOR, true  },
+        };
+
+        for (int i = 0; i < 3; i++) {
+            if (!badges[i].active) continue;
+
+            uint16_t fg = badges[i].color;
+            if (badges[i].pulse) {
+                float pulse = (sinf((float)millis() / 600.0f) + 1.0f) * 0.5f;
+                fg = lerp_col16(badges[i].color, ACCENT_COLOR, pulse * 0.5f);
+            }
+            uint16_t bg = lerp_col16(BG_COLOR, fg, 0.18f);
+
+            int pill_x = icon_right - 12;
+            spr.fillRoundRect(pill_x, icon_y, 11, 11, 2, bg);
+            spr.setTextColor(fg, bg);
+            spr.setTextSize(1);
+            spr.setCursor(pill_x + 3, icon_y + 2);
+            spr.print(badges[i].letter);
+            icon_right = pill_x - 3;
+        }
     }
 
     // Muted icon — larger 10×10 speaker with slash
@@ -2612,7 +2630,7 @@ void draw_help_overlay() {
         {"n",    "Night"},
         {"s",    "Stealth"},
         {"b",    "Brightness"},
-        {"c",    "LED color"},
+        {"\\",   "LED"},
         {"e",    "Export"},
         {"o",    "Reset sess"},
     };
@@ -3015,18 +3033,51 @@ void draw_scanner_screen() {
     spr.setCursor(right_text_x + wf_bw + 4, 29);
     spr.print("BLE");
 
-    // Labels — extra gap below badges (badges bottom = y=40); kerned
-    spr.fillCircle(right_text_x + 2, 51, 2, CAUTION_COLOR);
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x + 8, 48); kprint(spr, "WIFI");
-    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(right_text_x, 58); spr.print(sw);
+    // Compact horizontal stats — ▲ for WiFi, ◆ for BLE
+    int stats_y = 48;
 
-    spr.fillCircle(right_text_x + 2, 83, 2, PURPLE_COLOR);
+    int wf_x = right_text_x;
+    spr.fillTriangle(
+        wf_x,     stats_y + 7,
+        wf_x + 6, stats_y + 7,
+        wf_x + 3, stats_y + 1,
+        CAUTION_COLOR
+    );
+    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
+    spr.setCursor(wf_x + 10, stats_y);
+    spr.print(sw);
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x + 8, 80); kprint(spr, "BLE");
+    spr.setCursor(wf_x, stats_y + 18);
+    kprint(spr, "WIFI");
+
+    int ble_x = right_text_x + 50;
+    spr.fillTriangle(
+        ble_x,     stats_y + 4,
+        ble_x + 3, stats_y,
+        ble_x + 6, stats_y + 4,
+        PURPLE_COLOR
+    );
+    spr.fillTriangle(
+        ble_x,     stats_y + 4,
+        ble_x + 3, stats_y + 8,
+        ble_x + 6, stats_y + 4,
+        PURPLE_COLOR
+    );
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(right_text_x, 90); spr.print(sb);
+    spr.setCursor(ble_x + 10, stats_y);
+    spr.print(sb);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(ble_x, stats_y + 18);
+    kprint(spr, "BLE");
+
+    // Activity feed zone divider — horizontal line establishing the future feed area
+    int feed_top_y = 80;
+    uint16_t divider_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
+    spr.drawFastHLine(4, feed_top_y, DISP_W - 8, divider_col);
+    spr.setTextColor(divider_col, BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(8, feed_top_y - 4);
+    spr.print("ACTIVITY");
 
 }
 
@@ -4411,7 +4462,7 @@ void loop() {
                     }
                 }
             }
-            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(0); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } }
+            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } }
             else if (c == 'o') {
                 if (!stealth_mode) {
                     xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -4437,32 +4488,39 @@ void loop() {
                 // On other screens, 'g' is currently a no-op.
             }
             else if (c == 'l') {
+                // Instant locator stop from any screen. No-op when inactive.
+                if (locator_active) {
+                    locator_stop();
+                    trigger_toast("INFO", "Locator stopped", 0);
+                    beep(500, 60);
+                }
+            }
+            else if (c == '\\') {
+                // Single press: toggle LED breathing on/off (deferred to detect double-tap).
+                // Double press: random LED color from palette.
                 unsigned long now_ms = millis();
 
-                if (l_pending_exists && (now_ms - last_l_press_ms) < DOUBLE_TAP_MS) {
-                    // Second press within window → double-tap, cancel pending single-press
-                    l_pending_exists = false;
-                    l_pending_until = 0;
+                if (bs_pending_exists && (now_ms - last_bs_press_ms) < DOUBLE_TAP_MS) {
+                    bs_pending_exists = false;
+                    bs_pending_until = 0;
 
-                    // Double-tap: cycle LED color (works from any screen)
-                    led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+                    int n_colors = (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+                    int new_idx;
+                    if (n_colors > 1) {
+                        do { new_idx = random(0, n_colors); } while (new_idx == led_col_idx);
+                    } else {
+                        new_idx = 0;
+                    }
+                    led_col_idx = new_idx;
                     led_r = LED_COLORS[led_col_idx][0];
                     led_g = LED_COLORS[led_col_idx][1];
                     led_b = LED_COLORS[led_col_idx][2];
                     if (!led_breathing_on) led_breathing_on = true;
                     beep(900, 40);
-                } else if (locator_active) {
-                    // Single-press with locator running: stop immediately from any screen
-                    locator_stop();
-                    trigger_toast("INFO", "Locator stopped", 0);
-                    beep(500, 60);
-                    l_pending_exists = false;
-                    l_pending_until = 0;
                 } else {
-                    // First press, no active locator → arm deferred single-press
-                    l_pending_exists = true;
-                    l_pending_until = now_ms + DOUBLE_TAP_MS;
-                    last_l_press_ms = now_ms;
+                    bs_pending_exists = true;
+                    bs_pending_until = now_ms + DOUBLE_TAP_MS;
+                    last_bs_press_ms = now_ms;
                 }
             }
             else if (c == 'c') {
@@ -4514,26 +4572,12 @@ void loop() {
         }
     }
 
-    // Fire pending 'l' single-press action if double-tap window expired
-    if (l_pending_exists && millis() >= l_pending_until) {
-        l_pending_exists = false;
-        l_pending_until = 0;
-
-        if (locator_active) {
-            locator_stop();
-        } else {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            char l_type[16]; strncpy(l_type, last_cap_type, 15); l_type[15] = '\0';
-            char l_mac[18];  strncpy(l_mac,  last_cap_mac,  17); l_mac[17]  = '\0';
-            char l_name[65]; strncpy(l_name, last_cap_name, 64); l_name[64] = '\0';
-            xSemaphoreGive(dataMutex);
-            if (strcmp(l_type, "None") != 0 && l_type[0] != '\0') {
-                locator_start(l_mac, l_name, l_type);
-                transition_screen(1, 1);
-            } else {
-                led_breathing_on = !led_breathing_on;
-            }
-        }
+    // Fire pending '\' single-press action if double-tap window expired
+    if (bs_pending_exists && millis() >= bs_pending_until) {
+        bs_pending_exists = false;
+        bs_pending_until = 0;
+        led_breathing_on = !led_breathing_on;
+        beep(led_breathing_on ? 800 : 400, 30);
     }
 
     if (millis() - last_time_save >= 1000) { xSemaphoreTake(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGive(dataMutex); last_time_save = millis(); }
@@ -4642,7 +4686,20 @@ void loop() {
             spr.pushSprite(0, 0);
             last_ambient_draw = millis();
         }
-    } else if (!stealth_mode) {
+    } else if (stealth_mode) {
+        // Minimal stealth render: tiny dim "S" in bottom-right corner every 2s.
+        static unsigned long last_stealth_draw = 0;
+        if (millis() - last_stealth_draw > 2000) {
+            spr.fillSprite(BG_COLOR);
+            uint16_t s_col = lerp_col16(BG_COLOR, lgfx::color565(180, 30, 30), 0.6f);
+            spr.setTextColor(s_col, BG_COLOR);
+            spr.setTextSize(1);
+            spr.setCursor(DISP_W - 8, DISP_H - 9);
+            spr.print("S");
+            spr.pushSprite(0, 0);
+            last_stealth_draw = millis();
+        }
+    } else {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
