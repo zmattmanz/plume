@@ -3204,9 +3204,9 @@ void draw_scanner_screen() {
     {
         const int feed_col_left  = right_text_x;
         const int feed_col_right = DISP_W - 4;
-        const int feed_top_y     = 54;
+        const int feed_top_y     = 64;
         const int feed_row_h     = 11;
-        const int max_visible    = 7;
+        const int max_visible    = 5;
 
         FeedEntry local_feed[FEED_SIZE];
         int local_count, local_head;
