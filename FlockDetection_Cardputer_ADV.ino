@@ -2295,13 +2295,6 @@ void draw_header_spr(int screen_num) {
     };
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
-    int32_t med_mv = get_filtered_voltage();
-    // Voltage-based color band (no percentage, no charging detection)
-    uint16_t bcol;
-    if      (med_mv >= 3800) bcol = ACCENT_COLOR;
-    else if (med_mv >= 3600) bcol = CAUTION_COLOR;
-    else                     bcol = lgfx::color565(220, 60, 60);
-
     spr.fillRect(0, 0, DISP_W, 20, BG_COLOR);
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
@@ -2416,7 +2409,7 @@ void draw_header_spr(int screen_num) {
         int det_w = (int)strlen(det_str) * 6 + 6;
         uint16_t pill_bg = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.18f);
         spr.fillRoundRect(icon_right - det_w, icon_y, det_w, 11, 3, pill_bg);
-        spr.setTextColor(ACCENT_COLOR, pill_bg);
+        spr.setTextColor(lgfx::color565(255, 255, 255), pill_bg);
         spr.setTextSize(1);
         spr.setCursor(icon_right - det_w + 3, icon_y + 2);
         spr.print(det_str);
@@ -2460,14 +2453,6 @@ void draw_header_spr(int screen_num) {
             spr.drawPixel(dx, dots_y, CARD_BORDER);
         }
     }
-
-    // Voltage readout — color-coded, replaces percentage pill
-    char volt_hdr[8];
-    snprintf(volt_hdr, sizeof(volt_hdr), "%.2fV", med_mv / 1000.0f);
-    spr.setTextSize(1);
-    spr.setTextColor(bcol, BG_COLOR);
-    spr.setCursor(DISP_W - 30, 6);
-    spr.print(volt_hdr);
 
 }
 
@@ -2970,11 +2955,21 @@ void draw_scanner_screen() {
 
             if (is_strong) {
                 spr.drawLine(base_x, base_y, base_x, base_y - spike_len, line_col);
-                // Upward-pointing equilateral triangle outline at top of spike
-                // base 6px wide, height 5px (~6 * sqrt(3)/2)
-                spr.drawTriangle(base_x - 3, base_y - spike_len + 5,
-                                 base_x + 3, base_y - spike_len + 5,
-                                 base_x,     base_y - spike_len, line_col);
+                // Shape encodes protocol — matches stats column vocabulary:
+                // BLE = diamond (◆), WiFi = triangle (▲)
+                bool is_ble_blip = (line_col == PURPLE_COLOR);
+                int tip_y = base_y - spike_len;
+                if (is_ble_blip) {
+                    int cx_d = base_x, cy_d = tip_y + 3;
+                    spr.drawLine(cx_d - 3, cy_d,     cx_d,     cy_d - 3, line_col);
+                    spr.drawLine(cx_d,     cy_d - 3, cx_d + 3, cy_d,     line_col);
+                    spr.drawLine(cx_d + 3, cy_d,     cx_d,     cy_d + 3, line_col);
+                    spr.drawLine(cx_d,     cy_d + 3, cx_d - 3, cy_d,     line_col);
+                } else {
+                    spr.drawTriangle(base_x - 3, tip_y + 5,
+                                     base_x + 3, tip_y + 5,
+                                     base_x,     tip_y, line_col);
+                }
             } else {
                 // Small noise-style dash for weak signals
                 spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
@@ -3005,13 +3000,40 @@ void draw_scanner_screen() {
     uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
-    // WiFi badge — width wraps to actual text content (5px padding each side, 6px per char at size 1)
+    // ── Combined segmented pill: [WiFi: ch | BLE] ──
     char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi: %d", current_channel);
     bool wf_locked = (millis() < channel_lock_until);
-    int wf_bw = (strlen(wf_label) + (wf_locked ? 2 : 0)) * 6 + 10;
+    int wf_seg_w = (int)(strlen(wf_label) + (wf_locked ? 2 : 0)) * 6 + 10;
+    int ble_seg_w = 26;
+
+    bool ble_scan_window_active = (pBLEScan != nullptr && pBLEScan->isScanning());
+    bool ble_pulse_on = ble_scan_window_active && (((millis() / 500) % 2) == 0);
+    float ble_pulse_t = ble_scan_window_active ? (ble_pulse_on ? 1.0f : 0.35f) : 0.18f;
+    uint16_t ble_badge_col = lerp_col16(CARD_BORDER, ble_col, ble_pulse_t);
+
     uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
-    spr.fillRoundRect(right_text_x - 5, 24, wf_bw, 16, 7, wf_fill);
-    spr.drawRoundRect(right_text_x - 5, 24, wf_bw, 16, 7, wf_col);
+    uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
+
+    int badge_x = right_text_x - 5;
+    int badge_y = 24;
+    int badge_h = 16;
+    int total_w = wf_seg_w + ble_seg_w;
+    uint16_t outer_border = lerp_col16(wf_col, ble_badge_col, 0.5f);
+
+    // Clear pill area, then paint each segment fill
+    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 7, BG_COLOR);
+    // WiFi segment — full pill in wf_fill, square off right edge
+    spr.fillRoundRect(badge_x, badge_y, wf_seg_w + 6, badge_h, 7, wf_fill);
+    spr.fillRect(badge_x + wf_seg_w - 6, badge_y, 12, badge_h, wf_fill);
+    // BLE segment — rounded right, square off left edge
+    spr.fillRoundRect(badge_x + wf_seg_w - 6, badge_y, ble_seg_w + 6, badge_h, 7, ble_fill);
+    spr.fillRect(badge_x + wf_seg_w - 6, badge_y, 12, badge_h, ble_fill);
+
+    // Outer rounded outline + center divider
+    spr.drawRoundRect(badge_x, badge_y, total_w, badge_h, 7, outer_border);
+    spr.drawFastVLine(badge_x + wf_seg_w, badge_y + 1, badge_h - 2, outer_border);
+
+    // WiFi text
     spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1);
     spr.setCursor(right_text_x, 29);
     spr.print(wf_label);
@@ -3020,64 +3042,45 @@ void draw_scanner_screen() {
         spr.print(" L");
     }
 
-    // BLE badge — positioned 4px after WiFi badge ends
-    // Pulse at ~2Hz only during active BLE scan window; dim/static otherwise
-    bool ble_scan_window_active = (pBLEScan != nullptr && pBLEScan->isScanning());
-    bool ble_pulse_on = ble_scan_window_active && (((millis() / 500) % 2) == 0);
-    float ble_pulse_t = ble_scan_window_active ? (ble_pulse_on ? 1.0f : 0.35f) : 0.18f;
-    uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR, ble_ease * 0.22f);
-    uint16_t ble_badge_col = lerp_col16(CARD_BORDER, ble_col, ble_pulse_t);
-    spr.fillRoundRect(right_text_x + wf_bw - 1, 24, 28, 16, 7, ble_fill);
-    spr.drawRoundRect(right_text_x + wf_bw - 1, 24, 28, 16, 7, ble_badge_col);
+    // BLE text
     spr.setTextColor(ble_badge_col, ble_fill);
-    spr.setCursor(right_text_x + wf_bw + 4, 29);
+    spr.setCursor(badge_x + wf_seg_w + 6, 29);
     spr.print("BLE");
 
-    // Compact horizontal stats — ▲ for WiFi, ◆ for BLE
+    // ── Compact horizontal stats — labels above, symbol+value below ──
     int stats_y = 48;
 
+    // ─ WIFI block (left) ─
     int wf_x = right_text_x;
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(wf_x, stats_y);
+    kprint(spr, "WIFI");
+
+    int wf_sx = wf_x;
+    int wf_sy = stats_y + 12;
     spr.fillTriangle(
-        wf_x,     stats_y + 7,
-        wf_x + 6, stats_y + 7,
-        wf_x + 3, stats_y + 1,
+        wf_sx,     wf_sy + 8,
+        wf_sx + 8, wf_sy + 8,
+        wf_sx + 4, wf_sy,
         CAUTION_COLOR
     );
     spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(wf_x + 10, stats_y);
+    spr.setCursor(wf_x + 12, stats_y + 11);
     spr.print(sw);
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(wf_x, stats_y + 18);
-    kprint(spr, "WIFI");
 
+    // ─ BLE block (right) ─
     int ble_x = right_text_x + 50;
-    spr.fillTriangle(
-        ble_x,     stats_y + 4,
-        ble_x + 3, stats_y,
-        ble_x + 6, stats_y + 4,
-        PURPLE_COLOR
-    );
-    spr.fillTriangle(
-        ble_x,     stats_y + 4,
-        ble_x + 3, stats_y + 8,
-        ble_x + 6, stats_y + 4,
-        PURPLE_COLOR
-    );
-    spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(ble_x + 10, stats_y);
-    spr.print(sb);
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(ble_x, stats_y + 18);
+    spr.setCursor(ble_x, stats_y);
     kprint(spr, "BLE");
 
-    // Activity feed zone divider — horizontal line establishing the future feed area
-    int feed_top_y = 80;
-    uint16_t divider_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
-    spr.drawFastHLine(4, feed_top_y, DISP_W - 8, divider_col);
-    spr.setTextColor(divider_col, BG_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(8, feed_top_y - 4);
-    spr.print("ACTIVITY");
+    int ble_sx = ble_x;
+    int ble_sy = stats_y + 12;
+    spr.fillTriangle(ble_sx, ble_sy + 4, ble_sx + 4, ble_sy,     ble_sx + 8, ble_sy + 4, PURPLE_COLOR);
+    spr.fillTriangle(ble_sx, ble_sy + 4, ble_sx + 4, ble_sy + 8, ble_sx + 8, ble_sy + 4, PURPLE_COLOR);
+    spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
+    spr.setCursor(ble_x + 12, stats_y + 11);
+    spr.print(sb);
 
 }
 
