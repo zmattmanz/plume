@@ -3105,7 +3105,10 @@ void draw_scanner_screen() {
     uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
     uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
 
-    // ── Combined segmented pill: [WiFi: ch | BLE] ──
+    // ── Combined segmented pill: [WiFi: ch / BLE] ──
+    // Each segment fills its full half including the diagonal slash region —
+    // the slash is drawn last as a divider line over the seam, not as a fill
+    // boundary. This eliminates the unfilled triangular gaps.
     char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi: %d", current_channel);
     bool wf_locked = (millis() < channel_lock_until);
     int wf_seg_w = (int)(strlen(wf_label) + (wf_locked ? 2 : 0)) * 6 + 10;
@@ -3125,17 +3128,45 @@ void draw_scanner_screen() {
     int total_w = wf_seg_w + ble_seg_w;
     uint16_t outer_border = lerp_col16(wf_col, ble_badge_col, 0.5f);
 
-    // Clear pill area, then paint each segment fill
+    // Step 1: clear pill area
     spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 7, BG_COLOR);
-    // WiFi segment — full pill in wf_fill, square off right edge
-    spr.fillRoundRect(badge_x, badge_y, wf_seg_w + 6, badge_h, 7, wf_fill);
-    spr.fillRect(badge_x + wf_seg_w - 6, badge_y, 12, badge_h, wf_fill);
-    // BLE segment — rounded right, square off left edge
-    spr.fillRoundRect(badge_x + wf_seg_w - 6, badge_y, ble_seg_w + 6, badge_h, 7, ble_fill);
-    spr.fillRect(badge_x + wf_seg_w - 6, badge_y, 12, badge_h, ble_fill);
 
-    // Outer rounded outline + 45° slash divider
+    // Step 2: fill BLE segment (right) FIRST as full pill — gives it the
+    // rounded right corners
+    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 7, ble_fill);
+
+    // Step 3: overdraw WiFi segment (left) — extends slightly past the
+    // diagonal seam so no BLE color leaks through the slash region
+    {
+        int seam_x = badge_x + wf_seg_w;
+        // Fill the WiFi-side rounded area
+        spr.fillRoundRect(badge_x, badge_y, wf_seg_w, badge_h, 7, wf_fill);
+        // Square off the right edge of WiFi segment up to the slash midpoint,
+        // covering the seam fully. Use a triangle that extends past the
+        // diagonal so no BLE color shows through.
+        spr.fillRect(badge_x + wf_seg_w - 7, badge_y, 7, badge_h, wf_fill);
+        // Diagonal "wedge" of WiFi color extending into the seam area —
+        // matches the slope of the slash divider so the fill respects the
+        // diagonal boundary, eliminating triangle gaps.
+        for (int dy = 0; dy < badge_h; dy++) {
+            // Slash goes from (seam_x + 4, badge_y + 2) to (seam_x - 4, badge_y + badge_h - 3)
+            // For each y row, compute the x where the slash crosses
+            float t = (float)(dy - 2) / (float)(badge_h - 5);
+            t = (t < 0.0f) ? 0.0f : (t > 1.0f ? 1.0f : t);
+            int slash_x = (int)(seam_x + 4 - t * 8.0f);
+            // Fill from previous WiFi edge up to slash_x with WiFi color
+            int wfill_right = badge_x + wf_seg_w;
+            if (slash_x > wfill_right) {
+                spr.drawFastHLine(wfill_right, badge_y + dy,
+                                  slash_x - wfill_right, wf_fill);
+            }
+        }
+    }
+
+    // Step 4: outer rounded outline
     spr.drawRoundRect(badge_x, badge_y, total_w, badge_h, 7, outer_border);
+
+    // Step 5: 45° slash divider drawn on top of fills
     {
         int sx = badge_x + wf_seg_w;
         int sy_top = badge_y + 2;
@@ -3159,126 +3190,211 @@ void draw_scanner_screen() {
     spr.print("BLE");
 
     // ── Combined stats divider ──
-    // Horizontal line through the right column; WIFI ▲ N on left, BLE ◆ N on right.
-    // Text blocks overdraw (clear) the line behind each block.
+    // Larger size-2 numbers with the divider line rendered as a SUBTLE
+    // accent below the stats rather than crossing through them. Better
+    // breathing room and visual weight for the counts.
     {
-        const int sd_y      = 44;
-        const int sd_line_y = 47;
-        const int sd_left   = right_text_x;
-        const int sd_right  = DISP_W - 4;
-        uint16_t  line_col  = lerp_col16(BG_COLOR, CARD_BORDER, 0.7f);
+        long sw_local = sw;
+        long sb_local = sb;
 
+        const int sd_top_y    = 44;                  // top of label text
+        const int sd_num_y    = 53;                  // top of large numbers (size 2)
+        const int sd_line_y   = 70;                  // divider line below stats block
+        const int sd_left     = right_text_x;
+        const int sd_right    = DISP_W - 4;
+        uint16_t  line_col    = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
+
+        // Subtle divider line below the stats (not crossing through them)
         spr.drawFastHLine(sd_left, sd_line_y, sd_right - sd_left, line_col);
 
-        // WIFI block (left)
-        char wifi_num[6]; snprintf(wifi_num, sizeof(wifi_num), "%ld", (long)sw);
-        int wifi_block_w = 24 + 5 + 7 + 4 + (int)strlen(wifi_num) * 6;
-        spr.fillRect(sd_left + 2, sd_line_y - 1, wifi_block_w + 4, 3, BG_COLOR);
+        // ── WIFI block (left) ──
+        char wifi_num[6];
+        snprintf(wifi_num, sizeof(wifi_num), "%ld", sw_local);
 
-        int wx = sd_left + 4;
         spr.setTextSize(1);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(wx, sd_y); kprint(spr, "WIFI");
-        wx += 24 + 5;
-        spr.fillTriangle(wx, sd_y + 6, wx + 6, sd_y + 6, wx + 3, sd_y, CAUTION_COLOR);
-        wx += 7 + 4;
+        spr.setCursor(sd_left + 2, sd_top_y);
+        kprint(spr, "WIFI");
+
+        // 8-px filled triangle next to the bigger number
+        int wtri_x = sd_left + 2;
+        int wtri_y = sd_num_y + 3;
+        spr.fillTriangle(wtri_x, wtri_y + 7, wtri_x + 7, wtri_y + 7,
+                         wtri_x + 3, wtri_y, CAUTION_COLOR);
+
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setCursor(wx, sd_y); spr.print(wifi_num);
+        spr.setTextSize(2);
+        spr.setCursor(sd_left + 13, sd_num_y);
+        spr.print(wifi_num);
 
-        // BLE block (right-aligned)
-        char ble_num[6]; snprintf(ble_num, sizeof(ble_num), "%ld", (long)sb);
-        int ble_block_w = 18 + 5 + 7 + 4 + (int)strlen(ble_num) * 6;
-        int bx_start = sd_right - 4 - ble_block_w;
-        spr.fillRect(bx_start - 2, sd_line_y - 1, ble_block_w + 4, 3, BG_COLOR);
+        // ── BLE block (right, right-aligned) ──
+        char ble_num[6];
+        snprintf(ble_num, sizeof(ble_num), "%ld", sb_local);
 
-        int bx = bx_start;
+        // Compute right-aligned block width: number (size 2: 12px per digit) + gap + symbol
+        int ble_num_w = (int)strlen(ble_num) * 12;
+        int ble_block_w = 8 + 5 + ble_num_w;       // diamond + gap + number
+        int bx_start = sd_right - 2 - ble_block_w;
+
+        spr.setTextSize(1);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(bx, sd_y); kprint(spr, "BLE");
-        bx += 18 + 5;
-        spr.fillTriangle(bx, sd_y + 3, bx + 3, sd_y,     bx + 6, sd_y + 3, PURPLE_COLOR);
-        spr.fillTriangle(bx, sd_y + 3, bx + 3, sd_y + 6, bx + 6, sd_y + 3, PURPLE_COLOR);
-        bx += 7 + 4;
+        // "BLE" label aligned over the right block
+        spr.setCursor(sd_right - 2 - 18, sd_top_y);
+        kprint(spr, "BLE");
+
+        // 8-px filled diamond
+        int dtri_x = bx_start;
+        int dtri_y = sd_num_y + 3;
+        spr.fillTriangle(dtri_x, dtri_y + 4, dtri_x + 4, dtri_y,
+                         dtri_x + 8, dtri_y + 4, PURPLE_COLOR);
+        spr.fillTriangle(dtri_x, dtri_y + 4, dtri_x + 4, dtri_y + 8,
+                         dtri_x + 8, dtri_y + 4, PURPLE_COLOR);
+
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setCursor(bx, sd_y); spr.print(ble_num);
+        spr.setTextSize(2);
+        spr.setCursor(bx_start + 13, sd_num_y);
+        spr.print(ble_num);
     }
 
     // ── Live device feed (right column) ──
+    // List is anchored at the BOTTOM of the column. Existing rows stay still.
+    // When a new entry arrives, it appears at the top: fades in with slight
+    // slide-down from the section header. When the buffer overflows, the
+    // bottom (oldest) row fades out as it scrolls off. This matches the
+    // mental model of a notification/activity feed (Twitter, Slack, etc).
     {
-        const int feed_col_left  = right_text_x;
-        const int feed_col_right = DISP_W - 4;
-        const int feed_top_y     = 70;
-        const int feed_row_h     = 11;
-        const int max_visible    = 6;
-        const unsigned long FEED_SHIFT_MS = 250UL;
+        const int feed_col_left   = right_text_x;
+        const int feed_col_right  = DISP_W - 4;
+        const int feed_row_h      = 11;
+        const int max_visible     = 5;       // capped to leave room for header
+        const int feed_bottom_y   = DISP_H - 3;   // last row baseline ~ y=131
+        const int feed_top_y      = feed_bottom_y - max_visible * feed_row_h;
 
-        // Snapshot feed + shift timestamp under lock
+        // ── LIVE FEED label + divider ──
+        {
+            const int rl_y      = feed_top_y - 12;   // text top
+            const int rl_line_y = feed_top_y - 9;    // line passes through middle
+            const char* rl_text = "LIVE FEED";
+            int rl_text_w = (int)strlen(rl_text) * 6 + 4;
+            uint16_t rl_line_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.55f);
+            uint16_t rl_text_col = lerp_col16(BG_COLOR, DIM_COLOR, 0.95f);
+
+            spr.drawFastHLine(feed_col_left, rl_line_y,
+                              feed_col_right - feed_col_left, rl_line_col);
+
+            spr.fillRect(feed_col_left + 2, rl_line_y - 1, rl_text_w, 3, BG_COLOR);
+            spr.setTextSize(1);
+            spr.setTextColor(rl_text_col, BG_COLOR);
+            spr.setCursor(feed_col_left + 4, rl_y);
+            kprint(spr, rl_text);
+
+            // Right-aligned "f" hint
+            const char* hint_text = "f";
+            int hint_w = (int)strlen(hint_text) * 6 + 4;
+            int hint_x = feed_col_right - hint_w - 2;
+            spr.fillRect(hint_x, rl_line_y - 1, hint_w, 3, BG_COLOR);
+            spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
+            spr.setCursor(hint_x + 2, rl_y);
+            kprint(spr, hint_text);
+        }
+
+        // Snapshot feed
         FeedEntry local_feed[FEED_SIZE];
         int local_count, local_head;
         unsigned long local_now, local_shift_ms;
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        local_count    = feed_count;
-        local_head     = feed_head;
+        local_count = feed_count;
+        local_head = feed_head;
         local_shift_ms = feed_last_shift_ms;
         for (int i = 0; i < local_count; i++) local_feed[i] = feed_entries[i];
         local_now = millis();
         xSemaphoreGive(dataMutex);
 
-        // RECENT label + divider line
-        spr.setTextSize(1);
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.55f), BG_COLOR);
-        spr.setCursor(feed_col_left, 56);
-        spr.print("RECENT");
-        int label_w = 6 * 6;
-        spr.drawFastHLine(feed_col_left + label_w + 2, 59, feed_col_right - (feed_col_left + label_w + 2), lerp_col16(BG_COLOR, DIM_COLOR, 0.35f));
-
         if (local_count == 0) {
             spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
-            spr.setCursor(feed_col_left + 4, feed_top_y + 4);
+            spr.setTextSize(1);
+            int empty_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
+            spr.setCursor(feed_col_left + 4, empty_y);
             spr.print("listening...");
         } else {
-            // Unified shift: whole list slides down quadratic ease-out
-            float shift_frac = 0.0f;
+            const unsigned long FADE_IN_MS = 280;
             unsigned long shift_age = local_now - local_shift_ms;
-            if (shift_age < FEED_SHIFT_MS) {
-                float t = (float)shift_age / (float)FEED_SHIFT_MS;
-                shift_frac = 1.0f - t * t;  // quadratic ease-out: starts at 1, ends at 0
-            }
-            int shift_px = (int)(shift_frac * (float)feed_row_h);
+            float in_t = (shift_age < FADE_IN_MS)
+                         ? (float)shift_age / (float)FADE_IN_MS
+                         : 1.0f;
+            // Quadratic ease-out for the new entry's fade and slide
+            float in_ease = 1.0f - (1.0f - in_t) * (1.0f - in_t);
 
-            // Clip to feed area so shift doesn't bleed into stats above
-            spr.setClipRect(feed_col_left, feed_top_y, feed_col_right - feed_col_left, DISP_H - feed_top_y);
+            // Clip render to feed area to mask any overdraw at the divider edge
+            spr.setClipRect(feed_col_left, feed_top_y - 1,
+                            feed_col_right - feed_col_left,
+                            DISP_H - (feed_top_y - 1));
 
-            int rendered = 0;
-            for (int i = 0; i < local_count && rendered < max_visible; i++) {
+            int rows_to_draw = local_count < max_visible ? local_count : max_visible;
+
+            for (int i = 0; i < rows_to_draw; i++) {
                 int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
                 FeedEntry& e = local_feed[idx];
 
-                unsigned long age = local_now - e.timestamp;
+                // Position rows from top of feed area downward in newest-first
+                // order, but the LIST IS STATIC — same MAC always renders at
+                // the same row until a new entry arrives and pushes everything
+                // down by one slot.
+                int row_y = feed_top_y + i * feed_row_h;
 
+                // Per-row animation logic during a shift event:
+                //   i == 0 (newest):  slide down from above + fade in
+                //   i > 0:            no animation, fully opaque
+                //   i == rows_to_draw-1 AND we're full: fade out (being pushed off)
+                float row_alpha = 1.0f;
+                int row_offset_y = 0;
+
+                if (in_t < 1.0f) {
+                    if (i == 0) {
+                        // New entry: slide in from -feed_row_h pixels above,
+                        // fading in alpha 0 → 1
+                        row_offset_y = (int)((1.0f - in_ease) * -feed_row_h);
+                        row_alpha = in_ease;
+                    } else if (local_count > max_visible && i == rows_to_draw - 1) {
+                        // Bottom row is being pushed off (only when full)
+                        // Fades out 1 → 0 as the new entry slides in
+                        row_alpha = 1.0f - in_ease;
+                    }
+                    // Middle rows: stay put, fully opaque
+                }
+
+                row_y += row_offset_y;
+
+                // Age-based fade-out (separate from shift animation)
+                unsigned long age = local_now - e.timestamp;
                 float age_fade;
-                if (age < 30000UL)      age_fade = 1.0f;
+                if      (age < 30000UL) age_fade = 1.0f;
                 else if (age < 90000UL) age_fade = 1.0f - (float)(age - 30000UL) / 60000.0f;
                 else                    age_fade = 0.0f;
-                if (age_fade < 0.10f) { rendered++; continue; }
+                if (age_fade < 0.10f) continue;
 
-                int row_y = feed_top_y + rendered * feed_row_h + shift_px;
+                float total_alpha = age_fade * row_alpha;
 
+                // Type prefix color
                 uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
                 if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
-                proto_col = lerp_col16(BG_COLOR, proto_col, age_fade);
-                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, age_fade);
+                proto_col = lerp_col16(BG_COLOR, proto_col, total_alpha);
+
+                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, total_alpha);
 
                 const char* strength_str;
                 uint16_t strength_base;
                 if (e.rssi > -60)      { strength_str = "STR"; strength_base = ACCENT_COLOR; }
                 else if (e.rssi > -80) { strength_str = "MED"; strength_base = CAUTION_COLOR; }
                 else                   { strength_str = "WK";  strength_base = DIM_COLOR; }
-                uint16_t strength_col = lerp_col16(BG_COLOR, strength_base, age_fade);
+                uint16_t strength_col = lerp_col16(BG_COLOR, strength_base, total_alpha);
+
+                spr.setTextSize(1);
 
                 char prefix[6];
                 snprintf(prefix, sizeof(prefix), "[%c%s]",
-                         e.proto == 0 ? 'W' : 'B', e.is_flock ? "*" : "");
-                spr.setTextSize(1);
+                         e.proto == 0 ? 'W' : 'B',
+                         e.is_flock ? "*" : "");
                 spr.setTextColor(proto_col, BG_COLOR);
                 spr.setCursor(feed_col_left, row_y);
                 spr.print(prefix);
@@ -3301,8 +3417,6 @@ void draw_scanner_screen() {
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
-
-                rendered++;
             }
 
             spr.clearClipRect();
@@ -4548,13 +4662,13 @@ void setup() {
     draw_current_screen(); spr.pushSprite(0,0);
 
     if (!is_muted) {
-        int boot_vol = current_volume > 50 ? 50 : current_volume;
+        // Vintage handheld boot — two short ascending blips, soft volume.
+        // Think Casio calculator power-on, not orchestral fanfare.
+        int boot_vol = current_volume > 25 ? 25 : current_volume;
         M5Cardputer.Speaker.setVolume(boot_vol);
-        delay(200);
-        M5Cardputer.Speaker.tone(1320, 220); delay(320);
-        M5Cardputer.Speaker.tone(880,  220); delay(320);
-        M5Cardputer.Speaker.tone(660,  220); delay(320);
-        M5Cardputer.Speaker.tone(1760, 320); delay(720);
+        delay(120);
+        M5Cardputer.Speaker.tone(880,  60); delay(80);   // A5, brief
+        M5Cardputer.Speaker.tone(1318, 90); delay(140);  // E6, slightly longer
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
