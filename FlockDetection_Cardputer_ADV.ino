@@ -404,6 +404,27 @@ unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
 unsigned long last_persist_save = 0;
 unsigned long last_blip_time = 0;
+
+// ── Live activity feed (scanner screen) ──
+#define FEED_SIZE 8
+#define FEED_DEDUP_WINDOW_MS   30000UL
+#define FEED_MIN_PUSH_INTERVAL_MS 800UL
+
+struct FeedEntry {
+    char     mac[18];
+    char     name[20];
+    int8_t   rssi;
+    uint8_t  proto;        // 0=WiFi, 1=BLE
+    bool     is_flock;
+    unsigned long timestamp;
+};
+static FeedEntry feed_entries[FEED_SIZE];
+static int feed_count = 0;
+static int feed_head  = 0;
+static unsigned long last_feed_push_ms = 0;
+static FeedEntry feed_pending;
+static bool feed_pending_valid = false;
+
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
 static unsigned long bs_pending_until = 0;
@@ -1297,6 +1318,54 @@ static float noise_a[NUM_PARTICLES] = {0};
 static int noise_life[NUM_PARTICLES] = {0};
 static int noise_max_life[NUM_PARTICLES] = {0};
 
+static bool feed_recently_pushed(const char* mac) {
+    unsigned long now = millis();
+    for (int i = 0; i < feed_count; i++) {
+        int idx = (feed_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        if (now - feed_entries[idx].timestamp > FEED_DEDUP_WINDOW_MS) break;
+        if (strncmp(feed_entries[idx].mac, mac, 17) == 0) return true;
+    }
+    return false;
+}
+
+static void feed_push_candidate(const char* mac, const char* name, int rssi,
+                                int proto, bool is_flock) {
+    if (!mac || mac[0] == '\0') return;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (feed_recently_pushed(mac)) { xSemaphoreGive(dataMutex); return; }
+    if (feed_pending_valid && rssi <= feed_pending.rssi) { xSemaphoreGive(dataMutex); return; }
+
+    strncpy(feed_pending.mac, mac, 17); feed_pending.mac[17] = '\0';
+    if (name && name[0] != '\0') {
+        strncpy(feed_pending.name, name, sizeof(feed_pending.name) - 1);
+        feed_pending.name[sizeof(feed_pending.name) - 1] = '\0';
+    } else {
+        const char* tail = (strlen(mac) > 8) ? mac + 9 : mac;
+        strncpy(feed_pending.name, tail, sizeof(feed_pending.name) - 1);
+        feed_pending.name[sizeof(feed_pending.name) - 1] = '\0';
+    }
+    feed_pending.rssi      = (int8_t)rssi;
+    feed_pending.proto     = (uint8_t)proto;
+    feed_pending.is_flock  = is_flock;
+    feed_pending.timestamp = millis();
+    feed_pending_valid     = true;
+    xSemaphoreGive(dataMutex);
+}
+
+static void feed_commit_pending() {
+    unsigned long now = millis();
+    if (now - last_feed_push_ms < FEED_MIN_PUSH_INTERVAL_MS) return;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!feed_pending_valid) { xSemaphoreGive(dataMutex); return; }
+    feed_head = (feed_head + 1) % FEED_SIZE;
+    feed_entries[feed_head] = feed_pending;
+    feed_entries[feed_head].timestamp = now;
+    if (feed_count < FEED_SIZE) feed_count++;
+    feed_pending_valid = false;
+    last_feed_push_ms  = now;
+    xSemaphoreGive(dataMutex);
+}
+
 void add_blip(uint16_t blip_color, int rssi) {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     last_blip_time = millis();
@@ -1866,6 +1935,22 @@ void process_wifi_event_queue() {
 
         clean_device_name_char(local.ssid);
 
+        // Push to live feed (every observed device, preview flock status)
+        {
+            char mac_str_feed[18];
+            snprintf(mac_str_feed, sizeof(mac_str_feed),
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     local.mac[0], local.mac[1], local.mac[2],
+                     local.mac[3], local.mac[4], local.mac[5]);
+            const char* feed_name = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
+            int  preview_mac_score = check_mac_prefix_tiered(local.mac);
+            bool preview_is_flock  = (strlen(local.ssid) > 0
+                                      && (is_flock_ssid_format(local.ssid)
+                                          || check_ssid_pattern(local.ssid)))
+                                     || preview_mac_score == 1;
+            feed_push_candidate(mac_str_feed, feed_name, local.rssi, 0, preview_is_flock);
+        }
+
         int  confidence    = 0;
         char methods[64]   = {0};
         int  mac_score     = check_mac_prefix_tiered(local.mac);
@@ -1982,6 +2067,21 @@ static void ble_worker_task(void* pvParameters) {
             } else if (is_penguin_numeric_name(dev_name_char)) {
                 strlcat(methods, "penguin_num ", sizeof(methods)); got_penguin_name = true;
             }
+        }
+
+        // Push to live feed (every observed BLE device)
+        {
+            char mac_str_feed[18];
+            snprintf(mac_str_feed, sizeof(mac_str_feed),
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     ev->mac[0], ev->mac[1], ev->mac[2],
+                     ev->mac[3], ev->mac[4], ev->mac[5]);
+            bool preview_is_flock = (check_mac_prefix_tiered(ev->mac) == 1
+                                     || check_device_name_pattern(dev_name_char)
+                                     || is_penguin_numeric_name(dev_name_char));
+            feed_push_candidate(mac_str_feed,
+                                ev->have_name ? dev_name_char : "",
+                                ev->rssi, 1, preview_is_flock);
         }
 
         std::string mfg_std((const char*)ev->mfg_data, ev->mfg_data_len);
@@ -3081,6 +3181,80 @@ void draw_scanner_screen() {
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(ble_x + 12, stats_y + 11);
     spr.print(sb);
+
+    // ── Live device feed ──
+    {
+        const int feed_top_y  = 80;
+        const int feed_row_h  = 10;
+        const int max_visible = 4;
+        const int feed_left_x = 4;
+        const int feed_right_x = DISP_W - 4;
+
+        FeedEntry local_feed[FEED_SIZE];
+        int local_count, local_head;
+        unsigned long local_now;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        local_count = feed_count;
+        local_head  = feed_head;
+        for (int i = 0; i < local_count; i++) local_feed[i] = feed_entries[i];
+        local_now = millis();
+        xSemaphoreGive(dataMutex);
+
+        if (local_count == 0) {
+            spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
+            spr.setTextSize(1);
+            spr.setCursor(feed_left_x + 32, feed_top_y + 14);
+            spr.print("listening...");
+        } else {
+            int rendered = 0;
+            for (int i = 0; i < local_count && rendered < max_visible; i++) {
+                int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+                FeedEntry& e = local_feed[idx];
+
+                unsigned long age = local_now - e.timestamp;
+                float age_fade = 1.0f - fminf(1.0f, (float)age / 60000.0f);
+                if (age_fade < 0.15f) { rendered++; continue; }
+
+                int row_y = feed_top_y + rendered * feed_row_h;
+
+                uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
+                if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
+                proto_col = lerp_col16(BG_COLOR, proto_col, age_fade);
+                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR,  age_fade);
+                uint16_t rssi_col = lerp_col16(BG_COLOR, DIM_COLOR,   age_fade);
+
+                char prefix[6];
+                snprintf(prefix, sizeof(prefix), "[%c%s]",
+                         e.proto == 0 ? 'W' : 'B', e.is_flock ? "*" : "");
+
+                spr.setTextSize(1);
+                spr.setTextColor(proto_col, BG_COLOR);
+                spr.setCursor(feed_left_x, row_y);
+                spr.print(prefix);
+
+                int name_x = feed_left_x + (int)strlen(prefix) * 6 + 4;
+                int name_max_chars = ((feed_right_x - 30) - name_x) / 6;
+                if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
+                if (name_max_chars < 1) name_max_chars = 1;
+
+                char name_disp[20];
+                strncpy(name_disp, e.name, name_max_chars);
+                name_disp[name_max_chars] = '\0';
+                spr.setTextColor(name_col, BG_COLOR);
+                spr.setCursor(name_x, row_y);
+                spr.print(name_disp);
+
+                char rssi_str[6];
+                snprintf(rssi_str, sizeof(rssi_str), "%d", e.rssi);
+                int rssi_w = (int)strlen(rssi_str) * 6;
+                spr.setTextColor(rssi_col, BG_COLOR);
+                spr.setCursor(feed_right_x - rssi_w, row_y);
+                spr.print(rssi_str);
+
+                rendered++;
+            }
+        }
+    }
 
 }
 
@@ -4280,6 +4454,7 @@ void loop() {
     }
 
     process_wifi_event_queue();
+    feed_commit_pending();
 
     int conf_snapshot = 0;
     int src_snapshot = 0;
