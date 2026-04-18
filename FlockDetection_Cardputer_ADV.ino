@@ -424,6 +424,7 @@ static FeedEntry feed_entries[FEED_SIZE];
 static int feed_count = 0;
 static int feed_head  = 0;
 static unsigned long last_feed_push_ms = 0;
+static unsigned long feed_last_shift_ms = 0;
 static FeedEntry feed_pending;
 static bool feed_pending_valid = false;
 
@@ -1365,6 +1366,7 @@ static void feed_commit_pending() {
     if (feed_count < FEED_SIZE) feed_count++;
     feed_pending_valid = false;
     last_feed_push_ms  = now;
+    feed_last_shift_ms = now;
     xSemaphoreGive(dataMutex);
 }
 
@@ -3204,26 +3206,48 @@ void draw_scanner_screen() {
     {
         const int feed_col_left  = right_text_x;
         const int feed_col_right = DISP_W - 4;
-        const int feed_top_y     = 64;
+        const int feed_top_y     = 70;
         const int feed_row_h     = 11;
-        const int max_visible    = 5;
+        const int max_visible    = 6;
+        const unsigned long FEED_SHIFT_MS = 250UL;
 
+        // Snapshot feed + shift timestamp under lock
         FeedEntry local_feed[FEED_SIZE];
         int local_count, local_head;
-        unsigned long local_now;
+        unsigned long local_now, local_shift_ms;
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        local_count = feed_count;
-        local_head  = feed_head;
+        local_count    = feed_count;
+        local_head     = feed_head;
+        local_shift_ms = feed_last_shift_ms;
         for (int i = 0; i < local_count; i++) local_feed[i] = feed_entries[i];
         local_now = millis();
         xSemaphoreGive(dataMutex);
 
+        // RECENT label + divider line
+        spr.setTextSize(1);
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.55f), BG_COLOR);
+        spr.setCursor(feed_col_left, 56);
+        spr.print("RECENT");
+        int label_w = 6 * 6;
+        spr.drawFastHLine(feed_col_left + label_w + 2, 59, feed_col_right - (feed_col_left + label_w + 2), lerp_col16(BG_COLOR, DIM_COLOR, 0.35f));
+
         if (local_count == 0) {
             spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
-            spr.setTextSize(1);
-            spr.setCursor(feed_col_left + 4, feed_top_y + 14);
+            spr.setCursor(feed_col_left + 4, feed_top_y + 4);
             spr.print("listening...");
         } else {
+            // Unified shift: whole list slides down quadratic ease-out
+            float shift_frac = 0.0f;
+            unsigned long shift_age = local_now - local_shift_ms;
+            if (shift_age < FEED_SHIFT_MS) {
+                float t = (float)shift_age / (float)FEED_SHIFT_MS;
+                shift_frac = 1.0f - t * t;  // quadratic ease-out: starts at 1, ends at 0
+            }
+            int shift_px = (int)(shift_frac * (float)feed_row_h);
+
+            // Clip to feed area so shift doesn't bleed into stats above
+            spr.setClipRect(feed_col_left, feed_top_y, feed_col_right - feed_col_left, DISP_H - feed_top_y);
+
             int rendered = 0;
             for (int i = 0; i < local_count && rendered < max_visible; i++) {
                 int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
@@ -3237,27 +3261,19 @@ void draw_scanner_screen() {
                 else                    age_fade = 0.0f;
                 if (age_fade < 0.10f) { rendered++; continue; }
 
-                float in_ease = 1.0f;
-                if (age < 200UL) {
-                    float t = (float)age / 200.0f;
-                    in_ease = 1.0f - (1.0f - t) * (1.0f - t);
-                }
-                float total_alpha = age_fade * in_ease;
-
-                int slide_offset = (age < 200UL) ? (int)((1.0f - in_ease) * -3.0f) : 0;
-                int row_y = feed_top_y + rendered * feed_row_h + slide_offset;
+                int row_y = feed_top_y + rendered * feed_row_h + shift_px;
 
                 uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
                 if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
-                proto_col = lerp_col16(BG_COLOR, proto_col, total_alpha);
-                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, total_alpha);
+                proto_col = lerp_col16(BG_COLOR, proto_col, age_fade);
+                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, age_fade);
 
                 const char* strength_str;
                 uint16_t strength_base;
                 if (e.rssi > -60)      { strength_str = "STR"; strength_base = ACCENT_COLOR; }
                 else if (e.rssi > -80) { strength_str = "MED"; strength_base = CAUTION_COLOR; }
                 else                   { strength_str = "WK";  strength_base = DIM_COLOR; }
-                uint16_t strength_col = lerp_col16(BG_COLOR, strength_base, total_alpha);
+                uint16_t strength_col = lerp_col16(BG_COLOR, strength_base, age_fade);
 
                 char prefix[6];
                 snprintf(prefix, sizeof(prefix), "[%c%s]",
@@ -3288,6 +3304,8 @@ void draw_scanner_screen() {
 
                 rendered++;
             }
+
+            spr.clearClipRect();
         }
     }
 
