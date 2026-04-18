@@ -35,7 +35,6 @@ void drawCard(int x, int y, int w, int h);
 void draw_current_screen();
 void transition_screen(int new_screen, int dir);
 void play_escalated_alarm(int confidence, int source);
-void dedicated_charging_loop();
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
 void beep(int frequency, int duration_ms);
 void apply_color_palette();
@@ -381,7 +380,7 @@ int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
 static int device_info_scroll = 0;
-static const int DEVICE_INFO_CONTENT_HEIGHT = 320;
+static const int DEVICE_INFO_CONTENT_HEIGHT = 302;
 volatile bool sd_hist_dirty = false;
 
 #define TOAST_QUEUE_SIZE 3
@@ -594,128 +593,6 @@ void update_load_sag() {
 
     // Update global state for the battery thread
     current_load_sag_mv = total_sag;
-}
-
-int get_unified_battery_pct(int32_t mv) {
-    if (mv > 4350) return 255;
-
-    const int32_t ocv_table[13][2] = {
-        {4200, 100}, {4150, 95}, {4110, 90}, {4020, 80}, {3930, 70},
-        {3870, 60}, {3820, 50}, {3790, 40}, {3750, 30}, {3700, 20},
-        {3600, 10}, {3450, 5},  {3000, 0}
-    };
-
-    if (mv >= 4200) return 100;
-    if (mv <= 3000) return 0;
-
-    for (int i = 0; i < 12; i++) {
-        if (mv <= ocv_table[i][0] && mv >= ocv_table[i+1][0]) {
-            int32_t v_upper = ocv_table[i][0];
-            int32_t v_lower = ocv_table[i+1][0];
-            int32_t p_upper = ocv_table[i][1];
-            int32_t p_lower = ocv_table[i+1][1];
-
-            return p_lower + ((mv - v_lower) * (p_upper - p_lower)) / (v_upper - v_lower);
-        }
-    }
-    return 0;
-}
-
-bool is_device_charging(int32_t current_mv) {
-    if (current_mv > 4300) return true;
-    return M5Cardputer.Power.isCharging();
-}
-
-void dedicated_charging_loop() {
-    M5Cardputer.Speaker.stop();
-    int display_pct = -1;
-    unsigned long boot_time = millis();
-    led_breathing_on = true;
-    led_r = 0; led_g = 255; led_b = 0;
-    M5Cardputer.Display.setBrightness(255);
-
-    const unsigned long CHARGE_AUTO_BOOT_MS = 30UL * 60UL * 1000UL;
-    
-    while (true) {
-        M5Cardputer.update();
-        update_load_sag();
-        int32_t current_mv = get_filtered_voltage();
-        int calc_pct = get_unified_battery_pct(current_mv);
-
-        if (display_pct == -1 || calc_pct == 255) {
-            display_pct = calc_pct;
-        } else if (calc_pct > display_pct) {
-            display_pct = calc_pct;
-        }
-
-        // Cap the display value at 100% so the UI doesn't draw a 255% bar
-        int render_pct = (display_pct == 255) ? 100 : display_pct;
-
-        unsigned long elapsed = millis() - boot_time;
-
-        spr.fillSprite(BG_COLOR);
-
-        // ── "CHARGING" label — top-center ─────────────────────────────────
-        spr.setTextDatum(TC_DATUM);
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(2);
-        spr.drawString("CHARGING", DISP_W / 2, 25);
-
-        // ── Battery percentage — large, white, centred below label ─────────
-        char pct_str[8];
-        snprintf(pct_str, sizeof(pct_str), "%d%%", render_pct);
-        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-        spr.setTextSize(3);
-        spr.drawString(pct_str, DISP_W / 2, 50);
-
-        // ── Battery level bar — shorter, thicker, actual percentage ────────
-        const int bar_w = 120, bar_h = 16;
-        const int bar_x = (DISP_W - bar_w) / 2, bar_y = 82;
-        spr.drawRect(bar_x, bar_y, bar_w, bar_h, ACCENT_COLOR);
-        int fill_w = (render_pct * (bar_w - 2)) / 100;
-        if (fill_w > 0) {
-            float ph = (sinf((float)millis() / 700.0f) + 1.0f) * 0.5f;
-            uint8_t r1=(ACCENT_COLOR>>11)<<3, g1=((ACCENT_COLOR>>5)&0x3F)<<2, b1=(ACCENT_COLOR&0x1F)<<3;
-            uint8_t r2=(TEAL_COLOR>>11)<<3,  g2=((TEAL_COLOR>>5)&0x3F)<<2,  b2=(TEAL_COLOR&0x1F)<<3;
-            uint16_t bar_col = lgfx::color565(
-                (uint8_t)(r1 + (r2-r1)*ph), (uint8_t)(g1 + (g2-g1)*ph), (uint8_t)(b1 + (b2-b1)*ph));
-            spr.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, bar_col);
-        }
-
-        // ── Boot instruction ───────────────────────────────────────────────
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(1);
-        spr.drawString("(click any button to start scanning)", DISP_W / 2, 114);
-
-        // ── Auto-boot countdown (only in final minute) ─────────────────────
-        spr.setTextDatum(TL_DATUM);
-        unsigned long remaining_ms = (elapsed < CHARGE_AUTO_BOOT_MS)
-                                     ? (CHARGE_AUTO_BOOT_MS - elapsed) : 0;
-        if (remaining_ms < 60000UL) {
-            spr.setTextColor(CAUTION_COLOR, BG_COLOR);
-            spr.setCursor(4, DISP_H - 10);
-            spr.printf("AUTO-BOOT IN %lus", remaining_ms / 1000UL);
-        }
-
-        spr.pushSprite(0, 0);
-
-        bool currently_charging = is_device_charging(current_mv);
-
-        // Exit and boot normally if the user unplugs the device
-        if (elapsed > 3000 && !currently_charging) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
-        }
-        if (current_mv < 3200 && elapsed > 3000) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
-        }
-        if (elapsed > 1500 && M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
-        }
-        if (elapsed >= CHARGE_AUTO_BOOT_MS) {
-            M5Cardputer.Display.fillScreen(BG_COLOR); led_r = 50; led_g = 255; led_b = 100; led_breathing_on = true; return;
-        }
-        delay(15);
-    }
 }
 
 // ============================================================================
@@ -2414,31 +2291,20 @@ void play_escalated_alarm(int confidence, int source) {
 // ============================================================================
 void draw_header_spr(int screen_num) {
     static const char* screen_names[NUM_SCREENS] = {
-        "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "DEVICE INFO"
+        "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "STATS"
     };
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
     int32_t med_mv = get_filtered_voltage();
-    int raw_bat = get_unified_battery_pct(med_mv);
-    bool chg = is_device_charging(med_mv);
-
-    static int display_bat = -1;
-
-    if (display_bat == -1 || raw_bat == 255) {
-        display_bat = raw_bat;
-    } else if (chg) {
-        if (raw_bat > display_bat) display_bat = raw_bat;
-    } else {
-        if (raw_bat < display_bat) display_bat = raw_bat;
-    }
-
-    int render_bat = (display_bat == 255) ? 100 : display_bat;
+    // Voltage-based color band (no percentage, no charging detection)
+    uint16_t bcol;
+    if      (med_mv >= 3800) bcol = ACCENT_COLOR;
+    else if (med_mv >= 3600) bcol = CAUTION_COLOR;
+    else                     bcol = lgfx::color565(220, 60, 60);
 
     spr.fillRect(0, 0, DISP_W, 20, BG_COLOR);
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
-
-    uint16_t bcol = chg ? ACCENT_COLOR : (render_bat > 50 ? ACCENT_COLOR : (render_bat > 20 ? CAUTION_COLOR : CAUTION_COLOR));
 
     // ── Status icon row ──────────────────────────────────────────────────────
     const uint16_t ICON_COL = lgfx::color565(255, 255, 255);
@@ -2472,6 +2338,22 @@ void draw_header_spr(int screen_num) {
         return lerp_col16(BG_COLOR, ICON_COL, t);
     };
     auto should_draw = [](float t) -> bool { return t > 0.05f; };
+
+    // Locator-active indicator — pulsing crosshair when tracking
+    static float ease_locator = 0.0f;
+    bool locator_now = locator_active;
+    ease_locator += ((locator_now ? 1.0f : 0.0f) - ease_locator) * 0.10f;
+    if (ease_locator > 0.05f) {
+        int ix = icon_right - 12;
+        float pulse = (sinf((float)millis() / 600.0f) + 1.0f) * 0.5f;
+        uint16_t base_col = lerp_col16(BG_COLOR, HEADER_COLOR, ease_locator);
+        uint16_t pulse_col = lerp_col16(base_col, ACCENT_COLOR, pulse * 0.6f);
+        spr.drawCircle(ix + 5, icon_y + 5, 4, pulse_col);
+        spr.drawFastHLine(ix + 1, icon_y + 5, 9, pulse_col);
+        spr.drawFastVLine(ix + 5, icon_y + 1, 9, pulse_col);
+        spr.drawPixel(ix + 5, icon_y + 5, ACCENT_COLOR);
+        icon_right -= 16;
+    }
 
     // Muted icon — larger 10×10 speaker with slash
     if (should_draw(ease_muted)) {
@@ -2561,41 +2443,13 @@ void draw_header_spr(int screen_num) {
         }
     }
 
-    // Battery icon — pill shape (r=5) matching status indicator style
-    const int pill_x = DISP_W - 26;
-    const int pill_y = 4;
-    const int pill_w = 24;
-    const int pill_h = 10;
-    const int pill_interior_w = pill_w - 2;  // 22px interior
-    int bfill = (render_bat * pill_interior_w) / 100;
-    spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, 5, BG_COLOR);   // clear interior
-    if (bfill > 0) spr.fillRect(pill_x + 1, pill_y + 1, bfill, pill_h - 2, bcol);  // static fill
-    if (chg && bfill < pill_interior_w) {
-        // Climbing wave: bright highlight band sweeping left-to-right across fill+empty area
-        int wave_x = (int)((millis() / 800) % (uint32_t)pill_interior_w);
-        const int wave_w = 4;
-        uint16_t wave_col = lerp_col16(bcol, lgfx::color565(255, 255, 255), 0.6f);
-        for (int wi = 0; wi < wave_w; wi++) {
-            int wx = pill_x + 1 + wave_x + wi;
-            if (wx < pill_x + 1 + pill_interior_w) {
-                spr.drawFastVLine(wx, pill_y + 1, pill_h - 2, wave_col);
-            }
-        }
-    }
-    spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, 5, bcol);        // pill outline
-
-    // Lightning bolt stencil centered in pill when charging
-    if (chg) {
-        uint16_t bolt_col = BG_COLOR;
-        int bx = DISP_W - 14, by = 8;
-        // Classic lightning bolt geometry
-        spr.drawLine(bx + 1, by - 3, bx - 2, by + 1, bolt_col);
-        spr.drawLine(bx + 2, by - 3, bx - 1, by + 1, bolt_col);
-        spr.drawLine(bx - 2, by + 1, bx + 2, by + 1, bolt_col);
-        spr.drawLine(bx - 2, by + 2, bx + 2, by + 2, bolt_col);
-        spr.drawLine(bx + 1, by + 1, bx - 2, by + 3, bolt_col);
-        spr.drawLine(bx + 2, by + 1, bx - 1, by + 3, bolt_col);
-    }
+    // Voltage readout — color-coded, replaces percentage pill
+    char volt_hdr[8];
+    snprintf(volt_hdr, sizeof(volt_hdr), "%.2fV", med_mv / 1000.0f);
+    spr.setTextSize(1);
+    spr.setTextColor(bcol, BG_COLOR);
+    spr.setCursor(DISP_W - 30, 6);
+    spr.print(volt_hdr);
 
 }
 
@@ -2789,7 +2643,7 @@ void draw_help_overlay() {
         case 1: keys = locator_keys;    key_count = sizeof(locator_keys) / sizeof(locator_keys[0]);       title = "LOCATOR"; break;
         case 2: keys = detections_keys; key_count = sizeof(detections_keys) / sizeof(detections_keys[0]); title = "DETECT"; break;
         case 3: keys = gps_keys;        key_count = sizeof(gps_keys) / sizeof(gps_keys[0]);               title = "GPS"; break;
-        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys) / sizeof(devinfo_keys[0]);       title = "INFO"; break;
+        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys) / sizeof(devinfo_keys[0]);       title = "STATS"; break;
         default: keys = scanner_keys; key_count = 0; title = "HELP"; break;
     }
 
@@ -3174,14 +3028,6 @@ void draw_scanner_screen() {
     spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
     spr.setCursor(right_text_x, 90); spr.print(sb);
 
-    // Always show session time
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 113); kprint(spr, "SESSION");
-    char sess_buf[9];
-    format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setCursor(right_text_x, 123);
-    spr.print(sess_buf);
 }
 
 // FNV-1a 32-bit hash of MAC address → 6 uppercase hex chars (deterministic, no storage)
@@ -4026,8 +3872,20 @@ void draw_device_info_screen() {
     spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row1_y + 16);
     { char tb[9]; format_time_buf(lifetime_seconds, tb, sizeof(tb)); spr.print(tb); }
 
+    // Row 1.5: SESSION TIME (full width) — migrated from scanner screen
+    int row_sess_y = yoff + 66;
+    drawCard(COL_L, row_sess_y, DISP_W - 8, CARD_H);
+    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
+    spr.setCursor(COL_L + 4, row_sess_y + 4); kprint(spr, "SESSION");
+    {
+        char sess_buf[9];
+        format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
+        spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
+        spr.setCursor(COL_L + 4, row_sess_y + 14); spr.print(sess_buf);
+    }
+
     // Row 2: ALL-TIME (left), RAVEN (right)
-    int row2_y = yoff + 66;
+    int row2_y = yoff + 108;
     drawCard(COL_L, row2_y, CARD_W, CARD_H);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row2_y + 4); kprint(spr, "ALL-TIME");
     spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row2_y + 14); spr.print(lt);
@@ -4037,7 +3895,7 @@ void draw_device_info_screen() {
     spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_R + 4, row2_y + 14); spr.print(sr);
 
     // Row 3: WIFI SESS (left), BLE SESS (right)
-    int row3_y = yoff + 108;
+    int row3_y = yoff + 150;
     drawCard(COL_L, row3_y, CARD_W, CARD_H);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row3_y + 4); kprint(spr, "WIFI SESS");
     spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row3_y + 14); spr.print(sw);
@@ -4047,7 +3905,7 @@ void draw_device_info_screen() {
     spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_R + 4, row3_y + 14); spr.print(sb);
 
     // Row 4 label area: FLASH WRITES (full width)
-    int row4fw_y = yoff + 150;
+    int row4fw_y = yoff + 192;
     drawCard(COL_L, row4fw_y, DISP_W - 8, CARD_H);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
     spr.setCursor(COL_L + 4, row4fw_y + 4); kprint(spr, "FLASH WRITES");
@@ -4071,56 +3929,46 @@ void draw_device_info_screen() {
     spr.setTextColor(wear_col, CARD_COLOR);
     spr.setCursor(bar_x + bar_w - 28, bar_y + bar_h + 4); spr.print(pct_str);
 
-    // Row 5: BATTERY % (left) + VOLTAGE (right) — side-by-side
-    int row5_y = yoff + 192;
+    // Row 5: VOLTAGE (left) + POWER SOURCE (right)
+    int row5_y = yoff + 234;
     {
         int32_t bat_mv_snap = get_filtered_voltage();
-        int bat_pct_snap = get_unified_battery_pct(bat_mv_snap);
-        if (bat_pct_snap == 255) bat_pct_snap = 100;
 
+        // Voltage card (left)
         drawCard(COL_L, row5_y, CARD_W, CARD_H);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_L + 4, row5_y + 4); kprint(spr, "BATTERY");
-        spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
+        spr.setCursor(COL_L + 4, row5_y + 4); kprint(spr, "VOLTAGE");
+        uint16_t v_col;
+        if      (bat_mv_snap >= 3800) v_col = ACCENT_COLOR;
+        else if (bat_mv_snap >= 3600) v_col = CAUTION_COLOR;
+        else                          v_col = lgfx::color565(220, 60, 60);
+        spr.setTextColor(v_col, CARD_COLOR); spr.setTextSize(2);
         spr.setCursor(COL_L + 4, row5_y + 14);
-        char bat_str[8]; snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct_snap);
-        spr.print(bat_str);
+        char volt_str[10]; snprintf(volt_str, sizeof(volt_str), "%.2fV", bat_mv_snap / 1000.0f);
+        spr.print(volt_str);
 
+        // Power source card (right) — best-effort indication
         drawCard(COL_R, row5_y, CARD_W, CARD_H);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 4); kprint(spr, "VOLTAGE");
+        spr.setCursor(COL_R + 4, row5_y + 4); kprint(spr, "POWER");
         spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        char mv_str[10]; snprintf(mv_str, sizeof(mv_str), "%.2fV", bat_mv_snap / 1000.0f);
-        spr.setCursor(COL_R + 4, row5_y + 16); spr.print(mv_str);
+        spr.setCursor(COL_R + 4, row5_y + 16);
+        const char* pwr_label = (bat_mv_snap >= 4200) ? "USB" : "BATTERY";
+        spr.print(pwr_label);
+        spr.setTextColor(DIM_COLOR, CARD_COLOR);
+        spr.setCursor(COL_R + 4, row5_y + 28); spr.print("(estimated)");
     }
 
-    // Row 6: RUNTIME — full width
-    int row6_y = yoff + 234;
-    {
-        int32_t bat_mv_snap = get_filtered_voltage();
-        int bat_pct_snap = get_unified_battery_pct(bat_mv_snap);
-        if (bat_pct_snap == 255) bat_pct_snap = 100;
-        const int BATT_MAH = 500, AVG_MA = 180;
-        int runtime_min = (bat_pct_snap * BATT_MAH) / AVG_MA;
-        int rt_h = runtime_min / 60, rt_m = runtime_min % 60;
-        char rt_str[16]; snprintf(rt_str, sizeof(rt_str), "~%dh%02dm  est @180mA", rt_h, rt_m);
-        drawCard(COL_L, row6_y, DISP_W - 8, CARD_H);
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_L + 4, row6_y + 4); kprint(spr, "RUNTIME");
-        spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-        spr.setCursor(COL_L + 58, row6_y + 4); spr.print(rt_str);
-    }
-
-    // Row 7: SD STATUS — full width
-    int row7_y = yoff + 276;
-    drawCard(COL_L, row7_y, DISP_W - 8, CARD_H);
+    // Row 6: SD STATUS — full width
+    int row6_y = yoff + 276;
+    drawCard(COL_L, row6_y, DISP_W - 8, CARD_H);
     spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(COL_L + 4, row7_y + 4); kprint(spr, "SD CARD");
+    spr.setCursor(COL_L + 4, row6_y + 4); kprint(spr, "SD CARD");
     spr.setTextColor(sd_available ? ACCENT_COLOR : DIM_COLOR, CARD_COLOR);
-    spr.setCursor(COL_L + 58, row7_y + 4);
+    spr.setCursor(COL_L + 58, row6_y + 4);
     spr.print(sd_available ? "MOUNTED" : "NOT FOUND");
     spr.setTextColor(DIM_COLOR, CARD_COLOR);
-    spr.setCursor(150, row7_y + 4);
+    spr.setCursor(150, row6_y + 4);
     spr.print(littlefs_available ? "FS OK" : "FS ERR");
 
     spr.clearClipRect();
@@ -4223,7 +4071,6 @@ void setup() {
     dataMutex = xSemaphoreCreateMutex();
 
     // LED: start dark, then spawn the persistent breathing task.
-    // Must happen before dedicated_charging_loop() which sets led_breathing_on=true.
     set_cardputer_led(0, 0, 0);
     // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
     xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
@@ -4246,18 +4093,6 @@ void setup() {
         get_filtered_voltage();
         delay(2);
     }
-
-    int32_t start_v = get_filtered_voltage();
-    unsigned long trap_start = millis();
-    while (millis() - trap_start < 800) {
-        M5Cardputer.update();
-        update_load_sag();
-        get_filtered_voltage();
-        delay(15);
-    }
-    int32_t end_v = get_filtered_voltage();
-
-    if (M5Cardputer.Power.isCharging() || end_v > 4300) dedicated_charging_loop();
 
     Serial.begin(115200); delay(200);  
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
@@ -4375,26 +4210,18 @@ void loop() {
 
     int32_t loop_mv = get_filtered_voltage();
 
-    // Low-battery threshold warnings (20%, 10%, 5%) — once per crossing
+    // Low-battery voltage warnings — once per crossing, 100mV hysteresis to re-arm.
     {
-        static int last_battery_warning_pct = 100;
-        int loop_bat_pct = get_unified_battery_pct(loop_mv);
-        if (loop_bat_pct != 255) {
-            if (loop_bat_pct <= 5 && last_battery_warning_pct > 5) {
-                set_toast_direct("BATT CRITICAL 5%", CAUTION_COLOR);
-                last_battery_warning_pct = 5;
-            } else if (loop_bat_pct <= 10 && last_battery_warning_pct > 10) {
-                set_toast_direct("BATT LOW 10%", CAUTION_COLOR);
-                last_battery_warning_pct = 10;
-            } else if (loop_bat_pct <= 20 && last_battery_warning_pct > 20) {
-                set_toast_direct("BATT LOW 20%", CAUTION_COLOR);
-                last_battery_warning_pct = 20;
-            } else if (last_battery_warning_pct < 100
-                       && loop_bat_pct >= last_battery_warning_pct + 10) {
-                // Battery has genuinely recovered (10+ points above last fired
-                // threshold) — fully re-arm all thresholds for the next discharge.
-                last_battery_warning_pct = 100;
-            }
+        static int32_t last_battery_warning_mv = 9999;
+        if (loop_mv <= 3500 && last_battery_warning_mv > 3500) {
+            set_toast_direct("BATT CRITICAL 3.5V", CAUTION_COLOR);
+            last_battery_warning_mv = 3500;
+        } else if (loop_mv <= 3700 && last_battery_warning_mv > 3700) {
+            set_toast_direct("BATT LOW 3.7V", CAUTION_COLOR);
+            last_battery_warning_mv = 3700;
+        } else if (last_battery_warning_mv < 9999
+                   && loop_mv >= last_battery_warning_mv + 100) {
+            last_battery_warning_mv = 9999;
         }
     }
 
@@ -4415,23 +4242,24 @@ void loop() {
         play_escalated_alarm(conf_snapshot, src_snapshot);
     }
 
-    bool input_happened = false;
-
     if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
-        input_happened = true;
-        if (!ambient_mode) {
-            int next_screen = current_screen + 1;
-            int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
-            if (next_screen >= NUM_SCREENS) next_screen = 0;
-            transition_screen(next_screen, dir);
+        last_user_input_ms = millis();
+        if (ambient_mode) {
+            ambient_mode = false;
+            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
         }
+        int next_screen = current_screen + 1;
+        int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
+        if (next_screen >= NUM_SCREENS) next_screen = 0;
+        transition_screen(next_screen, dir);
     }
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-        input_happened = true;
+        last_user_input_ms = millis();
         if (ambient_mode) {
-            // Skip processing; ambient wake handled below
-        } else {
+            ambient_mode = false;
+            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+        }
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         
         if (status.tab && !stealth_mode) {
@@ -4616,15 +4444,22 @@ void loop() {
                     l_pending_exists = false;
                     l_pending_until = 0;
 
-                    // Double-tap: cycle LED color
+                    // Double-tap: cycle LED color (works from any screen)
                     led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
                     led_r = LED_COLORS[led_col_idx][0];
                     led_g = LED_COLORS[led_col_idx][1];
                     led_b = LED_COLORS[led_col_idx][2];
                     if (!led_breathing_on) led_breathing_on = true;
                     beep(900, 40);
+                } else if (locator_active) {
+                    // Single-press with locator running: stop immediately from any screen
+                    locator_stop();
+                    trigger_toast("INFO", "Locator stopped", 0);
+                    beep(500, 60);
+                    l_pending_exists = false;
+                    l_pending_until = 0;
                 } else {
-                    // First press → arm deferred single-press
+                    // First press, no active locator → arm deferred single-press
                     l_pending_exists = true;
                     l_pending_until = now_ms + DOUBLE_TAP_MS;
                     last_l_press_ms = now_ms;
@@ -4677,17 +4512,8 @@ void loop() {
                 transition_screen(prev, d);
             }
         }
-        }  // closes the else wrapping the keyboard handler body
+        }
     }
-
-    // Handle ambient wake — input occurred while ambient was active
-    if (input_happened && ambient_mode) {
-        ambient_mode = false;
-        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
-        draw_current_screen();
-        spr.pushSprite(0, 0);
-    }
-    if (input_happened) last_user_input_ms = millis();
 
     // Fire pending 'l' single-press action if double-tap window expired
     if (l_pending_exists && millis() >= l_pending_until) {
@@ -4788,6 +4614,12 @@ void loop() {
         (millis() - last_user_input_ms) > AMBIENT_TIMEOUT_MS) {
         ambient_mode = true;
         M5Cardputer.Display.setBrightness(AMBIENT_BRIGHTNESS);
+    }
+
+    // Exit ambient if conditions change from non-input sources
+    if (ambient_mode && (locator_active || export_mode_active || toast_active)) {
+        ambient_mode = false;
+        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
     }
 
     if (ambient_mode) {
