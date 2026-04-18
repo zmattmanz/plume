@@ -1300,10 +1300,10 @@ void rssi_track_expire() {
 // ============================================================================
 // THREAT EQUALIZER DATA
 // ============================================================================
-#define radar_cx 66
+#define radar_cx 62
 #define radar_cy 63
-#define radar_r  50
-#define inner_r  20
+#define radar_r  46
+#define inner_r  18
 
 #define NUM_RADIAL_BANDS 36
 float radial_spikes[NUM_RADIAL_BANDS] = {0};
@@ -3129,9 +3129,15 @@ void draw_scanner_screen() {
     spr.fillRoundRect(badge_x + wf_seg_w - 6, badge_y, ble_seg_w + 6, badge_h, 7, ble_fill);
     spr.fillRect(badge_x + wf_seg_w - 6, badge_y, 12, badge_h, ble_fill);
 
-    // Outer rounded outline + center divider
+    // Outer rounded outline + 45° slash divider
     spr.drawRoundRect(badge_x, badge_y, total_w, badge_h, 7, outer_border);
-    spr.drawFastVLine(badge_x + wf_seg_w, badge_y + 1, badge_h - 2, outer_border);
+    {
+        int sx = badge_x + wf_seg_w;
+        int sy_top = badge_y + 2;
+        int sy_bot = badge_y + badge_h - 3;
+        spr.drawLine(sx + 3, sy_top, sx - 3, sy_bot, outer_border);
+        spr.drawLine(sx + 4, sy_top, sx - 2, sy_bot, outer_border);
+    }
 
     // WiFi text
     spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1);
@@ -3147,48 +3153,49 @@ void draw_scanner_screen() {
     spr.setCursor(badge_x + wf_seg_w + 6, 29);
     spr.print("BLE");
 
-    // ── Compact horizontal stats — labels above, symbol+value below ──
-    int stats_y = 48;
+    // ── Compressed stats row — label above, symbol+value below (size 1) ──
+    int stats_y = 46;
 
-    // ─ WIFI block (left) ─
+    // ─ WIFI block ─
     int wf_x = right_text_x;
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(wf_x, stats_y);
     kprint(spr, "WIFI");
 
-    int wf_sx = wf_x;
-    int wf_sy = stats_y + 12;
-    spr.fillTriangle(
-        wf_sx,     wf_sy + 8,
-        wf_sx + 8, wf_sy + 8,
-        wf_sx + 4, wf_sy,
-        CAUTION_COLOR
-    );
-    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(wf_x + 12, stats_y + 11);
+    int wf_sx = wf_x, wf_sy = stats_y + 11;
+    spr.fillTriangle(wf_sx, wf_sy + 6, wf_sx + 6, wf_sy + 6, wf_sx + 3, wf_sy, CAUTION_COLOR);
+    spr.setTextColor(CAUTION_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(wf_x + 10, stats_y + 12);
     spr.print(sw);
 
-    // ─ BLE block (right) ─
-    int ble_x = right_text_x + 50;
+    // ─ BLE block ─
+    int ble_x = right_text_x + 48;
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(ble_x, stats_y);
     kprint(spr, "BLE");
 
-    int ble_sx = ble_x;
-    int ble_sy = stats_y + 12;
-    spr.fillTriangle(ble_sx, ble_sy + 4, ble_sx + 4, ble_sy,     ble_sx + 8, ble_sy + 4, PURPLE_COLOR);
-    spr.fillTriangle(ble_sx, ble_sy + 4, ble_sx + 4, ble_sy + 8, ble_sx + 8, ble_sy + 4, PURPLE_COLOR);
-    spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(2);
-    spr.setCursor(ble_x + 12, stats_y + 11);
+    int ble_sx = ble_x, ble_sy = stats_y + 11;
+    spr.fillTriangle(ble_sx, ble_sy + 3, ble_sx + 3, ble_sy,     ble_sx + 6, ble_sy + 3, PURPLE_COLOR);
+    spr.fillTriangle(ble_sx, ble_sy + 3, ble_sx + 3, ble_sy + 6, ble_sx + 6, ble_sy + 3, PURPLE_COLOR);
+    spr.setTextColor(PURPLE_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setCursor(ble_x + 10, stats_y + 12);
     spr.print(sb);
 
-    // ── Live device feed ──
+    // ── Live device feed (right column) ──
     {
-        const int feed_top_y  = 80;
-        const int feed_row_h  = 10;
-        const int max_visible = 4;
-        const int feed_left_x = 4;
-        const int feed_right_x = DISP_W - 4;
+        const int feed_col_left  = right_text_x;
+        const int feed_col_right = DISP_W - 4;
+        const int feed_top_y     = 66;
+        const int feed_row_h     = 11;
+        const int max_visible    = 6;
+
+        // Subtle divider + ACTIVITY label
+        uint16_t divider_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.6f);
+        spr.drawFastHLine(feed_col_left, feed_top_y - 4, feed_col_right - feed_col_left, divider_col);
+        spr.setTextColor(divider_col, BG_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(feed_col_left + 2, feed_top_y - 9);
+        spr.print("ACTIVITY");
 
         FeedEntry local_feed[FEED_SIZE];
         int local_count, local_head;
@@ -3203,7 +3210,7 @@ void draw_scanner_screen() {
         if (local_count == 0) {
             spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
             spr.setTextSize(1);
-            spr.setCursor(feed_left_x + 32, feed_top_y + 14);
+            spr.setCursor(feed_col_left + 4, feed_top_y + 14);
             spr.print("listening...");
         } else {
             int rendered = 0;
@@ -3212,28 +3219,52 @@ void draw_scanner_screen() {
                 FeedEntry& e = local_feed[idx];
 
                 unsigned long age = local_now - e.timestamp;
-                float age_fade = 1.0f - fminf(1.0f, (float)age / 60000.0f);
-                if (age_fade < 0.15f) { rendered++; continue; }
 
-                int row_y = feed_top_y + rendered * feed_row_h;
+                float age_fade;
+                if (age < 30000UL)      age_fade = 1.0f;
+                else if (age < 90000UL) age_fade = 1.0f - (float)(age - 30000UL) / 60000.0f;
+                else                    age_fade = 0.0f;
+                if (age_fade < 0.10f) { rendered++; continue; }
+
+                float in_ease = 1.0f;
+                if (age < 200UL) {
+                    float t = (float)age / 200.0f;
+                    in_ease = 1.0f - (1.0f - t) * (1.0f - t);
+                }
+                float total_alpha = age_fade * in_ease;
+
+                int slide_offset = (age < 200UL) ? (int)((1.0f - in_ease) * -3.0f) : 0;
+                int row_y = feed_top_y + rendered * feed_row_h + slide_offset;
 
                 uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
                 if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
-                proto_col = lerp_col16(BG_COLOR, proto_col, age_fade);
-                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR,  age_fade);
-                uint16_t rssi_col = lerp_col16(BG_COLOR, DIM_COLOR,   age_fade);
+                proto_col = lerp_col16(BG_COLOR, proto_col, total_alpha);
+                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, total_alpha);
+
+                const char* strength_str;
+                uint16_t strength_base;
+                if (e.rssi > -60)      { strength_str = "STR"; strength_base = ACCENT_COLOR; }
+                else if (e.rssi > -80) { strength_str = "MED"; strength_base = CAUTION_COLOR; }
+                else                   { strength_str = "WK";  strength_base = DIM_COLOR; }
+                uint16_t strength_col = lerp_col16(BG_COLOR, strength_base, total_alpha);
 
                 char prefix[6];
                 snprintf(prefix, sizeof(prefix), "[%c%s]",
                          e.proto == 0 ? 'W' : 'B', e.is_flock ? "*" : "");
-
                 spr.setTextSize(1);
                 spr.setTextColor(proto_col, BG_COLOR);
-                spr.setCursor(feed_left_x, row_y);
+                spr.setCursor(feed_col_left, row_y);
                 spr.print(prefix);
 
-                int name_x = feed_left_x + (int)strlen(prefix) * 6 + 4;
-                int name_max_chars = ((feed_right_x - 30) - name_x) / 6;
+                int strength_w = (int)strlen(strength_str) * 6;
+                spr.setTextColor(strength_col, BG_COLOR);
+                spr.setCursor(feed_col_right - strength_w, row_y);
+                spr.print(strength_str);
+
+                int prefix_w = (int)strlen(prefix) * 6;
+                int name_x = feed_col_left + prefix_w + 3;
+                int name_x_end = feed_col_right - strength_w - 3;
+                int name_max_chars = (name_x_end - name_x) / 6;
                 if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
                 if (name_max_chars < 1) name_max_chars = 1;
 
@@ -3243,13 +3274,6 @@ void draw_scanner_screen() {
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
-
-                char rssi_str[6];
-                snprintf(rssi_str, sizeof(rssi_str), "%d", e.rssi);
-                int rssi_w = (int)strlen(rssi_str) * 6;
-                spr.setTextColor(rssi_col, BG_COLOR);
-                spr.setCursor(feed_right_x - rssi_w, row_y);
-                spr.print(rssi_str);
 
                 rendered++;
             }
