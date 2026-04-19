@@ -3296,17 +3296,6 @@ void draw_scanner_screen() {
         spr.print(ble_num);
     }
 
-    // LIVE FEED section label
-    {
-        const int feed_label_y = DISP_H - (4 * 12) - 18;
-        spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f), BG_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(right_text_x, feed_label_y - 11);
-        kprint(spr, "LIVE FEED");
-        spr.drawFastHLine(right_text_x, feed_label_y - 3, DISP_W - right_text_x - 4,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.5f));
-    }
-
     // ── Live device feed (right column) ──
     // List is anchored at the BOTTOM of the column. Existing rows stay still.
     // When a new entry arrives, it appears at the top: fades in with slight
@@ -3316,9 +3305,9 @@ void draw_scanner_screen() {
     {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
-        const int feed_row_h      = 14;                  // slightly taller rows
+        const int feed_row_h      = 16;                  // slightly taller rows
         const int max_visible     = 4;                   // 4 rows, more breathing room
-        const int feed_bottom_y   = DISP_H - 2;          // row baseline
+        const int feed_bottom_y   = DISP_H - 1;          // row baseline
         const int feed_top_y      = feed_bottom_y - max_visible * feed_row_h;
 
         // Snapshot feed
@@ -3374,19 +3363,19 @@ void draw_scanner_screen() {
 
                 // Only animate when there are multiple rows — prevents the
                 // very first entry from fading up from invisible at startup.
-                if (in_t < 1.0f && rows_to_draw > 1 && local_count > 1) {
+                if (in_t < 1.0f && rows_to_draw > 1 && local_count > max_visible) {
                     if (i == 0) {
                         // New entry: gentle slide down 4px (not full row
                         // height — that felt too violent). Fade in
                         // alpha 0 → 1 with the same ease curve.
                         row_offset_y = (int)((1.0f - in_ease) * -4);
-                        row_alpha = max(in_ease, 0.15f);
+                        row_alpha = (in_ease < 0.2f) ? 0.2f : in_ease;
                     } else if (local_count > max_visible && i == rows_to_draw - 1) {
-                        // Bottom row fading out (only when buffer is full).
-                        // Fades to 0 AND slides down 4px to suggest it's
-                        // exiting downward, not just vanishing.
-                        row_alpha = 1.0f - in_ease;
-                        row_offset_y = (int)(in_ease * 4);
+                        // Bottom row slides down a full row height and fades out.
+                        // Fade is delayed 30% so the slide gets a head start.
+                        float fade_t = (in_ease > 0.3f) ? (in_ease - 0.3f) / 0.7f : 0.0f;
+                        row_alpha = 1.0f - fade_t;
+                        row_offset_y = (int)(in_ease * feed_row_h);
                     }
                     // Middle rows: stay put, fully opaque
                 }
@@ -3465,13 +3454,14 @@ void draw_scanner_screen() {
                 spr.setTextSize(1);
                 spr.setTextColor(strength_col, BG_COLOR);
                 spr.setCursor(strength_x, row_y);
-                kprint(spr, strength_str, 2);
+                kprint(spr, strength_str, 1);
 
                 // Name — kerned, wider space available now that symbol is compact
                 int name_x = feed_col_left + (e.is_flock ? 14 : 10);
                 int name_x_end = strength_x - 3;
                 // kerned text: 7px per char
-                int name_max_chars = (name_x_end - name_x) / 7;
+                int name_max_chars = (name_x_end - name_x - 4) / 7;
+                if (name_max_chars > 10) name_max_chars = 10;
                 if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
                 if (name_max_chars < 1) name_max_chars = 1;
 
@@ -3480,7 +3470,7 @@ void draw_scanner_screen() {
                 name_disp[name_max_chars] = '\0';
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
-                kprint(spr, name_disp, 2);
+                kprint(spr, name_disp, 1);
             }
 
             spr.clearClipRect();
