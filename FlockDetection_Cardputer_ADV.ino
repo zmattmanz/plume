@@ -3051,12 +3051,10 @@ void draw_scanner_screen() {
                 bool is_ble_blip = (line_col == PURPLE_COLOR);
                 int tip_y = base_y - spike_len;
                 if (is_ble_blip) {
-                    // Filled 9px diamond with outline
-                    int cx_d = base_x, cy_d = tip_y + 4;
-                    spr.fillTriangle(cx_d - 4, cy_d,     cx_d,     cy_d - 4,
-                                     cx_d + 4, cy_d,                           line_col);
-                    spr.fillTriangle(cx_d - 4, cy_d,     cx_d,     cy_d + 4,
-                                     cx_d + 4, cy_d,                           line_col);
+                    // Filled 9px symmetric diamond with outline
+                    int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
+                    spr.fillTriangle(cx_d - bhr, cy_d, cx_d, cy_d - bhr, cx_d + bhr, cy_d, line_col);
+                    spr.fillTriangle(cx_d - bhr, cy_d, cx_d, cy_d + bhr, cx_d + bhr, cy_d, line_col);
                     uint16_t blip_outline = lerp_col16(line_col, lgfx::color565(255,255,255), 0.35f);
                     spr.drawLine(cx_d - 4, cy_d,     cx_d,     cy_d - 4, blip_outline);
                     spr.drawLine(cx_d,     cy_d - 4, cx_d + 4, cy_d,     blip_outline);
@@ -3221,7 +3219,7 @@ void draw_scanner_screen() {
         kprint(spr, "WIFI");
 
         // 9×9 outline-only upward triangle, centered with size-2 number
-        int wtri_x = col1_x;
+        int wtri_x = col1_x + 2;
         int wtri_y = stats_num_y + 2;
         spr.drawTriangle(wtri_x,     wtri_y + 9,
                          wtri_x + 9, wtri_y + 9,
@@ -3230,7 +3228,7 @@ void draw_scanner_screen() {
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(2);
-        spr.setCursor(col1_x + 14, stats_num_y);
+        spr.setCursor(col1_x + 16, stats_num_y);
         spr.print(wifi_num);
 
         // ── BLE block (left-aligned, fixed column) ──
@@ -3242,17 +3240,18 @@ void draw_scanner_screen() {
         spr.setCursor(col2_x, stats_label_y);
         kprint(spr, "BLE");
 
-        // 9×9 outline-only diamond, vertically centered with size-2 number
-        int dia_x = col2_x;
+        // 9×9 outline-only symmetric diamond
+        int dia_x = col2_x + 2;
         int dia_y = stats_num_y + 2;
-        spr.drawLine(dia_x,     dia_y + 4, dia_x + 4, dia_y,     PURPLE_COLOR);
-        spr.drawLine(dia_x + 4, dia_y,     dia_x + 9, dia_y + 4, PURPLE_COLOR);
-        spr.drawLine(dia_x + 9, dia_y + 4, dia_x + 4, dia_y + 9, PURPLE_COLOR);
-        spr.drawLine(dia_x + 4, dia_y + 9, dia_x,     dia_y + 4, PURPLE_COLOR);
+        int dcx = dia_x + 4, dcy = dia_y + 4, dhr = 4;
+        spr.drawLine(dcx,       dcy - dhr, dcx + dhr, dcy,       PURPLE_COLOR);
+        spr.drawLine(dcx + dhr, dcy,       dcx,       dcy + dhr, PURPLE_COLOR);
+        spr.drawLine(dcx,       dcy + dhr, dcx - dhr, dcy,       PURPLE_COLOR);
+        spr.drawLine(dcx - dhr, dcy,       dcx,       dcy - dhr, PURPLE_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(2);
-        spr.setCursor(col2_x + 14, stats_num_y);
+        spr.setCursor(col2_x + 16, stats_num_y);
         spr.print(ble_num);
     }
 
@@ -3267,8 +3266,8 @@ void draw_scanner_screen() {
         const int feed_col_right  = DISP_W - 4;
         const int feed_row_h      = 12;
         const int max_visible     = 3;
-        const int feed_bottom_y   = DISP_H - 1;          // row baseline
-        const int feed_top_y      = feed_bottom_y - max_visible * feed_row_h;
+        const int feed_top_y      = 82;
+        const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
         // Snapshot feed
         FeedEntry local_feed[FEED_SIZE];
@@ -3282,30 +3281,13 @@ void draw_scanner_screen() {
         local_now = millis();
         xSemaphoreGive(dataMutex);
 
-        static unsigned long feed_first_full_ms = 0;
-        if (local_count >= max_visible && feed_first_full_ms == 0) {
-            feed_first_full_ms = local_now;
-        }
-        if (local_count < max_visible) feed_first_full_ms = 0;
-        bool feed_ready = (feed_first_full_ms > 0 && (local_now - feed_first_full_ms) > 2000);
+        // Always render feed — overlay covers it during startup warm-up
+        spr.setClipRect(feed_col_left, feed_top_y - 1,
+                        feed_col_right - feed_col_left,
+                        DISP_H - (feed_top_y - 1));
 
-        if (!feed_ready) {
-            spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
-            spr.setTextSize(1);
-            int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
-            int nd = (int)(millis() / 600) % 4;
-            char load_str[20];
-            snprintf(load_str, sizeof(load_str), "scanning%s",
-                     nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
-            spr.setCursor(feed_col_left + 2, load_y);
-            spr.print(load_str);
-        } else {
-            // Clip render to feed area to mask any overdraw at the divider edge
-            spr.setClipRect(feed_col_left, feed_top_y - 1,
-                            feed_col_right - feed_col_left,
-                            DISP_H - (feed_top_y - 1));
-
-            int rows_to_draw = max_visible;
+        {
+            int rows_to_draw = (local_count < max_visible) ? local_count : max_visible;
 
             for (int i = 0; i < rows_to_draw; i++) {
                 int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
@@ -3363,19 +3345,14 @@ void draw_scanner_screen() {
                                      sym_x + 3, sym_y,
                                      sym_border);
                 } else {
-                    // Filled + outlined diamond (◆) — BLE
-                    spr.fillTriangle(sym_x,     sym_y + 3,
-                                     sym_x + 3, sym_y,
-                                     sym_x + 6, sym_y + 3,
-                                     sym_col);
-                    spr.fillTriangle(sym_x,     sym_y + 3,
-                                     sym_x + 3, sym_y + 6,
-                                     sym_x + 6, sym_y + 3,
-                                     sym_col);
-                    spr.drawLine(sym_x,     sym_y + 3, sym_x + 3, sym_y,     sym_border);
-                    spr.drawLine(sym_x + 3, sym_y,     sym_x + 6, sym_y + 3, sym_border);
-                    spr.drawLine(sym_x + 6, sym_y + 3, sym_x + 3, sym_y + 6, sym_border);
-                    spr.drawLine(sym_x + 3, sym_y + 6, sym_x,     sym_y + 3, sym_border);
+                    // Filled + outlined symmetric diamond (◆) — BLE
+                    int fcx = sym_x + 3, fcy = sym_y + 3, fhr = 3;
+                    spr.fillTriangle(fcx - fhr, fcy, fcx, fcy - fhr, fcx + fhr, fcy, sym_col);
+                    spr.fillTriangle(fcx - fhr, fcy, fcx, fcy + fhr, fcx + fhr, fcy, sym_col);
+                    spr.drawLine(fcx,       fcy - fhr, fcx + fhr, fcy,       sym_border);
+                    spr.drawLine(fcx + fhr, fcy,       fcx,       fcy + fhr, sym_border);
+                    spr.drawLine(fcx,       fcy + fhr, fcx - fhr, fcy,       sym_border);
+                    spr.drawLine(fcx - fhr, fcy,       fcx,       fcy - fhr, sym_border);
                 }
                 // Flock indicator: small asterisk after the symbol
                 if (e.is_flock) {
@@ -3385,19 +3362,19 @@ void draw_scanner_screen() {
                     spr.print("*");
                 }
 
-                // Strength right-aligned (kerned for consistency)
-                int strength_w = (int)strlen(strength_str) * 7;  // kerned width
+                // Strength right-aligned
+                int strength_w = (int)strlen(strength_str) * 6;
                 int strength_x = feed_col_right - strength_w;
                 spr.setTextSize(1);
                 spr.setTextColor(strength_col, BG_COLOR);
                 spr.setCursor(strength_x, row_y);
-                kprint(spr, strength_str, 1);
+                spr.print(strength_str);
 
                 // Name — kerned, wider space available now that symbol is compact
                 int name_x = feed_col_left + (e.is_flock ? 14 : 10);
                 int name_x_end = strength_x - 3;
                 // kerned text: 7px per char
-                int name_max_chars = (name_x_end - name_x - 4) / 7;
+                int name_max_chars = (name_x_end - name_x - 4) / 6;
                 if (name_max_chars > 10) name_max_chars = 10;
                 if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
                 if (name_max_chars < 1) name_max_chars = 1;
@@ -3407,10 +3384,62 @@ void draw_scanner_screen() {
                 name_disp[name_max_chars] = '\0';
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
-                kprint(spr, name_disp, 1);
+                spr.print(name_disp);
             }
 
-            spr.clearClipRect();
+        }
+
+        spr.clearClipRect();
+
+        // Loading overlay: solid for 3s, fades over 1s, permanently gone after 4s.
+        // The feed renders normally underneath the whole time — no layout pop.
+        {
+            static unsigned long feed_overlay_start = 0;
+            if (feed_overlay_start == 0) feed_overlay_start = local_now;
+
+            const unsigned long OVERLAY_SOLID_MS = 3000;
+            const unsigned long OVERLAY_FADE_MS  = 1000;
+            unsigned long overlay_age = local_now - feed_overlay_start;
+
+            if (overlay_age < OVERLAY_SOLID_MS + OVERLAY_FADE_MS) {
+                float overlay_alpha;
+                if (overlay_age < OVERLAY_SOLID_MS) {
+                    overlay_alpha = 1.0f;
+                } else {
+                    float fade_t = (float)(overlay_age - OVERLAY_SOLID_MS) / (float)OVERLAY_FADE_MS;
+                    overlay_alpha = 1.0f - fade_t;
+                }
+
+                if (overlay_alpha > 0.95f) {
+                    spr.fillRect(feed_col_left, feed_top_y,
+                                 feed_col_right - feed_col_left,
+                                 max_visible * feed_row_h, BG_COLOR);
+                } else if (overlay_alpha > 0.02f) {
+                    int step = (int)(1.0f / overlay_alpha);
+                    if (step < 1) step = 1;
+                    if (step > 4) step = 4;
+                    for (int fy = feed_top_y; fy < feed_top_y + max_visible * feed_row_h; fy++) {
+                        for (int fx = feed_col_left; fx < feed_col_right; fx += step) {
+                            if (((fx + fy) % 2) == 0 || step <= 1) {
+                                spr.drawPixel(fx, fy, BG_COLOR);
+                            }
+                        }
+                    }
+                }
+
+                if (overlay_alpha > 0.3f) {
+                    uint16_t load_col = lerp_col16(BG_COLOR, DIM_COLOR, overlay_alpha * 0.7f);
+                    spr.setTextColor(load_col, BG_COLOR);
+                    spr.setTextSize(1);
+                    int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
+                    int nd = (int)(local_now / 500) % 4;
+                    char load_str[20];
+                    snprintf(load_str, sizeof(load_str), "scanning%s",
+                             nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
+                    spr.setCursor(feed_col_left + 8, load_y);
+                    spr.print(load_str);
+                }
+            }
         }
     }
 
@@ -4432,20 +4461,16 @@ void draw_feed_expanded_overlay() {
         //   x=210  AGE (short form like "1m" or "45s" = 20px)
 
         const int col_sym    = 4;
-        const int col_rssi   = 126;
-        const int col_sig    = 176;
+        const int col_rssi   = 130;
+        const int col_sig    = 190;
 
         // Column headers (faded in)
         const int hdr_y = 23;
         spr.setTextSize(1);
         spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-        spr.setCursor(col_sym,  hdr_y); kprint(spr, "DEVICE", 3);
-        spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI", 3);
-        spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL", 3);
-
-        // Thin rule below headers
-        spr.drawFastHLine(4, hdr_y + 10, DISP_W - 8,
-                          ea(lerp_col16(BG_COLOR, CARD_BORDER, 0.5f)));
+        spr.setCursor(col_sym,  hdr_y); kprint(spr, "DEVICE");
+        spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
+        spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
 
         // Render rows
         const int row_h    = 13;
@@ -4472,14 +4497,9 @@ void draw_feed_expanded_overlay() {
                                  sym_x + 3, sym_y,
                                  proto_col);
             } else {
-                spr.fillTriangle(sym_x,     sym_y + 3,
-                                 sym_x + 3, sym_y,
-                                 sym_x + 7, sym_y + 3,
-                                 proto_col);
-                spr.fillTriangle(sym_x,     sym_y + 3,
-                                 sym_x + 3, sym_y + 7,
-                                 sym_x + 7, sym_y + 3,
-                                 proto_col);
+                int ecx = sym_x + 3, ecy = sym_y + 3, ehr = 3;
+                spr.fillTriangle(ecx - ehr, ecy, ecx, ecy - ehr, ecx + ehr, ecy, proto_col);
+                spr.fillTriangle(ecx - ehr, ecy, ecx, ecy + ehr, ecx + ehr, ecy, proto_col);
             }
             if (e.is_flock) {
                 spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
@@ -4497,14 +4517,14 @@ void draw_feed_expanded_overlay() {
             int name_start_x = col_sym + 10;
             if (e.is_flock) name_start_x += 8;
             spr.setCursor(name_start_x, row_y);
-            kprint(spr, name_disp, 3);
+            spr.print(name_disp);
 
             // RSSI in dBm with units
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setCursor(col_rssi, row_y);
-            kprint(spr, rssi_str, 3);
+            spr.print(rssi_str);
 
             // SIGNAL (spelled out)
             const char* strength_str;
@@ -4514,7 +4534,7 @@ void draw_feed_expanded_overlay() {
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
             spr.setCursor(col_sig, row_y);
-            kprint(spr, strength_str, 3);
+            spr.print(strength_str);
 
             rendered++;
         }
