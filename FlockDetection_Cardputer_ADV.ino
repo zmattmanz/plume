@@ -3232,9 +3232,6 @@ void draw_scanner_screen() {
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
 
-        uint16_t wf_sym_border  = lerp_col16(CAUTION_COLOR, lgfx::color565(255,255,255), 0.35f);
-        uint16_t ble_sym_border = lerp_col16(PURPLE_COLOR,  lgfx::color565(255,255,255), 0.35f);
-
         // ── WIFI block ──
         char wifi_num[6];
         snprintf(wifi_num, sizeof(wifi_num), "%ld", sw_local);
@@ -3244,17 +3241,13 @@ void draw_scanner_screen() {
         spr.setCursor(col1_x, stats_label_y);
         kprint(spr, "WIFI");
 
-        // 9×9 filled + outlined upward triangle, centered with size-2 number
+        // 9×9 outline-only upward triangle, centered with size-2 number
         int wtri_x = col1_x;
         int wtri_y = stats_num_y + 2;
-        spr.fillTriangle(wtri_x,     wtri_y + 9,
-                         wtri_x + 9, wtri_y + 9,
-                         wtri_x + 4, wtri_y,
-                         CAUTION_COLOR);
         spr.drawTriangle(wtri_x,     wtri_y + 9,
                          wtri_x + 9, wtri_y + 9,
                          wtri_x + 4, wtri_y,
-                         wf_sym_border);
+                         CAUTION_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(2);
@@ -3270,25 +3263,13 @@ void draw_scanner_screen() {
         spr.setCursor(col2_x, stats_label_y);
         kprint(spr, "BLE");
 
-        // 9×9 filled + outlined diamond, vertically centered with size-2 number
+        // 9×9 outline-only diamond, vertically centered with size-2 number
         int dia_x = col2_x;
         int dia_y = stats_num_y + 2;
-        spr.fillTriangle(dia_x,     dia_y + 4,
-                         dia_x + 4, dia_y,
-                         dia_x + 9, dia_y + 4,
-                         PURPLE_COLOR);
-        spr.fillTriangle(dia_x,     dia_y + 4,
-                         dia_x + 4, dia_y + 9,
-                         dia_x + 9, dia_y + 4,
-                         PURPLE_COLOR);
-        spr.drawTriangle(dia_x,     dia_y + 4,
-                         dia_x + 4, dia_y,
-                         dia_x + 9, dia_y + 4,
-                         ble_sym_border);
-        spr.drawTriangle(dia_x,     dia_y + 4,
-                         dia_x + 4, dia_y + 9,
-                         dia_x + 9, dia_y + 4,
-                         ble_sym_border);
+        spr.drawLine(dia_x,     dia_y + 4, dia_x + 4, dia_y,     PURPLE_COLOR);
+        spr.drawLine(dia_x + 4, dia_y,     dia_x + 9, dia_y + 4, PURPLE_COLOR);
+        spr.drawLine(dia_x + 9, dia_y + 4, dia_x + 4, dia_y + 9, PURPLE_COLOR);
+        spr.drawLine(dia_x + 4, dia_y + 9, dia_x,     dia_y + 4, PURPLE_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(2);
@@ -3322,27 +3303,31 @@ void draw_scanner_screen() {
         local_now = millis();
         xSemaphoreGive(dataMutex);
 
-        if (local_count == 0) {
-            spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
-            spr.setTextSize(1);
-            int empty_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
-            spr.setCursor(feed_col_left + 4, empty_y);
-            spr.print("listening...");
-        } else {
-            const unsigned long FADE_IN_MS = 400;
-            unsigned long shift_age = local_now - local_shift_ms;
-            float in_t = (shift_age < FADE_IN_MS)
-                         ? (float)shift_age / (float)FADE_IN_MS
-                         : 1.0f;
-            // Quadratic ease-out for the new entry's fade and slide
-            float in_ease = 1.0f - (1.0f - in_t) * (1.0f - in_t);
+        bool feed_ready = (local_count >= max_visible);
 
+        if (!feed_ready) {
+            spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
+            spr.setTextSize(1);
+            int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
+            int nd = (int)(millis() / 600) % 4;
+            char load_str[20];
+            snprintf(load_str, sizeof(load_str), "scanning%s",
+                     nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
+            spr.setCursor(feed_col_left + 2, load_y);
+            spr.print(load_str);
+            for (int i = 0; i < max_visible; i++) {
+                int row_y = feed_top_y + i * feed_row_h;
+                spr.drawFastHLine(feed_col_left, row_y + feed_row_h - 1,
+                                  feed_col_right - feed_col_left,
+                                  lerp_col16(BG_COLOR, CARD_BORDER, 0.15f));
+            }
+        } else {
             // Clip render to feed area to mask any overdraw at the divider edge
             spr.setClipRect(feed_col_left, feed_top_y - 1,
                             feed_col_right - feed_col_left,
                             DISP_H - (feed_top_y - 1));
 
-            int rows_to_draw = local_count < max_visible ? local_count : max_visible;
+            int rows_to_draw = max_visible;
 
             for (int i = 0; i < rows_to_draw; i++) {
                 int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
@@ -3354,33 +3339,7 @@ void draw_scanner_screen() {
                 // down by one slot.
                 int row_y = feed_top_y + i * feed_row_h;
 
-                // Per-row animation logic during a shift event:
-                //   i == 0 (newest):  slide down from above + fade in
-                //   i > 0:            no animation, fully opaque
-                //   i == rows_to_draw-1 AND we're full: fade out (being pushed off)
-                float row_alpha = 1.0f;
-                int row_offset_y = 0;
-
-                // Only animate when there are multiple rows — prevents the
-                // very first entry from fading up from invisible at startup.
-                if (in_t < 1.0f && rows_to_draw > 1 && local_count > max_visible) {
-                    if (i == 0) {
-                        // New entry: gentle slide down 4px (not full row
-                        // height — that felt too violent). Fade in
-                        // alpha 0 → 1 with the same ease curve.
-                        row_offset_y = (int)((1.0f - in_ease) * -4);
-                        row_alpha = (in_ease < 0.2f) ? 0.2f : in_ease;
-                    } else if (local_count > max_visible && i == rows_to_draw - 1) {
-                        // Bottom row slides down a full row height and fades out.
-                        // Fade is delayed 30% so the slide gets a head start.
-                        float fade_t = (in_ease > 0.3f) ? (in_ease - 0.3f) / 0.7f : 0.0f;
-                        row_alpha = 1.0f - fade_t;
-                        row_offset_y = (int)(in_ease * feed_row_h);
-                    }
-                    // Middle rows: stay put, fully opaque
-                }
-
-                row_y += row_offset_y;
+                float row_alpha = 1.0f;  // always fully opaque — no animation needed
 
                 // Age-based fade-out (separate from shift animation)
                 unsigned long age = local_now - e.timestamp;
@@ -4472,22 +4431,11 @@ void draw_feed_expanded_overlay() {
     // Solid backdrop
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
-    // Title bar
-    spr.fillRect(0, 18, DISP_W, 14, ea(CARD_COLOR));
-    spr.drawFastHLine(0, 32, DISP_W, ea(CARD_BORDER));
+    // Subtitle appended to header bar ("SCANNER / LIVE FEED")
+    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), ea(BG_COLOR));
     spr.setTextSize(1);
-    spr.setTextColor(ea(HEADER_COLOR), ea(CARD_COLOR));
-    spr.setCursor(4, 22);
-    kprint(spr, "LIVE FEED");
-
-    // Entry count, right-aligned in title bar
-    char count_str[16];
-    snprintf(count_str, sizeof(count_str), "%d %s",
-             local_count, local_count == 1 ? "entry" : "entries");
-    int count_w = (int)strlen(count_str) * 6;
-    spr.setTextColor(ea(DIM_COLOR), ea(CARD_COLOR));
-    spr.setCursor(DISP_W - count_w - 4, 22);
-    spr.print(count_str);
+    spr.setCursor(62, 5);
+    kprint(spr, "/ LIVE FEED");
 
     // Empty state
     if (local_count == 0) {
@@ -4507,12 +4455,12 @@ void draw_feed_expanded_overlay() {
 
         const int col_sym    = 4;
         const int col_dev    = 26;
-        const int col_rssi   = 114;
-        const int col_sig    = 162;
-        const int col_age    = 210;
+        const int col_rssi   = 118;
+        const int col_sig    = 164;
+        const int col_age    = 212;
 
         // Column headers (faded in)
-        const int hdr_y = 37;
+        const int hdr_y = 23;
         spr.setTextSize(1);
         spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
         spr.setCursor(col_dev,  hdr_y); kprint(spr, "DEVICE");
@@ -4525,8 +4473,8 @@ void draw_feed_expanded_overlay() {
                           ea(lerp_col16(BG_COLOR, CARD_BORDER, 0.5f)));
 
         // Render rows
-        const int row_h    = 11;
-        const int row_top  = hdr_y + 14;
+        const int row_h    = 13;
+        const int row_top  = hdr_y + 12;
         const int max_rows = (DISP_H - row_top - 10) / row_h;
 
         int rendered = 0;
@@ -4574,14 +4522,14 @@ void draw_feed_expanded_overlay() {
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setTextSize(1);
             spr.setCursor(col_dev, row_y);
-            spr.print(name_disp);
+            kprint(spr, name_disp, 2);
 
             // RSSI in dBm with units
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setCursor(col_rssi, row_y);
-            spr.print(rssi_str);
+            kprint(spr, rssi_str, 2);
 
             // SIGNAL (spelled out)
             const char* strength_str;
@@ -4591,7 +4539,7 @@ void draw_feed_expanded_overlay() {
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
             spr.setCursor(col_sig, row_y);
-            spr.print(strength_str);
+            kprint(spr, strength_str, 2);
 
             // AGE — unitless if seconds, with 'm' suffix if minutes
             char age_str[8];
@@ -4600,7 +4548,7 @@ void draw_feed_expanded_overlay() {
             else              snprintf(age_str, sizeof(age_str), "%dm",  age_sec / 60);
             spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
             spr.setCursor(col_age, row_y);
-            spr.print(age_str);
+            kprint(spr, age_str, 2);
 
             rendered++;
         }
