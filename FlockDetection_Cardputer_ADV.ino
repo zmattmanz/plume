@@ -2404,36 +2404,6 @@ void draw_header_spr(int screen_num) {
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
 
-    // Scanner-only: small feed indicator caret (▼) — appears briefly after
-    // new feed entries to signal activity. Snapshot feed_last_shift_ms under
-    // mutex and show the caret for 2 seconds after any push.
-    if (screen_num == 0) {
-        unsigned long local_shift;
-        int local_feed_count;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        local_shift = feed_last_shift_ms;
-        local_feed_count = feed_count;
-        xSemaphoreGive(dataMutex);
-
-        unsigned long caret_age = millis() - local_shift;
-        if (local_feed_count > 0) {
-            float alpha;
-            if (caret_age < 2000UL) {
-                alpha = 1.0f - ((float)caret_age / 2000.0f) * 0.65f;
-            } else {
-                alpha = 0.35f;
-            }
-            int name_px = (int)strlen(screen_names[screen_num]) * 7;
-            int caret_x = 4 + name_px + 22;
-            int caret_y = 7;
-            uint16_t caret_col = lerp_col16(BG_COLOR, ACCENT_COLOR, alpha);
-            spr.fillTriangle(caret_x,     caret_y,
-                             caret_x + 4, caret_y,
-                             caret_x + 2, caret_y + 3,
-                             caret_col);
-        }
-    }
-
     // ── Status icon row ──────────────────────────────────────────────────────
     const uint16_t ICON_COL = lgfx::color565(255, 255, 255);
 
@@ -3205,19 +3175,28 @@ void draw_scanner_screen() {
         spr.drawLine(sx + 4, sy_top, sx - 2, sy_bot, outer_border);
     }
 
-    // WiFi text
+    // WiFi text — centered in WiFi segment
     spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1);
-    spr.setCursor(badge_x + 6, 29);
-    spr.print(wf_label);
-    if (wf_locked) {
-        spr.setTextColor(CAUTION_COLOR, wf_fill);
-        spr.print(" L");
+    {
+        int wf_text_w = (int)strlen(wf_label) * 6;
+        if (wf_locked) wf_text_w += 12;
+        int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
+        spr.setCursor(wf_text_x, 29);
+        spr.print(wf_label);
+        if (wf_locked) {
+            spr.setTextColor(CAUTION_COLOR, wf_fill);
+            spr.print(" L");
+        }
     }
 
-    // BLE text
+    // BLE text — centered in BLE segment
     spr.setTextColor(ble_badge_col, ble_fill);
-    spr.setCursor(badge_x + wf_seg_w + 6, 29);
-    spr.print("BLE");
+    {
+        int ble_text_w = 3 * 6;
+        int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
+        spr.setCursor(ble_text_x, 29);
+        spr.print("BLE");
+    }
 
     // ── Stats block — labels above, symbol + number inline below ──
     // Both blocks left-aligned at a fixed column split. Symbols are
@@ -3286,8 +3265,8 @@ void draw_scanner_screen() {
     {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
-        const int feed_row_h      = 16;                  // slightly taller rows
-        const int max_visible     = 4;                   // 4 rows, more breathing room
+        const int feed_row_h      = 12;
+        const int max_visible     = 3;
         const int feed_bottom_y   = DISP_H - 1;          // row baseline
         const int feed_top_y      = feed_bottom_y - max_visible * feed_row_h;
 
@@ -3303,7 +3282,12 @@ void draw_scanner_screen() {
         local_now = millis();
         xSemaphoreGive(dataMutex);
 
-        bool feed_ready = (local_count >= max_visible);
+        static unsigned long feed_first_full_ms = 0;
+        if (local_count >= max_visible && feed_first_full_ms == 0) {
+            feed_first_full_ms = local_now;
+        }
+        if (local_count < max_visible) feed_first_full_ms = 0;
+        bool feed_ready = (feed_first_full_ms > 0 && (local_now - feed_first_full_ms) > 2000);
 
         if (!feed_ready) {
             spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
@@ -3315,12 +3299,6 @@ void draw_scanner_screen() {
                      nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
             spr.setCursor(feed_col_left + 2, load_y);
             spr.print(load_str);
-            for (int i = 0; i < max_visible; i++) {
-                int row_y = feed_top_y + i * feed_row_h;
-                spr.drawFastHLine(feed_col_left, row_y + feed_row_h - 1,
-                                  feed_col_right - feed_col_left,
-                                  lerp_col16(BG_COLOR, CARD_BORDER, 0.15f));
-            }
         } else {
             // Clip render to feed area to mask any overdraw at the divider edge
             spr.setClipRect(feed_col_left, feed_top_y - 1,
@@ -4454,19 +4432,16 @@ void draw_feed_expanded_overlay() {
         //   x=210  AGE (short form like "1m" or "45s" = 20px)
 
         const int col_sym    = 4;
-        const int col_dev    = 26;
-        const int col_rssi   = 118;
-        const int col_sig    = 164;
-        const int col_age    = 212;
+        const int col_rssi   = 126;
+        const int col_sig    = 176;
 
         // Column headers (faded in)
         const int hdr_y = 23;
         spr.setTextSize(1);
         spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-        spr.setCursor(col_dev,  hdr_y); kprint(spr, "DEVICE");
-        spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
-        spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
-        spr.setCursor(col_age,  hdr_y); kprint(spr, "AGE");
+        spr.setCursor(col_sym,  hdr_y); kprint(spr, "DEVICE", 3);
+        spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI", 3);
+        spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL", 3);
 
         // Thin rule below headers
         spr.drawFastHLine(4, hdr_y + 10, DISP_W - 8,
@@ -4475,15 +4450,13 @@ void draw_feed_expanded_overlay() {
         // Render rows
         const int row_h    = 13;
         const int row_top  = hdr_y + 12;
-        const int max_rows = (DISP_H - row_top - 10) / row_h;
+        const int max_rows = (DISP_H - row_top - 2) / row_h;
 
         int rendered = 0;
         for (int i = 0; i < local_count && rendered < max_rows; i++) {
             int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
             FeedEntry& e = local_feed[idx];
             int row_y = row_top + rendered * row_h;
-
-            unsigned long age = local_now - e.timestamp;
 
             // Type symbol color (Flock entries tinted toward ACCENT), faded in
             uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
@@ -4515,21 +4488,23 @@ void draw_feed_expanded_overlay() {
                 spr.print("*");
             }
 
-            // DEVICE name (12 chars)
+            // DEVICE name — left-aligned immediately after symbol
             char name_disp[13];
             strncpy(name_disp, e.name, 12);
             name_disp[12] = '\0';
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setTextSize(1);
-            spr.setCursor(col_dev, row_y);
-            kprint(spr, name_disp, 2);
+            int name_start_x = col_sym + 10;
+            if (e.is_flock) name_start_x += 8;
+            spr.setCursor(name_start_x, row_y);
+            kprint(spr, name_disp, 3);
 
             // RSSI in dBm with units
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setCursor(col_rssi, row_y);
-            kprint(spr, rssi_str, 2);
+            kprint(spr, rssi_str, 3);
 
             // SIGNAL (spelled out)
             const char* strength_str;
@@ -4539,26 +4514,12 @@ void draw_feed_expanded_overlay() {
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
             spr.setCursor(col_sig, row_y);
-            kprint(spr, strength_str, 2);
-
-            // AGE — unitless if seconds, with 'm' suffix if minutes
-            char age_str[8];
-            int age_sec = (int)(age / 1000UL);
-            if (age_sec < 60) snprintf(age_str, sizeof(age_str), "%ds",  age_sec);
-            else              snprintf(age_str, sizeof(age_str), "%dm",  age_sec / 60);
-            spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-            spr.setCursor(col_age, row_y);
-            kprint(spr, age_str, 2);
+            kprint(spr, strength_str, 3);
 
             rendered++;
         }
     }
 
-    // Footer hint
-    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(4, DISP_H - 9);
-    spr.print("f or ESC to close");
 }
 
 // ============================================================================
@@ -5107,7 +5068,10 @@ void loop() {
             }
         }
         if (status.del && !stealth_mode) {
-            if (current_screen == 2 && hist_detail_open) {
+            if (show_feed_expanded) {
+                show_feed_expanded = false;
+                draw_current_screen(); spr.pushSprite(0, 0);
+            } else if (current_screen == 2 && hist_detail_open) {
                 hist_detail_open = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else {
