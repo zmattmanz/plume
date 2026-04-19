@@ -3077,6 +3077,13 @@ void draw_scanner_screen() {
         }
     }
     hud_rotation += 0.0033f;
+
+    // Hint text below radar cylinder
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(radar_cx - 28, DISP_H - 10);
+    spr.print("f: live feed");
+
     spr.clearClipRect();
 
 
@@ -3265,21 +3272,34 @@ void draw_scanner_screen() {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
         const int feed_row_h      = 12;
-        const int max_visible     = 3;
-        const int feed_top_y      = 82;
+        const int max_visible     = 4;
+        const int feed_top_y      = 78;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
-        // Snapshot feed
-        FeedEntry local_feed[FEED_SIZE];
-        int local_count, local_head;
-        unsigned long local_now, local_shift_ms;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        local_count = feed_count;
-        local_head = feed_head;
-        local_shift_ms = feed_last_shift_ms;
-        for (int i = 0; i < local_count; i++) local_feed[i] = feed_entries[i];
-        local_now = millis();
-        xSemaphoreGive(dataMutex);
+        // Throttled display snapshot — only refreshes every 2 seconds.
+        // Eliminates flicker caused by rapid feed_entries mutations between frames.
+        static FeedEntry display_feed[FEED_SIZE];
+        static int display_count = 0;
+        static int display_head = 0;
+        static unsigned long display_last_refresh = 0;
+        static bool display_ever_populated = false;
+
+        unsigned long local_now = millis();
+        const unsigned long FEED_DISPLAY_REFRESH_MS = 2000;
+
+        if ((local_now - display_last_refresh) >= FEED_DISPLAY_REFRESH_MS || !display_ever_populated) {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            display_count = feed_count;
+            display_head = feed_head;
+            for (int i = 0; i < display_count; i++) display_feed[i] = feed_entries[i];
+            xSemaphoreGive(dataMutex);
+            display_last_refresh = local_now;
+            if (display_count > 0) display_ever_populated = true;
+        }
+
+        FeedEntry* local_feed = display_feed;
+        int local_count = display_count;
+        int local_head = display_head;
 
         // Always render feed — overlay covers it during startup warm-up
         spr.setClipRect(feed_col_left, feed_top_y - 1,
@@ -3333,26 +3353,19 @@ void draw_scanner_screen() {
                 int sym_x = feed_col_left;
                 int sym_y = row_y + 1;
                 uint16_t sym_col = proto_col;
-                uint16_t sym_border = lerp_col16(sym_col, lgfx::color565(255,255,255), 0.15f);
                 if (e.proto == 0) {
-                    // Filled + outlined triangle (▲) — WiFi
-                    spr.fillTriangle(sym_x,     sym_y + 6,
-                                     sym_x + 6, sym_y + 6,
-                                     sym_x + 3, sym_y,
-                                     sym_col);
+                    // Outline-only triangle (△) — WiFi — matches stats icons
                     spr.drawTriangle(sym_x,     sym_y + 6,
                                      sym_x + 6, sym_y + 6,
                                      sym_x + 3, sym_y,
-                                     sym_border);
+                                     sym_col);
                 } else {
-                    // Filled + outlined symmetric diamond (◆) — BLE
+                    // Outline-only symmetric diamond (◇) — BLE — matches stats icons
                     int fcx = sym_x + 3, fcy = sym_y + 3, fhr = 3;
-                    spr.fillTriangle(fcx - fhr, fcy, fcx, fcy - fhr, fcx + fhr, fcy, sym_col);
-                    spr.fillTriangle(fcx - fhr, fcy, fcx, fcy + fhr, fcx + fhr, fcy, sym_col);
-                    spr.drawLine(fcx,       fcy - fhr, fcx + fhr, fcy,       sym_border);
-                    spr.drawLine(fcx + fhr, fcy,       fcx,       fcy + fhr, sym_border);
-                    spr.drawLine(fcx,       fcy + fhr, fcx - fhr, fcy,       sym_border);
-                    spr.drawLine(fcx - fhr, fcy,       fcx,       fcy - fhr, sym_border);
+                    spr.drawLine(fcx,       fcy - fhr, fcx + fhr, fcy,       sym_col);
+                    spr.drawLine(fcx + fhr, fcy,       fcx,       fcy + fhr, sym_col);
+                    spr.drawLine(fcx,       fcy + fhr, fcx - fhr, fcy,       sym_col);
+                    spr.drawLine(fcx - fhr, fcy,       fcx,       fcy - fhr, sym_col);
                 }
                 // Flock indicator: small asterisk after the symbol
                 if (e.is_flock) {
@@ -3391,55 +3404,20 @@ void draw_scanner_screen() {
 
         spr.clearClipRect();
 
-        // Loading overlay: solid for 3s, fades over 1s, permanently gone after 4s.
-        // The feed renders normally underneath the whole time — no layout pop.
-        {
-            static unsigned long feed_overlay_start = 0;
-            if (feed_overlay_start == 0) feed_overlay_start = local_now;
-
-            const unsigned long OVERLAY_SOLID_MS = 3000;
-            const unsigned long OVERLAY_FADE_MS  = 1000;
-            unsigned long overlay_age = local_now - feed_overlay_start;
-
-            if (overlay_age < OVERLAY_SOLID_MS + OVERLAY_FADE_MS) {
-                float overlay_alpha;
-                if (overlay_age < OVERLAY_SOLID_MS) {
-                    overlay_alpha = 1.0f;
-                } else {
-                    float fade_t = (float)(overlay_age - OVERLAY_SOLID_MS) / (float)OVERLAY_FADE_MS;
-                    overlay_alpha = 1.0f - fade_t;
-                }
-
-                if (overlay_alpha > 0.95f) {
-                    spr.fillRect(feed_col_left, feed_top_y,
-                                 feed_col_right - feed_col_left,
-                                 max_visible * feed_row_h, BG_COLOR);
-                } else if (overlay_alpha > 0.02f) {
-                    int step = (int)(1.0f / overlay_alpha);
-                    if (step < 1) step = 1;
-                    if (step > 4) step = 4;
-                    for (int fy = feed_top_y; fy < feed_top_y + max_visible * feed_row_h; fy++) {
-                        for (int fx = feed_col_left; fx < feed_col_right; fx += step) {
-                            if (((fx + fy) % 2) == 0 || step <= 1) {
-                                spr.drawPixel(fx, fy, BG_COLOR);
-                            }
-                        }
-                    }
-                }
-
-                if (overlay_alpha > 0.3f) {
-                    uint16_t load_col = lerp_col16(BG_COLOR, DIM_COLOR, overlay_alpha * 0.7f);
-                    spr.setTextColor(load_col, BG_COLOR);
-                    spr.setTextSize(1);
-                    int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
-                    int nd = (int)(local_now / 500) % 4;
-                    char load_str[20];
-                    snprintf(load_str, sizeof(load_str), "scanning%s",
-                             nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
-                    spr.setCursor(feed_col_left + 8, load_y);
-                    spr.print(load_str);
-                }
-            }
+        // Show "scanning..." only until the first snapshot captures data
+        if (!display_ever_populated) {
+            spr.fillRect(feed_col_left, feed_top_y,
+                         feed_col_right - feed_col_left,
+                         max_visible * feed_row_h, BG_COLOR);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(1);
+            int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
+            int nd = (int)(local_now / 500) % 4;
+            char load_str[20];
+            snprintf(load_str, sizeof(load_str), "scanning%s",
+                     nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
+            spr.setCursor(feed_col_left + 8, load_y);
+            spr.print(load_str);
         }
     }
 
@@ -4492,14 +4470,16 @@ void draw_feed_expanded_overlay() {
             int sym_x = col_sym;
             int sym_y = row_y + 1;
             if (e.proto == 0) {
-                spr.fillTriangle(sym_x,     sym_y + 7,
+                spr.drawTriangle(sym_x,     sym_y + 7,
                                  sym_x + 7, sym_y + 7,
                                  sym_x + 3, sym_y,
                                  proto_col);
             } else {
                 int ecx = sym_x + 3, ecy = sym_y + 3, ehr = 3;
-                spr.fillTriangle(ecx - ehr, ecy, ecx, ecy - ehr, ecx + ehr, ecy, proto_col);
-                spr.fillTriangle(ecx - ehr, ecy, ecx, ecy + ehr, ecx + ehr, ecy, proto_col);
+                spr.drawLine(ecx,       ecy - ehr, ecx + ehr, ecy,       proto_col);
+                spr.drawLine(ecx + ehr, ecy,       ecx,       ecy + ehr, proto_col);
+                spr.drawLine(ecx,       ecy + ehr, ecx - ehr, ecy,       proto_col);
+                spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
             }
             if (e.is_flock) {
                 spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
@@ -4539,6 +4519,12 @@ void draw_feed_expanded_overlay() {
             rendered++;
         }
     }
+
+    // Footer hint
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(4, DISP_H - 9);
+    spr.print("ESC to close");
 
 }
 
