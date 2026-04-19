@@ -71,6 +71,7 @@ unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
 bool show_locator_help = false;  // 'h' on locator screen
 static bool show_feed_expanded = false;
+static unsigned long feed_expand_ms = 0;
 bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
@@ -3146,8 +3147,8 @@ void draw_scanner_screen() {
     char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi: %2d", current_channel);
     bool wf_locked = (millis() < channel_lock_until);
     // Fixed width: "WiFi: 12" = 8 chars + optional " L" (2) padding always applied
-    int wf_seg_w = 10 * 6 + 10;  // always reserve space for 8-char label + 2-char lock
-    int ble_seg_w = 26;
+    int wf_seg_w = 10 * 6 + 6;   // slightly reduced right padding
+    int ble_seg_w = 32;            // increased right breathing room
 
     bool ble_scan_window_active = (pBLEScan != nullptr && pBLEScan->isScanning());
     bool ble_pulse_on = ble_scan_window_active && (((millis() / 500) % 2) == 0);
@@ -3225,57 +3226,58 @@ void draw_scanner_screen() {
     spr.print("BLE");
 
     // ── Stats block — labels above, symbol + number inline below ──
-    // Symbol is vertically centered with the size-2 number. Both WIFI and
-    // BLE blocks are laid out to the same width so the BLE number stays
-    // fixed-position even when digit count changes.
+    // Both blocks left-aligned at a fixed column split. Symbols are
+    // filled + outlined for legibility against the dark background.
     {
         long sw_local = sw;
         long sb_local = sb;
 
-        const int stats_label_y = 44;       // size-1 label baseline top
-        const int stats_num_y   = 54;       // size-2 number top (14px tall)
+        const int stats_label_y = 48;       // top of size-1 labels (8px gap from pill bottom y=40)
+        const int stats_num_y   = 58;       // top of size-2 numbers (14px tall, bottom y=72)
         const int sd_left       = right_text_x;
-        const int sd_right      = DISP_W - 4;
+        const int col1_x        = sd_left + 2;
+        const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
 
-        // ── WIFI block (left) ──
+        uint16_t wf_sym_border  = lerp_col16(CAUTION_COLOR, lgfx::color565(255,255,255), 0.35f);
+        uint16_t ble_sym_border = lerp_col16(PURPLE_COLOR,  lgfx::color565(255,255,255), 0.35f);
+
+        // ── WIFI block ──
         char wifi_num[6];
         snprintf(wifi_num, sizeof(wifi_num), "%ld", sw_local);
 
         spr.setTextSize(1);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(sd_left + 2, stats_label_y);
+        spr.setCursor(col1_x, stats_label_y);
         kprint(spr, "WIFI");
 
-        // 9×9 filled upward triangle, vertically centered with size-2 digits
-        // Size-2 text is 14px tall; triangle centered on its midline (y+7).
-        // Triangle y range: stats_num_y+2 to stats_num_y+11 (9px tall).
-        int wtri_x = sd_left + 2;
+        // 9×9 filled + outlined upward triangle, centered with size-2 number
+        int wtri_x = col1_x;
         int wtri_y = stats_num_y + 2;
         spr.fillTriangle(wtri_x,     wtri_y + 9,
                          wtri_x + 9, wtri_y + 9,
                          wtri_x + 4, wtri_y,
                          CAUTION_COLOR);
+        spr.drawTriangle(wtri_x,     wtri_y + 9,
+                         wtri_x + 9, wtri_y + 9,
+                         wtri_x + 4, wtri_y,
+                         wf_sym_border);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(2);
-        spr.setCursor(sd_left + 16, stats_num_y);
+        spr.setCursor(col1_x + 14, stats_num_y);
         spr.print(wifi_num);
 
-        // ── BLE block (right, right-aligned) ──
+        // ── BLE block (left-aligned, fixed column) ──
         char ble_num[6];
         snprintf(ble_num, sizeof(ble_num), "%ld", sb_local);
 
-        int ble_num_w = (int)strlen(ble_num) * 12;
-        int ble_block_w = 9 + 5 + ble_num_w;            // diamond + gap + number
-        int bx_start = sd_right - 2 - ble_block_w;
-
         spr.setTextSize(1);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(bx_start, stats_label_y);
+        spr.setCursor(col2_x, stats_label_y);
         kprint(spr, "BLE");
 
-        // 9×9 filled diamond, vertically centered with size-2 digits
-        int dia_x = bx_start;
+        // 9×9 filled + outlined diamond, vertically centered with size-2 number
+        int dia_x = col2_x;
         int dia_y = stats_num_y + 2;
         spr.fillTriangle(dia_x,     dia_y + 4,
                          dia_x + 4, dia_y,
@@ -3285,10 +3287,18 @@ void draw_scanner_screen() {
                          dia_x + 4, dia_y + 9,
                          dia_x + 9, dia_y + 4,
                          PURPLE_COLOR);
+        spr.drawTriangle(dia_x,     dia_y + 4,
+                         dia_x + 4, dia_y,
+                         dia_x + 9, dia_y + 4,
+                         ble_sym_border);
+        spr.drawTriangle(dia_x,     dia_y + 4,
+                         dia_x + 4, dia_y + 9,
+                         dia_x + 9, dia_y + 4,
+                         ble_sym_border);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(2);
-        spr.setCursor(bx_start + 14, stats_num_y);
+        spr.setCursor(col2_x + 14, stats_num_y);
         spr.print(ble_num);
     }
 
@@ -3357,7 +3367,9 @@ void draw_scanner_screen() {
                 float row_alpha = 1.0f;
                 int row_offset_y = 0;
 
-                if (in_t < 1.0f) {
+                // Only animate when there are multiple rows — prevents the
+                // very first entry from fading up from invisible at startup.
+                if (in_t < 1.0f && rows_to_draw > 1) {
                     if (i == 0) {
                         // New entry: gentle slide down 4px (not full row
                         // height — that felt too violent). Fade in
@@ -3408,14 +3420,19 @@ void draw_scanner_screen() {
                 int sym_x = feed_col_left;
                 int sym_y = row_y + 1;
                 uint16_t sym_col = proto_col;
+                uint16_t sym_border = lerp_col16(sym_col, lgfx::color565(255,255,255), 0.4f);
                 if (e.proto == 0) {
-                    // Filled triangle (▲) — WiFi
+                    // Filled + outlined triangle (▲) — WiFi
                     spr.fillTriangle(sym_x,     sym_y + 6,
                                      sym_x + 6, sym_y + 6,
                                      sym_x + 3, sym_y,
                                      sym_col);
+                    spr.drawTriangle(sym_x,     sym_y + 6,
+                                     sym_x + 6, sym_y + 6,
+                                     sym_x + 3, sym_y,
+                                     sym_border);
                 } else {
-                    // Filled diamond (◆) — BLE
+                    // Filled + outlined diamond (◆) — BLE
                     spr.fillTriangle(sym_x,     sym_y + 3,
                                      sym_x + 3, sym_y,
                                      sym_x + 6, sym_y + 3,
@@ -3424,6 +3441,14 @@ void draw_scanner_screen() {
                                      sym_x + 3, sym_y + 6,
                                      sym_x + 6, sym_y + 3,
                                      sym_col);
+                    spr.drawTriangle(sym_x,     sym_y + 3,
+                                     sym_x + 3, sym_y,
+                                     sym_x + 6, sym_y + 3,
+                                     sym_border);
+                    spr.drawTriangle(sym_x,     sym_y + 3,
+                                     sym_x + 3, sym_y + 6,
+                                     sym_x + 6, sym_y + 3,
+                                     sym_border);
                 }
                 // Flock indicator: small asterisk after the symbol
                 if (e.is_flock) {
@@ -4445,14 +4470,22 @@ void draw_feed_expanded_overlay() {
     local_now = millis();
     xSemaphoreGive(dataMutex);
 
-    // Solid backdrop (clears whatever was rendered underneath)
+    // Fade-in easing: quadratic ease-out over 200ms
+    const unsigned long EXPAND_ANIM_MS = 200UL;
+    unsigned long ea_age = local_now - feed_expand_ms;
+    float ea_t = (ea_age < EXPAND_ANIM_MS) ? (float)ea_age / (float)EXPAND_ANIM_MS : 1.0f;
+    float expand_alpha = 1.0f - (1.0f - ea_t) * (1.0f - ea_t);
+    // Helper: lerp any color from BG_COLOR at ea=0 to target at ea=1
+    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, expand_alpha); };
+
+    // Solid backdrop
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
     // Title bar
-    spr.fillRect(0, 18, DISP_W, 14, CARD_COLOR);
-    spr.drawFastHLine(0, 32, DISP_W, CARD_BORDER);
+    spr.fillRect(0, 18, DISP_W, 14, ea(CARD_COLOR));
+    spr.drawFastHLine(0, 32, DISP_W, ea(CARD_BORDER));
     spr.setTextSize(1);
-    spr.setTextColor(HEADER_COLOR, CARD_COLOR);
+    spr.setTextColor(ea(HEADER_COLOR), ea(CARD_COLOR));
     spr.setCursor(4, 22);
     kprint(spr, "LIVE FEED");
 
@@ -4461,13 +4494,13 @@ void draw_feed_expanded_overlay() {
     snprintf(count_str, sizeof(count_str), "%d %s",
              local_count, local_count == 1 ? "entry" : "entries");
     int count_w = (int)strlen(count_str) * 6;
-    spr.setTextColor(DIM_COLOR, CARD_COLOR);
+    spr.setTextColor(ea(DIM_COLOR), ea(CARD_COLOR));
     spr.setCursor(DISP_W - count_w - 4, 22);
     spr.print(count_str);
 
     // Empty state
     if (local_count == 0) {
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
         spr.setTextSize(1);
         const char* msg = "no activity yet";
         int mw = (int)strlen(msg) * 7;
@@ -4487,10 +4520,10 @@ void draw_feed_expanded_overlay() {
         const int col_sig    = 162;
         const int col_age    = 210;
 
-        // Column headers
+        // Column headers (faded in)
         const int hdr_y = 37;
         spr.setTextSize(1);
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
         spr.setCursor(col_dev,  hdr_y); kprint(spr, "DEVICE");
         spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
         spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
@@ -4498,7 +4531,7 @@ void draw_feed_expanded_overlay() {
 
         // Thin rule below headers
         spr.drawFastHLine(4, hdr_y + 10, DISP_W - 8,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.5f));
+                          ea(lerp_col16(BG_COLOR, CARD_BORDER, 0.5f)));
 
         // Render rows
         const int row_h    = 11;
@@ -4513,9 +4546,10 @@ void draw_feed_expanded_overlay() {
 
             unsigned long age = local_now - e.timestamp;
 
-            // Type symbol color (Flock entries tinted toward ACCENT)
+            // Type symbol color (Flock entries tinted toward ACCENT), faded in
             uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
             if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
+            proto_col = ea(proto_col);
 
             // Colored symbol at left — no brackets/letter
             int sym_x = col_sym;
@@ -4536,7 +4570,7 @@ void draw_feed_expanded_overlay() {
                                  proto_col);
             }
             if (e.is_flock) {
-                spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+                spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
                 spr.setTextSize(1);
                 spr.setCursor(sym_x + 10, row_y);
                 spr.print("*");
@@ -4546,7 +4580,7 @@ void draw_feed_expanded_overlay() {
             char name_disp[13];
             strncpy(name_disp, e.name, 12);
             name_disp[12] = '\0';
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setTextSize(1);
             spr.setCursor(col_dev, row_y);
             spr.print(name_disp);
@@ -4554,7 +4588,7 @@ void draw_feed_expanded_overlay() {
             // RSSI in dBm with units
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setCursor(col_rssi, row_y);
             spr.print(rssi_str);
 
@@ -4564,7 +4598,7 @@ void draw_feed_expanded_overlay() {
             if (e.rssi > -60)      { strength_str = "STRONG"; strength_col = ACCENT_COLOR; }
             else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
-            spr.setTextColor(strength_col, BG_COLOR);
+            spr.setTextColor(ea(strength_col), BG_COLOR);
             spr.setCursor(col_sig, row_y);
             spr.print(strength_str);
 
@@ -4573,7 +4607,7 @@ void draw_feed_expanded_overlay() {
             int age_sec = (int)(age / 1000UL);
             if (age_sec < 60) snprintf(age_str, sizeof(age_str), "%ds",  age_sec);
             else              snprintf(age_str, sizeof(age_str), "%dm",  age_sec / 60);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
             spr.setCursor(col_age, row_y);
             spr.print(age_str);
 
@@ -4582,7 +4616,7 @@ void draw_feed_expanded_overlay() {
     }
 
     // Footer hint
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(1);
     spr.setCursor(4, DISP_H - 9);
     spr.print("f or ESC to close");
@@ -5111,6 +5145,7 @@ void loop() {
             else if (c == 'f') {
                 if (!stealth_mode) {
                     show_feed_expanded = !show_feed_expanded;
+                    if (show_feed_expanded) feed_expand_ms = millis();
                     draw_current_screen();
                     spr.pushSprite(0, 0);
                 }
