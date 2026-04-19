@@ -64,7 +64,7 @@ static unsigned long help_ease_start = 0;
 // Ambient mode: dim minimal UI after sustained idle
 static unsigned long last_user_input_ms = 0;
 static const unsigned long AMBIENT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
-static const uint8_t AMBIENT_BRIGHTNESS = 8;
+static const uint8_t AMBIENT_BRIGHTNESS = 40;
 static bool ambient_mode = false;
 
 unsigned long vol_overlay_start = 0;
@@ -2573,21 +2573,6 @@ void draw_header_spr(int screen_num) {
         icon_right -= 14;
     }
 
-    // Rotation position dots — tight spacing, active is filled+larger, inactive is 2px line
-    int title_len = (int)strlen(screen_names[screen_num]);
-    int title_w = title_len * 7;
-    int dots_x = 4 + title_w + 8;
-    int dots_y = 9;
-    for (int d = 0; d < NUM_SCREENS; d++) {
-        int dx = dots_x + d * 5;
-        if (d == screen_num) {
-            // Active: small filled square (2x2)
-            spr.fillRect(dx - 1, dots_y - 1, 3, 3, HEADER_COLOR);
-        } else {
-            // Inactive: single pixel dot
-            spr.drawPixel(dx, dots_y, CARD_BORDER);
-        }
-    }
 
 }
 
@@ -3096,17 +3081,26 @@ void draw_scanner_screen() {
                 bool is_ble_blip = (line_col == PURPLE_COLOR);
                 int tip_y = base_y - spike_len;
                 if (is_ble_blip) {
-                    // Filled 9px diamond
+                    // Filled 9px diamond with outline
                     int cx_d = base_x, cy_d = tip_y + 4;
                     spr.fillTriangle(cx_d - 4, cy_d,     cx_d,     cy_d - 4,
                                      cx_d + 4, cy_d,                           line_col);
                     spr.fillTriangle(cx_d - 4, cy_d,     cx_d,     cy_d + 4,
                                      cx_d + 4, cy_d,                           line_col);
+                    uint16_t blip_outline = lerp_col16(line_col, lgfx::color565(255,255,255), 0.35f);
+                    spr.drawLine(cx_d - 4, cy_d,     cx_d,     cy_d - 4, blip_outline);
+                    spr.drawLine(cx_d,     cy_d - 4, cx_d + 4, cy_d,     blip_outline);
+                    spr.drawLine(cx_d + 4, cy_d,     cx_d,     cy_d + 4, blip_outline);
+                    spr.drawLine(cx_d,     cy_d + 4, cx_d - 4, cy_d,     blip_outline);
                 } else {
-                    // Filled 9px upward triangle
+                    // Filled 9px upward triangle with outline
                     spr.fillTriangle(base_x - 4, tip_y + 7,
                                      base_x + 4, tip_y + 7,
                                      base_x,     tip_y, line_col);
+                    uint16_t blip_outline = lerp_col16(line_col, lgfx::color565(255,255,255), 0.35f);
+                    spr.drawTriangle(base_x - 4, tip_y + 7,
+                                     base_x + 4, tip_y + 7,
+                                     base_x,     tip_y, blip_outline);
                 }
             } else {
                 // Small noise-style dash for weak signals
@@ -3158,7 +3152,7 @@ void draw_scanner_screen() {
     uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
     uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
 
-    int badge_x = right_text_x - 5;
+    int badge_x = right_text_x + 2;
     int badge_y = 24;
     int badge_h = 16;
     int total_w = wf_seg_w + ble_seg_w;
@@ -3213,7 +3207,7 @@ void draw_scanner_screen() {
 
     // WiFi text
     spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1);
-    spr.setCursor(right_text_x, 29);
+    spr.setCursor(badge_x + 6, 29);
     spr.print(wf_label);
     if (wf_locked) {
         spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3234,7 +3228,7 @@ void draw_scanner_screen() {
 
         const int stats_label_y = 48;       // top of size-1 labels (8px gap from pill bottom y=40)
         const int stats_num_y   = 58;       // top of size-2 numbers (14px tall, bottom y=72)
-        const int sd_left       = right_text_x;
+        const int sd_left       = right_text_x + 2;
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
 
@@ -3302,6 +3296,17 @@ void draw_scanner_screen() {
         spr.print(ble_num);
     }
 
+    // LIVE FEED section label
+    {
+        const int feed_label_y = DISP_H - (4 * 12) - 18;
+        spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f), BG_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(right_text_x, feed_label_y - 11);
+        kprint(spr, "LIVE FEED");
+        spr.drawFastHLine(right_text_x, feed_label_y - 3, DISP_W - right_text_x - 4,
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.5f));
+    }
+
     // ── Live device feed (right column) ──
     // List is anchored at the BOTTOM of the column. Existing rows stay still.
     // When a new entry arrives, it appears at the top: fades in with slight
@@ -3311,7 +3316,7 @@ void draw_scanner_screen() {
     {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
-        const int feed_row_h      = 12;                  // slightly taller rows
+        const int feed_row_h      = 14;                  // slightly taller rows
         const int max_visible     = 4;                   // 4 rows, more breathing room
         const int feed_bottom_y   = DISP_H - 2;          // row baseline
         const int feed_top_y      = feed_bottom_y - max_visible * feed_row_h;
@@ -3369,13 +3374,13 @@ void draw_scanner_screen() {
 
                 // Only animate when there are multiple rows — prevents the
                 // very first entry from fading up from invisible at startup.
-                if (in_t < 1.0f && rows_to_draw > 1) {
+                if (in_t < 1.0f && rows_to_draw > 1 && local_count > 1) {
                     if (i == 0) {
                         // New entry: gentle slide down 4px (not full row
                         // height — that felt too violent). Fade in
                         // alpha 0 → 1 with the same ease curve.
                         row_offset_y = (int)((1.0f - in_ease) * -4);
-                        row_alpha = in_ease;
+                        row_alpha = max(in_ease, 0.15f);
                     } else if (local_count > max_visible && i == rows_to_draw - 1) {
                         // Bottom row fading out (only when buffer is full).
                         // Fades to 0 AND slides down 4px to suggest it's
@@ -3420,7 +3425,7 @@ void draw_scanner_screen() {
                 int sym_x = feed_col_left;
                 int sym_y = row_y + 1;
                 uint16_t sym_col = proto_col;
-                uint16_t sym_border = lerp_col16(sym_col, lgfx::color565(255,255,255), 0.4f);
+                uint16_t sym_border = lerp_col16(sym_col, lgfx::color565(255,255,255), 0.15f);
                 if (e.proto == 0) {
                     // Filled + outlined triangle (▲) — WiFi
                     spr.fillTriangle(sym_x,     sym_y + 6,
@@ -3441,14 +3446,10 @@ void draw_scanner_screen() {
                                      sym_x + 3, sym_y + 6,
                                      sym_x + 6, sym_y + 3,
                                      sym_col);
-                    spr.drawTriangle(sym_x,     sym_y + 3,
-                                     sym_x + 3, sym_y,
-                                     sym_x + 6, sym_y + 3,
-                                     sym_border);
-                    spr.drawTriangle(sym_x,     sym_y + 3,
-                                     sym_x + 3, sym_y + 6,
-                                     sym_x + 6, sym_y + 3,
-                                     sym_border);
+                    spr.drawLine(sym_x,     sym_y + 3, sym_x + 3, sym_y,     sym_border);
+                    spr.drawLine(sym_x + 3, sym_y,     sym_x + 6, sym_y + 3, sym_border);
+                    spr.drawLine(sym_x + 6, sym_y + 3, sym_x + 3, sym_y + 6, sym_border);
+                    spr.drawLine(sym_x + 3, sym_y + 6, sym_x,     sym_y + 3, sym_border);
                 }
                 // Flock indicator: small asterisk after the symbol
                 if (e.is_flock) {
@@ -3464,7 +3465,7 @@ void draw_scanner_screen() {
                 spr.setTextSize(1);
                 spr.setTextColor(strength_col, BG_COLOR);
                 spr.setCursor(strength_x, row_y);
-                kprint(spr, strength_str);
+                kprint(spr, strength_str, 2);
 
                 // Name — kerned, wider space available now that symbol is compact
                 int name_x = feed_col_left + (e.is_flock ? 14 : 10);
@@ -3479,7 +3480,7 @@ void draw_scanner_screen() {
                 name_disp[name_max_chars] = '\0';
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
-                kprint(spr, name_disp);
+                kprint(spr, name_disp, 2);
             }
 
             spr.clearClipRect();
@@ -5275,11 +5276,23 @@ void loop() {
 
     if (ambient_mode) {
         static unsigned long last_ambient_draw = 0;
-        if (millis() - last_ambient_draw > 2000) {
+        static float amb_x = DISP_W / 2.0f, amb_y = DISP_H / 2.0f;
+        static float amb_vx = 0.7f, amb_vy = 0.5f;
+        unsigned long now_amb = millis();
+        if (now_amb - last_ambient_draw > 33) {  // ~30fps
             long det_total;
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             det_total = session_flock_wifi + session_flock_ble + session_raven;
             xSemaphoreGive(dataMutex);
+
+            // Bounce the text block (approx 48px wide, 26px tall)
+            const int text_half_w = 24, text_half_h = 13;
+            amb_x += amb_vx;
+            amb_y += amb_vy;
+            if (amb_x - text_half_w < 2)  { amb_x = 2 + text_half_w;  amb_vx = fabsf(amb_vx); }
+            if (amb_x + text_half_w > DISP_W - 2) { amb_x = DISP_W - 2 - text_half_w; amb_vx = -fabsf(amb_vx); }
+            if (amb_y - text_half_h < 2)  { amb_y = 2 + text_half_h;  amb_vy = fabsf(amb_vy); }
+            if (amb_y + text_half_h > DISP_H - 2) { amb_y = DISP_H - 2 - text_half_h; amb_vy = -fabsf(amb_vy); }
 
             spr.fillSprite(BG_COLOR);
             char det_buf[16];
@@ -5287,12 +5300,12 @@ void loop() {
             spr.setTextDatum(MC_DATUM);
             spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.setTextSize(3);
-            spr.drawString(det_buf, DISP_W / 2, DISP_H / 2 - 6);
+            spr.drawString(det_buf, (int)amb_x, (int)amb_y - 6);
             spr.setTextSize(1);
-            spr.drawString("DETECTIONS", DISP_W / 2, DISP_H / 2 + 16);
+            spr.drawString("DETECTIONS", (int)amb_x, (int)amb_y + 16);
             spr.setTextDatum(TL_DATUM);
             spr.pushSprite(0, 0);
-            last_ambient_draw = millis();
+            last_ambient_draw = now_amb;
         }
     } else if (stealth_mode) {
         // Minimal stealth render: tiny dim "S" in bottom-right corner every 2s.
