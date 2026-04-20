@@ -2954,7 +2954,12 @@ void draw_scanner_screen() {
             float diff_sweep = sweep_norm - pa;
             if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
             if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
-            float sweep_proximity = 1.0f - fminf(1.0f, fabsf(diff_sweep) / 0.5f);  // 1 at sweep, 0 at >0.5 rad away
+            // Only show particles in the sweep's wake (behind the sweep line)
+            // diff_sweep > 0 means sweep has passed this angle
+            float trail_arc = 2.0f;  // radians of visible trail behind sweep
+            if (diff_sweep < 0) diff_sweep += TWO_PIf;  // normalize to [0, 2π]
+            if (diff_sweep > trail_arc) continue;  // too far behind sweep — not visible
+            float sweep_proximity = 1.0f - (diff_sweep / trail_arc);  // 1 at sweep, 0 at trail_arc behind
             int sweep_boost = (int)(sweep_proximity * 80);
             int total_intensity = intensity + sweep_boost;
             if (total_intensity > 255) total_intensity = 255;
@@ -3051,24 +3056,17 @@ void draw_scanner_screen() {
                 bool is_ble_blip = (line_col == PURPLE_COLOR);
                 int tip_y = base_y - spike_len;
                 if (is_ble_blip) {
-                    // Filled 9px symmetric diamond with outline
+                    // Outline-only 9px symmetric diamond
                     int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
-                    spr.fillTriangle(cx_d - bhr, cy_d, cx_d, cy_d - bhr, cx_d + bhr, cy_d, line_col);
-                    spr.fillTriangle(cx_d - bhr, cy_d, cx_d, cy_d + bhr, cx_d + bhr, cy_d, line_col);
-                    uint16_t blip_outline = lerp_col16(line_col, lgfx::color565(255,255,255), 0.35f);
-                    spr.drawLine(cx_d - 4, cy_d,     cx_d,     cy_d - 4, blip_outline);
-                    spr.drawLine(cx_d,     cy_d - 4, cx_d + 4, cy_d,     blip_outline);
-                    spr.drawLine(cx_d + 4, cy_d,     cx_d,     cy_d + 4, blip_outline);
-                    spr.drawLine(cx_d,     cy_d + 4, cx_d - 4, cy_d,     blip_outline);
+                    spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
+                    spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
+                    spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
+                    spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
                 } else {
-                    // Filled 9px upward triangle with outline
-                    spr.fillTriangle(base_x - 4, tip_y + 7,
-                                     base_x + 4, tip_y + 7,
-                                     base_x,     tip_y, line_col);
-                    uint16_t blip_outline = lerp_col16(line_col, lgfx::color565(255,255,255), 0.35f);
+                    // Outline-only 9px upward triangle
                     spr.drawTriangle(base_x - 4, tip_y + 7,
                                      base_x + 4, tip_y + 7,
-                                     base_x,     tip_y, blip_outline);
+                                     base_x,     tip_y, line_col);
                 }
             } else {
                 // Small noise-style dash for weak signals
@@ -3077,12 +3075,6 @@ void draw_scanner_screen() {
         }
     }
     hud_rotation += 0.0033f;
-
-    // Hint text below radar cylinder
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(1.2);
-    spr.setCursor(4, DISP_H - 11);
-    spr.print("'F' for Live Feed");
 
     spr.clearClipRect();
 
@@ -3113,11 +3105,11 @@ void draw_scanner_screen() {
     // boundary. This eliminates the unfilled triangular gaps.
     // Pad channel to 2 digits for fixed pill width (prevents layout jumps
     // when cycling between channel 9 and 10)
-    char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi: %2d", current_channel);
+    char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi:%2d", current_channel);
     bool wf_locked = (millis() < channel_lock_until);
     // Fixed width: "WiFi: 12" = 8 chars + optional " L" (2) padding always applied
-    int wf_seg_w = 10 * 6 + 6;   // slightly reduced right padding
-    int ble_seg_w = 32;            // increased right breathing room
+    int wf_seg_w = 10 * 6 + 14;  // +4 more horizontal
+    int ble_seg_w = 40;            // +4 more horizontal
 
     bool ble_scan_window_active = (pBLEScan != nullptr && pBLEScan->isScanning());
     bool ble_pulse_on = ble_scan_window_active && (((millis() / 500) % 2) == 0);
@@ -3128,24 +3120,24 @@ void draw_scanner_screen() {
     uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
 
     int badge_x = right_text_x + 2;
-    int badge_y = 24;
-    int badge_h = 16;
+    int badge_y = 22;
+    int badge_h = 18;
     int total_w = wf_seg_w + ble_seg_w;
     uint16_t outer_border = lerp_col16(wf_col, ble_badge_col, 0.5f);
 
     // Step 1: clear pill area
-    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 7, BG_COLOR);
+    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 8, BG_COLOR);
 
     // Step 2: fill BLE segment (right) FIRST as full pill — gives it the
     // rounded right corners
-    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 7, ble_fill);
+    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 8, ble_fill);
 
     // Step 3: overdraw WiFi segment (left) — extends slightly past the
     // diagonal seam so no BLE color leaks through the slash region
     {
         int seam_x = badge_x + wf_seg_w;
         // Fill the WiFi-side rounded area
-        spr.fillRoundRect(badge_x, badge_y, wf_seg_w, badge_h, 7, wf_fill);
+        spr.fillRoundRect(badge_x, badge_y, wf_seg_w, badge_h, 8, wf_fill);
         // Square off the right edge of WiFi segment up to the slash midpoint,
         // covering the seam fully. Use a triangle that extends past the
         // diagonal so no BLE color shows through.
@@ -3169,7 +3161,7 @@ void draw_scanner_screen() {
     }
 
     // Step 4: outer rounded outline
-    spr.drawRoundRect(badge_x, badge_y, total_w, badge_h, 7, outer_border);
+    spr.drawRoundRect(badge_x, badge_y, total_w, badge_h, 8, outer_border);
 
     // Step 5: 45° slash divider drawn on top of fills
     {
@@ -3184,9 +3176,9 @@ void draw_scanner_screen() {
     spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1.2);
     {
         int wf_text_w = (int)strlen(wf_label) * 7;
-        if (wf_locked) wf_text_w += 15;
+        if (wf_locked) wf_text_w += 14;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, 29);
+        spr.setCursor(wf_text_x, 30);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3197,9 +3189,9 @@ void draw_scanner_screen() {
     // BLE text — centered in BLE segment
     spr.setTextColor(ble_badge_col, ble_fill);
     {
-        int ble_text_w = 3 * 8;
+        int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, 29);
+        spr.setCursor(ble_text_x, 30);
         spr.print("BLE");
     }
 
@@ -3210,8 +3202,8 @@ void draw_scanner_screen() {
         long sw_local = sw;
         long sb_local = sb;
 
-        const int stats_label_y = 48;       // top of size-1 labels (8px gap from pill bottom y=40)
-        const int stats_num_y   = 58;       // top of size-2 numbers (14px tall, bottom y=72)
+        const int stats_label_y = 46;       // top of size-1 labels
+        const int stats_num_y   = 56;       // top of size-3 numbers
         const int sd_left       = right_text_x + 2;
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
@@ -3234,8 +3226,8 @@ void draw_scanner_screen() {
                          CAUTION_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(2.2);
-        spr.setCursor(col1_x + 16, stats_num_y);
+        spr.setTextSize(3);
+        spr.setCursor(col1_x + 18, stats_num_y);
         spr.print(wifi_num);
 
         // ── BLE block (left-aligned, fixed column) ──
@@ -3247,18 +3239,18 @@ void draw_scanner_screen() {
         spr.setCursor(col2_x, stats_label_y);
         kprint(spr, "BLE");
 
-        // 9×9 outline-only symmetric diamond
-        int dia_x = col2_x + 2;
-        int dia_y = stats_num_y + 2;
-        int dcx = dia_x + 4, dcy = dia_y + 4, dhr = 4;
+        // 13×13 outline-only symmetric diamond
+        int dia_x = col2_x;
+        int dia_y = stats_num_y;
+        int dcx = dia_x + 6, dcy = dia_y + 6, dhr = 6;
         spr.drawLine(dcx,       dcy - dhr, dcx + dhr, dcy,       PURPLE_COLOR);
         spr.drawLine(dcx + dhr, dcy,       dcx,       dcy + dhr, PURPLE_COLOR);
         spr.drawLine(dcx,       dcy + dhr, dcx - dhr, dcy,       PURPLE_COLOR);
         spr.drawLine(dcx - dhr, dcy,       dcx,       dcy - dhr, PURPLE_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(2.2);
-        spr.setCursor(col2_x + 16, stats_num_y);
+        spr.setTextSize(3);
+        spr.setCursor(col2_x + 18, stats_num_y);
         spr.print(ble_num);
     }
 
@@ -3273,7 +3265,7 @@ void draw_scanner_screen() {
         const int feed_col_right  = DISP_W - 4;
         const int feed_row_h      = 13;
         const int max_visible     = 4;
-        const int feed_top_y      = 88;
+        const int feed_top_y      = 84;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
         // Throttled display snapshot — only refreshes every 2 seconds.
@@ -4493,7 +4485,7 @@ void draw_feed_expanded_overlay() {
 
             // Colored symbol at left — no brackets/letter
             int sym_x = col_sym;
-            int sym_y = row_y + 4;
+            int sym_y = row_y + 2;
             if (e.proto == 0) {
                 spr.drawTriangle(sym_x,     sym_y + 6,
                                  sym_x + 6, sym_y + 6,
@@ -4509,7 +4501,7 @@ void draw_feed_expanded_overlay() {
             if (e.is_flock) {
                 spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
                 spr.setTextSize(1.2);
-                spr.setCursor(sym_x + 10, row_y + 4);
+                spr.setCursor(sym_x + 10, row_y + 2);
                 spr.print("*");
             }
 
@@ -4524,16 +4516,15 @@ void draw_feed_expanded_overlay() {
             strncpy(name_disp, e.name, name_max_chars);
             name_disp[name_max_chars] = '\0';
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setTextSize(1.3);
-            spr.setCursor(name_start_x, row_y);
-            spr.print(name_disp);
             spr.setTextSize(1.2);
+            spr.setCursor(name_start_x, row_y);
+            kprint(spr, name_disp, 2);
 
             // RSSI in dBm with units
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setCursor(col_rssi, row_y + 1);
+            spr.setCursor(col_rssi, row_y);
             spr.print(rssi_str);
 
             // SIGNAL (spelled out)
@@ -4543,7 +4534,7 @@ void draw_feed_expanded_overlay() {
             else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
-            spr.setCursor(col_sig, row_y + 1);
+            spr.setCursor(col_sig, row_y);
             spr.print(strength_str);
 
             rendered++;
@@ -4554,7 +4545,7 @@ void draw_feed_expanded_overlay() {
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(1.2);
     spr.setCursor(4, DISP_H - 9);
-    spr.print("Press F or ESC to close");
+    spr.print("F or DEL to close");
 
 }
 
@@ -5115,6 +5106,7 @@ void loop() {
                 }
             }
         }
+
         if (status.del && !stealth_mode) {
             if (show_feed_expanded) {
                 show_feed_expanded = false;
