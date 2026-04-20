@@ -2401,7 +2401,7 @@ void draw_header_spr(int screen_num) {
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
     spr.fillRect(0, 0, DISP_W, 20, BG_COLOR);
-    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1.1);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1.2);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
 
     // ── Status icon row ──────────────────────────────────────────────────────
@@ -2464,7 +2464,7 @@ void draw_header_spr(int screen_num) {
             int pill_x = icon_right - 12;
             spr.fillRoundRect(pill_x, icon_y, 11, 11, 2, bg);
             spr.setTextColor(fg, bg);
-            spr.setTextSize(1.1);
+            spr.setTextSize(1.2);
             spr.setCursor(pill_x + 3, icon_y + 2);
             spr.print(badges[i].letter);
             icon_right = pill_x - 3;
@@ -2511,11 +2511,11 @@ void draw_header_spr(int screen_num) {
 
         char det_str[8];
         snprintf(det_str, sizeof(det_str), "%lu", det_total);
-        int det_w = (int)strlen(det_str) * 7 + 6;
+        int det_w = (int)strlen(det_str) * 8 + 6;
         uint16_t pill_bg = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.18f);
         spr.fillRoundRect(icon_right - det_w, icon_y, det_w, 11, 3, pill_bg);
         spr.setTextColor(lgfx::color565(255, 255, 255), pill_bg);
-        spr.setTextSize(1.1);
+        spr.setTextSize(1.2);
         spr.setCursor(icon_right - det_w + 3, icon_y + 2);
         spr.print(det_str);
         icon_right -= det_w + 2;
@@ -2526,7 +2526,7 @@ void draw_header_spr(int screen_num) {
         uint16_t c = lgfx::color565(255, 140, 0);
         spr.fillRoundRect(icon_right - 22, icon_y, 22, 11, 3, c);
         spr.setTextColor(lgfx::color565(0, 0, 0), c);
-        spr.setTextSize(1.1);
+        spr.setTextSize(1.2);
         spr.setCursor(icon_right - 19, icon_y + 2);
         spr.print("EXP");
         icon_right -= 26;
@@ -2741,7 +2741,7 @@ void draw_help_overlay() {
         default: keys = scanner_keys; key_count = 0; title = "HELP"; break;
     }
 
-    spr.setTextSize(1);
+    spr.setTextSize(1.2);
     spr.setTextColor(HEADER_COLOR, panel_bg);
     spr.setCursor(panel_x + 6, panel_y + 5);
     kprint(spr, title);
@@ -2760,7 +2760,7 @@ void draw_help_overlay() {
         spr.setCursor(col_left_x, row_y);
         spr.print(keys[i].key);
         spr.setTextColor(TEXT_COLOR, panel_bg);
-        spr.setCursor(col_left_x + 26, row_y);
+        spr.setCursor(col_left_x + 28, row_y);
         spr.print(keys[i].desc);
         row_y += ROW_H;
     }
@@ -2776,7 +2776,7 @@ void draw_help_overlay() {
         spr.setCursor(col_right_x, row_y);
         spr.print(global_keys[i].key);
         spr.setTextColor(TEXT_COLOR, panel_bg);
-        spr.setCursor(col_right_x + 26, row_y);
+        spr.setCursor(col_right_x + 28, row_y);
         spr.print(global_keys[i].desc);
         row_y += ROW_H;
     }
@@ -3080,7 +3080,7 @@ void draw_scanner_screen() {
 
     // Hint text below radar cylinder
     spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(1.1);
+    spr.setTextSize(1.2);
     spr.setCursor(4, DISP_H - 11);
     spr.print("'F' for Live Feed");
 
@@ -3181,10 +3181,10 @@ void draw_scanner_screen() {
     }
 
     // WiFi text — centered in WiFi segment
-    spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1.1);
+    spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1.2);
     {
         int wf_text_w = (int)strlen(wf_label) * 7;
-        if (wf_locked) wf_text_w += 14;
+        if (wf_locked) wf_text_w += 15;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
         spr.setCursor(wf_text_x, 29);
         spr.print(wf_label);
@@ -3197,7 +3197,7 @@ void draw_scanner_screen() {
     // BLE text — centered in BLE segment
     spr.setTextColor(ble_badge_col, ble_fill);
     {
-        int ble_text_w = 3 * 7;
+        int ble_text_w = 3 * 8;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
         spr.setCursor(ble_text_x, 29);
         spr.print("BLE");
@@ -3220,7 +3220,7 @@ void draw_scanner_screen() {
         char wifi_num[6];
         snprintf(wifi_num, sizeof(wifi_num), "%ld", sw_local);
 
-        spr.setTextSize(1.1);
+        spr.setTextSize(1.2);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setCursor(col1_x, stats_label_y);
         kprint(spr, "WIFI");
@@ -3234,7 +3234,7 @@ void draw_scanner_screen() {
                          CAUTION_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(2.1);
+        spr.setTextSize(2.2);
         spr.setCursor(col1_x + 16, stats_num_y);
         spr.print(wifi_num);
 
@@ -3242,7 +3242,7 @@ void draw_scanner_screen() {
         char ble_num[6];
         snprintf(ble_num, sizeof(ble_num), "%ld", sb_local);
 
-        spr.setTextSize(1.1);
+        spr.setTextSize(1.2);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setCursor(col2_x, stats_label_y);
         kprint(spr, "BLE");
@@ -3257,7 +3257,7 @@ void draw_scanner_screen() {
         spr.drawLine(dcx - dhr, dcy,       dcx,       dcy - dhr, PURPLE_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(2.1);
+        spr.setTextSize(2.2);
         spr.setCursor(col2_x + 16, stats_num_y);
         spr.print(ble_num);
     }
@@ -3271,7 +3271,7 @@ void draw_scanner_screen() {
     {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
-        const int feed_row_h      = 12;
+        const int feed_row_h      = 13;
         const int max_visible     = 4;
         const int feed_top_y      = 88;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
@@ -3370,7 +3370,7 @@ void draw_scanner_screen() {
                 else                   { strength_str = "WK";  strength_base = DIM_COLOR; }
                 uint16_t strength_col = lerp_col16(BG_COLOR, strength_base, total_alpha);
 
-                spr.setTextSize(1);
+                spr.setTextSize(1.2);
 
                 // Prefix is a small colored symbol (filled triangle/diamond)
                 // instead of a bracketed letter — more visually distinctive,
@@ -3395,15 +3395,15 @@ void draw_scanner_screen() {
                 // Flock indicator: small asterisk after the symbol
                 if (e.is_flock) {
                     spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, total_alpha), BG_COLOR);
-                    spr.setTextSize(1.1);
+                    spr.setTextSize(1.2);
                     spr.setCursor(sym_x + 7, row_y);
                     spr.print("*");
                 }
 
                 // Strength right-aligned
-                int strength_w = (int)strlen(strength_str) * 7;
+                int strength_w = (int)strlen(strength_str) * 8;
                 int strength_x = feed_col_right - strength_w;
-                spr.setTextSize(1.1);
+                spr.setTextSize(1.2);
                 spr.setTextColor(strength_col, BG_COLOR);
                 spr.setCursor(strength_x, row_y);
                 spr.print(strength_str);
@@ -3411,7 +3411,7 @@ void draw_scanner_screen() {
                 // Name — kerned, wider space available now that symbol is compact
                 int name_x = feed_col_left + (e.is_flock ? 14 : 10);
                 int name_x_end = strength_x - 3;
-                int name_max_chars = (name_x_end - name_x - 4) / 7;
+                int name_max_chars = (name_x_end - name_x - 4) / 8;
                 if (name_max_chars > 10) name_max_chars = 10;
                 if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
                 if (name_max_chars < 1) name_max_chars = 1;
@@ -3419,7 +3419,7 @@ void draw_scanner_screen() {
                 char name_disp[20];
                 strncpy(name_disp, e.name, name_max_chars);
                 name_disp[name_max_chars] = '\0';
-                spr.setTextSize(1.1);
+                spr.setTextSize(1.2);
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
@@ -3435,7 +3435,7 @@ void draw_scanner_screen() {
                          feed_col_right - feed_col_left,
                          max_visible * feed_row_h, BG_COLOR);
             spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(1.1);
+            spr.setTextSize(1.2);
             int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
             int nd = (int)(local_now / 500) % 4;
             char load_str[20];
@@ -4443,14 +4443,14 @@ void draw_feed_expanded_overlay() {
 
     // Subtitle appended to header bar ("SCANNER / LIVE FEED")
     spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), ea(BG_COLOR));
-    spr.setTextSize(1);
+    spr.setTextSize(1.2);
     spr.setCursor(62, 5);
     kprint(spr, "/ LIVE FEED");
 
     // Empty state
     if (local_count == 0) {
         spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-        spr.setTextSize(1);
+        spr.setTextSize(1.2);
         const char* msg = "no activity yet";
         int mw = (int)strlen(msg) * 7;
         spr.setCursor((DISP_W - mw) / 2, DISP_H / 2 - 4);
@@ -4469,7 +4469,7 @@ void draw_feed_expanded_overlay() {
 
         // Column headers (faded in)
         const int hdr_y = 23;
-        spr.setTextSize(1);
+        spr.setTextSize(1.2);
         spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
         spr.setCursor(col_sym, hdr_y); kprint(spr, "DEVICE");
         spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
@@ -4508,7 +4508,7 @@ void draw_feed_expanded_overlay() {
             }
             if (e.is_flock) {
                 spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-                spr.setTextSize(1);
+                spr.setTextSize(1.2);
                 spr.setCursor(sym_x + 10, row_y + 4);
                 spr.print("*");
             }
@@ -4516,7 +4516,7 @@ void draw_feed_expanded_overlay() {
             // DEVICE name — size 2, truncated to fit before RSSI column
             int name_start_x = col_sym + 10;
             if (e.is_flock) name_start_x += 8;
-            int name_max_chars = (col_rssi - name_start_x - 4) / 9;
+            int name_max_chars = (col_rssi - name_start_x - 4) / 8;
             if (name_max_chars > 12) name_max_chars = 12;
             if (name_max_chars < 1) name_max_chars = 1;
             if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
@@ -4524,16 +4524,16 @@ void draw_feed_expanded_overlay() {
             strncpy(name_disp, e.name, name_max_chars);
             name_disp[name_max_chars] = '\0';
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setTextSize(1.5);
+            spr.setTextSize(1.3);
             spr.setCursor(name_start_x, row_y);
             spr.print(name_disp);
-            spr.setTextSize(1);
+            spr.setTextSize(1.2);
 
             // RSSI in dBm with units
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setCursor(col_rssi, row_y + 2);
+            spr.setCursor(col_rssi, row_y + 1);
             spr.print(rssi_str);
 
             // SIGNAL (spelled out)
@@ -4543,7 +4543,7 @@ void draw_feed_expanded_overlay() {
             else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
-            spr.setCursor(col_sig, row_y + 2);
+            spr.setCursor(col_sig, row_y + 1);
             spr.print(strength_str);
 
             rendered++;
@@ -4552,7 +4552,7 @@ void draw_feed_expanded_overlay() {
 
     // Footer hint
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-    spr.setTextSize(1);
+    spr.setTextSize(1.2);
     spr.setCursor(4, DISP_H - 9);
     spr.print("Press F or ESC to close");
 
