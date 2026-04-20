@@ -1305,8 +1305,8 @@ void rssi_track_expire() {
 // THREAT EQUALIZER DATA
 // ============================================================================
 #define radar_cx 58
-#define radar_cy 70
-#define radar_r  46
+#define radar_cy 66
+#define radar_r  42
 #define inner_r  18
 
 #define NUM_RADIAL_BANDS 36
@@ -3178,7 +3178,7 @@ void draw_scanner_screen() {
         int wf_text_w = (int)strlen(wf_label) * 7;
         if (wf_locked) wf_text_w += 14;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, 30);
+        spr.setCursor(wf_text_x, 26);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3191,9 +3191,12 @@ void draw_scanner_screen() {
     {
         int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, 30);
+        spr.setCursor(ble_text_x, 26);
         spr.print("BLE");
     }
+
+    // Subtle rule separating badge (status zone) from stats (data zone)
+    spr.drawFastHLine(badge_x, 44, total_w, CARD_BORDER);
 
     // ── Stats block — labels above, symbol + number inline below ──
     // Both blocks left-aligned at a fixed column split. Symbols are
@@ -3202,8 +3205,8 @@ void draw_scanner_screen() {
         long sw_local = sw;
         long sb_local = sb;
 
-        const int stats_label_y = 46;       // top of size-1 labels
-        const int stats_num_y   = 56;       // top of size-3 numbers
+        const int stats_label_y = 50;       // top of size-1 labels
+        const int stats_num_y   = 60;       // top of size-3 numbers
         const int sd_left       = right_text_x + 2;
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
@@ -3263,7 +3266,7 @@ void draw_scanner_screen() {
     {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
-        const int feed_row_h      = 13;
+        const int feed_row_h      = 14;
         const int max_visible     = 4;
         const int feed_top_y      = 84;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
@@ -3415,6 +3418,11 @@ void draw_scanner_screen() {
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
+
+                // Subtle row separator
+                spr.drawFastHLine(feed_col_left, row_y + feed_row_h - 1,
+                                  feed_col_right - feed_col_left,
+                                  lerp_col16(BG_COLOR, CARD_BORDER, total_alpha * 0.4f));
             }
 
         }
@@ -4436,7 +4444,7 @@ void draw_feed_expanded_overlay() {
     // Subtitle appended to header bar ("SCANNER / LIVE FEED")
     spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), ea(BG_COLOR));
     spr.setTextSize(1.2);
-    spr.setCursor(62, 5);
+    spr.setCursor(56, 5);
     kprint(spr, "/ LIVE FEED");
 
     // Empty state
@@ -4468,7 +4476,7 @@ void draw_feed_expanded_overlay() {
         spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
 
         // Render rows
-        const int row_h    = 18;
+        const int row_h    = 16;
         const int row_top  = hdr_y + 12;
         const int max_rows = (DISP_H - row_top - 2) / row_h;
 
@@ -4508,7 +4516,7 @@ void draw_feed_expanded_overlay() {
             // DEVICE name — size 2, truncated to fit before RSSI column
             int name_start_x = col_sym + 10;
             if (e.is_flock) name_start_x += 8;
-            int name_max_chars = (col_rssi - name_start_x - 4) / 8;
+            int name_max_chars = (col_rssi - name_start_x - 4) / 7;
             if (name_max_chars > 12) name_max_chars = 12;
             if (name_max_chars < 1) name_max_chars = 1;
             if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
@@ -4518,13 +4526,16 @@ void draw_feed_expanded_overlay() {
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setTextSize(1.2);
             spr.setCursor(name_start_x, row_y);
-            kprint(spr, name_disp, 2);
+            spr.print(name_disp);
 
-            // RSSI in dBm with units
+            // RSSI in dBm with units — right-aligned within the RSSI column
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setCursor(col_rssi, row_y);
+            {
+                int rssi_w = (int)strlen(rssi_str) * 7;
+                spr.setCursor(col_sig - 4 - rssi_w, row_y);
+            }
             spr.print(rssi_str);
 
             // SIGNAL (spelled out)
@@ -4536,6 +4547,11 @@ void draw_feed_expanded_overlay() {
             spr.setTextColor(ea(strength_col), BG_COLOR);
             spr.setCursor(col_sig, row_y);
             spr.print(strength_str);
+
+            // Subtle row separator
+            spr.drawFastHLine(col_sym, row_y + row_h - 1,
+                              DISP_W - col_sym - 4,
+                              lerp_col16(BG_COLOR, CARD_BORDER, 0.5f));
 
             rendered++;
         }
