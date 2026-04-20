@@ -2808,7 +2808,7 @@ void draw_locator_help_overlay() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
-    int divider_x = 118;
+    int divider_x = 112;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
     spr.setClipRect(0, 18, divider_x, DISP_H - 18);
@@ -2844,12 +2844,8 @@ void draw_scanner_screen() {
             float ca = cosf(a), sa = sinf(a);
             int ex = rcx + (int)(radar_r * ca);
             int ey = rcy + (int)(radar_r * TILT * sa);
-            // Cylinder wall side: 3px tick downward from rim
+            // Cylinder wall side only — inward ticks removed (caused top-face sections)
             spr.drawLine(ex, ey + 1, ex, ey + 4, hat_col);
-            // Top face side: 4px tick inward from rim toward center
-            int ix = rcx + (int)((radar_r - 4) * ca);
-            int iy = rcy + (int)((radar_r - 4) * TILT * sa);
-            spr.drawLine(ex, ey, ix, iy, hat_col);
         }
     }
 
@@ -3175,8 +3171,9 @@ void draw_scanner_screen() {
     // WiFi text — centered in WiFi segment
     spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1.2);
     {
-        int wf_text_w = (int)strlen(wf_label) * 7;
-        if (wf_locked) wf_text_w += 14;
+        int wf_base_w = (int)strlen(wf_label) * 7;
+        int wf_lock_w = wf_locked ? 14 : 0;
+        int wf_text_w = wf_base_w + wf_lock_w;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
         spr.setCursor(wf_text_x, 26);
         spr.print(wf_label);
@@ -3194,9 +3191,6 @@ void draw_scanner_screen() {
         spr.setCursor(ble_text_x, 26);
         spr.print("BLE");
     }
-
-    // Subtle rule separating badge (status zone) from stats (data zone)
-    spr.drawFastHLine(badge_x, 44, total_w, CARD_BORDER);
 
     // ── Stats block — labels above, symbol + number inline below ──
     // Both blocks left-aligned at a fixed column split. Symbols are
@@ -3266,9 +3260,9 @@ void draw_scanner_screen() {
     {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
-        const int feed_row_h      = 14;
+        const int feed_row_h      = 12;
         const int max_visible     = 4;
-        const int feed_top_y      = 84;
+        const int feed_top_y      = 92;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
         // Throttled display snapshot — only refreshes every 2 seconds.
@@ -4430,6 +4424,23 @@ void draw_feed_expanded_overlay() {
     local_now = millis();
     xSemaphoreGive(dataMutex);
 
+    // Slide-in animation state — tracks new entries arriving while overlay is open
+    static int           expand_prev_head   = -1;
+    static unsigned long expand_shift_ms    = 0;
+    static unsigned long expand_open_ms_last = 0;
+
+    if (feed_expand_ms != expand_open_ms_last) {
+        expand_open_ms_last = feed_expand_ms;
+        expand_prev_head    = local_head;
+        expand_shift_ms     = 0;
+    }
+    if (local_count > 0 && expand_prev_head != -1 && local_head != expand_prev_head) {
+        expand_shift_ms  = local_now;
+        expand_prev_head = local_head;
+    } else if (expand_prev_head == -1 && local_count > 0) {
+        expand_prev_head = local_head;
+    }
+
     // Fade-in easing: quadratic ease-out over 200ms
     const unsigned long EXPAND_ANIM_MS = 200UL;
     unsigned long ea_age = local_now - feed_expand_ms;
@@ -4484,23 +4495,36 @@ void draw_feed_expanded_overlay() {
         for (int i = 0; i < local_count && rendered < max_rows; i++) {
             int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
             FeedEntry& e = local_feed[idx];
-            int row_y = row_top + rendered * row_h;
+            int row_y;
+            if (rendered == 0 && expand_shift_ms > 0) {
+                unsigned long slide_elapsed = local_now - expand_shift_ms;
+                if (slide_elapsed < 300UL) {
+                    float st = (float)slide_elapsed / 300.0f;
+                    float ease = 1.0f - (1.0f - st) * (1.0f - st);
+                    int slide_offset = (int)((1.0f - ease) * (float)row_h);
+                    row_y = row_top - slide_offset;
+                } else {
+                    row_y = row_top;
+                }
+            } else {
+                row_y = row_top + rendered * row_h;
+            }
 
             // Type symbol color (Flock entries tinted toward ACCENT), faded in
             uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
             if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
             proto_col = ea(proto_col);
 
-            // Colored symbol at left — no brackets/letter
+            // Small stats-style symbols: outline-only triangle (WiFi) or diamond (BLE)
             int sym_x = col_sym;
-            int sym_y = row_y + 2;
+            int sym_y = row_y + 3;
             if (e.proto == 0) {
-                spr.drawTriangle(sym_x,     sym_y + 6,
-                                 sym_x + 6, sym_y + 6,
-                                 sym_x + 3, sym_y,
+                spr.drawTriangle(sym_x,     sym_y + 7,
+                                 sym_x + 8, sym_y + 7,
+                                 sym_x + 4, sym_y,
                                  proto_col);
             } else {
-                int ecx = sym_x + 3, ecy = sym_y + 3, ehr = 4;
+                int ecx = sym_x + 4, ecy = sym_y + 4, ehr = 4;
                 spr.drawLine(ecx,       ecy - ehr, ecx + ehr, ecy,       proto_col);
                 spr.drawLine(ecx + ehr, ecy,       ecx,       ecy + ehr, proto_col);
                 spr.drawLine(ecx,       ecy + ehr, ecx - ehr, ecy,       proto_col);
@@ -4509,12 +4533,12 @@ void draw_feed_expanded_overlay() {
             if (e.is_flock) {
                 spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
                 spr.setTextSize(1.2);
-                spr.setCursor(sym_x + 10, row_y + 2);
+                spr.setCursor(sym_x + 10, row_y + 3);
                 spr.print("*");
             }
 
             // DEVICE name — size 2, truncated to fit before RSSI column
-            int name_start_x = col_sym + 10;
+            int name_start_x = col_sym + 11;
             if (e.is_flock) name_start_x += 8;
             int name_max_chars = (col_rssi - name_start_x - 4) / 7;
             if (name_max_chars > 12) name_max_chars = 12;
@@ -4525,7 +4549,7 @@ void draw_feed_expanded_overlay() {
             name_disp[name_max_chars] = '\0';
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             spr.setTextSize(1.2);
-            spr.setCursor(name_start_x, row_y);
+            spr.setCursor(name_start_x, row_y + 3);
             spr.print(name_disp);
 
             // RSSI in dBm with units — right-aligned within the RSSI column
@@ -4534,7 +4558,7 @@ void draw_feed_expanded_overlay() {
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
             {
                 int rssi_w = (int)strlen(rssi_str) * 7;
-                spr.setCursor(col_sig - 4 - rssi_w, row_y);
+                spr.setCursor(col_sig - 4 - rssi_w, row_y + 3);
             }
             spr.print(rssi_str);
 
@@ -4545,7 +4569,7 @@ void draw_feed_expanded_overlay() {
             else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
-            spr.setCursor(col_sig, row_y);
+            spr.setCursor(col_sig, row_y + 3);
             spr.print(strength_str);
 
             // Subtle row separator
