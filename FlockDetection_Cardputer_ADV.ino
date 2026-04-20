@@ -3082,7 +3082,7 @@ void draw_scanner_screen() {
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(1);
     spr.setCursor(4, DISP_H - 10);
-    spr.print("Press F: Live Feed");
+    spr.print("'F' for Live Feed");
 
     spr.clearClipRect();
 
@@ -3374,13 +3374,13 @@ void draw_scanner_screen() {
                 uint16_t sym_col = proto_col;
                 if (e.proto == 0) {
                     // Outline-only triangle (△) — WiFi — matches stats icons
-                    spr.drawTriangle(sym_x,     sym_y + 6,
-                                     sym_x + 6, sym_y + 6,
-                                     sym_x + 3, sym_y,
+                    spr.drawTriangle(sym_x,     sym_y + 5,
+                                     sym_x + 5, sym_y + 5,
+                                     sym_x + 2, sym_y,
                                      sym_col);
                 } else {
                     // Outline-only symmetric diamond (◇) — BLE — matches stats icons
-                    int fcx = sym_x + 3, fcy = sym_y + 3, fhr = 3;
+                    int fcx = sym_x + 3, fcy = sym_y + 3, fhr = 4;
                     spr.drawLine(fcx,       fcy - fhr, fcx + fhr, fcy,       sym_col);
                     spr.drawLine(fcx + fhr, fcy,       fcx,       fcy + fhr, sym_col);
                     spr.drawLine(fcx,       fcy + fhr, fcx - fhr, fcy,       sym_col);
@@ -4458,14 +4458,14 @@ void draw_feed_expanded_overlay() {
         //   x=210  AGE (short form like "1m" or "45s" = 20px)
 
         const int col_sym    = 4;
-        const int col_rssi   = 130;
-        const int col_sig    = 190;
+        const int col_rssi   = 140;
+        const int col_sig    = 195;
 
         // Column headers (faded in)
         const int hdr_y = 23;
         spr.setTextSize(1);
         spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-        spr.setCursor(col_sym + 10, hdr_y); kprint(spr, "DEVICE");
+        spr.setCursor(col_sym, hdr_y); kprint(spr, "DEVICE");
         spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
         spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
 
@@ -4489,12 +4489,12 @@ void draw_feed_expanded_overlay() {
             int sym_x = col_sym;
             int sym_y = row_y + 4;
             if (e.proto == 0) {
-                spr.drawTriangle(sym_x,     sym_y + 7,
-                                 sym_x + 7, sym_y + 7,
+                spr.drawTriangle(sym_x,     sym_y + 6,
+                                 sym_x + 6, sym_y + 6,
                                  sym_x + 3, sym_y,
                                  proto_col);
             } else {
-                int ecx = sym_x + 3, ecy = sym_y + 3, ehr = 3;
+                int ecx = sym_x + 3, ecy = sym_y + 3, ehr = 4;
                 spr.drawLine(ecx,       ecy - ehr, ecx + ehr, ecy,       proto_col);
                 spr.drawLine(ecx + ehr, ecy,       ecx,       ecy + ehr, proto_col);
                 spr.drawLine(ecx,       ecy + ehr, ecx - ehr, ecy,       proto_col);
@@ -4510,14 +4510,15 @@ void draw_feed_expanded_overlay() {
             // DEVICE name — size 2, truncated to fit before RSSI column
             int name_start_x = col_sym + 10;
             if (e.is_flock) name_start_x += 8;
-            int name_max_chars = (col_rssi - name_start_x - 4) / 12;
+            int name_max_chars = (col_rssi - name_start_x - 4) / 9;
+            if (name_max_chars > 12) name_max_chars = 12;
             if (name_max_chars < 1) name_max_chars = 1;
             if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
             char name_disp[20];
             strncpy(name_disp, e.name, name_max_chars);
             name_disp[name_max_chars] = '\0';
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setTextSize(2);
+            spr.setTextSize(1.5);
             spr.setCursor(name_start_x, row_y);
             spr.print(name_disp);
             spr.setTextSize(1);
@@ -4526,7 +4527,7 @@ void draw_feed_expanded_overlay() {
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setCursor(col_rssi, row_y + 4);
+            spr.setCursor(col_rssi, row_y + 2);
             spr.print(rssi_str);
 
             // SIGNAL (spelled out)
@@ -4536,7 +4537,7 @@ void draw_feed_expanded_overlay() {
             else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
-            spr.setCursor(col_sig, row_y + 4);
+            spr.setCursor(col_sig, row_y + 2);
             spr.print(strength_str);
 
             rendered++;
