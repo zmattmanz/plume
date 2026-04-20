@@ -3175,7 +3175,7 @@ void draw_scanner_screen() {
         int wf_lock_w = wf_locked ? 14 : 0;
         int wf_text_w = wf_base_w + wf_lock_w;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, 26);
+        spr.setCursor(wf_text_x, badge_y + 4);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3188,7 +3188,7 @@ void draw_scanner_screen() {
     {
         int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, 26);
+        spr.setCursor(ble_text_x, badge_y + 4);
         spr.print("BLE");
     }
 
@@ -3199,8 +3199,8 @@ void draw_scanner_screen() {
         long sw_local = sw;
         long sb_local = sb;
 
-        const int stats_label_y = 50;       // top of size-1 labels
-        const int stats_num_y   = 60;       // top of size-3 numbers
+        const int stats_label_y = 48;       // top of size-1 labels
+        const int stats_num_y   = 64;       // top of size-3 numbers
         const int sd_left       = right_text_x + 2;
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
@@ -3217,9 +3217,9 @@ void draw_scanner_screen() {
         // 9×9 outline-only upward triangle, centered with size-2 number
         int wtri_x = col1_x + 2;
         int wtri_y = stats_num_y + 2;
-        spr.drawTriangle(wtri_x,     wtri_y + 9,
-                         wtri_x + 9, wtri_y + 9,
-                         wtri_x + 4, wtri_y,
+        spr.drawTriangle(wtri_x,      wtri_y + 10,
+                         wtri_x + 10, wtri_y + 10,
+                         wtri_x + 5,  wtri_y,
                          CAUTION_COLOR);
 
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
@@ -3239,7 +3239,7 @@ void draw_scanner_screen() {
         // 13×13 outline-only symmetric diamond
         int dia_x = col2_x;
         int dia_y = stats_num_y;
-        int dcx = dia_x + 6, dcy = dia_y + 6, dhr = 6;
+        int dcx = dia_x + 6, dcy = dia_y + 6, dhr = 7;
         spr.drawLine(dcx,       dcy - dhr, dcx + dhr, dcy,       PURPLE_COLOR);
         spr.drawLine(dcx + dhr, dcy,       dcx,       dcy + dhr, PURPLE_COLOR);
         spr.drawLine(dcx,       dcy + dhr, dcx - dhr, dcy,       PURPLE_COLOR);
@@ -3261,8 +3261,8 @@ void draw_scanner_screen() {
         const int feed_col_left   = right_text_x;
         const int feed_col_right  = DISP_W - 4;
         const int feed_row_h      = 12;
-        const int max_visible     = 4;
-        const int feed_top_y      = 92;
+        const int max_visible     = 3;
+        const int feed_top_y      = 95;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
         // Throttled display snapshot — only refreshes every 2 seconds.
@@ -3352,13 +3352,6 @@ void draw_scanner_screen() {
 
                 uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, total_alpha);
 
-                const char* strength_str;
-                uint16_t strength_base;
-                if (e.rssi > -60)      { strength_str = "STR"; strength_base = ACCENT_COLOR; }
-                else if (e.rssi > -80) { strength_str = "MED"; strength_base = CAUTION_COLOR; }
-                else                   { strength_str = "WK";  strength_base = DIM_COLOR; }
-                uint16_t strength_col = lerp_col16(BG_COLOR, strength_base, total_alpha);
-
                 spr.setTextSize(1.2);
 
                 // Prefix is a small colored symbol (filled triangle/diamond)
@@ -3389,19 +3382,11 @@ void draw_scanner_screen() {
                     spr.print("*");
                 }
 
-                // Strength right-aligned
-                int strength_w = (int)strlen(strength_str) * 8;
-                int strength_x = feed_col_right - strength_w;
-                spr.setTextSize(1.2);
-                spr.setTextColor(strength_col, BG_COLOR);
-                spr.setCursor(strength_x, row_y);
-                spr.print(strength_str);
-
-                // Name — kerned, wider space available now that symbol is compact
+                // Name — full width available now that strength column is gone
                 int name_x = feed_col_left + (e.is_flock ? 14 : 10);
-                int name_x_end = strength_x - 3;
-                int name_max_chars = (name_x_end - name_x - 4) / 8;
-                if (name_max_chars > 10) name_max_chars = 10;
+                int name_x_end = feed_col_right - 2;
+                int name_max_chars = (name_x_end - name_x) / 7;
+                if (name_max_chars > 14) name_max_chars = 14;
                 if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
                 if (name_max_chars < 1) name_max_chars = 1;
 
@@ -4489,8 +4474,10 @@ void draw_feed_expanded_overlay() {
         // Render rows
         const int row_h    = 16;
         const int row_top  = hdr_y + 12;
-        const int max_rows = (DISP_H - row_top - 2) / row_h;
+        const int max_rows = (DISP_H - row_top) / row_h;
 
+        // Clip to row area to prevent slide animation from bleeding into headers
+        spr.setClipRect(0, row_top, DISP_W, DISP_H - row_top);
         int rendered = 0;
         for (int i = 0; i < local_count && rendered < max_rows; i++) {
             int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
@@ -4538,7 +4525,7 @@ void draw_feed_expanded_overlay() {
             }
 
             // DEVICE name — size 2, truncated to fit before RSSI column
-            int name_start_x = col_sym + 11;
+            int name_start_x = col_sym + 15;
             if (e.is_flock) name_start_x += 8;
             int name_max_chars = (col_rssi - name_start_x - 4) / 7;
             if (name_max_chars > 12) name_max_chars = 12;
@@ -4556,10 +4543,7 @@ void draw_feed_expanded_overlay() {
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            {
-                int rssi_w = (int)strlen(rssi_str) * 7;
-                spr.setCursor(col_sig - 4 - rssi_w, row_y + 3);
-            }
+            spr.setCursor(col_rssi, row_y + 3);
             spr.print(rssi_str);
 
             // SIGNAL (spelled out)
@@ -4572,20 +4556,10 @@ void draw_feed_expanded_overlay() {
             spr.setCursor(col_sig, row_y + 3);
             spr.print(strength_str);
 
-            // Subtle row separator
-            spr.drawFastHLine(col_sym, row_y + row_h - 1,
-                              DISP_W - col_sym - 4,
-                              lerp_col16(BG_COLOR, CARD_BORDER, 0.5f));
-
             rendered++;
         }
+        spr.clearClipRect();
     }
-
-    // Footer hint
-    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
-    spr.setCursor(4, DISP_H - 9);
-    spr.print("F or DEL to close");
 
 }
 
