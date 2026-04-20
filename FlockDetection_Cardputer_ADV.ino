@@ -3081,8 +3081,8 @@ void draw_scanner_screen() {
     // Hint text below radar cylinder
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(1);
-    spr.setCursor(radar_cx - 28, DISP_H - 10);
-    spr.print("f: live feed");
+    spr.setCursor(4, DISP_H - 10);
+    spr.print("Press F: Live Feed");
 
     spr.clearClipRect();
 
@@ -3273,7 +3273,7 @@ void draw_scanner_screen() {
         const int feed_col_right  = DISP_W - 4;
         const int feed_row_h      = 12;
         const int max_visible     = 4;
-        const int feed_top_y      = 78;
+        const int feed_top_y      = 88;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
         // Throttled display snapshot — only refreshes every 2 seconds.
@@ -3283,6 +3283,8 @@ void draw_scanner_screen() {
         static int display_head = 0;
         static unsigned long display_last_refresh = 0;
         static bool display_ever_populated = false;
+        static char display_prev_top_mac[18] = "";
+        static unsigned long display_shift_ms = 0;
 
         unsigned long local_now = millis();
         const unsigned long FEED_DISPLAY_REFRESH_MS = 2000;
@@ -3294,7 +3296,15 @@ void draw_scanner_screen() {
             for (int i = 0; i < display_count; i++) display_feed[i] = feed_entries[i];
             xSemaphoreGive(dataMutex);
             display_last_refresh = local_now;
-            if (display_count > 0) display_ever_populated = true;
+            if (display_count > 0) {
+                display_ever_populated = true;
+                int top_idx = (display_head + FEED_SIZE * 2) % FEED_SIZE;
+                if (strcmp(display_feed[top_idx].mac, display_prev_top_mac) != 0) {
+                    strncpy(display_prev_top_mac, display_feed[top_idx].mac, 17);
+                    display_prev_top_mac[17] = '\0';
+                    display_shift_ms = local_now;
+                }
+            }
         }
 
         FeedEntry* local_feed = display_feed;
@@ -3313,11 +3323,20 @@ void draw_scanner_screen() {
                 int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
                 FeedEntry& e = local_feed[idx];
 
-                // Position rows from top of feed area downward in newest-first
-                // order, but the LIST IS STATIC — same MAC always renders at
-                // the same row until a new entry arrives and pushes everything
-                // down by one slot.
-                int row_y = feed_top_y + i * feed_row_h;
+                int row_y;
+                if (i == 0 && display_shift_ms != 0) {
+                    unsigned long elapsed = local_now - display_shift_ms;
+                    if (elapsed < 300) {
+                        float t = (float)elapsed / 300.0f;
+                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                        int slide_offset = (int)((1.0f - ease) * (float)feed_row_h);
+                        row_y = feed_top_y - slide_offset;
+                    } else {
+                        row_y = feed_top_y;
+                    }
+                } else {
+                    row_y = feed_top_y + i * feed_row_h;
+                }
 
                 float row_alpha = 1.0f;  // always fully opaque — no animation needed
 
@@ -3461,7 +3480,7 @@ void draw_locator_screen() {
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
     // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 110;
+    const int GRID_RIGHT = 140;
     const int GRID_STEP  = 14;
     unsigned long now_ms = millis();
 
@@ -3494,7 +3513,7 @@ void draw_locator_screen() {
     // Solid vertical separator on right edge of grid panel
     spr.drawFastVLine(GRID_RIGHT, 18, DISP_H - 18, CARD_BORDER);
 
-    const int cx = 55, cy = 62;
+    const int cx = 70, cy = 62;
 
     // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
@@ -3628,8 +3647,8 @@ void draw_locator_screen() {
     // lock indicator: subtle glow on the last sample box instead of text
 
     // ── Right panel ──
-    int rx = 114;
-    int rpx = rx + 8;
+    int rx = 144;
+    int rpx = rx + 4;
 
     // Status — dynamic-width box
     const char* status_base; uint16_t status_col; bool status_anim = false;
@@ -4446,12 +4465,12 @@ void draw_feed_expanded_overlay() {
         const int hdr_y = 23;
         spr.setTextSize(1);
         spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-        spr.setCursor(col_sym,  hdr_y); kprint(spr, "DEVICE");
+        spr.setCursor(col_sym + 10, hdr_y); kprint(spr, "DEVICE");
         spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
         spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
 
         // Render rows
-        const int row_h    = 13;
+        const int row_h    = 18;
         const int row_top  = hdr_y + 12;
         const int max_rows = (DISP_H - row_top - 2) / row_h;
 
@@ -4468,7 +4487,7 @@ void draw_feed_expanded_overlay() {
 
             // Colored symbol at left — no brackets/letter
             int sym_x = col_sym;
-            int sym_y = row_y + 1;
+            int sym_y = row_y + 4;
             if (e.proto == 0) {
                 spr.drawTriangle(sym_x,     sym_y + 7,
                                  sym_x + 7, sym_y + 7,
@@ -4484,26 +4503,30 @@ void draw_feed_expanded_overlay() {
             if (e.is_flock) {
                 spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
                 spr.setTextSize(1);
-                spr.setCursor(sym_x + 10, row_y);
+                spr.setCursor(sym_x + 10, row_y + 4);
                 spr.print("*");
             }
 
-            // DEVICE name — left-aligned immediately after symbol
-            char name_disp[13];
-            strncpy(name_disp, e.name, 12);
-            name_disp[12] = '\0';
-            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setTextSize(1);
+            // DEVICE name — size 2, truncated to fit before RSSI column
             int name_start_x = col_sym + 10;
             if (e.is_flock) name_start_x += 8;
+            int name_max_chars = (col_rssi - name_start_x - 4) / 12;
+            if (name_max_chars < 1) name_max_chars = 1;
+            if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
+            char name_disp[20];
+            strncpy(name_disp, e.name, name_max_chars);
+            name_disp[name_max_chars] = '\0';
+            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+            spr.setTextSize(2);
             spr.setCursor(name_start_x, row_y);
             spr.print(name_disp);
+            spr.setTextSize(1);
 
             // RSSI in dBm with units
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setCursor(col_rssi, row_y);
+            spr.setCursor(col_rssi, row_y + 4);
             spr.print(rssi_str);
 
             // SIGNAL (spelled out)
@@ -4513,7 +4536,7 @@ void draw_feed_expanded_overlay() {
             else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
             spr.setTextColor(ea(strength_col), BG_COLOR);
-            spr.setCursor(col_sig, row_y);
+            spr.setCursor(col_sig, row_y + 4);
             spr.print(strength_str);
 
             rendered++;
@@ -4524,7 +4547,7 @@ void draw_feed_expanded_overlay() {
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(1);
     spr.setCursor(4, DISP_H - 9);
-    spr.print("ESC to close");
+    spr.print("Press F or ESC to close");
 
 }
 
@@ -4566,6 +4589,7 @@ void transition_screen(int new_screen, int dir) {
         device_info_scroll = 0;
     }
     if (new_screen != 1) show_locator_help = false;
+    if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
     current_screen = new_screen;
     draw_current_screen();
 
@@ -4781,10 +4805,16 @@ void loop() {
             ambient_mode = false;
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
         }
-        int next_screen = current_screen + 1;
-        int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
-        if (next_screen >= NUM_SCREENS) next_screen = 0;
-        transition_screen(next_screen, dir);
+        if (show_feed_expanded) {
+            show_feed_expanded = false;
+            draw_current_screen();
+            spr.pushSprite(0, 0);
+        } else {
+            int next_screen = current_screen + 1;
+            int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
+            if (next_screen >= NUM_SCREENS) next_screen = 0;
+            transition_screen(next_screen, dir);
+        }
     }
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
@@ -5050,8 +5080,13 @@ void loop() {
             }
             else if (c == 'f') {
                 if (!stealth_mode) {
-                    show_feed_expanded = !show_feed_expanded;
-                    if (show_feed_expanded) feed_expand_ms = millis();
+                    if (show_feed_expanded) {
+                        show_feed_expanded = false;
+                    } else {
+                        if (current_screen != 0) transition_screen(0, -1);
+                        show_feed_expanded = true;
+                        feed_expand_ms = millis();
+                    }
                     draw_current_screen();
                     spr.pushSprite(0, 0);
                 }
