@@ -2833,7 +2833,6 @@ void draw_scanner_screen() {
 
     // Top face fill and border — draw ellipse twice (y offset 1) for thicker rim
     spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(rcx, rcy - 1, radar_r, (int)(radar_r * TILT), HEADER_COLOR);
     spr.drawEllipse(rcx, rcy,     radar_r, (int)(radar_r * TILT), HEADER_COLOR);
     spr.drawEllipse(rcx, rcy + 1, radar_r, (int)(radar_r * TILT), HEADER_COLOR);
 
@@ -2845,7 +2844,6 @@ void draw_scanner_screen() {
 
     // Structural ribs on left wall removed
 
-    spr.drawEllipse(rcx, rcy - 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
     spr.drawEllipse(rcx, rcy,     inner_r, (int)(inner_r * TILT), DIM_COLOR);
     spr.drawEllipse(rcx, rcy + 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
 
@@ -3166,7 +3164,7 @@ void draw_scanner_screen() {
         int wf_lock_w = wf_locked ? 14 : 0;
         int wf_text_w = wf_base_w + wf_lock_w;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, badge_y + 2);
+        spr.setCursor(wf_text_x, badge_y);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3179,7 +3177,7 @@ void draw_scanner_screen() {
     {
         int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, badge_y + 2);
+        spr.setCursor(ble_text_x, badge_y);
         spr.print("BLE");
     }
 
