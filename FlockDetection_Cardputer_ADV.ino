@@ -3456,7 +3456,7 @@ void draw_locator_screen() {
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
     // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 140;
+    const int GRID_RIGHT = 120;
     const int GRID_STEP  = 14;
     unsigned long now_ms = millis();
 
@@ -3564,78 +3564,30 @@ void draw_locator_screen() {
         spr.drawLine(ax7[vi], ay7[vi], ax7[ni], ay7[ni], GPS_COLOR);
     }
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(cx - 24, cy + 22);
+    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1.2);
+    spr.setCursor(cx - 28, cy + 22);
     kprint(spr, "DIRECTION");
 
     // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : 0;
     bool lock = active ? has_est : false;
 
-    static unsigned long smpl_birth[3] = {0, 0, 0};
-    static int smpl_prev = 0;
-    if (sc != smpl_prev) {
-        if (sc > smpl_prev) {
-            for (int i = smpl_prev; i < sc && i < LOC_MIN_SAMPLES_EST; i++)
-                smpl_birth[i] = now_ms;
-        } else {
-            for (int i = 0; i < LOC_MIN_SAMPLES_EST; i++) smpl_birth[i] = 0;
-        }
-        smpl_prev = sc;
-    }
-
-    const int BOX = 11;
-    const int by0 = 95;        // near bottom of left panel
-    const int bx0 = cx - 25;  // centers 3 boxes under cx
-
-    char samp_label[16];
-    snprintf(samp_label, sizeof(samp_label), "SAMPLES %d/%d", sc, LOC_MIN_SAMPLES_EST);
-    spr.setTextColor(sc >= LOC_MIN_SAMPLES_EST ? ACCENT_COLOR : DIM_COLOR, BG_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(bx0, by0 - 10);
-    kprint(spr, samp_label);
-
-    for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
-        int bxi = bx0 + di * 17;
-        bool filled = di < sc;
-
-        uint16_t box_col;
-        if (filled) {
-            // Pulse ACCENT_COLOR using sin wave
-            float pulse_t = sinf((float)now_ms * 0.004f) * 0.5f + 0.5f;
-            uint16_t dark_accent = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.4f);
-            box_col = lerp_col16(dark_accent, ACCENT_COLOR, pulse_t);
-        } else {
-            box_col = DIM_COLOR;
-        }
-
-        spr.drawRect(bxi, by0, BOX, BOX, box_col);
-        if (filled) {
-            // Oversized static X — 2px thick, extends 1px outside box edges
-            int mx = bxi + BOX / 2, my = by0 + BOX / 2;
-            int xr = BOX / 2 + 1;
-            spr.drawLine(mx - xr, my - xr, mx + xr, my + xr, box_col);
-            spr.drawLine(mx - xr + 1, my - xr, mx + xr, my + xr - 1, box_col);
-            spr.drawLine(mx + xr, my - xr, mx - xr, my + xr, box_col);
-            spr.drawLine(mx + xr - 1, my - xr, mx - xr, my + xr - 1, box_col);
-        }
-    }
-    // lock indicator: subtle glow on the last sample box instead of text
+    (void)sc; (void)lock;
 
     // ── Right panel ──
-    int rx = 144;
+    int rx = 124;
     int rpx = rx + 4;
 
-    // Status — dynamic-width box
+    // ── Status badge ──
     const char* status_base; uint16_t status_col; bool status_anim = false;
     if (north_mode) {
-        status_base = "Pointing North";  status_col = GPS_COLOR;
+        status_base = "North Mode";  status_col = GPS_COLOR;
     } else if (!has_loc && !gps_valid) {
-        status_base = "GPS";             status_col = GPS_COLOR;     status_anim = true;
+        status_base = "GPS";         status_col = GPS_COLOR;     status_anim = true;
     } else if (!active) {
-        status_base = "Need Target";     status_col = CAUTION_COLOR; status_anim = true;
+        status_base = "Need Target"; status_col = CAUTION_COLOR; status_anim = true;
     } else {
-        status_base = "Hunting";         status_col = ACCENT_COLOR;
+        status_base = "Hunting";     status_col = ACCENT_COLOR;
     }
     char status_str[26];
     if (status_anim) {
@@ -3647,28 +3599,62 @@ void draw_locator_screen() {
         status_str[sizeof(status_str) - 1] = '\0';
     }
     int max_chars = (int)strlen(status_base) + (status_anim ? 3 : 0);
-    int box_w = max_chars * 7 + 12;   // 7px/char (kerned) + left+right padding
+    int box_w = max_chars * 8 + 12;
     int avail_w = DISP_W - rpx - 2;
     if (box_w > avail_w) box_w = avail_w;
-    // Tinted fill toward status color, matching scanner badge treatment
     uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
     spr.fillRoundRect(rpx, 23, box_w, 16, 5, status_fill);
     spr.drawRoundRect(rpx, 23, box_w, 16, 5, status_col);
-    spr.setTextColor(status_col, status_fill); spr.setTextSize(1);
+    spr.setTextColor(status_col, status_fill); spr.setTextSize(1.2);
     spr.setClipRect(rpx + 1, 24, box_w - 2, 14);
     spr.setCursor(rpx + 6, 27); kprint(spr, status_str);
     spr.clearClipRect();
 
-    // DISTANCE (hero)
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 48); kprint(spr, "DISTANCE");
+    // ── SIGNAL (primary metric — hero treatment) ──
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+    spr.setCursor(rpx, 46); kprint(spr, "SIGNAL");
+    {
+        int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
+        const char* sig_str;
+        uint16_t sig_col;
+        if (sr == -999) {
+            sig_str = "--"; sig_col = DIM_COLOR;
+        } else if (sr > -60) {
+            sig_str = "STRONG"; sig_col = ACCENT_COLOR;
+        } else if (sr > -80) {
+            sig_str = "MEDIUM"; sig_col = CAUTION_COLOR;
+        } else {
+            sig_str = "WEAK"; sig_col = DIM_COLOR;
+        }
+        spr.setTextColor(sig_col, BG_COLOR);
+        spr.setTextSize(2);
+        spr.setCursor(rpx, 58);
+        spr.print(sig_str);
+    }
 
-    // Trend arrow next to DISTANCE label — green ↓ closer, amber ↑ farther
+    // ── TARGET (secondary) ──
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+    spr.setCursor(rpx, 82); kprint(spr, "TARGET");
+    {
+        char tname[15];
+        if (active) {
+            bool nok = (target_name[0] != '\0' && strcmp(target_name,"Hidden")!=0 && strcmp(target_name,"Unknown")!=0);
+            const char* src = nok ? target_name : ((strlen(target_mac)>8)?target_mac+9:target_mac);
+            strncpy(tname, src, 14); tname[14] = '\0';
+        } else { strncpy(tname, demo_name, 14); tname[14] = '\0'; }
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+        spr.setCursor(rpx, 93); spr.print(tname);
+    }
+
+    // ── DISTANCE (secondary) ──
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+    spr.setCursor(rpx, 108); kprint(spr, "DISTANCE");
+
     {
         int trend = (active && has_est) ? locator_distance_trend() : 0;
         if (trend != 0) {
-            int tx = rpx + 58;
-            int ty = 48;
+            int tx = rpx + 60;
+            int ty = 108;
             if (trend < 0) {
                 spr.fillTriangle(tx, ty, tx + 6, ty, tx + 3, ty + 6, ACCENT_COLOR);
             } else {
@@ -3678,44 +3664,16 @@ void draw_locator_screen() {
     }
     {
         float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(3);
-        spr.setCursor(rpx, 58);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+        spr.setCursor(rpx, 120);
         if (sd < 0) {
             spr.print("--");
         } else {
             char db[12];
-            if (sd < 100) snprintf(db, sizeof(db), "%.0f", sd);
-            else          snprintf(db, sizeof(db), "%.1f", sd / 1000.0f);
+            if (sd < 100) snprintf(db, sizeof(db), "%.0fm", sd);
+            else          snprintf(db, sizeof(db), "%.1fkm", sd / 1000.0f);
             spr.print(db);
-            spr.setTextSize(1);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.print(sd < 100 ? "m" : "km");
         }
-    }
-
-    // TARGET (secondary)
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 90); kprint(spr, "TARGET");
-    {
-        char tname[15];
-        if (active) {
-            bool nok = (target_name[0] != '\0' && strcmp(target_name,"Hidden")!=0 && strcmp(target_name,"Unknown")!=0);
-            const char* src = nok ? target_name : ((strlen(target_mac)>8)?target_mac+9:target_mac);
-            strncpy(tname, src, 14); tname[14] = '\0';
-        } else { strncpy(tname, demo_name, 14); tname[14] = '\0'; }
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 100); spr.print(tname);
-    }
-
-    // SIGNAL (secondary)
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(rpx, 114); kprint(spr, "SIGNAL");
-    {
-        int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(rpx, 124);
-        if (sr == -999) { spr.print("--"); }
-        else { spr.print(sr > -60 ? "STRONG" : sr > -80 ? "MEDIUM" : "WEAK"); }
     }
 }
 
