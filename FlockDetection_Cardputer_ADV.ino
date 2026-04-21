@@ -1358,7 +1358,7 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
 
 static void feed_commit_pending() {
     unsigned long now = millis();
-    unsigned long interval = show_feed_expanded ? 400UL : FEED_MIN_PUSH_INTERVAL_MS;
+    unsigned long interval = show_feed_expanded ? 667UL : FEED_MIN_PUSH_INTERVAL_MS;
     if (now - last_feed_push_ms < interval) return;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (!feed_pending_valid) { xSemaphoreGive(dataMutex); return; }
@@ -3166,7 +3166,7 @@ void draw_scanner_screen() {
         int wf_lock_w = wf_locked ? 14 : 0;
         int wf_text_w = wf_base_w + wf_lock_w;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, badge_y + 3);
+        spr.setCursor(wf_text_x, badge_y + 2);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3179,7 +3179,7 @@ void draw_scanner_screen() {
     {
         int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, badge_y + 3);
+        spr.setCursor(ble_text_x, badge_y + 2);
         spr.print("BLE");
     }
 
@@ -3196,50 +3196,90 @@ void draw_scanner_screen() {
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
 
-        // ── WIFI block ──
         char wifi_num[6];
         snprintf(wifi_num, sizeof(wifi_num), "%ld", sw_local);
+        char ble_num[6];
+        snprintf(ble_num, sizeof(ble_num), "%ld", sb_local);
 
+        // Roll-in animation: when count changes, new number slides up into place
+        static long prev_sw = 0, prev_sb = 0;
+        static unsigned long sw_anim_start = 0, sb_anim_start = 0;
+        const unsigned long ROLL_DURATION = 300;
+        if (sw_local != prev_sw) { sw_anim_start = millis(); prev_sw = sw_local; }
+        if (sb_local != prev_sb) { sb_anim_start = millis(); prev_sb = sb_local; }
+
+        // ── WIFI label ──
         spr.setTextSize(1.2);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setCursor(col1_x, stats_label_y);
         kprint(spr, "WIFI");
 
-        // 9×9 outline-only upward triangle, centered with size-2 number
+        // WIFI triangle symbol
         int wtri_x = col1_x + 2;
-        int wtri_y = stats_num_y + 2;
+        int wtri_y = stats_num_y + 3;
         spr.drawTriangle(wtri_x,      wtri_y + 10,
                          wtri_x + 10, wtri_y + 10,
                          wtri_x + 5,  wtri_y,
                          CAUTION_COLOR);
 
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(3);
-        spr.setCursor(col1_x + 18, stats_num_y);
-        spr.print(wifi_num);
+        // WIFI number with roll animation
+        {
+            unsigned long sw_elapsed = millis() - sw_anim_start;
+            int num_clip_y = stats_num_y;
+            int num_h = 24;  // textSize(3) height
+            spr.setClipRect(col1_x + 20, num_clip_y, 40, num_h);
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setTextSize(3);
+            if (sw_anim_start > 0 && sw_elapsed < ROLL_DURATION) {
+                float t = (float)sw_elapsed / (float)ROLL_DURATION;
+                float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                int offset = (int)((1.0f - ease) * (float)num_h);
+                spr.fillRect(col1_x + 20, num_clip_y, 40, num_h, BG_COLOR);
+                spr.setCursor(col1_x + 20, stats_num_y + offset);
+                spr.print(wifi_num);
+            } else {
+                spr.setCursor(col1_x + 20, stats_num_y);
+                spr.print(wifi_num);
+            }
+            spr.clearClipRect();
+        }
 
-        // ── BLE block (left-aligned, fixed column) ──
-        char ble_num[6];
-        snprintf(ble_num, sizeof(ble_num), "%ld", sb_local);
-
+        // ── BLE label ──
         spr.setTextSize(1.2);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setCursor(col2_x, stats_label_y);
         kprint(spr, "BLE");
 
-        // 13×13 outline-only symmetric diamond
+        // BLE diamond symbol
         int dia_x = col2_x;
         int dia_y = stats_num_y;
-        int dcx = dia_x + 6, dcy = dia_y + 6, dhr = 7;
+        int dcx = dia_x + 6, dcy = dia_y + 7, dhr = 7;
         spr.drawLine(dcx,       dcy - dhr, dcx + dhr, dcy,       PURPLE_COLOR);
         spr.drawLine(dcx + dhr, dcy,       dcx,       dcy + dhr, PURPLE_COLOR);
         spr.drawLine(dcx,       dcy + dhr, dcx - dhr, dcy,       PURPLE_COLOR);
         spr.drawLine(dcx - dhr, dcy,       dcx,       dcy - dhr, PURPLE_COLOR);
 
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(3);
-        spr.setCursor(col2_x + 18, stats_num_y);
-        spr.print(ble_num);
+        // BLE number with roll animation
+        {
+            unsigned long sb_elapsed = millis() - sb_anim_start;
+            int num_clip_y = stats_num_y;
+            int num_h = 24;
+            spr.setClipRect(col2_x + 20, num_clip_y, 40, num_h);
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setTextSize(3);
+            if (sb_anim_start > 0 && sb_elapsed < ROLL_DURATION) {
+                float t = (float)sb_elapsed / (float)ROLL_DURATION;
+                float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                int offset = (int)((1.0f - ease) * (float)num_h);
+                spr.fillRect(col2_x + 20, num_clip_y, 40, num_h, BG_COLOR);
+                spr.setCursor(col2_x + 20, stats_num_y + offset);
+                spr.print(ble_num);
+            } else {
+                spr.setCursor(col2_x + 20, stats_num_y);
+                spr.print(ble_num);
+            }
+            spr.clearClipRect();
+        }
     }
 
     // ── Live device feed (right column) ──
@@ -3456,7 +3496,7 @@ void draw_locator_screen() {
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
     // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 140;
+    const int GRID_RIGHT = 60;
     const int GRID_STEP  = 14;
     unsigned long now_ms = millis();
 
@@ -3489,7 +3529,7 @@ void draw_locator_screen() {
     // Solid vertical separator on right edge of grid panel
     spr.drawFastVLine(GRID_RIGHT, 18, DISP_H - 18, CARD_BORDER);
 
-    const int cx = 70, cy = 62;
+    const int cx = 30, cy = 62;
 
     // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
@@ -3513,8 +3553,8 @@ void draw_locator_screen() {
     float ang = ease_arrow;
 
     // ── Compass rose ring ──
-    spr.drawCircle(cx, cy, 18, CARD_BORDER);
-    spr.drawCircle(cx, cy, 19, BG_COLOR);  // thin separation from arrow
+    spr.drawCircle(cx, cy, 16, CARD_BORDER);
+    spr.drawCircle(cx, cy, 17, BG_COLOR);  // thin separation from arrow
 
     // ── Arrow: cursor/pointer shape — 7-point polygon ──
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
@@ -3524,8 +3564,8 @@ void draw_locator_screen() {
     };
     // Local-space vertices (pointing up before rotation):
     //   0=tip, 1=right-outer, 2=right-inner, 3=right-base, 4=left-base, 5=left-inner, 6=left-outer
-    const float A_TIP_Y   = -15.0f, A_SHLDR_Y = -4.0f, A_BASE_Y = 9.5f;
-    const float A_HEAD_HW =  8.0f,  A_STEM_HW =  4.0f;
+    const float A_TIP_Y   = -18.0f, A_SHLDR_Y = -5.0f, A_BASE_Y = 11.5f;
+    const float A_HEAD_HW = 10.0f,  A_STEM_HW =  5.0f;
     const float lx7[7] = {  0,          A_HEAD_HW,  A_STEM_HW,  A_STEM_HW, -A_STEM_HW, -A_STEM_HW, -A_HEAD_HW };
     const float ly7[7] = { A_TIP_Y, A_SHLDR_Y, A_SHLDR_Y, A_BASE_Y,  A_BASE_Y, A_SHLDR_Y,  A_SHLDR_Y };
     int ax7[7], ay7[7];
@@ -3565,17 +3605,48 @@ void draw_locator_screen() {
     }
 
     spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(cx - 28, cy + 22);
-    kprint(spr, "DIRECTION");
+    spr.setCursor(2, cy + 22);
+    kprint(spr, "DIR");
 
     // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : 0;
     bool lock = active ? has_est : false;
 
-    (void)sc; (void)lock;
+    (void)lock;
+
+    // ── Sample acquisition boxes — bottom of grid panel ──
+    {
+        int sc_count = active ? sample_count : 0;
+        (void)sc;
+        const int BOX     = 9;
+        const int BOX_GAP = 5;
+        int total_box_w   = LOC_MIN_SAMPLES_EST * BOX + (LOC_MIN_SAMPLES_EST - 1) * BOX_GAP;
+        int bx0 = cx - total_box_w / 2;
+        int by0 = DISP_H - BOX - 6;
+
+        for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
+            int bxi = bx0 + di * (BOX + BOX_GAP);
+            bool filled = di < sc_count;
+
+            uint16_t box_col;
+            if (filled) {
+                float pulse_t = sinf((float)now_ms * 0.004f) * 0.5f + 0.5f;
+                uint16_t dark_accent = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.4f);
+                box_col = lerp_col16(dark_accent, ACCENT_COLOR, pulse_t);
+            } else {
+                box_col = lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
+            }
+
+            spr.drawRect(bxi, by0, BOX, BOX, box_col);
+            if (filled) {
+                spr.drawLine(bxi + 1, by0 + 1, bxi + BOX - 2, by0 + BOX - 2, box_col);
+                spr.drawLine(bxi + BOX - 2, by0 + 1, bxi + 1, by0 + BOX - 2, box_col);
+            }
+        }
+    }
 
     // ── Right panel ──
-    int rx = 144;
+    int rx = 64;
     int rpx = rx + 4;
 
     // ── Status badge ──
@@ -4917,8 +4988,16 @@ void loop() {
                     
                     if (sim_wifi) {
                         log_detection("SIMULATION", "WIFI", random(-80, -30), fake_mac, "Test_WiFi", 6, 0, "Beacon", "manual_test", 100, 1);
+                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        session_flock_wifi--; session_wifi--; lifetime_wifi--;
+                        lifetime_flock_total--;
+                        xSemaphoreGive(dataMutex);
                     } else {
                         log_detection("SIMULATION", "BLE", random(-90, -40), fake_mac, "Test_BLE", 0, 0, "Adv", "manual_test", 100, 1);
+                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        session_flock_ble--; session_ble--; lifetime_ble--;
+                        lifetime_flock_total--;
+                        xSemaphoreGive(dataMutex);
                     }
                     // Set alarm trigger under mutex — both fields together,
                     // matching the producer pattern in process_wifi_event_queue
