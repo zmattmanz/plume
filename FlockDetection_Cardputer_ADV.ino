@@ -248,9 +248,9 @@ int  sd_write_count = 0;
 unsigned long last_sd_flush = 0;
 static int flash_write_fail_count = 0; 
 
-String current_log_file = "/FlockLog.csv";
-String current_pcap_file = "/Threats.pcap";
-String current_ble_pcap_file = "/BLE_Threats.pcap";
+String current_log_file = "/FLOCK/FlockLog.csv";
+String current_pcap_file = "/FLOCK/Threats.pcap";
+String current_ble_pcap_file = "/FLOCK/BLE_Threats.pcap";
 
 // Export server state
 static WebServer* export_server = nullptr;
@@ -4601,6 +4601,57 @@ void setup() {
     brightness_level = 2;
     apply_color_palette();
 
+    bool mount_success = false;
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);   // deselect SD before SPI init
+    delay(100);                       // let card power stabilize
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
+    static const uint32_t sd_speeds[] = {25000000, 20000000, 10000000, 4000000, 1000000};
+    for (int si = 0; si < 5 && !mount_success; si++) {
+        for (int attempt = 0; attempt < 3 && !mount_success; attempt++) {
+            if (SD.begin(SD_CS_PIN, SPI, sd_speeds[si])) { mount_success = true; }
+            else { SD.end(); delay(250); }
+        }
+    }
+    if (mount_success) {
+        sd_available = true;
+        if (!SD.exists("/FLOCK")) {
+            SD.mkdir("/FLOCK");
+        }
+        if (!SD.exists(current_log_file.c_str())) {
+            File file = SD.open(current_log_file.c_str(), FILE_WRITE);
+            if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
+        }
+        {
+            bool need_pcap_header = !SD.exists(current_pcap_file.c_str());
+            if (!need_pcap_header) {
+                File pcheck = SD.open(current_pcap_file.c_str(), FILE_READ);
+                if (pcheck) { if (pcheck.size() < 24) need_pcap_header = true; pcheck.close(); }
+            }
+            if (need_pcap_header) {
+                File pfile = SD.open(current_pcap_file.c_str(), FILE_WRITE);
+                if (pfile) {
+                    uint32_t pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x00000069};
+                    pfile.write((const uint8_t*)pcap_header, 24); pfile.close();
+                }
+            }
+        }
+        {
+            bool need_ble_header = !SD.exists(current_ble_pcap_file.c_str());
+            if (!need_ble_header) {
+                File bcheck = SD.open(current_ble_pcap_file.c_str(), FILE_READ);
+                if (bcheck) { if (bcheck.size() < 24) need_ble_header = true; bcheck.close(); }
+            }
+            if (need_ble_header) {
+                File bfile = SD.open(current_ble_pcap_file.c_str(), FILE_WRITE);
+                if (bfile) {
+                    uint32_t ble_pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x000000fb};
+                    bfile.write((const uint8_t*)ble_pcap_header, 24); bfile.close();
+                }
+            }
+        }
+    }
+
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
 
@@ -4639,37 +4690,6 @@ void setup() {
 
     lifetime_boots++;
     save_session_to_flash();
-
-    bool mount_success = false;
-    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
-    static const uint32_t sd_speeds[] = {4000000, 10000000, 20000000};
-    for (int si = 0; si < 3 && !mount_success; si++) {
-        for (int attempt = 0; attempt < 3 && !mount_success; attempt++) {
-            if (SD.begin(SD_CS_PIN, SPI, sd_speeds[si])) { mount_success = true; }
-            else { SD.end(); delay(80); }
-        }
-    }
-    if (mount_success) {
-        sd_available = true; current_log_file = "/FlockLog.csv";
-        if (!SD.exists(current_log_file.c_str())) {
-            File file = SD.open(current_log_file.c_str(), FILE_WRITE);
-            if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
-        }
-        if (!SD.exists(current_pcap_file.c_str())) {
-            File pfile = SD.open(current_pcap_file.c_str(), FILE_WRITE);
-            if (pfile) {
-                uint32_t pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x00000069};
-                pfile.write((const uint8_t*)pcap_header, 24); pfile.close();
-            }
-        }
-        if (!SD.exists(current_ble_pcap_file.c_str())) {
-            File bfile = SD.open(current_ble_pcap_file.c_str(), FILE_WRITE);
-            if (bfile) {
-                uint32_t ble_pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x000000fb};
-                bfile.write((const uint8_t*)ble_pcap_header, 24); bfile.close();
-            }
-        }
-    }
 
     session_start_time = millis();
 
