@@ -3164,7 +3164,7 @@ void draw_scanner_screen() {
         int wf_lock_w = wf_locked ? 14 : 0;
         int wf_text_w = wf_base_w + wf_lock_w;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, badge_y);
+        spr.setCursor(wf_text_x, badge_y + 1);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3177,7 +3177,7 @@ void draw_scanner_screen() {
     {
         int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, badge_y);
+        spr.setCursor(ble_text_x, badge_y + 1);
         spr.print("BLE");
     }
 
@@ -3494,7 +3494,7 @@ void draw_locator_screen() {
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
     // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 60;
+    const int GRID_RIGHT = 78;
     const int GRID_STEP  = 14;
     unsigned long now_ms = millis();
 
@@ -3527,7 +3527,7 @@ void draw_locator_screen() {
     // Solid vertical separator on right edge of grid panel
     spr.drawFastVLine(GRID_RIGHT, 18, DISP_H - 18, CARD_BORDER);
 
-    const int cx = 30, cy = 62;
+    const int cx = 39, cy = 62;
 
     // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
     static float ease_arrow = 0.0f;
@@ -3551,8 +3551,8 @@ void draw_locator_screen() {
     float ang = ease_arrow;
 
     // ── Compass rose ring ──
-    spr.drawCircle(cx, cy, 16, CARD_BORDER);
-    spr.drawCircle(cx, cy, 17, BG_COLOR);  // thin separation from arrow
+    spr.drawCircle(cx, cy, 18, CARD_BORDER);
+    spr.drawCircle(cx, cy, 19, BG_COLOR);  // thin separation from arrow
 
     // ── Arrow: cursor/pointer shape — 7-point polygon ──
     auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
@@ -3562,8 +3562,8 @@ void draw_locator_screen() {
     };
     // Local-space vertices (pointing up before rotation):
     //   0=tip, 1=right-outer, 2=right-inner, 3=right-base, 4=left-base, 5=left-inner, 6=left-outer
-    const float A_TIP_Y   = -18.0f, A_SHLDR_Y = -5.0f, A_BASE_Y = 11.5f;
-    const float A_HEAD_HW = 10.0f,  A_STEM_HW =  5.0f;
+    const float A_TIP_Y   = -20.5f, A_SHLDR_Y = -5.7f, A_BASE_Y = 13.0f;
+    const float A_HEAD_HW = 11.4f,  A_STEM_HW =  5.7f;
     const float lx7[7] = {  0,          A_HEAD_HW,  A_STEM_HW,  A_STEM_HW, -A_STEM_HW, -A_STEM_HW, -A_HEAD_HW };
     const float ly7[7] = { A_TIP_Y, A_SHLDR_Y, A_SHLDR_Y, A_BASE_Y,  A_BASE_Y, A_SHLDR_Y,  A_SHLDR_Y };
     int ax7[7], ay7[7];
@@ -3602,11 +3602,7 @@ void draw_locator_screen() {
         spr.drawLine(ax7[vi], ay7[vi], ax7[ni], ay7[ni], GPS_COLOR);
     }
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(2, cy + 22);
-    kprint(spr, "DIR");
-
-    // ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
+// ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
     int sc = active ? sample_count : 0;
     bool lock = active ? has_est : false;
 
@@ -3644,7 +3640,7 @@ void draw_locator_screen() {
     }
 
     // ── Right panel ──
-    int rx = 64;
+    int rx = 82;
     int rpx = rx + 4;
 
     // ── Status badge ──
@@ -3668,8 +3664,8 @@ void draw_locator_screen() {
         status_str[sizeof(status_str) - 1] = '\0';
     }
     {
-        int max_chars = (int)strlen(status_base) + (status_anim ? 3 : 0);
-        int box_w = max_chars * 8 + 12;
+        int max_chars_sb = (int)strlen(status_base) + (status_anim ? 3 : 0);
+        int box_w = max_chars_sb * 8 + 12;
         int avail_w = DISP_W - rpx - 2;
         if (box_w > avail_w) box_w = avail_w;
         uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
@@ -3681,70 +3677,81 @@ void draw_locator_screen() {
         spr.clearClipRect();
     }
 
-    // ── DISTANCE (primary — hero) ──
+    // ── TARGET (prominent — larger value text) ──
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(rpx, 46); kprint(spr, "DISTANCE");
+    spr.setCursor(rpx, 46); kprint(spr, "TARGET");
     {
-        int trend = (active && has_est) ? locator_distance_trend() : 0;
-        if (trend != 0) {
-            int tx = rpx + 64;
-            int ty = 46;
-            if (trend < 0) {
-                spr.fillTriangle(tx, ty, tx + 6, ty, tx + 3, ty + 6, ACCENT_COLOR);
-            } else {
-                spr.fillTriangle(tx, ty + 6, tx + 6, ty + 6, tx + 3, ty, CAUTION_COLOR);
-            }
-        }
-    }
-    {
-        float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(3);
-        spr.setCursor(rpx, 56);
-        if (sd < 0) {
-            spr.print("--");
-        } else {
-            char db[12];
-            if (sd < 100) snprintf(db, sizeof(db), "%.0f", sd);
-            else          snprintf(db, sizeof(db), "%.1f", sd / 1000.0f);
-            spr.print(db);
-            spr.setTextSize(1.2);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.print(sd < 100 ? "m" : "km");
-        }
-    }
-
-    // ── TARGET (secondary) ──
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(rpx, 88); kprint(spr, "TARGET");
-    {
-        char tname[15];
+        char tname[18];
         if (active) {
             bool nok = (target_name[0] != '\0'
                         && strcmp(target_name, "Hidden")  != 0
                         && strcmp(target_name, "Unknown") != 0);
             const char* src = nok ? target_name
                                    : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
-            strncpy(tname, src, 14); tname[14] = '\0';
+            strncpy(tname, src, 17); tname[17] = '\0';
         } else {
-            strncpy(tname, demo_name, 14); tname[14] = '\0';
+            strncpy(tname, demo_name, 17); tname[17] = '\0';
         }
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.2);
-        spr.setCursor(rpx, 99); spr.print(tname);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.5);
+        spr.setCursor(rpx, 58); spr.print(tname);
     }
 
-    // ── SIGNAL (tertiary) ──
+    // ── DISTANCE + SIGNAL on same line ──
     spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(rpx, 114); kprint(spr, "SIGNAL");
+    spr.setCursor(rpx, 80); kprint(spr, "DIST");
+
     {
+        int trend = (active && has_est) ? locator_distance_trend() : 0;
+        if (trend != 0) {
+            int tx = rpx + 34;
+            int ty = 80;
+            if (trend < 0) {
+                spr.fillTriangle(tx, ty, tx + 5, ty, tx + 2, ty + 5, ACCENT_COLOR);
+            } else {
+                spr.fillTriangle(tx, ty + 5, tx + 5, ty + 5, tx + 2, ty, CAUTION_COLOR);
+            }
+        }
+    }
+    {
+        float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
+        float sd_ft = sd * 3.28084f;
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(2);
+        spr.setCursor(rpx, 92);
+        if (sd < 0) {
+            spr.print("--");
+        } else {
+            char db[12];
+            if (sd < 300) {
+                snprintf(db, sizeof(db), "%.0f", sd_ft);
+                spr.print(db);
+                spr.setTextSize(1.2);
+                spr.setTextColor(DIM_COLOR, BG_COLOR);
+                spr.print("ft");
+            } else {
+                snprintf(db, sizeof(db), "%.1f", sd / 1000.0f);
+                spr.print(db);
+                spr.setTextSize(1.2);
+                spr.setTextColor(DIM_COLOR, BG_COLOR);
+                spr.print("km");
+            }
+        }
+    }
+
+    {
+        int sig_x = rpx + 80;
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+        spr.setCursor(sig_x, 80); kprint(spr, "SIGNAL");
+
         int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
         uint16_t sig_col;
         const char* sig_str;
-        if      (sr == -999)   { sig_str = "--";     sig_col = DIM_COLOR; }
-        else if (sr > -60)     { sig_str = "STRONG"; sig_col = ACCENT_COLOR; }
-        else if (sr > -80)     { sig_str = "MEDIUM"; sig_col = CAUTION_COLOR; }
-        else                   { sig_str = "WEAK";   sig_col = DIM_COLOR; }
+        if      (sr == -999) { sig_str = "--";     sig_col = DIM_COLOR; }
+        else if (sr > -60)   { sig_str = "STRONG"; sig_col = ACCENT_COLOR; }
+        else if (sr > -80)   { sig_str = "MED";    sig_col = CAUTION_COLOR; }
+        else                 { sig_str = "WEAK";   sig_col = DIM_COLOR; }
+
         spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(1.2);
-        spr.setCursor(rpx, 124); spr.print(sig_str);
+        spr.setCursor(sig_x, 92); spr.print(sig_str);
     }
 }
 
