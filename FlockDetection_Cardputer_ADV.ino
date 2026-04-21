@@ -1358,7 +1358,8 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
 
 static void feed_commit_pending() {
     unsigned long now = millis();
-    if (now - last_feed_push_ms < FEED_MIN_PUSH_INTERVAL_MS) return;
+    unsigned long interval = show_feed_expanded ? 400UL : FEED_MIN_PUSH_INTERVAL_MS;
+    if (now - last_feed_push_ms < interval) return;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (!feed_pending_valid) { xSemaphoreGive(dataMutex); return; }
     feed_head = (feed_head + 1) % FEED_SIZE;
@@ -2832,22 +2833,11 @@ void draw_scanner_screen() {
 
     // Top face fill and border — draw ellipse twice (y offset 1) for thicker rim
     spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(rcx, rcy - 1, radar_r, radar_r * TILT, HEADER_COLOR);
-    spr.drawEllipse(rcx, rcy,     radar_r, radar_r * TILT, HEADER_COLOR);
+    spr.drawEllipse(rcx, rcy - 1, radar_r, (int)(radar_r * TILT), HEADER_COLOR);
+    spr.drawEllipse(rcx, rcy,     radar_r, (int)(radar_r * TILT), HEADER_COLOR);
+    spr.drawEllipse(rcx, rcy + 1, radar_r, (int)(radar_r * TILT), HEADER_COLOR);
 
     // Hatching on both sides of the cylinder rim seam
-    {
-        const int HAT_TICKS = 20;
-        uint16_t hat_col = lgfx::color565(30, 60, 100);
-        for (int t = 0; t < HAT_TICKS; t++) {
-            float a  = (float)t / HAT_TICKS * (float)M_PI * 2.0f;
-            float ca = cosf(a), sa = sinf(a);
-            int ex = rcx + (int)(radar_r * ca);
-            int ey = rcy + (int)(radar_r * TILT * sa);
-            // Cylinder wall side only — inward ticks removed (caused top-face sections)
-            spr.drawLine(ex, ey + 1, ex, ey + 4, hat_col);
-        }
-    }
 
     // Redraw bottom rim so it shows over the top face fill — doubled for thickness
     spr.drawEllipse(rcx, rcy + THICKNESS,     radar_r, radar_r * TILT, DIM_COLOR);
@@ -2855,8 +2845,9 @@ void draw_scanner_screen() {
 
     // Structural ribs on left wall removed
 
-    spr.drawEllipse(rcx, rcy,     inner_r, inner_r * TILT, DIM_COLOR);
-    spr.drawEllipse(rcx, rcy - 1, inner_r, inner_r * TILT, DIM_COLOR);
+    spr.drawEllipse(rcx, rcy - 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
+    spr.drawEllipse(rcx, rcy,     inner_r, (int)(inner_r * TILT), DIM_COLOR);
+    spr.drawEllipse(rcx, rcy + 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
 
     float sweep_rad = (millis() / 3000.0f) * (float)M_PI * 2.0f;
 
@@ -3175,7 +3166,7 @@ void draw_scanner_screen() {
         int wf_lock_w = wf_locked ? 14 : 0;
         int wf_text_w = wf_base_w + wf_lock_w;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, badge_y + 4);
+        spr.setCursor(wf_text_x, badge_y + 3);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3188,7 +3179,7 @@ void draw_scanner_screen() {
     {
         int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, badge_y + 4);
+        spr.setCursor(ble_text_x, badge_y + 3);
         spr.print("BLE");
     }
 
@@ -3262,7 +3253,7 @@ void draw_scanner_screen() {
         const int feed_col_right  = DISP_W - 4;
         const int feed_row_h      = 12;
         const int max_visible     = 3;
-        const int feed_top_y      = 95;
+        const int feed_top_y      = 100;
         const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
         // Throttled display snapshot — only refreshes every 2 seconds.
@@ -4472,12 +4463,15 @@ void draw_feed_expanded_overlay() {
         spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
 
         // Render rows
-        const int row_h    = 16;
-        const int row_top  = hdr_y + 12;
-        const int max_rows = (DISP_H - row_top) / row_h;
+        const int row_top    = hdr_y + 12;
+        const int avail_h    = DISP_H - row_top;
+        const int max_rows   = 6;
+        const int row_h      = avail_h / max_rows;
+        const int row_pad    = avail_h - (max_rows * row_h);
+        const int row_top_adj = row_top + row_pad / 2;
 
         // Clip to row area to prevent slide animation from bleeding into headers
-        spr.setClipRect(0, row_top, DISP_W, DISP_H - row_top);
+        spr.setClipRect(0, row_top_adj, DISP_W, DISP_H - row_top_adj);
         int rendered = 0;
         for (int i = 0; i < local_count && rendered < max_rows; i++) {
             int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
@@ -4489,12 +4483,12 @@ void draw_feed_expanded_overlay() {
                     float st = (float)slide_elapsed / 300.0f;
                     float ease = 1.0f - (1.0f - st) * (1.0f - st);
                     int slide_offset = (int)((1.0f - ease) * (float)row_h);
-                    row_y = row_top - slide_offset;
+                    row_y = row_top_adj - slide_offset;
                 } else {
-                    row_y = row_top;
+                    row_y = row_top_adj;
                 }
             } else {
-                row_y = row_top + rendered * row_h;
+                row_y = row_top_adj + rendered * row_h;
             }
 
             // Type symbol color (Flock entries tinted toward ACCENT), faded in
