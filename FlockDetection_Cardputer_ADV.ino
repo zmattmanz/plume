@@ -3164,7 +3164,7 @@ void draw_scanner_screen() {
         int wf_lock_w = wf_locked ? 14 : 0;
         int wf_text_w = wf_base_w + wf_lock_w;
         int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, badge_y + 1);
+        spr.setCursor(wf_text_x, badge_y + 5);
         spr.print(wf_label);
         if (wf_locked) {
             spr.setTextColor(CAUTION_COLOR, wf_fill);
@@ -3177,7 +3177,7 @@ void draw_scanner_screen() {
     {
         int ble_text_w = 3 * 7;
         int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, badge_y + 1);
+        spr.setCursor(ble_text_x, badge_y + 5);
         spr.print("BLE");
     }
 
@@ -3427,10 +3427,6 @@ void draw_scanner_screen() {
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
 
-                // Subtle row separator
-                spr.drawFastHLine(feed_col_left, row_y + feed_row_h - 1,
-                                  feed_col_right - feed_col_left,
-                                  lerp_col16(BG_COLOR, CARD_BORDER, total_alpha * 0.4f));
             }
 
         }
