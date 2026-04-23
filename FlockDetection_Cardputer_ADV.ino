@@ -5286,12 +5286,6 @@ void setup() {
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
-    // Disable the task watchdog before LittleFS in case the partition is corrupt
-    // and needs a 15s format pass — the default watchdog would panic-reboot us
-    // mid-format and cause an infinite boot loop. A fresh watchdog is configured
-    // right before the long-running tasks start at the end of setup().
-    esp_task_wdt_deinit();
-
     // Robust LittleFS mount: try begin(true) which auto-formats on corruption.
     // If that fails (known ESP32-S3 issue where block 0x0 reports as bad),
     // manually erase the partition bytes and retry.
