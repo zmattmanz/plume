@@ -5163,6 +5163,17 @@ void setup() {
     // chargeLedTask (started just below) takes this mutex on every loop iteration.
     dataMutex = xSemaphoreCreateMutex();
 
+    // ── TEMPORARY: one-time LittleFS format to clear corruption ──
+    // REMOVE THIS BLOCK after one successful boot.
+    // Must run before any FreeRTOS tasks are spawned (chargeLedTask etc.)
+    // because flash erase operations are not safe while other tasks run.
+    Serial.begin(115200);
+    delay(100);
+    Serial.println("[FS] Formatting LittleFS (one-time repair)...");
+    LittleFS.format();
+    Serial.println("[FS] Format complete.");
+    // ── END TEMPORARY BLOCK ──
+
     // LED: start dark, then spawn the persistent breathing task.
     set_cardputer_led(0, 0, 0);
     // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
