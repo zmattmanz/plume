@@ -4910,6 +4910,9 @@ void transition_screen(int new_screen, int dir) {
 static int boot_prev_pct = -1;
 static float boot_eased_fill = 0.0f;
 static bool boot_first_draw = true;
+static int boot_prev_fill_w = 0;
+static char  boot_prev_digits[8]          = "";
+static unsigned long boot_digit_anim_ms[8] = {0};
 
 void draw_boot_screen(int pct, const char* status_text = nullptr) {
     auto& lcd = M5Cardputer.Display;
@@ -4924,14 +4927,14 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
     // Bar geometry
     const int bar_w = 180;
-    const int bar_h = 10;
+    const int bar_h = 14;
     const int bar_x = (DISP_W - bar_w) / 2;
     const int bar_y = 92;
     const int bar_r = bar_h / 2;
 
     // Number geometry
     const int num_y = 50;
-    const int num_w = 80;
+    const int num_w = 100;
     const int num_x = (DISP_W - num_w) / 2;
     const int num_h = 24;
 
@@ -4943,50 +4946,94 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     if (boot_first_draw) {
         lcd.fillScreen(bg);
 
-        // Version string (static)
-        lcd.setTextColor(dim, bg);
+        // Version string (static) — blue for pop against dark background
+        lcd.setTextColor(blue, bg);
         lcd.setTextSize(1);
         lcd.setTextDatum(TC_DATUM);
         lcd.drawString(VERSION_STRING, DISP_W / 2, 18);
 
-        // Bar outline (static)
-        lcd.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, blue);
+        // Bar outline — 2px stroke (outer + inset inner)
+        lcd.drawRoundRect(bar_x,     bar_y,     bar_w,     bar_h,     bar_r,     blue);
+        lcd.drawRoundRect(bar_x + 1, bar_y + 1, bar_w - 2, bar_h - 2, bar_r - 1, blue);
 
         boot_first_draw = false;
         boot_eased_fill = 0.0f;
+        boot_prev_fill_w = 0;
     }
 
-    // ── Update number only when pct changes ──
-    if (pct != boot_prev_pct) {
-        boot_prev_pct = pct;
+    // ── Per-digit roll-up animation with % symbol ──
+    {
+        char pct_str[8];
+        snprintf(pct_str, sizeof(pct_str), "%d%%", pct);
+        int n_chars = (int)strlen(pct_str);
 
+        if (pct != boot_prev_pct) {
+            for (int di = 0; di < n_chars && di < 8; di++) {
+                bool prev_exists = (di < (int)strlen(boot_prev_digits));
+                if (!prev_exists || pct_str[di] != boot_prev_digits[di]) {
+                    boot_digit_anim_ms[di] = millis();
+                }
+            }
+            strncpy(boot_prev_digits, pct_str, sizeof(boot_prev_digits) - 1);
+            boot_prev_digits[sizeof(boot_prev_digits) - 1] = '\0';
+            boot_prev_pct = pct;
+        }
+
+        // Clear the number area
         lcd.fillRect(num_x, num_y, num_w, num_h, bg);
 
-        char pct_str[8];
-        snprintf(pct_str, sizeof(pct_str), "%d", pct);
+        // Each character ~18px wide at textSize 3
+        const int char_w = 18;
+        int total_w = n_chars * char_w;
+        int start_x = (DISP_W - total_w) / 2;
+        const unsigned long ROLL_MS = 200;
+
+        lcd.setClipRect(num_x, num_y, num_w, num_h);
         lcd.setTextColor(white, bg);
         lcd.setTextSize(3);
-        lcd.setTextDatum(TC_DATUM);
-        lcd.drawString(pct_str, DISP_W / 2, num_y);
+        lcd.setTextDatum(TL_DATUM);
+
+        for (int di = 0; di < n_chars && di < 8; di++) {
+            int dx = start_x + di * char_w;
+
+            int y_off = 0;
+            if (boot_digit_anim_ms[di] > 0) {
+                unsigned long elapsed = millis() - boot_digit_anim_ms[di];
+                if (elapsed < ROLL_MS) {
+                    float t    = (float)elapsed / (float)ROLL_MS;
+                    float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                    y_off = (int)((1.0f - ease) * (float)num_h);
+                }
+            }
+
+            char ch[2] = { pct_str[di], '\0' };
+            lcd.drawString(ch, dx, num_y + y_off);
+        }
+
+        lcd.clearClipRect();
+        lcd.setTextDatum(TL_DATUM);
     }
 
-    // ── Update bar fill every frame (eased) ──
+    // ── Update bar fill (incremental — extend forward only, no clear) ──
     {
-        int target_fill = (pct * (bar_w - 4)) / 100;
+        int target_fill = (pct * (bar_w - 8)) / 100;
         float diff = (float)target_fill - boot_eased_fill;
         boot_eased_fill += diff * 0.3f;
         if (fabsf(diff) < 0.5f) boot_eased_fill = (float)target_fill;
         int fill_w = (int)(boot_eased_fill + 0.5f);
+        if (fill_w < 0) fill_w = 0;
 
-        lcd.fillRect(bar_x + 2, bar_y + 2, bar_w - 4, bar_h - 4, bg);
-        if (fill_w > 0) {
-            int fill_r = (bar_h - 4) / 2;
+        // Bar only grows during boot — never clear, just redraw from the origin so
+        // the rounded ends stay crisp as new pixels are added to the right.
+        if (fill_w > boot_prev_fill_w) {
+            int fill_r = (bar_h - 8) / 2;
             if (fill_r < 1) fill_r = 1;
             if (fill_w < fill_r * 2) {
-                lcd.fillRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, blue);
+                lcd.fillRect(bar_x + 4, bar_y + 4, fill_w, bar_h - 8, blue);
             } else {
-                lcd.fillRoundRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, fill_r, blue);
+                lcd.fillRoundRect(bar_x + 4, bar_y + 4, fill_w, bar_h - 8, fill_r, blue);
             }
+            boot_prev_fill_w = fill_w;
         }
     }
 
@@ -5200,6 +5247,24 @@ void setup() {
     system_fully_booted = true;
     boot_animate(100, "ready");
     delay(400);
+
+    // Gate: wait for the WiFi sniffer to confirm radios are up (~15 packets) or
+    // 4 seconds, whichever comes first. Pump event queues during the wait so the
+    // live feed buffer pre-populates before the scanner screen appears.
+    {
+        unsigned long feed_gate_start = millis();
+        const unsigned long FEED_GATE_MAX_MS = 4000;
+        while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
+            if (ambient_packet_count >= 15) break;
+            draw_boot_screen(100, "scanning...");
+            delay(30);
+            M5Cardputer.update();
+            process_wifi_event_queue();
+            feed_commit_pending();
+        }
+        // Reset so a later boot-screen draw (shouldn't happen) would repaint cleanly
+        boot_prev_fill_w = 0;
+    }
 
     // === Boot screen is done — now show the scanner ===
     draw_current_screen(); spr.pushSprite(0, 0);
