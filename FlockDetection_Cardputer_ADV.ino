@@ -5191,7 +5191,7 @@ void setup() {
     // the SPI peripheral can claim them cleanly — this is what the launcher
     // apps do implicitly via their init path. Then idle CS high and wait
     // 100ms for the card's internal controller to settle before clocking.
-    Serial.println("[SD] === Initializing SPI3 for SD Card ===");
+    Serial.println("[SD] === Initializing FSPI for SD Card ===");
 
     gpio_reset_pin((gpio_num_t)SD_SPI_SCK_PIN);   // GPIO40 — clear JTAG MTDO
     gpio_reset_pin((gpio_num_t)SD_SPI_MISO_PIN);  // GPIO39 — clear JTAG MTCK
@@ -5283,6 +5283,11 @@ void setup() {
     // mid-format and cause an infinite boot loop. A fresh watchdog is configured
     // right before the long-running tasks start at the end of setup().
     esp_task_wdt_deinit();
+
+    // ONE-TIME: force a LittleFS reformat to clear corruption from previous
+    // boots. Flash once with this line active, boot, then remove it and flash
+    // again so persistent state survives across reboots.
+    LittleFS.format();
 
     if (!LittleFS.begin(true)) {
         Serial.println("[FS] LittleFS format failed!");
