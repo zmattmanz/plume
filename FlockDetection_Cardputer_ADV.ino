@@ -1261,10 +1261,10 @@ static void sd_check_hotplug() {
     last_sd_check_ms = now;
 
     if (!sd_available) {
-        // Ask M5Unified's already-configured SD bus to re-mount. SD.begin() with
-        // no args uses the pins/SPI instance M5Cardputer.begin() set up.
+        // Pass SD_CS_PIN (GPIO 12) explicitly — no-arg SD.begin() defaults to
+        // GPIO 5, which the Cardputer doesn't use for SD and would silently fail.
         bool mounted = false;
-        if (SD.begin()) {
+        if (SD.begin(SD_CS_PIN)) {
             if (SD.cardType() != CARD_NONE) {
                 mounted = true;
             } else {
@@ -1566,11 +1566,11 @@ void flush_sd_buffer() {
             for (int i = 0; i < log_count; i++) file.println(local_log_buf[i]);
             file.close();
         } else if (sd_available) {
-            // Open failed on a card that should be present — treat as removal
-            sd_available = false;
-            SD.end();
+            // Soft failure: controller may be doing GC or a brief voltage dip.
+            // Don't tear down the SD connection — the 5s hot-plug probe owns the
+            // real removal check, and this write will retry on the next flush.
             set_toast_direct("SD WRITE FAIL", CAUTION_COLOR);
-            Serial.println("[SD] Write failed — card may have been removed");
+            Serial.println("[SD] Write failed — retrying next flush cycle");
         }
     }
 
