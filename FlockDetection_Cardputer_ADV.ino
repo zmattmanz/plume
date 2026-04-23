@@ -244,7 +244,6 @@ static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms
 // GLOBALS & STRUCTS
 // ============================================================================
 M5Canvas spr(&M5Cardputer.Display);
-SPIClass sdSPI(SPI3_HOST);  // dedicated SPI bus for SD — avoids conflict with display on SPI2
 
 TaskHandle_t ScannerTaskHandle;
 TaskHandle_t GPSTaskHandle; 
@@ -260,6 +259,11 @@ static uint32_t ble_scan_cycle = 0;
 static volatile uint32_t ambient_packet_count = 0;
 QueueHandle_t ble_event_queue;
 bool sd_available = false;
+
+// SD hot-plug state — poll every 5s to detect inserted/removed cards
+static unsigned long last_sd_check_ms = 0;
+static const unsigned long SD_CHECK_INTERVAL_MS = 5000;
+static bool sd_was_available = false;
 bool littlefs_available = false;
 volatile int trigger_alarm_confidence = 0;
 volatile int trigger_alarm_source = 0;   // 0 = WiFi, 1 = BLE
@@ -1245,6 +1249,89 @@ void save_stats_to_sd() {
     f.close();
 }
 
+// ── SD hot-plug: attempt remount when absent, detect silent removal ──────────
+// Called every SD_CHECK_INTERVAL_MS from loop(). When no card is present, tries
+// SD.begin() at 4 MHz then 20 MHz; on success, recreates the /FLOCK_FINDER
+// directory tree, writes PCAP headers, reloads history, and toasts. When a
+// card is present, probes a known file; if the open fails silently, treats it
+// as a removal.
+static void sd_check_hotplug() {
+    unsigned long now = millis();
+    if (now - last_sd_check_ms < SD_CHECK_INTERVAL_MS) return;
+    last_sd_check_ms = now;
+
+    if (!sd_available) {
+        // Ask M5Unified's already-configured SD bus to re-mount. SD.begin() with
+        // no args uses the pins/SPI instance M5Cardputer.begin() set up.
+        bool mounted = false;
+        if (SD.begin()) {
+            if (SD.cardType() != CARD_NONE) {
+                mounted = true;
+            } else {
+                SD.end();
+            }
+        }
+
+        if (!mounted) return;
+
+        sd_available = true;
+
+        if (!SD.exists("/FLOCK_FINDER"))          SD.mkdir("/FLOCK_FINDER");
+        if (!SD.exists("/FLOCK_FINDER/logs"))     SD.mkdir("/FLOCK_FINDER/logs");
+        if (!SD.exists("/FLOCK_FINDER/captures")) SD.mkdir("/FLOCK_FINDER/captures");
+        if (!SD.exists("/FLOCK_FINDER/stats"))    SD.mkdir("/FLOCK_FINDER/stats");
+
+        if (!SD.exists(current_log_file.c_str())) {
+            File f = SD.open(current_log_file.c_str(), FILE_WRITE);
+            if (f) {
+                f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM");
+                f.close();
+            }
+        }
+
+        auto ensure_pcap = [](const String& path, uint32_t link_type) {
+            bool need_hdr = !SD.exists(path.c_str());
+            if (!need_hdr) {
+                File pcheck = SD.open(path.c_str(), FILE_READ);
+                if (pcheck) { need_hdr = (pcheck.size() < 24); pcheck.close(); }
+            }
+            if (need_hdr) {
+                File pf = SD.open(path.c_str(), FILE_WRITE);
+                if (pf) {
+                    uint32_t hdr[6] = {0xa1b2c3d4, 0x00040002, 0, 0, 0x0000ffff, link_type};
+                    pf.write((const uint8_t*)hdr, 24);
+                    pf.close();
+                }
+            }
+        };
+        ensure_pcap(current_pcap_file,     0x00000069);  // WiFi 802.11
+        ensure_pcap(current_ble_pcap_file, 0x000000fb);  // Bluetooth LE
+
+        load_sd_history();
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        sd_hist_dirty = false;
+        xSemaphoreGive(dataMutex);
+
+        save_stats_to_sd();
+
+        set_toast_direct("SD CARD MOUNTED", ACCENT_COLOR);
+        Serial.println("[SD] Hot-plug mount succeeded");
+
+    } else {
+        // Card was present — probe a known file as a cheap presence check
+        File probe = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_READ);
+        if (!probe && sd_was_available) {
+            sd_available = false;
+            SD.end();
+            set_toast_direct("SD CARD REMOVED", CAUTION_COLOR);
+            Serial.println("[SD] Card removal detected");
+        }
+        if (probe) probe.close();
+    }
+
+    sd_was_available = sd_available;
+}
+
 void load_session_from_flash() {
     if (!LittleFS.exists(PERSIST_FILE)) return;
     File f = LittleFS.open(PERSIST_FILE, "r");
@@ -1478,6 +1565,12 @@ void flush_sd_buffer() {
         if (file) {
             for (int i = 0; i < log_count; i++) file.println(local_log_buf[i]);
             file.close();
+        } else if (sd_available) {
+            // Open failed on a card that should be present — treat as removal
+            sd_available = false;
+            SD.end();
+            set_toast_direct("SD WRITE FAIL", CAUTION_COLOR);
+            Serial.println("[SD] Write failed — card may have been removed");
         }
     }
 
@@ -5081,62 +5174,25 @@ void setup() {
     Serial.begin(115200); delay(200);
     boot_animate(5, "serial ok");
 
-    bool mount_success = false;
-    pinMode(SD_CS_PIN, OUTPUT);
-    digitalWrite(SD_CS_PIN, HIGH);   // deselect SD before SPI init
-    delay(100);                       // let card power stabilize
-    sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
     boot_animate(10, "SD card...");
 
-    Serial.println("[SD] === SD Card Mount Diagnostic ===");
-    Serial.printf("[SD] Pins: SCK=%d MISO=%d MOSI=%d CS=%d\n",
-                  SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
+    // M5Cardputer.begin() already initialized the microSD bus and mount state on
+    // SPI3 with the correct pins — we just check whether a card is present.
+    // Doing our own SPI.begin() + SD.begin() here used to race the M5Unified init
+    // and occasionally tripped the hardware watchdog.
+    Serial.println("[SD] === Checking SD Card via M5Unified ===");
 
-    // Probe CS pin connectivity
-    pinMode(SD_CS_PIN, OUTPUT);
-    digitalWrite(SD_CS_PIN, LOW);  delay(1);
-    int cs_low  = digitalRead(SD_CS_PIN);
-    digitalWrite(SD_CS_PIN, HIGH); delay(1);
-    int cs_high = digitalRead(SD_CS_PIN);
-    Serial.printf("[SD] CS pin test: LOW=%d HIGH=%d (expect 0,1)\n", cs_low, cs_high);
-
-    static const uint32_t sd_speeds[] = {25000000, 20000000, 10000000, 4000000, 1000000};
-    for (int si = 0; si < 5 && !mount_success; si++) {
-        for (int attempt = 0; attempt < 3 && !mount_success; attempt++) {
-            Serial.printf("[SD] Speed=%luHz attempt=%d... ", sd_speeds[si], attempt + 1);
-            if (SD.begin(SD_CS_PIN, sdSPI, sd_speeds[si])) {
-                mount_success = true;
-                Serial.printf("OK! Type=%d Size=%lluMB\n",
-                              SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
-                if (SD.cardType() == CARD_NONE) {
-                    Serial.println("[SD] WARNING: cardType=CARD_NONE — card present but unreadable");
-                    mount_success = false;
-                    SD.end();
-                }
-            } else {
-                Serial.println("FAIL");
-                SD.end();
-                delay(250);
-            }
-        }
-        draw_boot_screen(10 + si * 4, "SD card...");
-    }
-    if (!mount_success) {
-        Serial.println("[SD] ALL ATTEMPTS FAILED");
-        Serial.println("[SD] Checklist:");
-        Serial.println("[SD]   1. Is a microSD card physically inserted?");
-        Serial.println("[SD]   2. Is the card formatted as FAT32?");
-        Serial.println("[SD]   3. Is the card < 32GB? (SDXC/exFAT not supported)");
-        Serial.println("[SD]   4. Try a different card");
-    }
-
-    if (mount_success) {
+    if (SD.cardType() != CARD_NONE) {
         sd_available = true;
+        Serial.printf("[SD] OK! Type=%d Size=%lluMB\n",
+                      SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
+
         if (!SD.exists("/FLOCK_FINDER"))           SD.mkdir("/FLOCK_FINDER");
         if (!SD.exists("/FLOCK_FINDER/logs"))      SD.mkdir("/FLOCK_FINDER/logs");
         if (!SD.exists("/FLOCK_FINDER/captures"))  SD.mkdir("/FLOCK_FINDER/captures");
         if (!SD.exists("/FLOCK_FINDER/stats"))     SD.mkdir("/FLOCK_FINDER/stats");
         Serial.println("[SD] Directory structure OK");
+
         if (!SD.exists(current_log_file.c_str())) {
             File file = SD.open(current_log_file.c_str(), FILE_WRITE);
             if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
@@ -5169,8 +5225,14 @@ void setup() {
                 }
             }
         }
+    } else {
+        sd_available = false;
+        Serial.println("[SD] Mount failed. No card detected or format unsupported.");
     }
     boot_animate(35, sd_available ? "SD mounted" : "no SD card");
+    // Seed hot-plug state so the first poll doesn't fire a spurious "mounted" toast
+    sd_was_available = sd_available;
+    last_sd_check_ms = millis();
 
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
@@ -5701,6 +5763,9 @@ void loop() {
     if (millis() - last_time_save >= 1000) { xSemaphoreTake(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGive(dataMutex); last_time_save = millis(); }
     if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) save_session_to_flash();
     rssi_track_expire();
+
+    // SD hot-plug: periodically attempt remount if card is absent, or probe if present
+    sd_check_hotplug();
 
     if (millis() - last_sd_flush_check >= 500) {
         last_sd_flush_check = millis(); 
