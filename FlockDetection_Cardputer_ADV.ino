@@ -14,6 +14,7 @@
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "esp_task_wdt.h"
+#include "esp_partition.h"
 #include "driver/gpio.h"
 #include <SPI.h>
 #include <SD.h>
@@ -5163,17 +5164,6 @@ void setup() {
     // chargeLedTask (started just below) takes this mutex on every loop iteration.
     dataMutex = xSemaphoreCreateMutex();
 
-    // ── TEMPORARY: one-time LittleFS format to clear corruption ──
-    // REMOVE THIS BLOCK after one successful boot.
-    // Must run before any FreeRTOS tasks are spawned (chargeLedTask etc.)
-    // because flash erase operations are not safe while other tasks run.
-    Serial.begin(115200);
-    delay(100);
-    Serial.println("[FS] Formatting LittleFS (one-time repair)...");
-    LittleFS.format();
-    Serial.println("[FS] Format complete.");
-    // ── END TEMPORARY BLOCK ──
-
     // LED: start dark, then spawn the persistent breathing task.
     set_cardputer_led(0, 0, 0);
     // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
@@ -5302,11 +5292,39 @@ void setup() {
     // right before the long-running tasks start at the end of setup().
     esp_task_wdt_deinit();
 
-    if (!LittleFS.begin(false)) {
-        Serial.println("[FS] LittleFS mount failed!");
-        littlefs_available = false;
+    // Robust LittleFS mount: try begin(true) which auto-formats on corruption.
+    // If that fails (known ESP32-S3 issue where block 0x0 reports as bad),
+    // manually erase the partition bytes and retry.
+    if (!LittleFS.begin(true)) {
+        Serial.println("[FS] LittleFS begin(true) failed — erasing partition...");
+        const esp_partition_t* part = esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+        if (part) {
+            Serial.printf("[FS] Erasing partition '%s' (%lu bytes)...\n",
+                          part->label, (unsigned long)part->size);
+            esp_err_t err = esp_partition_erase_range(part, 0, part->size);
+            if (err == ESP_OK) {
+                Serial.println("[FS] Partition erased. Retrying mount...");
+                if (LittleFS.begin(true)) {
+                    Serial.println("[FS] LittleFS recovered after partition erase");
+                    littlefs_available = true;
+                } else {
+                    Serial.println("[FS] LittleFS still failed after erase!");
+                    littlefs_available = false;
+                }
+            } else {
+                Serial.printf("[FS] Partition erase failed: %d\n", err);
+                littlefs_available = false;
+            }
+        } else {
+            Serial.println("[FS] No spiffs partition found in partition table!");
+            littlefs_available = false;
+        }
     } else {
         littlefs_available = true;
+    }
+
+    if (littlefs_available) {
         load_session_from_flash();
         load_detections_from_flash();
     }
@@ -5323,7 +5341,9 @@ void setup() {
     }
 
     lifetime_boots++;
-    save_session_to_flash();
+    if (littlefs_available) {
+        save_session_to_flash();
+    }
     session_start_time = millis();
 
     // WiFi promiscuous mode — complete before scanner screen appears
