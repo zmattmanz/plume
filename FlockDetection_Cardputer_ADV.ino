@@ -5291,8 +5291,8 @@ void setup() {
     // right before the long-running tasks start at the end of setup().
     esp_task_wdt_deinit();
 
-    if (!LittleFS.begin(true)) {
-        Serial.println("[FS] LittleFS format failed!");
+    if (!LittleFS.begin(false)) {
+        Serial.println("[FS] LittleFS mount failed!");
         littlefs_available = false;
     } else {
         littlefs_available = true;
