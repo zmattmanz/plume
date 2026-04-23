@@ -512,10 +512,6 @@ void beep(int frequency, int duration_ms) {
     }
 }
 
-void speaker_off() { 
-    M5Cardputer.Speaker.stop(); 
-}
-
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
     neopixelWrite(21, r, g, b);
 }
@@ -2998,7 +2994,7 @@ void draw_scanner_screen() {
                  rcx + (int)((radar_r - 1) * cosf(sweep_rad)),
                  rcy + (int)((radar_r - 1) * sinf(sweep_rad) * TILT), HEADER_COLOR);
 
-    float angle_step = (float)M_PI * 2.0f / NUM_RADIAL_BANDS; bool any_active = false;
+    float angle_step = (float)M_PI * 2.0f / NUM_RADIAL_BANDS;
 
     const float BLIP_RELIGHT_ARC = 0.20f;
     for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
@@ -3018,7 +3014,6 @@ void draw_scanner_screen() {
 
     for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
         float a = i * angle_step;
-        if (local_spikes[i] > 0.1f) any_active = true;
         if (local_spikes[i] > 0) {
             bool is_strong = (local_spikes[i] > 0.8f);
 
@@ -3292,7 +3287,6 @@ void draw_scanner_screen() {
         const int feed_row_h      = 12;
         const int max_visible     = 3;
         const int feed_top_y      = 100;
-        const int feed_bottom_y   = feed_top_y + max_visible * feed_row_h;
 
         // Throttled display snapshot — only refreshes every 2 seconds.
         // Eliminates flicker caused by rapid feed_entries mutations between frames.
@@ -3452,13 +3446,6 @@ void draw_scanner_screen() {
 
 }
 
-// FNV-1a 32-bit hash of MAC address → 6 uppercase hex chars (deterministic, no storage)
-void mac_to_short_id(const char* mac, char* out7) {
-    uint32_t h = 2166136261UL;
-    for (const char* p = mac; *p; p++) { h ^= (uint8_t)*p; h *= 16777619UL; }
-    snprintf(out7, 7, "%06X", h & 0xFFFFFF);
-}
-
 void draw_locator_screen() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     bool active=locator_active, has_est=locator_has_estimate;
@@ -3468,7 +3455,6 @@ void draw_locator_screen() {
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
     bool has_loc   = gps.location.isValid();
     float gps_course = gps.course.deg();
-    unsigned long newest_ms = locator_newest_sample_ms;
     int sample_count = locator_sample_count;
     int target_rssi = 0; bool has_rssi = false;
     for (int _i = 0; _i < rssi_tracker_count; _i++) {
@@ -3480,8 +3466,6 @@ void draw_locator_screen() {
     }
     xSemaphoreGive(dataMutex);
 
-    unsigned long est_age_ms = (has_est && newest_ms > 0) ? (millis() - newest_ms) : 0;
-    bool est_stale = has_est && (est_age_ms > 60000UL);
     bool demo = !active;
     const char* demo_name = "Pixel-6A-7F";
     const int   demo_rssi = -67;
@@ -3598,16 +3582,9 @@ void draw_locator_screen() {
         spr.drawLine(ax7[vi], ay7[vi], ax7[ni], ay7[ni], GPS_COLOR);
     }
 
-// ── Sample boxes: GPS_COLOR, bottom of left panel, centered, thick X ──
-    int sc = active ? sample_count : 0;
-    bool lock = active ? has_est : false;
-
-    (void)lock;
-
     // ── Sample acquisition boxes — bottom of grid panel ──
     {
         int sc_count = active ? sample_count : 0;
-        (void)sc;
         const int BOX     = 9;
         const int BOX_GAP = 5;
         int total_box_w   = LOC_MIN_SAMPLES_EST * BOX + (LOC_MIN_SAMPLES_EST - 1) * BOX_GAP;
@@ -3812,7 +3789,7 @@ void draw_capture_history_screen() {
         bool selected = (i == history_selected_idx);
 
         // Pull fields from whichever source
-        const char* e_type;  uint16_t e_conf_col;
+        const char* e_type;
         char e_mac[18], e_name[32], e_method[24];
         int e_rssi, e_conf;
 
@@ -5088,6 +5065,12 @@ void loop() {
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
                 // On other screens, 'g' is currently a no-op.
+            }
+            else if (c == 'h') {
+                if (current_screen == 1) {
+                    show_locator_help = !show_locator_help;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                }
             }
             else if (c == 'l') {
                 // Instant locator stop from any screen. No-op when inactive.
