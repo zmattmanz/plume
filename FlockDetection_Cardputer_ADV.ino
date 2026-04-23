@@ -245,7 +245,9 @@ static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms
 // GLOBALS & STRUCTS
 // ============================================================================
 M5Canvas spr(&M5Cardputer.Display);
-SPIClass sdSPI(SPI3_HOST);  // dedicated SPI3 bus for the microSD card — keeps it off the display's SPI
+SPIClass sdSPI(FSPI);  // FSPI (SPI2_HOST) — matches the bmorcelli Launcher reference;
+                       // M5GFX talks to the display via the ESP-IDF SPI driver directly, so
+                       // sharing FSPI with a separate Arduino SPIClass for SD is safe.
 
 TaskHandle_t ScannerTaskHandle;
 TaskHandle_t GPSTaskHandle; 
