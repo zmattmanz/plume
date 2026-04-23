@@ -149,23 +149,21 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
         cx += 6 + extra;
     }
 }
+
+static void safe_copy(char* dest, const char* src, size_t dest_size) {
+    if (dest_size == 0) return;
+    strncpy(dest, src, dest_size - 1);
+    dest[dest_size - 1] = '\0';
+}
 #define GPS_RX_PIN   15  
 #define GPS_TX_PIN   13   
 #define GPS_BAUD     115200 
-
-#define LOW_FREQ  200
-#define HIGH_FREQ 800
-#define DETECT_FREQ 1000
-#define DETECT_FREQ_HIGH 1200
-#define DETECT_FREQ_CERTAIN 1500
 
 #define MAX_CHANNEL 13
 #define BLE_SCAN_DURATION 2
 #define BLE_SCAN_INTERVAL      3000   // normal inter-scan gap (ms)
 #define BLE_SCAN_INTERVAL_LOCK  800   // boosted gap during 10s channel lock window
 #define BUZZER_COOLDOWN 60000
-#define BOOT_BEEP_DURATION 300
-#define DETECT_BEEP_DURATION 150
 #define IGNORE_WEAK_RSSI -80
 
 #define MAX_LOG_BUFFER 10
@@ -187,7 +185,6 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
 
 #define LOC_MAX_SAMPLES 40
 #define LOC_SAMPLE_INTERVAL 500
-#define LOC_PATH_LOSS_N 2.5
 #define LOC_MIN_SAMPLES_EST 3
 
 #define SCORE_DEFINITIVE 100  
@@ -234,7 +231,6 @@ static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
 static uint32_t ble_scan_cycle = 0;
 static volatile uint32_t ambient_packet_count = 0;
-#define BLE_MAX_CONCURRENT_TASKS 6
 QueueHandle_t ble_event_queue;
 bool sd_available = false;
 bool littlefs_available = false;
@@ -425,7 +421,6 @@ static FeedEntry feed_entries[FEED_SIZE];
 static int feed_count = 0;
 static int feed_head  = 0;
 static unsigned long last_feed_push_ms = 0;
-static unsigned long feed_last_shift_ms = 0;
 static FeedEntry feed_pending;
 static bool feed_pending_valid = false;
 
@@ -443,6 +438,7 @@ struct RSSITrack {
 };
 RSSITrack rssi_tracker[RSSI_TRACK_MAX_DEVICES];
 int rssi_tracker_count = 0;
+static int locator_tracker_idx = -1;  // cached index into rssi_tracker for locator target
 
 struct LocSample { 
     double lat; 
@@ -458,7 +454,6 @@ char locator_target_type[8]  = "";   // "WiFi", "BLE", or ""
 LocSample locator_samples[LOC_MAX_SAMPLES];
 int locator_sample_count = 0;
 unsigned long locator_last_sample = 0;
-unsigned long locator_start_time = 0;
 unsigned long locator_newest_sample_ms = 0;  
 
 double locator_est_lat = 0.0;
@@ -857,13 +852,6 @@ const char* confidence_label(int score) {
     return "LOW";
 }
 
-uint16_t confidence_color(int score) {
-    if (score >= CONFIDENCE_CERTAIN) return ACCENT_COLOR;
-    if (score >= CONFIDENCE_HIGH)    return CAUTION_COLOR;
-    if (score >= CONFIDENCE_ALARM_THRESHOLD) return CAUTION_COLOR;
-    return TEXT_COLOR;
-}
-
 void write_threat_pcap(const uint8_t* payload, uint32_t length) {
     if (!sd_available) return;
     uint32_t capture_len = (length > 256) ? 256 : length;
@@ -1233,6 +1221,9 @@ void rssi_track_update(const char* mac, int rssi) {
                 rssi_tracker[i].scored = false;
             }
             rssi_tracker[i].last_seen = now;
+            if (locator_active && strncmp(rssi_tracker[i].mac, locator_target_mac, 17) == 0) {
+                locator_tracker_idx = i;
+            }
             xSemaphoreGive(dataMutex);
             return;
         }
@@ -1292,6 +1283,9 @@ void rssi_track_expire() {
         if ((now - rssi_tracker[i].last_seen) > RSSI_TRACK_EXPIRY_MS) {
             for (int j = i; j < rssi_tracker_count - 1; j++) rssi_tracker[j] = rssi_tracker[j + 1];
             rssi_tracker_count--;
+            // Keep locator_tracker_idx consistent across the array shift
+            if (locator_tracker_idx == i)       locator_tracker_idx = -1;
+            else if (locator_tracker_idx > i)   locator_tracker_idx--;
         }
     }
     xSemaphoreGive(dataMutex);
@@ -1364,7 +1358,6 @@ static void feed_commit_pending() {
     if (feed_count < FEED_SIZE) feed_count++;
     feed_pending_valid = false;
     last_feed_push_ms  = now;
-    feed_last_shift_ms = now;
     xSemaphoreGive(dataMutex);
 }
 
@@ -1584,16 +1577,11 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         sd_hist_dirty = true;
     }
 
-    strncpy(last_cap_type,       type,             sizeof(last_cap_type) - 1);
-    last_cap_type[sizeof(last_cap_type) - 1] = '\0';
-    strncpy(last_cap_mac,        mac,              sizeof(last_cap_mac) - 1);
-    last_cap_mac[sizeof(last_cap_mac) - 1] = '\0';
-    strncpy(last_cap_name,       name,             sizeof(last_cap_name) - 1);
-    last_cap_name[sizeof(last_cap_name) - 1] = '\0';
-    strncpy(last_cap_time,       current_time,     sizeof(last_cap_time) - 1);
-    last_cap_time[sizeof(last_cap_time) - 1] = '\0';
-    strncpy(last_cap_det_method, detection_method, sizeof(last_cap_det_method) - 1);
-    last_cap_det_method[sizeof(last_cap_det_method) - 1] = '\0';
+    safe_copy(last_cap_type,       type,             sizeof(last_cap_type));
+    safe_copy(last_cap_mac,        mac,              sizeof(last_cap_mac));
+    safe_copy(last_cap_name,       name,             sizeof(last_cap_name));
+    safe_copy(last_cap_time,       current_time,     sizeof(last_cap_time));
+    safe_copy(last_cap_det_method, detection_method, sizeof(last_cap_det_method));
     last_cap_rssi       = rssi;
     last_cap_confidence = confidence;
     last_cap_seq_num    = seq_num;
@@ -1607,13 +1595,11 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     // Heavy work outside mutex
     if (is_new && sd_available) {
         char clean_name[64];
-        strncpy(clean_name, name, sizeof(clean_name) - 1);
-        clean_name[sizeof(clean_name) - 1] = '\0';
+        safe_copy(clean_name, name, sizeof(clean_name));
         for (char* p = clean_name; *p; p++) if (*p == ',') *p = ' ';
 
         char clean_extra[64];
-        strncpy(clean_extra, extra_data, sizeof(clean_extra) - 1);
-        clean_extra[sizeof(clean_extra) - 1] = '\0';
+        safe_copy(clean_extra, extra_data, sizeof(clean_extra));
         for (char* p = clean_extra; *p; p++) if (*p == ',') *p = ' ';
 
         // Brief window: GPS snapshot
@@ -1776,10 +1762,11 @@ void locator_start(const char* mac, const char* name, const char* type = "") {
     locator_sample_count = 0; locator_has_estimate = false; locator_peak_rssi = -120;
     locator_estimate_announced = false;
     locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
-    locator_start_time = millis(); locator_newest_sample_ms = 0;
+    locator_newest_sample_ms = 0;
     locator_dist_history_count = 0;
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
+    locator_tracker_idx = -1;
     xSemaphoreGive(dataMutex);
 }
 
@@ -1791,6 +1778,7 @@ void locator_stop() {
     locator_dist_history_count = 0;
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
+    locator_tracker_idx = -1;
     xSemaphoreGive(dataMutex);
 }
 
@@ -2808,6 +2796,7 @@ void draw_scanner_screen() {
     int divider_x = 112;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
+    unsigned long frame_ms = millis();
     spr.setClipRect(0, 18, divider_x, DISP_H - 18);
     
     float TILT = 0.55f;
@@ -2843,7 +2832,7 @@ void draw_scanner_screen() {
     spr.drawEllipse(rcx, rcy,     inner_r, (int)(inner_r * TILT), DIM_COLOR);
     spr.drawEllipse(rcx, rcy + 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
 
-    float sweep_rad = (millis() / 3000.0f) * (float)M_PI * 2.0f;
+    float sweep_rad = (frame_ms / 3000.0f) * (float)M_PI * 2.0f;
 
     static bool p_init = false;
     if (!p_init) {
@@ -2968,8 +2957,8 @@ void draw_scanner_screen() {
         }
     }
 
-    uint16_t modulated_col = (sinf(millis() / 500.0f) > 0) ? HEADER_COLOR : DIM_COLOR;
-    float breathe   = sinf(millis() / 500.0f);
+    float breathe = sinf(frame_ms / 500.0f);
+    uint16_t modulated_col = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
     int dynamic_r   = (radar_r - 6) + (int)(4 * breathe);
     float cos_rot   = cosf(hud_rotation);
     float sin_rot   = sinf(hud_rotation);
@@ -3086,14 +3075,13 @@ void draw_scanner_screen() {
     // Pad channel to 2 digits for fixed pill width (prevents layout jumps
     // when cycling between channel 9 and 10)
     char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi:%2d", current_channel);
-    bool wf_locked = (millis() < channel_lock_until);
+    bool wf_locked = (frame_ms < channel_lock_until);
     // Fixed width: "WiFi: 12" = 8 chars + optional " L" (2) padding always applied
     int wf_seg_w = 10 * 6 + 14;  // +4 more horizontal
     int ble_seg_w = 40;            // +4 more horizontal
 
-    bool ble_scan_window_active = (pBLEScan != nullptr && pBLEScan->isScanning());
-    bool ble_pulse_on = ble_scan_window_active && (((millis() / 500) % 2) == 0);
-    float ble_pulse_t = ble_scan_window_active ? (ble_pulse_on ? 1.0f : 0.35f) : 0.18f;
+    bool ble_pulse_on = ble_active && (((frame_ms / 500) % 2) == 0);
+    float ble_pulse_t = ble_active ? (ble_pulse_on ? 1.0f : 0.35f) : 0.18f;
     uint16_t ble_badge_col = lerp_col16(CARD_BORDER, ble_col, ble_pulse_t);
 
     uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
@@ -3198,8 +3186,8 @@ void draw_scanner_screen() {
         static long prev_sw = 0, prev_sb = 0;
         static unsigned long sw_anim_start = 0, sb_anim_start = 0;
         const unsigned long ROLL_DURATION = 300;
-        if (sw_local != prev_sw) { sw_anim_start = millis(); prev_sw = sw_local; }
-        if (sb_local != prev_sb) { sb_anim_start = millis(); prev_sb = sb_local; }
+        if (sw_local != prev_sw) { sw_anim_start = frame_ms; prev_sw = sw_local; }
+        if (sb_local != prev_sb) { sb_anim_start = frame_ms; prev_sb = sb_local; }
 
         // ── WIFI label ──
         spr.setTextSize(1.2);
@@ -3217,7 +3205,7 @@ void draw_scanner_screen() {
 
         // WIFI number with roll animation
         {
-            unsigned long sw_elapsed = millis() - sw_anim_start;
+            unsigned long sw_elapsed = frame_ms - sw_anim_start;
             int num_clip_y = stats_num_y;
             int num_h = 24;  // textSize(3) height
             spr.setClipRect(col1_x + 20, num_clip_y, 40, num_h);
@@ -3254,7 +3242,7 @@ void draw_scanner_screen() {
 
         // BLE number with roll animation
         {
-            unsigned long sb_elapsed = millis() - sb_anim_start;
+            unsigned long sb_elapsed = frame_ms - sb_anim_start;
             int num_clip_y = stats_num_y;
             int num_h = 24;
             spr.setClipRect(col2_x + 20, num_clip_y, 40, num_h);
@@ -3299,7 +3287,7 @@ void draw_scanner_screen() {
         static unsigned long display_shift_ms = 0;
         static bool display_first_shown = false;
 
-        unsigned long local_now = millis();
+        unsigned long local_now = frame_ms;
         const unsigned long FEED_DISPLAY_REFRESH_MS = 2000;
 
         if ((local_now - display_last_refresh) >= FEED_DISPLAY_REFRESH_MS || !display_ever_populated) {
@@ -3356,7 +3344,6 @@ void draw_scanner_screen() {
                     row_y = feed_top_y + i * feed_row_h;
                 }
 
-                float row_alpha = 1.0f;  // always fully opaque — no animation needed
 
                 // Age-based fade-out (separate from shift animation)
                 unsigned long age = local_now - e.timestamp;
@@ -3366,7 +3353,7 @@ void draw_scanner_screen() {
                 else                    age_fade = 0.0f;
                 if (age_fade < 0.10f) continue;
 
-                float total_alpha = age_fade * row_alpha;
+                float total_alpha = age_fade;
 
                 // Type prefix color
                 uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
@@ -3449,20 +3436,19 @@ void draw_scanner_screen() {
 void draw_locator_screen() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     bool active=locator_active, has_est=locator_has_estimate;
-    char target_mac[18];  strncpy(target_mac,  locator_target_mac,  sizeof(target_mac)  - 1); target_mac[sizeof(target_mac)-1]   = '\0';
-    char target_name[65]; strncpy(target_name, locator_target_name, sizeof(target_name) - 1); target_name[sizeof(target_name)-1] = '\0';
+    char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
+    char target_name[65]; safe_copy(target_name, locator_target_name, sizeof(target_name));
     float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
     bool has_loc   = gps.location.isValid();
     float gps_course = gps.course.deg();
     int sample_count = locator_sample_count;
     int target_rssi = 0; bool has_rssi = false;
-    for (int _i = 0; _i < rssi_tracker_count; _i++) {
-        if (strncmp(rssi_tracker[_i].mac, locator_target_mac, 17) == 0
-            && rssi_tracker[_i].sample_count > 0) {
-            target_rssi = rssi_tracker[_i].samples[rssi_tracker[_i].sample_count - 1];
-            has_rssi = true; break;
-        }
+    if (locator_tracker_idx >= 0 && locator_tracker_idx < rssi_tracker_count
+        && rssi_tracker[locator_tracker_idx].sample_count > 0) {
+        target_rssi = rssi_tracker[locator_tracker_idx].samples[
+            rssi_tracker[locator_tracker_idx].sample_count - 1];
+        has_rssi = true;
     }
     xSemaphoreGive(dataMutex);
 
@@ -3633,8 +3619,7 @@ void draw_locator_screen() {
         snprintf(status_str, sizeof(status_str), "%s%s", status_base,
                  nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
     } else {
-        strncpy(status_str, status_base, sizeof(status_str) - 1);
-        status_str[sizeof(status_str) - 1] = '\0';
+        safe_copy(status_str, status_base, sizeof(status_str));
     }
     {
         int max_chars_sb = (int)strlen(status_base) + (status_anim ? 3 : 0);
@@ -3661,9 +3646,9 @@ void draw_locator_screen() {
                         && strcmp(target_name, "Unknown") != 0);
             const char* src = nok ? target_name
                                    : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
-            strncpy(tname, src, 17); tname[17] = '\0';
+            safe_copy(tname, src, sizeof(tname));
         } else {
-            strncpy(tname, demo_name, 17); tname[17] = '\0';
+            safe_copy(tname, demo_name, sizeof(tname));
         }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.5);
         spr.setCursor(rpx, 58); spr.print(tname);
@@ -3977,6 +3962,7 @@ void draw_capture_history_screen() {
 void draw_gps_screen() {
     spr.fillSprite(BG_COLOR);
     draw_header_spr(3);
+    unsigned long frame_ms = millis();
 
     bool has_loc, stale, speed_valid;
     int sats;
@@ -4000,7 +3986,7 @@ void draw_gps_screen() {
     // TILT: X-axis — north pole backward; ROLL: Z-axis — axis diagonal upper-left→lower-right
     const float TILT  = -0.30f;
     const float ROLL  =  0.45f;
-    float rot = fmodf((float)millis() / 8000.0f, 1.0f) * 2.0f * (float)M_PI;
+    float rot = fmodf((float)frame_ms / 8000.0f, 1.0f) * 2.0f * (float)M_PI;
 
     float sr = sinf(rot),  cr = cosf(rot);
     float st = sinf(TILT), ct = cosf(TILT);
@@ -4129,7 +4115,7 @@ void draw_gps_screen() {
             }
 
             // Draw satellite dots with motion trails
-            float orbit_t = (float)millis() * pl.speed + pl.phase_off;
+            float orbit_t = (float)frame_ms * pl.speed + pl.phase_off;
             for (int si = 0; si < pl.n_sats; si++) {
                 float base_ang = orbit_t + (float)si / (float)pl.n_sats * 2.0f * (float)M_PI;
                 // Motion trail: 4 ghost dots fading behind
@@ -4185,7 +4171,7 @@ void draw_gps_screen() {
         else                        { status_base = "GPS";           status_col = GPS_COLOR; status_anim = true; }
         char status_str[22];
         if (status_anim) {
-            int nd = (int)(millis() / 500) % 4;
+            int nd = (int)(frame_ms / 500) % 4;
             snprintf(status_str, sizeof(status_str), "%s%s", status_base,
                      nd==0?"":nd==1?".":nd==2?"..":"...");
         } else {
@@ -4276,7 +4262,7 @@ void draw_device_info_screen() {
     spr.setCursor(COL_L + 4, row_sess_y + 4); kprint(spr, "SESSION");
     {
         char sess_buf[9];
-        format_time_buf((millis() - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
+        format_time_buf((frame_ms - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
         spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
         spr.setCursor(COL_L + 4, row_sess_y + 14); spr.print(sess_buf);
     }
