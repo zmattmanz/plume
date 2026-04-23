@@ -10,6 +10,7 @@
 #include <NimBLEAdvertisedDevice.h>
 #include <vector>
 #include <algorithm>
+#include <new>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "esp_task_wdt.h"
@@ -982,7 +983,7 @@ bool export_mode_start() {
     IPAddress ip = WiFi.localIP();
     snprintf(export_ip_str, sizeof(export_ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 
-    export_server = new WebServer(80);
+    export_server = new(std::nothrow) WebServer(80);
     if (!export_server) {
         set_toast_direct("EXPORT ALLOC FAIL", CAUTION_COLOR);
         // Restore promiscuous sniffing — same restoration the connect-fail path does.
@@ -1287,6 +1288,10 @@ void rssi_track_expire() {
             if (locator_tracker_idx == i)       locator_tracker_idx = -1;
             else if (locator_tracker_idx > i)   locator_tracker_idx--;
         }
+    }
+    // Re-validate after all shifts — defensive against combined adjustments
+    if (locator_tracker_idx >= rssi_tracker_count) {
+        locator_tracker_idx = -1;
     }
     xSemaphoreGive(dataMutex);
 }
@@ -1756,9 +1761,9 @@ void locator_add_sample(const char* mac, int rssi) {
 void locator_start(const char* mac, const char* name, const char* type = "") {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     locator_active = true;
-    strncpy(locator_target_mac,  mac,  sizeof(locator_target_mac)  - 1); locator_target_mac[17]  = '\0';
-    strncpy(locator_target_name, name, sizeof(locator_target_name) - 1); locator_target_name[64] = '\0';
-    strncpy(locator_target_type, type, sizeof(locator_target_type) - 1); locator_target_type[7]  = '\0';
+    safe_copy(locator_target_mac,  mac,  sizeof(locator_target_mac));
+    safe_copy(locator_target_name, name, sizeof(locator_target_name));
+    safe_copy(locator_target_type, type, sizeof(locator_target_type));
     locator_sample_count = 0; locator_has_estimate = false; locator_peak_rssi = -120;
     locator_estimate_announced = false;
     locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
@@ -1925,6 +1930,8 @@ void process_wifi_event_queue() {
 
         clean_device_name_char(local.ssid);
 
+        int  mac_score     = check_mac_prefix_tiered(local.mac);
+
         // Push to live feed (every observed device, preview flock status)
         {
             char mac_str_feed[18];
@@ -1933,17 +1940,15 @@ void process_wifi_event_queue() {
                      local.mac[0], local.mac[1], local.mac[2],
                      local.mac[3], local.mac[4], local.mac[5]);
             const char* feed_name = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
-            int  preview_mac_score = check_mac_prefix_tiered(local.mac);
             bool preview_is_flock  = (strlen(local.ssid) > 0
                                       && (is_flock_ssid_format(local.ssid)
                                           || check_ssid_pattern(local.ssid)))
-                                     || preview_mac_score == 1;
+                                     || mac_score == 1;
             feed_push_candidate(mac_str_feed, feed_name, local.rssi, 0, preview_is_flock);
         }
 
         int  confidence    = 0;
         char methods[64]   = {0};
-        int  mac_score     = check_mac_prefix_tiered(local.mac);
         bool ssid_generic  = (strlen(local.ssid) > 0 && check_ssid_pattern(local.ssid));
         bool ssid_flock_fmt = (strlen(local.ssid) > 0 && is_flock_ssid_format(local.ssid));
 
@@ -2066,7 +2071,7 @@ static void ble_worker_task(void* pvParameters) {
                      "%02x:%02x:%02x:%02x:%02x:%02x",
                      ev->mac[0], ev->mac[1], ev->mac[2],
                      ev->mac[3], ev->mac[4], ev->mac[5]);
-            bool preview_is_flock = (check_mac_prefix_tiered(ev->mac) == 1
+            bool preview_is_flock = (mac_score == 1
                                      || check_device_name_pattern(dev_name_char)
                                      || is_penguin_numeric_name(dev_name_char));
             feed_push_candidate(mac_str_feed,
@@ -2393,20 +2398,16 @@ void draw_header_spr(int screen_num) {
     const uint16_t ICON_COL = lgfx::color565(255, 255, 255);
 
     bool gps_lock_now;
+    bool cooldown_now;
+    unsigned long cooldown_elapsed = 0;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
+    cooldown_elapsed = millis() - last_buzzer_time;
+    cooldown_now = (last_buzzer_time > 0) && (cooldown_elapsed < BUZZER_COOLDOWN);
     xSemaphoreGive(dataMutex);
     bool muted_now = is_muted;
 
     ease_muted += ((muted_now ? 1.0f : 0.0f) - ease_muted) * 0.12f;
-
-    // Alarm cooldown state: fires during the 60s window after a detection alarm
-    bool cooldown_now;
-    unsigned long cooldown_elapsed = 0;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    cooldown_elapsed = millis() - last_buzzer_time;
-    cooldown_now = (last_buzzer_time > 0) && (cooldown_elapsed < BUZZER_COOLDOWN);
-    xSemaphoreGive(dataMutex);
 
     static float ease_cooldown = 0.0f;
     ease_cooldown += ((cooldown_now ? 1.0f : 0.0f) - ease_cooldown) * 0.08f;
@@ -4982,10 +4983,11 @@ void loop() {
                     target_select_idx = (target_select_idx + 1) % current_hist_count;
                     char t_mac[18];  strncpy(t_mac,  capture_history[target_select_idx].mac,  17); t_mac[17]  = '\0';
                     char t_name[65]; strncpy(t_name, capture_history[target_select_idx].name, 64); t_name[64] = '\0';
+                    char t_type[16]; strncpy(t_type, capture_history[target_select_idx].type, 15); t_type[15] = '\0';
                     int t_conf = capture_history[target_select_idx].confidence;
                     xSemaphoreGive(dataMutex);
-                    
-                    locator_start(t_mac, t_name, capture_history[target_select_idx].type);
+
+                    locator_start(t_mac, t_name, t_type);
                     trigger_toast("TARGET", t_name, t_conf);
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
