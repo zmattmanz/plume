@@ -1262,10 +1262,11 @@ static void sd_check_hotplug() {
     last_sd_check_ms = now;
 
     if (!sd_available) {
-        // Remount via the same dedicated sdSPI bus setup() uses. No-arg SD.begin
-        // or the default global SPI route to wrong pins on the Cardputer.
+        // Remount via the same dedicated sdSPI bus setup() uses at the same
+        // 15 MHz rate. No-arg SD.begin or the default global SPI route to
+        // wrong pins on the Cardputer.
         bool mounted = false;
-        if (SD.begin(SD_CS_PIN, sdSPI, 20000000)) {
+        if (SD.begin(SD_CS_PIN, sdSPI, 15000000)) {
             if (SD.cardType() != CARD_NONE) {
                 mounted = true;
             } else {
@@ -5177,14 +5178,19 @@ void setup() {
 
     boot_animate(10, "SD card...");
 
-    // Route a dedicated SPI3 instance to the Cardputer's SD pins so the mount
-    // doesn't race the display bus that M5Cardputer.begin() owns. 20 MHz matches
-    // MSLauncher's stable operating point.
-    Serial.println("[SD] === Initializing SPI & SD Card ===");
+    // Route a dedicated SPI3 instance to the Cardputer's SD pins. 15 MHz is
+    // the FAT32 sweet spot — slow enough for marginal cards, fast enough for
+    // pcap flushes. Manually idle CS high before SPI.begin so the card sees a
+    // clean deselect during the bus init.
+    Serial.println("[SD] === Initializing SPI3 for SD Card ===");
+
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
+    delay(10);
 
     sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
 
-    if (SD.begin(SD_CS_PIN, sdSPI, 20000000)) {
+    if (SD.begin(SD_CS_PIN, sdSPI, 15000000)) {
         sd_available = true;
         Serial.printf("[SD] OK! Type=%d Size=%lluMB\n",
                       SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
@@ -5229,7 +5235,7 @@ void setup() {
         }
     } else {
         sd_available = false;
-        Serial.println("[SD] Mount failed. Check insertion or format.");
+        Serial.println("[SD] Mount failed. Verify card is FAT32 and fully inserted.");
     }
     boot_animate(35, sd_available ? "SD mounted" : "no SD card");
     // Seed hot-plug state so the first poll doesn't fire a spurious "mounted" toast
@@ -5305,7 +5311,6 @@ void setup() {
 
     // Tasks and watchdog
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    esp_task_wdt_deinit();
     esp_task_wdt_config_t wdt_cfg = {
         .timeout_ms = 10000,
         .idle_core_mask = 0,
