@@ -40,7 +40,8 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
 void beep(int frequency, int duration_ms);
 void apply_color_palette();
 void draw_help_overlay();
-void draw_locator_help_overlay();
+void draw_menu_overlay();
+void handle_menu_select();
 void draw_feed_expanded_overlay();
 void draw_gps_screen();
 void load_sd_history();
@@ -70,11 +71,19 @@ static bool ambient_mode = false;
 
 unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
-bool show_locator_help = false;  // 'h' on locator screen
 static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
 bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
+
+// ── Menu overlay state ──
+static bool show_menu = false;
+static int  menu_selected = 0;
+static unsigned long menu_open_ms = 0;
+#define MENU_ITEM_COUNT 10
+
+// Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
+static bool low_power_mode = false;
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
 static float ease_muted = 0.0f;
@@ -254,6 +263,13 @@ static WebServer* export_server = nullptr;
 static bool export_mode_active = false;
 static unsigned long export_mode_started_at = 0;
 static const unsigned long EXPORT_MODE_MAX_MS = 600000UL;  // 10 min auto-exit
+
+// Non-blocking WiFi-connect state machine for export mode.
+// While export_connecting is true, loop() polls WiFi.status() instead of
+// blocking the main thread so keyboard/feed/alarm handling stay live.
+static bool export_connecting = false;
+static unsigned long export_connect_start_ms = 0;
+static const unsigned long EXPORT_CONNECT_TIMEOUT_MS = 5000UL;
 static char export_ssid[33] = "";  // configured WiFi SSID (persisted)
 static char export_pass[65] = "";  // configured WiFi password (persisted)
 static char export_ip_str[20] = "0.0.0.0";
@@ -947,55 +963,30 @@ void export_server_setup_routes() {
     });
 }
 
-bool export_mode_start() {
-    if (export_mode_active) return true;
-    if (strlen(export_ssid) == 0) {
-        set_toast_direct("NO WIFI CONFIGURED", CAUTION_COLOR);
-        return false;
-    }
-
-    // Shut down promiscuous sniffing before joining a network
-    esp_wifi_set_promiscuous(false);
+// Restore the promiscuous sniffer after export mode is finished or aborted.
+static void export_restore_promiscuous() {
     WiFi.disconnect(true);
     delay(100);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(export_ssid, export_pass);
+    wifi_promiscuous_filter_t pf_restore;
+    pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&pf_restore);
+    esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+}
 
-    unsigned long connect_start = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - connect_start) < 15000) {
-        delay(100);
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-        set_toast_direct("WIFI CONNECT FAIL", CAUTION_COLOR);
-        // Restore sniffing
-        WiFi.disconnect(true);
-        delay(100);
-        WiFi.mode(WIFI_STA);
-        wifi_promiscuous_filter_t pf_restore; pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-        esp_wifi_set_promiscuous_filter(&pf_restore);
-        esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
-        esp_wifi_set_promiscuous(true);
-        esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
-        return false;
-    }
-
+// Finish the connect sequence once WiFi.status() == WL_CONNECTED.
+// Returns true on success, false if server allocation failed (in which case
+// promiscuous has already been restored and a toast has been shown).
+static bool export_finalize_connect() {
     IPAddress ip = WiFi.localIP();
     snprintf(export_ip_str, sizeof(export_ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 
     export_server = new(std::nothrow) WebServer(80);
     if (!export_server) {
         set_toast_direct("EXPORT ALLOC FAIL", CAUTION_COLOR);
-        // Restore promiscuous sniffing — same restoration the connect-fail path does.
-        WiFi.disconnect(true);
-        delay(100);
-        WiFi.mode(WIFI_STA);
-        wifi_promiscuous_filter_t pf_restore;
-        pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-        esp_wifi_set_promiscuous_filter(&pf_restore);
-        esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
-        esp_wifi_set_promiscuous(true);
-        esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+        export_restore_promiscuous();
         return false;
     }
     export_server_setup_routes();
@@ -1010,21 +1001,60 @@ bool export_mode_start() {
     return true;
 }
 
+// Kick off the WiFi connect. Returns true if the attempt was started; the
+// caller should not assume export_mode_active is set on return. The
+// non-blocking poll in loop() (export_tick_connect) completes or aborts it.
+bool export_mode_start() {
+    if (export_mode_active || export_connecting) return true;
+    if (strlen(export_ssid) == 0) {
+        set_toast_direct("NO WIFI CONFIGURED", CAUTION_COLOR);
+        return false;
+    }
+
+    // Shut down promiscuous sniffing before joining a network
+    esp_wifi_set_promiscuous(false);
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(export_ssid, export_pass);
+
+    export_connecting = true;
+    export_connect_start_ms = millis();
+    set_toast_direct("CONNECTING...", GPS_COLOR);
+    return true;
+}
+
+// Called every loop() iteration while a connect attempt is pending.
+// Transitions to active on success or restores sniffer + toast on timeout.
+void export_tick_connect() {
+    if (!export_connecting) return;
+    if (WiFi.status() == WL_CONNECTED) {
+        export_connecting = false;
+        export_finalize_connect();
+        return;
+    }
+    if (millis() - export_connect_start_ms >= EXPORT_CONNECT_TIMEOUT_MS) {
+        export_connecting = false;
+        set_toast_direct("WIFI CONNECT FAIL", CAUTION_COLOR);
+        export_restore_promiscuous();
+    }
+}
+
 void export_mode_stop() {
+    // Cancel a pending connect attempt.
+    if (export_connecting) {
+        export_connecting = false;
+        export_restore_promiscuous();
+        set_toast_direct("EXPORT CANCELLED", DIM_COLOR);
+        return;
+    }
     if (!export_mode_active) return;
     if (export_server) {
         export_server->stop();
         delete export_server;
         export_server = nullptr;
     }
-    WiFi.disconnect(true);
-    delay(100);
-    WiFi.mode(WIFI_STA);
-    wifi_promiscuous_filter_t pf; pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-    esp_wifi_set_promiscuous_filter(&pf);
-    esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+    export_restore_promiscuous();
     export_mode_active = false;
     set_toast_direct("EXPORT MODE OFF", DIM_COLOR);
 }
@@ -2285,7 +2315,8 @@ void ScannerLoopTask(void* pvParameters) {
         esp_task_wdt_reset();
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
-            if (now - last_channel_hop > CHANNEL_DWELL_MS) {
+            unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
+            if (now - last_channel_hop > dwell) {
                 current_channel++; 
                 if (current_channel > MAX_CHANNEL) current_channel = 1;
                 esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); 
@@ -2293,20 +2324,23 @@ void ScannerLoopTask(void* pvParameters) {
             }
         }
 
+        unsigned long base_interval = low_power_mode ? 6000UL : BLE_SCAN_INTERVAL;
         unsigned long ble_interval = ((long)(now - channel_lock_until) < 0)
             ? BLE_SCAN_INTERVAL_LOCK
-            : BLE_SCAN_INTERVAL;
+            : base_interval;
 
+        bool scanning = pBLEScan->isScanning();
         if (millis() - last_ble_scan >= ble_interval) {
-            if (!pBLEScan->isScanning()) {
-                bool active = (ble_scan_cycle % 3 == 0);
+            if (!scanning) {
+                bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
                 pBLEScan->setActiveScan(active);
                 pBLEScan->start(BLE_SCAN_DURATION, false);
                 last_ble_scan = millis();
                 ble_scan_cycle++;
+                scanning = true;  // we just started
             }
         }
-        if (!pBLEScan->isScanning() && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
+        if (!scanning && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
             pBLEScan->clearResults();
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -2431,13 +2465,14 @@ void draw_header_spr(int screen_num) {
             uint16_t color;
             bool pulse;
         };
-        ModeBadge badges[3] = {
-            { night_mode,     "N", HEADER_COLOR, false },
-            { stealth_mode,   "S", DIM_COLOR,    false },
-            { locator_active, "L", HEADER_COLOR, true  },
+        ModeBadge badges[4] = {
+            { night_mode,      "N", HEADER_COLOR, false },
+            { stealth_mode,    "S", DIM_COLOR,    false },
+            { locator_active,  "L", HEADER_COLOR, true  },
+            { low_power_mode,  "P", ACCENT_COLOR, false },
         };
 
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             if (!badges[i].active) continue;
 
             uint16_t fg = badges[i].color;
@@ -2647,54 +2682,43 @@ void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
 }
 
 void draw_help_overlay() {
+    // Fade-in: 150ms quadratic ease-out (matches menu/feed overlay style)
     unsigned long elapsed = millis() - help_ease_start;
-    float target = 1.0f;
-    if (elapsed < 80) {
-        float t = (float)elapsed / 80.0f;
-        target = 1.0f - (1.0f - t) * (1.0f - t);
+    const unsigned long HELP_ANIM_MS = 150UL;
+    float alpha = 1.0f;
+    if (elapsed < HELP_ANIM_MS) {
+        float t = (float)elapsed / (float)HELP_ANIM_MS;
+        alpha = 1.0f - (1.0f - t) * (1.0f - t);
     }
-    help_ease += (target - help_ease) * 0.5f;
-    if (help_ease > 1.0f) help_ease = 1.0f;
-    if (help_ease < 0.02f) return;
+    if (alpha < 0.02f) return;
 
-    for (int dy = 18; dy < DISP_H; dy += 2) {
-        uint16_t bg = lerp_col16(BG_COLOR, lgfx::color565(0, 0, 0), help_ease * 0.5f);
-        spr.drawFastHLine(0, dy, DISP_W, bg);
-    }
+    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    int full_w = DISP_W - 20;
-    int full_h = DISP_H - 28;
-    int panel_w = (int)(full_w * help_ease);
-    int panel_h = (int)(full_h * help_ease);
-    int panel_x = (DISP_W - panel_w) / 2;
-    int panel_y = 18 + (full_h - panel_h) / 2;
+    // Solid backdrop below header (like expanded feed)
+    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
-    uint16_t panel_bg = lerp_col16(BG_COLOR, CARD_COLOR, help_ease);
-    uint16_t panel_border = lerp_col16(BG_COLOR, HEADER_COLOR, help_ease);
-    spr.fillRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_bg);
-    spr.drawRoundRect(panel_x, panel_y, panel_w, panel_h, 6, panel_border);
-
-    if (help_ease < 0.3f) return;
+    // Subtitle in header area (overwrite screen name)
+    spr.fillRect(0, 0, 80, 18, BG_COLOR);
+    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), BG_COLOR);
+    spr.setTextSize(1.2);
+    spr.setCursor(4, 5);
+    kprint(spr, "KEYS");
 
     struct HelpKey { const char* key; const char* desc; };
     const HelpKey* keys;
     int key_count;
-    const char* title;
 
     static const HelpKey global_keys[] = {
+        {"m",    "Menu"},
         {"</>",  "Prev/Next"},
-        {"1-5",  "Jump screen"},
-        {"ESC",  "Scanner"},
-        {"TAB",  "Close help"},
-        {"m/q",  "Mute"},
-        {";/.",  "Vol/scroll"},
-        {"n",    "Night"},
+        {"ESC",  "Home"},
+        {"DEL",  "Back/Close"},
+        {"`",    "Mute"},
+        {";/.",  "Volume"},
         {"s",    "Stealth"},
-        {"b",    "Brightness"},
         {"\\",   "LED"},
-        {"e",    "Export"},
         {"f",    "Feed view"},
-        {"o",    "Reset sess"},
+        {"TAB",  "This help"},
     };
 
     static const HelpKey scanner_keys[] = {
@@ -2707,87 +2731,212 @@ void draw_help_overlay() {
         {"g", "N-mode"},
     };
     static const HelpKey detections_keys[] = {
-        {";/.", "Navigate"},
+        {"-/+", "Navigate"},
         {"ENT", "Detail"},
         {"DEL", "Close"},
     };
     static const HelpKey gps_keys[] = {
-        {"(info)", ""},
+        {"", "No keys"},
     };
     static const HelpKey devinfo_keys[] = {
-        {";/.", "Scroll"},
+        {"-/+", "Scroll"},
     };
 
     switch (current_screen) {
-        case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys) / sizeof(scanner_keys[0]);       title = "SCANNER"; break;
-        case 1: keys = locator_keys;    key_count = sizeof(locator_keys) / sizeof(locator_keys[0]);       title = "LOCATOR"; break;
-        case 2: keys = detections_keys; key_count = sizeof(detections_keys) / sizeof(detections_keys[0]); title = "DETECT"; break;
-        case 3: keys = gps_keys;        key_count = sizeof(gps_keys) / sizeof(gps_keys[0]);               title = "GPS"; break;
-        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys) / sizeof(devinfo_keys[0]);       title = "STATS"; break;
-        default: keys = scanner_keys; key_count = 0; title = "HELP"; break;
+        case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys)/sizeof(scanner_keys[0]);       break;
+        case 1: keys = locator_keys;    key_count = sizeof(locator_keys)/sizeof(locator_keys[0]);       break;
+        case 2: keys = detections_keys; key_count = sizeof(detections_keys)/sizeof(detections_keys[0]); break;
+        case 3: keys = gps_keys;        key_count = sizeof(gps_keys)/sizeof(gps_keys[0]);               break;
+        case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys)/sizeof(devinfo_keys[0]);       break;
+        default: keys = scanner_keys; key_count = 0; break;
     }
 
-    spr.setTextSize(1.2);
-    spr.setTextColor(HEADER_COLOR, panel_bg);
-    spr.setCursor(panel_x + 6, panel_y + 5);
-    kprint(spr, title);
-    spr.drawFastHLine(panel_x + 4, panel_y + 14, panel_w - 8, CARD_BORDER);
-
     const int ROW_H = 10;
-    int col_left_x  = panel_x + 6;
-    int col_right_x = panel_x + panel_w / 2 + 2;
-    int row_y = panel_y + 18;
+    const int col_left_x  = 6;
+    const int col_right_x = DISP_W / 2 + 4;
+    int row_y;
 
-    // No "SCREEN" label — the per-screen keys are clear from context
-    // since the screen title is already in the help panel's header bar.
+    // ── Left column: screen-specific keys ──
+    row_y = 24;
+    spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
+    spr.setTextSize(1.2);
+    spr.setCursor(col_left_x, row_y);
+    kprint(spr, "SCREEN");
+    row_y += ROW_H + 2;
 
-    for (int i = 0; i < key_count && row_y < panel_y + panel_h - 8; i++) {
-        spr.setTextColor(HEADER_COLOR, panel_bg);
+    for (int i = 0; i < key_count && row_y < DISP_H - 12; i++) {
+        spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
         spr.setCursor(col_left_x, row_y);
         spr.print(keys[i].key);
-        spr.setTextColor(TEXT_COLOR, panel_bg);
+        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
         spr.setCursor(col_left_x + 28, row_y);
         spr.print(keys[i].desc);
         row_y += ROW_H;
     }
 
-    row_y = panel_y + 18;
-    spr.setTextColor(ACCENT_COLOR, panel_bg);
-    spr.setCursor(col_right_x, row_y); kprint(spr, "GLOBAL");
-    row_y += ROW_H;
+    // ── Right column: global keys ──
+    row_y = 24;
+    spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
+    spr.setTextSize(1.2);
+    spr.setCursor(col_right_x, row_y);
+    kprint(spr, "GLOBAL");
+    row_y += ROW_H + 2;
 
     int global_count = sizeof(global_keys) / sizeof(global_keys[0]);
-    for (int i = 0; i < global_count && row_y < panel_y + panel_h - 8; i++) {
-        spr.setTextColor(HEADER_COLOR, panel_bg);
+    for (int i = 0; i < global_count && row_y < DISP_H - 12; i++) {
+        spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
         spr.setCursor(col_right_x, row_y);
         spr.print(global_keys[i].key);
-        spr.setTextColor(TEXT_COLOR, panel_bg);
+        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
         spr.setCursor(col_right_x + 28, row_y);
         spr.print(global_keys[i].desc);
         row_y += ROW_H;
     }
 
-    spr.setTextColor(DIM_COLOR, panel_bg);
-    spr.setCursor(panel_x + 6, panel_y + panel_h - 8);
-    spr.print("TAB=close");
+    // Footer
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(6, DISP_H - 10);
+    spr.print("TAB or DEL to close");
 }
 
-void draw_locator_help_overlay() {
-    spr.fillRoundRect(62, 22, DISP_W - 66, DISP_H - 28, 5, lgfx::color565(10, 15, 25));
-    spr.drawRoundRect(62, 22, DISP_W - 66, DISP_H - 28, 5, HEADER_COLOR);
-    spr.fillRect(62, 22, 4, DISP_H - 28, HEADER_COLOR);
-    spr.setTextColor(HEADER_COLOR); spr.setTextSize(1);
-    spr.setCursor(70, 28); spr.print("LOCATOR KEYS");
-    spr.drawLine(62, 38, DISP_W - 4, 38, CARD_BORDER);
-    spr.setTextColor(TEXT_COLOR);
-    spr.setCursor(68, 42);  spr.print("l : start/stop track");
-    spr.setCursor(68, 52);  spr.print("t : cycle target");
-    spr.setCursor(68, 62);  spr.print("arrow = bearing");
-    spr.setCursor(68, 72);  spr.print("N   = true north");
-    spr.setCursor(68, 82);  spr.print("blue rim = GPS lock");
-    spr.setCursor(68, 92);  spr.print("amber = stale data");
-    spr.setTextColor(DIM_COLOR);
-    spr.setCursor(68, 107); spr.print("h to close");
+void draw_menu_overlay() {
+    unsigned long now_ms = millis();
+
+    // Fade-in: 150ms quadratic ease-out (matches help/feed overlay)
+    const unsigned long MENU_ANIM_MS = 150UL;
+    unsigned long age = now_ms - menu_open_ms;
+    float alpha = 1.0f;
+    if (age < MENU_ANIM_MS) {
+        float t = (float)age / (float)MENU_ANIM_MS;
+        alpha = 1.0f - (1.0f - t) * (1.0f - t);
+    }
+    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+
+    // Solid backdrop below header
+    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
+
+    // Overwrite the screen name area with "MENU"
+    spr.fillRect(0, 0, 80, 18, BG_COLOR);
+    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), BG_COLOR);
+    spr.setTextSize(1.2);
+    spr.setCursor(4, 5);
+    kprint(spr, "MENU");
+
+    struct MenuLine {
+        const char* label;
+        const char* right_text;
+        uint16_t    accent;
+    };
+
+    char night_label[20], lp_label[20], mute_label[20];
+    snprintf(night_label, sizeof(night_label), "Night Mode: %s", night_mode ? "ON" : "OFF");
+    snprintf(lp_label,    sizeof(lp_label),    "Low Power: %s",  low_power_mode ? "ON" : "OFF");
+    snprintf(mute_label,  sizeof(mute_label),  "Mute: %s",       is_muted ? "ON" : "OFF");
+
+    MenuLine items[MENU_ITEM_COUNT] = {
+        {"Scanner",       "1",  CAUTION_COLOR},
+        {"Locator",       "2",  GPS_COLOR},
+        {"Detections",    "3",  TEAL_COLOR},
+        {"GPS",           "4",  GPS_COLOR},
+        {"Stats",         "5",  ACCENT_COLOR},
+        {night_label,     "",   HEADER_COLOR},
+        {lp_label,        "",   HEADER_COLOR},
+        {mute_label,      "",   HEADER_COLOR},
+        {"WiFi Config",   "",   CAUTION_COLOR},
+        {"Export Data",   "",   export_mode_active ? ACCENT_COLOR : DIM_COLOR},
+    };
+
+    if (menu_selected < 0) menu_selected = 0;
+    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
+
+    const int row_h    = 11;
+    const int row_gap  = 1;
+    const int start_y  = 22;
+    const int left_bar = 3;
+
+    for (int i = 0; i < MENU_ITEM_COUNT; i++) {
+        int y = start_y + i * (row_h + row_gap);
+        bool sel = (i == menu_selected);
+
+        uint16_t row_bg = sel ? ea(CARD_BORDER) : BG_COLOR;
+        spr.fillRect(0, y, DISP_W, row_h, row_bg);
+        spr.fillRect(0, y, left_bar, row_h, ea(items[i].accent));
+
+        if (sel) {
+            spr.fillRect(0, y, left_bar + 2, row_h, ea(HEADER_COLOR));
+            int ay = y + row_h / 2;
+            for (int p = 0; p < 3; p++) {
+                spr.drawLine(left_bar + 3 + p, ay - (2 - p),
+                             left_bar + 3 + p, ay + (2 - p), ea(HEADER_COLOR));
+            }
+        }
+
+        int text_x = sel ? left_bar + 8 : left_bar + 4;
+        spr.setTextColor(sel ? ea(TEXT_COLOR) : ea(DIM_COLOR), row_bg);
+        spr.setTextSize(1.2);
+        spr.setCursor(text_x, y + 2);
+        spr.print(items[i].label);
+
+        if (items[i].right_text[0]) {
+            spr.setTextColor(ea(DIM_COLOR), row_bg);
+            spr.setCursor(DISP_W - 14, y + 2);
+            spr.print(items[i].right_text);
+        }
+    }
+
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(4, DISP_H - 10);
+    spr.print(";/. nav  ENTER select  DEL close");
+}
+
+void handle_menu_select() {
+    switch (menu_selected) {
+        case 0: case 1: case 2: case 3: case 4: {
+            int target = menu_selected;
+            show_menu = false;
+            transition_screen(target, (target >= current_screen) ? 1 : -1);
+            break;
+        }
+        case 5:
+            night_mode = !night_mode;
+            apply_color_palette();
+            draw_current_screen(); spr.pushSprite(0, 0);
+            break;
+        case 6:
+            low_power_mode = !low_power_mode;
+            if (low_power_mode) {
+                set_toast_direct("LOW POWER ON", ACCENT_COLOR);
+            } else {
+                set_toast_direct("LOW POWER OFF", DIM_COLOR);
+            }
+            draw_current_screen(); spr.pushSprite(0, 0);
+            break;
+        case 7:
+            is_muted = !is_muted;
+            if (!is_muted) beep(600, 50);
+            draw_current_screen(); spr.pushSprite(0, 0);
+            break;
+        case 8:
+            if (strlen(export_ssid) > 0) {
+                char info[32];
+                snprintf(info, sizeof(info), "SSID: %.20s", export_ssid);
+                set_toast_direct(info, HEADER_COLOR);
+            } else {
+                set_toast_direct("SET IN SOURCE CODE", CAUTION_COLOR);
+            }
+            break;
+        case 9:
+            show_menu = false;
+            if (export_mode_active || export_connecting) {
+                export_mode_stop();
+            } else {
+                export_mode_start();
+            }
+            draw_current_screen(); spr.pushSprite(0, 0);
+            break;
+    }
 }
 
 // ============================================================================
@@ -3876,7 +4025,7 @@ void draw_capture_history_screen() {
     if (total > 4) {
         spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
         spr.setCursor(DISP_W - 56, DISP_H - 8);
-        char scr_buf[16]; snprintf(scr_buf, sizeof(scr_buf), "%d/%d ;/.", history_selected_idx + 1, total);
+        char scr_buf[16]; snprintf(scr_buf, sizeof(scr_buf), "%d/%d -/+", history_selected_idx + 1, total);
         spr.print(scr_buf);
     }
 
@@ -4216,6 +4365,7 @@ void draw_gps_screen() {
 }
 
 void draw_device_info_screen() {
+    unsigned long frame_ms = millis();
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     long lt = lifetime_flock_total;
     long sr = session_raven;
@@ -4568,7 +4718,7 @@ void draw_current_screen() {
     if (show_feed_expanded) draw_feed_expanded_overlay();
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
-    if (show_locator_help && current_screen == 1) draw_locator_help_overlay();
+    if (show_menu) draw_menu_overlay();
     draw_toast_spr();
 }
 
@@ -4590,7 +4740,6 @@ void transition_screen(int new_screen, int dir) {
     if (new_screen == 4) {
         device_info_scroll = 0;
     }
-    if (new_screen != 1) show_locator_help = false;
     if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
     current_screen = new_screen;
     draw_current_screen();
@@ -4639,22 +4788,61 @@ void setup() {
     brightness_level = 2;
     apply_color_palette();
 
+    // Serial early for SD mount diagnostics
+    Serial.begin(115200); delay(200);
+
     bool mount_success = false;
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);   // deselect SD before SPI init
     delay(100);                       // let card power stabilize
     SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
+
+    Serial.println("[SD] === SD Card Mount Diagnostic ===");
+    Serial.printf("[SD] Pins: SCK=%d MISO=%d MOSI=%d CS=%d\n",
+                  SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
+
+    // Probe CS pin connectivity
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, LOW);  delay(1);
+    int cs_low  = digitalRead(SD_CS_PIN);
+    digitalWrite(SD_CS_PIN, HIGH); delay(1);
+    int cs_high = digitalRead(SD_CS_PIN);
+    Serial.printf("[SD] CS pin test: LOW=%d HIGH=%d (expect 0,1)\n", cs_low, cs_high);
+
     static const uint32_t sd_speeds[] = {25000000, 20000000, 10000000, 4000000, 1000000};
     for (int si = 0; si < 5 && !mount_success; si++) {
         for (int attempt = 0; attempt < 3 && !mount_success; attempt++) {
-            if (SD.begin(SD_CS_PIN, SPI, sd_speeds[si])) { mount_success = true; }
-            else { SD.end(); delay(250); }
+            Serial.printf("[SD] Speed=%luHz attempt=%d... ", sd_speeds[si], attempt + 1);
+            if (SD.begin(SD_CS_PIN, SPI, sd_speeds[si])) {
+                mount_success = true;
+                Serial.printf("OK! Type=%d Size=%lluMB\n",
+                              SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
+                if (SD.cardType() == CARD_NONE) {
+                    Serial.println("[SD] WARNING: cardType=CARD_NONE — card present but unreadable");
+                    mount_success = false;
+                    SD.end();
+                }
+            } else {
+                Serial.println("FAIL");
+                SD.end();
+                delay(250);
+            }
         }
     }
+    if (!mount_success) {
+        Serial.println("[SD] ALL ATTEMPTS FAILED");
+        Serial.println("[SD] Checklist:");
+        Serial.println("[SD]   1. Is a microSD card physically inserted?");
+        Serial.println("[SD]   2. Is the card formatted as FAT32?");
+        Serial.println("[SD]   3. Is the card < 32GB? (SDXC/exFAT not supported)");
+        Serial.println("[SD]   4. Try a different card");
+    }
+
     if (mount_success) {
         sd_available = true;
         if (!SD.exists("/FLOCK")) {
             SD.mkdir("/FLOCK");
+            Serial.println("[SD] Created /FLOCK directory");
         }
         if (!SD.exists(current_log_file.c_str())) {
             File file = SD.open(current_log_file.c_str(), FILE_WRITE);
@@ -4703,7 +4891,6 @@ void setup() {
         delay(2);
     }
 
-    Serial.begin(115200); delay(200);  
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, NULL, 1);
 
@@ -4776,6 +4963,9 @@ void setup() {
 void loop() {
     M5Cardputer.update(); yield();
 
+    if (export_connecting) {
+        export_tick_connect();
+    }
     if (export_mode_active) {
         if (export_server) export_server->handleClient();
         if ((millis() - export_mode_started_at) > EXPORT_MODE_MAX_MS) {
@@ -4858,11 +5048,27 @@ void loop() {
 
         for (auto c : status.word) {
 
+            // ── Menu input intercept — when menu is open, swallow nav keys ──
+            if (show_menu) {
+                if (c == ';') {
+                    menu_selected--;
+                    if (menu_selected < 0) menu_selected = 0;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (c == '.') {
+                    menu_selected++;
+                    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (c == '\n' || c == '\r') {
+                    handle_menu_select();
+                } else if (c == 0x1B || c == 'm') {
+                    show_menu = false;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                }
+                continue;  // swallow all keys while menu is open
+            }
+
             if (c == 0x1B && !stealth_mode) {  // ASCII Escape
                 // Priority order: close overlays first, then navigate home.
-                // Any overlay close is immediately followed by draw+push so
-                // the screen reflects the state change without waiting for
-                // the next frame.
                 if (show_feed_expanded) {
                     show_feed_expanded = false;
                     draw_current_screen(); spr.pushSprite(0, 0);
@@ -4870,11 +5076,6 @@ void loop() {
                 }
                 if (show_help_overlay) {
                     show_help_overlay = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                    continue;
-                }
-                if (show_locator_help) {
-                    show_locator_help = false;
                     draw_current_screen(); spr.pushSprite(0, 0);
                     continue;
                 }
@@ -4889,15 +5090,55 @@ void loop() {
                 }
                 // Already on scanner with no overlays — nothing to do.
             }
-            else if (c == 'n') {
-                night_mode = !night_mode; apply_color_palette();
-                draw_current_screen(); spr.pushSprite(0,0);
-            } 
-            else if (c == 'q' || c == 'm') { 
+            else if (c == 'm') {
+                if (!stealth_mode) {
+                    show_menu = !show_menu;
+                    if (show_menu) {
+                        menu_open_ms = millis();
+                        show_feed_expanded = false;
+                        show_help_overlay = false;
+                    }
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                }
+            }
+            else if (c == '`') {
                 is_muted = !is_muted; draw_current_screen(); spr.pushSprite(0,0);
-                if (!is_muted) beep(600, 50); 
+                if (!is_muted) beep(600, 50);
+            }
+            else if (c == ';') {
+                current_volume -= 15; if (current_volume < 0) current_volume = 0;
+                M5Cardputer.Speaker.setVolume(current_volume); beep(400, 50);
+                if (!show_vol_overlay) {
+                    vol_overlay_start = millis(); show_vol_overlay = true;
+                } else {
+                    unsigned long el = millis() - vol_overlay_start;
+                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
+                }
+                draw_current_screen(); spr.pushSprite(0, 0);
             }
             else if (c == '.') {
+                current_volume += 15; if (current_volume > 255) current_volume = 255;
+                M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
+                if (!show_vol_overlay) {
+                    vol_overlay_start = millis(); show_vol_overlay = true;
+                } else {
+                    unsigned long el = millis() - vol_overlay_start;
+                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
+                }
+                draw_current_screen(); spr.pushSprite(0, 0);
+            }
+            else if (c == '-') {
+                if (current_screen == 2) {
+                    history_selected_idx--;
+                    if (history_selected_idx < 0) history_selected_idx = 0;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (current_screen == 4) {
+                    device_info_scroll -= 12;
+                    if (device_info_scroll < 0) device_info_scroll = 0;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                }
+            }
+            else if (c == '+' || c == '=') {
                 if (current_screen == 2) {
                     int hist_total = sd_available ? sd_hist_count : capture_history_count;
                     history_selected_idx++;
@@ -4911,39 +5152,6 @@ void loop() {
                     if (device_info_scroll > max_scroll) device_info_scroll = max_scroll;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
-            }
-            else if (c == ';') {
-                if (current_screen == 2) {
-                    history_selected_idx--;
-                    if (history_selected_idx < 0) history_selected_idx = 0;
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (current_screen == 4) {
-                    device_info_scroll -= 12;
-                    if (device_info_scroll < 0) device_info_scroll = 0;
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                }
-            }
-            else if (c == '-') {
-                current_volume -= 15; if (current_volume < 0) current_volume = 0;
-                M5Cardputer.Speaker.setVolume(current_volume); beep(400, 50);
-                if (!show_vol_overlay) {
-                    vol_overlay_start = millis(); show_vol_overlay = true;
-                } else {
-                    unsigned long el = millis() - vol_overlay_start;
-                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
-                }
-                draw_current_screen(); spr.pushSprite(0, 0);
-            }
-            else if (c == '+' || c == '=') {
-                current_volume += 15; if (current_volume > 255) current_volume = 255;
-                M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
-                if (!show_vol_overlay) {
-                    vol_overlay_start = millis(); show_vol_overlay = true;
-                } else {
-                    unsigned long el = millis() - vol_overlay_start;
-                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
-                }
-                draw_current_screen(); spr.pushSprite(0, 0);
             }
             else if (c == 'x') {
                 if (!stealth_mode) {
@@ -4994,7 +5202,7 @@ void loop() {
                     trigger_toast("INFO", "No targets yet", 0);
                 }
             }
-            else if (c == '/' || c == '>') {
+            else if (c == '/') {
                 if (!stealth_mode) {
                     int next = current_screen + 1;
                     int d = (next >= NUM_SCREENS) ? -1 : 1;
@@ -5002,7 +5210,7 @@ void loop() {
                     transition_screen(next, d);
                 }
             }
-            else if (c == ',' || c == '<') {
+            else if (c == ',') {
                 if (!stealth_mode) {
                     int prev = current_screen - 1;
                     int d = (prev < 0) ? 1 : -1;
@@ -5010,13 +5218,6 @@ void loop() {
                     transition_screen(prev, d);
                 }
             }
-            else if (c >= '1' && c <= '5') {
-                if (!stealth_mode) { 
-                    int target = c - '1'; 
-                    if (target < NUM_SCREENS) transition_screen(target, (target >= current_screen) ? 1 : -1); 
-                } 
-            } 
-            else if (c == '0') { if (!stealth_mode) transition_screen(1, 1); } 
             else if (c == 'b') {
                 if (!stealth_mode) {
                     brightness_level = (brightness_level + 1) % 3;
@@ -5030,22 +5231,6 @@ void loop() {
                 }
             }
             else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } }
-            else if (c == 'o') {
-                if (!stealth_mode) {
-                    xSemaphoreTake(dataMutex, portMAX_DELAY);
-                    session_wifi = 0;
-                    session_ble = 0;
-                    session_flock_wifi = 0;
-                    session_flock_ble = 0;
-                    session_raven = 0;
-                    session_start_time = millis();
-                    xSemaphoreGive(dataMutex);
-                    trigger_toast("INFO", "Session reset", 0);
-                    beep(800, 60);
-                    draw_current_screen();
-                    spr.pushSprite(0, 0);
-                }
-            }
             else if (c == 'g') {
                 if (current_screen == 1) {
                     // Locator screen: toggle Pointing North mode
@@ -5053,12 +5238,6 @@ void loop() {
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
                 // On other screens, 'g' is currently a no-op.
-            }
-            else if (c == 'h') {
-                if (current_screen == 1) {
-                    show_locator_help = !show_locator_help;
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                }
             }
             else if (c == 'l') {
                 // Instant locator stop from any screen. No-op when inactive.
@@ -5096,25 +5275,6 @@ void loop() {
                     last_bs_press_ms = now_ms;
                 }
             }
-            else if (c == 'c') {
-                // Cycle LED color
-                led_col_idx = (led_col_idx + 1) % (int)(sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
-                led_r = LED_COLORS[led_col_idx][0];
-                led_g = LED_COLORS[led_col_idx][1];
-                led_b = LED_COLORS[led_col_idx][2];
-                if (!led_breathing_on) { led_breathing_on = true; }
-            }
-            else if (c == 'e') {
-                if (!stealth_mode) {
-                    if (export_mode_active) {
-                        export_mode_stop();
-                    } else {
-                        export_mode_start();
-                    }
-                    draw_current_screen();
-                    spr.pushSprite(0, 0);
-                }
-            }
             else if (c == 'f') {
                 if (!stealth_mode) {
                     if (show_feed_expanded) {
@@ -5129,35 +5289,34 @@ void loop() {
                 }
             }
             else if (c == '\n' || c == '\r') {
-                if (!stealth_mode) {
-                    if (current_screen == 2) {
-                        int hist_total = sd_available ? sd_hist_count : capture_history_count;
-                        if (hist_total > 0) {
-                            hist_detail_open = !hist_detail_open;
-                            draw_current_screen(); spr.pushSprite(0, 0);
-                        }
-                    } else {
-                        int next = current_screen + 1;
-                        int d = (next >= NUM_SCREENS) ? -1 : 1;
-                        if (next >= NUM_SCREENS) next = 0;
-                        transition_screen(next, d);
+                if (!stealth_mode && current_screen == 2) {
+                    int hist_total = sd_available ? sd_hist_count : capture_history_count;
+                    if (hist_total > 0) {
+                        hist_detail_open = !hist_detail_open;
+                        draw_current_screen(); spr.pushSprite(0, 0);
                     }
                 }
+                // ENTER on other screens is a no-op (menu handles navigation)
             }
         }
 
         if (status.del && !stealth_mode) {
+            // DEL = universal "close / go back" — priority order:
             if (show_feed_expanded) {
                 show_feed_expanded = false;
+                draw_current_screen(); spr.pushSprite(0, 0);
+            } else if (show_help_overlay) {
+                show_help_overlay = false;
+                draw_current_screen(); spr.pushSprite(0, 0);
+            } else if (show_menu) {
+                show_menu = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (current_screen == 2 && hist_detail_open) {
                 hist_detail_open = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
-            } else {
-                int prev = current_screen - 1;
-                int d = (prev < 0) ? 1 : -1;
-                if (prev < 0) prev = NUM_SCREENS - 1;
-                transition_screen(prev, d);
+            } else if (current_screen != 0) {
+                // Nothing to close — go home to scanner
+                transition_screen(0, -1);
             }
         }
     }
