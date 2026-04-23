@@ -5291,11 +5291,6 @@ void setup() {
     // right before the long-running tasks start at the end of setup().
     esp_task_wdt_deinit();
 
-    // ONE-TIME: force a LittleFS reformat to clear corruption from previous
-    // boots. Flash once with this line active, boot, then remove it and flash
-    // again so persistent state survives across reboots.
-    LittleFS.format();
-
     if (!LittleFS.begin(true)) {
         Serial.println("[FS] LittleFS format failed!");
         littlefs_available = false;
