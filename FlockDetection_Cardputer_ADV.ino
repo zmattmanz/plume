@@ -60,7 +60,6 @@ uint16_t ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
 uint16_t CAUTION_COLOR, GPS_COLOR;
 bool night_mode = false;
 bool show_help_overlay = false;
-static float help_ease = 0.0f;
 static unsigned long help_ease_start = 0;
 
 // Ambient mode: dim minimal UI after sustained idle
@@ -5017,7 +5016,11 @@ void loop() {
             ambient_mode = false;
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
         }
-        if (show_feed_expanded) {
+        if (show_menu) {
+            show_menu = false;
+            draw_current_screen();
+            spr.pushSprite(0, 0);
+        } else if (show_feed_expanded) {
             show_feed_expanded = false;
             draw_current_screen();
             spr.pushSprite(0, 0);
@@ -5040,7 +5043,6 @@ void loop() {
         if (status.tab && !stealth_mode) {
             show_help_overlay = !show_help_overlay;
             if (show_help_overlay) {
-                help_ease = 0.0f;
                 help_ease_start = millis();
             }
             draw_current_screen(); spr.pushSprite(0,0);
