@@ -168,6 +168,19 @@ static void safe_copy(char* dest, const char* src, size_t dest_size) {
     strncpy(dest, src, dest_size - 1);
     dest[dest_size - 1] = '\0';
 }
+
+// ── Easing utilities — shared by all overlays and animations ──
+
+static inline float ease_out_quad(float t) {
+    return 1.0f - (1.0f - t) * (1.0f - t);
+}
+
+// Returns 0.0 at start_ms, eases to 1.0 at start_ms + duration_ms, stays 1.0 after.
+static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms) {
+    unsigned long elapsed = millis() - start_ms;
+    if (elapsed >= duration_ms) return 1.0f;
+    return ease_out_quad((float)elapsed / (float)duration_ms);
+}
 #define GPS_RX_PIN   15  
 #define GPS_TX_PIN   13   
 #define GPS_BAUD     115200 
@@ -2610,23 +2623,35 @@ void draw_toast_spr() {
     }
 
     int y_pos = DISP_H - 34;
-    if (elapsed < 150) y_pos = DISP_H - 10 - (int)((elapsed / 150.0f) * 24);
-    else if (elapsed > TOAST_DURATION_MS - 150) y_pos = DISP_H - 34 + (int)(((elapsed - (TOAST_DURATION_MS - 150)) / 150.0f) * 24);
+
+    // Fade in over 150ms, hold, fade out over 200ms
+    float toast_alpha;
+    if (elapsed < 150) {
+        toast_alpha = ease_out_quad((float)elapsed / 150.0f);
+    } else if (elapsed > TOAST_DURATION_MS - 200) {
+        float fade_t = (float)(elapsed - (TOAST_DURATION_MS - 200)) / 200.0f;
+        toast_alpha = 1.0f - ease_out_quad(fade_t);
+    } else {
+        toast_alpha = 1.0f;
+    }
+    if (toast_alpha < 0.02f) return;
+
+    auto ta = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, toast_alpha); };
 
     uint16_t accent = toast_accent_color ? toast_accent_color : CAUTION_COLOR;
     int t_w = 210; int t_x = (DISP_W - t_w) / 2;
 
-    spr.fillRect(t_x, y_pos, t_w, 26, CARD_COLOR);
-    spr.drawRect(t_x, y_pos, t_w, 26, CARD_BORDER);
+    spr.fillRect(t_x, y_pos, t_w, 26, ta(CARD_COLOR));
+    spr.drawRect(t_x, y_pos, t_w, 26, ta(CARD_BORDER));
 
-    spr.setTextColor(accent, CARD_COLOR); spr.setTextSize(1);
+    spr.setTextColor(ta(accent), ta(CARD_COLOR)); spr.setTextSize(1);
     spr.setCursor(t_x + 6, y_pos + 9); spr.print(toast_is_action ? "[i]" : "[!]");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR);
+    spr.setTextColor(ta(TEXT_COLOR), ta(CARD_COLOR));
     spr.setCursor(t_x + 26, y_pos + 9); spr.print(toast_text);
     if (toast_queue_count > 1) {
         char qnum[6];
         snprintf(qnum, sizeof(qnum), "+%d", toast_queue_count - 1);
-        spr.setTextColor(DIM_COLOR, CARD_COLOR);
+        spr.setTextColor(ta(DIM_COLOR), ta(CARD_COLOR));
         spr.setCursor(t_x + t_w - 22, y_pos + 9);
         spr.print(qnum);
     }
@@ -2638,49 +2663,49 @@ void draw_vol_overlay() {
     const unsigned long SHOW_MS = 2200;
     if (elapsed > SHOW_MS) { show_vol_overlay = false; return; }
 
-    // Quick fade-in (100ms), quadratic ease-out fade — no position change
     float alpha;
-    const unsigned long FADE_IN_MS = 100;
-    if (elapsed < FADE_IN_MS) {
-        alpha = (float)elapsed / (float)FADE_IN_MS;
+    if (elapsed < 100) {
+        alpha = ease_out_quad((float)elapsed / 100.0f);
+    } else if (elapsed > SHOW_MS - 300) {
+        float t = (float)(elapsed - (SHOW_MS - 300)) / 300.0f;
+        alpha = 1.0f - ease_out_quad(t);
     } else {
-        float t = (float)(elapsed - FADE_IN_MS) / (float)(SHOW_MS - FADE_IN_MS);
-        alpha = 1.0f - (t * t);
+        alpha = 1.0f;
     }
+    if (alpha < 0.02f) return;
 
-    const int t_w = 92;
-    const int t_h = 22;
-    const int t_x = DISP_W - t_w - 3;
-    const int t_y = DISP_H - t_h - 3;
+    auto va = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    auto blend16 = [](uint16_t bg, uint16_t fg, float a) -> uint16_t {
-        int br = ((bg >> 11) & 0x1F) << 3, bg_g = ((bg >> 5) & 0x3F) << 2, bb = (bg & 0x1F) << 3;
-        int fr = ((fg >> 11) & 0x1F) << 3, fg_g = ((fg >> 5) & 0x3F) << 2, fb = (fg & 0x1F) << 3;
-        return lgfx::color565((uint8_t)(br+(fr-br)*a),(uint8_t)(bg_g+(fg_g-bg_g)*a),(uint8_t)(bb+(fb-bb)*a));
-    };
+    const int bar_w = 160;
+    const int bar_h = 10;
+    const int bar_x = (DISP_W - bar_w) / 2;
+    const int bar_y = DISP_H - bar_h - 8;
+    const int bar_r = bar_h / 2;
 
-    uint16_t bg_c  = blend16(BG_COLOR, CARD_COLOR,   alpha);
-    uint16_t brd_c = blend16(BG_COLOR, CARD_BORDER,  alpha);
-    uint16_t hdr_c = blend16(BG_COLOR, HEADER_COLOR, alpha);
-    uint16_t txt_c = blend16(BG_COLOR, TEXT_COLOR,    alpha);
+    int vol_pct = is_muted ? 0 : map(current_volume, 0, 255, 0, 100);
+    char vol_str[12];
+    if (is_muted) {
+        snprintf(vol_str, sizeof(vol_str), "MUTED");
+    } else {
+        snprintf(vol_str, sizeof(vol_str), "VOL %d%%", vol_pct);
+    }
+    spr.setTextColor(va(is_muted ? DIM_COLOR : HEADER_COLOR), BG_COLOR);
+    spr.setTextSize(1.2);
+    spr.setTextDatum(TC_DATUM);
+    spr.drawString(vol_str, DISP_W / 2, bar_y - 14);
+    spr.setTextDatum(TL_DATUM);
 
-    spr.fillRect(t_x, t_y, t_w, t_h, bg_c);
-    spr.drawRect(t_x, t_y, t_w, t_h, brd_c);
+    spr.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, va(HEADER_COLOR));
 
-    int vol_pct = map(current_volume, 0, 255, 0, 100);
-    char vol_str[5]; snprintf(vol_str, sizeof(vol_str), "%d%%", vol_pct);
-
-    spr.setTextColor(hdr_c, bg_c); spr.setTextSize(1);
-    spr.setCursor(t_x + 5, t_y + 7); spr.print("VOL");
-    spr.setTextColor(txt_c, bg_c);
-    spr.setCursor(t_x + 28, t_y + 7); spr.print(vol_str);
-
-    int bar_x = t_x + 50; int bar_y = t_y + 6;
-    int bar_w = t_w - 54;  int bar_h = 10;
-    spr.drawRect(bar_x, bar_y, bar_w, bar_h, brd_c);
-    int fill = (current_volume * (bar_w - 2)) / 255;
-    if (fill > 0) {
-        spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, blend16(BG_COLOR, HEADER_COLOR, alpha));
+    int fill_w = is_muted ? 0 : (current_volume * (bar_w - 4)) / 255;
+    if (fill_w > 0) {
+        int fill_r = (bar_h - 4) / 2;
+        if (fill_r < 1) fill_r = 1;
+        if (fill_w < fill_r * 2) {
+            spr.fillRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, va(HEADER_COLOR));
+        } else {
+            spr.fillRoundRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, fill_r, va(HEADER_COLOR));
+        }
     }
 }
 
@@ -2700,14 +2725,7 @@ void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
 }
 
 void draw_help_overlay() {
-    // Fade-in: 150ms quadratic ease-out (matches menu/feed overlay style)
-    unsigned long elapsed = millis() - help_ease_start;
-    const unsigned long HELP_ANIM_MS = 150UL;
-    float alpha = 1.0f;
-    if (elapsed < HELP_ANIM_MS) {
-        float t = (float)elapsed / (float)HELP_ANIM_MS;
-        alpha = 1.0f - (1.0f - t) * (1.0f - t);
-    }
+    float alpha = ease_alpha(help_ease_start, 150);
     if (alpha < 0.02f) return;
 
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
@@ -2842,15 +2860,7 @@ static void menu_click() {
 
 void draw_menu_overlay() {
     unsigned long now_ms = millis();
-
-    // Fade-in: 150ms quadratic ease-out (matches help/feed overlay)
-    const unsigned long MENU_ANIM_MS = 150UL;
-    unsigned long age = now_ms - menu_open_ms;
-    float alpha = 1.0f;
-    if (age < MENU_ANIM_MS) {
-        float t = (float)age / (float)MENU_ANIM_MS;
-        alpha = 1.0f - (1.0f - t) * (1.0f - t);
-    }
+    float alpha = ease_alpha(menu_open_ms, 150);
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
     // Solid dark backdrop — fully opaque to block underlying animations
@@ -2870,10 +2880,15 @@ void draw_menu_overlay() {
         uint16_t    accent;
     };
 
-    char night_label[20], lp_label[20], mute_label[20];
+    char night_label[20], lp_label[20], mute_label[20], export_label[28];
     snprintf(night_label, sizeof(night_label), "Night Mode: %s", night_mode ? "ON" : "OFF");
     snprintf(lp_label,    sizeof(lp_label),    "Low Power: %s",  low_power_mode ? "ON" : "OFF");
     snprintf(mute_label,  sizeof(mute_label),  "Mute: %s",       is_muted ? "ON" : "OFF");
+    if (export_mode_active) {
+        snprintf(export_label, sizeof(export_label), "Export: %s", export_ip_str);
+    } else {
+        snprintf(export_label, sizeof(export_label), "Export Data");
+    }
 
     MenuLine items[MENU_ITEM_COUNT] = {
         {"Scanner",       HEADER_COLOR},
@@ -2885,7 +2900,7 @@ void draw_menu_overlay() {
         {lp_label,        DIM_COLOR},
         {mute_label,      DIM_COLOR},
         {"WiFi Config",   DIM_COLOR},
-        {"Export Data",   export_mode_active ? ACCENT_COLOR : DIM_COLOR},
+        {export_label,    export_mode_active ? ACCENT_COLOR : DIM_COLOR},
         {"Clear Stats",   CAUTION_COLOR},
     };
 
@@ -3022,13 +3037,21 @@ void handle_menu_select() {
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
         case 9:
-            show_menu = false;
-            if (export_mode_active || export_connecting) {
+            if (export_mode_active) {
+                // First tap while active: show IP reminder; DEL or second tap to stop
+                char ip_toast[32];
+                snprintf(ip_toast, sizeof(ip_toast), "http://%s", export_ip_str);
+                set_toast_direct(ip_toast, ACCENT_COLOR);
+                draw_current_screen(); spr.pushSprite(0, 0);
+            } else if (export_connecting) {
+                show_menu = false;
                 export_mode_stop();
+                draw_current_screen(); spr.pushSprite(0, 0);
             } else {
+                show_menu = false;
                 export_mode_start();
+                draw_current_screen(); spr.pushSprite(0, 0);
             }
-            draw_current_screen(); spr.pushSprite(0, 0);
             break;
         case 10: {
             // Clear all stats — session and lifetime
@@ -3309,6 +3332,24 @@ void draw_scanner_screen() {
 
     spr.clearClipRect();
 
+    // ── Ambient packet counter — bottom of left panel ──
+    {
+        uint32_t pkts = ambient_packet_count;
+        char pkt_str[20];
+        if (pkts >= 1000000) {
+            snprintf(pkt_str, sizeof(pkt_str), "%.1fM pkts", pkts / 1000000.0f);
+        } else if (pkts >= 1000) {
+            snprintf(pkt_str, sizeof(pkt_str), "%.1fk pkts", pkts / 1000.0f);
+        } else {
+            snprintf(pkt_str, sizeof(pkt_str), "%lu pkts", pkts);
+        }
+
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        spr.setTextDatum(TC_DATUM);
+        spr.drawString(pkt_str, radar_cx, DISP_H - 9);
+        spr.setTextDatum(TL_DATUM);
+    }
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     long sw = session_flock_wifi; long sb = session_flock_ble;
@@ -4217,7 +4258,7 @@ void draw_capture_history_screen() {
 
         // Footer hint
         spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(cx + 6, cy + ch - 11); spr.print("ENTER to close");
+        spr.setCursor(cx + 6, cy + ch - 11); spr.print("DEL or ENTER to close");
     }
 }
 
@@ -4675,12 +4716,7 @@ void draw_feed_expanded_overlay() {
         expand_prev_head = local_head;
     }
 
-    // Fade-in easing: quadratic ease-out over 200ms
-    const unsigned long EXPAND_ANIM_MS = 200UL;
-    unsigned long ea_age = local_now - feed_expand_ms;
-    float ea_t = (ea_age < EXPAND_ANIM_MS) ? (float)ea_age / (float)EXPAND_ANIM_MS : 1.0f;
-    float expand_alpha = 1.0f - (1.0f - ea_t) * (1.0f - ea_t);
-    // Helper: lerp any color from BG_COLOR at ea=0 to target at ea=1
+    float expand_alpha = ease_alpha(feed_expand_ms, 200);
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, expand_alpha); };
 
     // Solid backdrop
@@ -4881,6 +4917,109 @@ void transition_screen(int new_screen, int dir) {
 // ============================================================================
 // SYSTEM SETUP
 // ============================================================================
+
+// Boot progress screen — drawn directly to Display (not sprite).
+// Called at key milestones during setup() to show initialization progress.
+static int boot_prev_pct = -1;
+static unsigned long boot_pct_change_ms = 0;
+
+void draw_boot_screen(int pct, const char* status_text = nullptr) {
+    auto& lcd = M5Cardputer.Display;
+
+    uint16_t bg      = lgfx::color565( 10,  20,  48);
+    uint16_t blue    = lgfx::color565(  0, 215, 235);
+    uint16_t dim     = lgfx::color565(100, 140, 180);
+    uint16_t text_c  = lgfx::color565(220, 232, 255);
+
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    if (pct != boot_prev_pct) {
+        boot_pct_change_ms = millis();
+        boot_prev_pct = pct;
+    }
+
+    lcd.fillScreen(bg);
+
+    // Version string at top
+    lcd.setTextColor(dim, bg);
+    lcd.setTextSize(1);
+    lcd.setTextDatum(TC_DATUM);
+    lcd.drawString(VERSION_STRING, DISP_W / 2, 16);
+
+    // Percentage number with roll-up animation
+    {
+        unsigned long elapsed = millis() - boot_pct_change_ms;
+        const unsigned long ROLL_MS = 200;
+
+        char pct_str[8];
+        snprintf(pct_str, sizeof(pct_str), "%d%%", pct);
+
+        int num_y = 48;
+        int num_h = 24;
+
+        lcd.setClipRect(0, num_y - 2, DISP_W, num_h + 4);
+        lcd.setTextColor(text_c, bg);
+        lcd.setTextSize(3);
+        lcd.setTextDatum(TC_DATUM);
+
+        if (elapsed < ROLL_MS) {
+            float t = (float)elapsed / (float)ROLL_MS;
+            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+            int offset = (int)((1.0f - ease) * (float)num_h);
+            lcd.drawString(pct_str, DISP_W / 2, num_y + offset);
+        } else {
+            lcd.drawString(pct_str, DISP_W / 2, num_y);
+        }
+        lcd.clearClipRect();
+    }
+
+    // Progress bar
+    {
+        const int bar_w = 180;
+        const int bar_h = 10;
+        const int bar_x = (DISP_W - bar_w) / 2;
+        const int bar_y = 92;
+        const int bar_r = bar_h / 2;
+
+        lcd.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, blue);
+
+        int target_fill = (pct * (bar_w - 4)) / 100;
+        static float eased_fill = 0.0f;
+        float diff = (float)target_fill - eased_fill;
+        eased_fill += diff * 0.25f;
+        if (fabsf(diff) < 0.5f) eased_fill = (float)target_fill;
+        int fill_w = (int)(eased_fill + 0.5f);
+
+        if (fill_w > 0) {
+            int fill_r = (bar_h - 4) / 2;
+            if (fill_r < 1) fill_r = 1;
+            if (fill_w < fill_r * 2) {
+                lcd.fillRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, blue);
+            } else {
+                lcd.fillRoundRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, fill_r, blue);
+            }
+        }
+    }
+
+    if (status_text) {
+        lcd.setTextColor(dim, bg);
+        lcd.setTextSize(1);
+        lcd.setTextDatum(TC_DATUM);
+        lcd.drawString(status_text, DISP_W / 2, 110);
+    }
+
+    lcd.setTextDatum(TL_DATUM);
+}
+
+// Animate the boot progress bar for a brief moment so easing is visible.
+static void boot_animate(int pct, const char* status, int frames = 6) {
+    for (int i = 0; i < frames; i++) {
+        draw_boot_screen(pct, status);
+        delay(20);
+    }
+}
+
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
@@ -4897,17 +5036,20 @@ void setup() {
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
     M5Cardputer.Display.setBrightness(255);
+    boot_animate(0, "starting...");
     brightness_level = 2;
     apply_color_palette();
 
     // Serial early for SD mount diagnostics
     Serial.begin(115200); delay(200);
+    boot_animate(5, "serial ok");
 
     bool mount_success = false;
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);   // deselect SD before SPI init
     delay(100);                       // let card power stabilize
     sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
+    boot_animate(10, "SD card...");
 
     Serial.println("[SD] === SD Card Mount Diagnostic ===");
     Serial.printf("[SD] Pins: SCK=%d MISO=%d MOSI=%d CS=%d\n",
@@ -4940,6 +5082,7 @@ void setup() {
                 delay(250);
             }
         }
+        draw_boot_screen(10 + si * 4, "SD card...");
     }
     if (!mount_success) {
         Serial.println("[SD] ALL ATTEMPTS FAILED");
@@ -4990,31 +5133,37 @@ void setup() {
             }
         }
     }
+    boot_animate(35, sd_available ? "SD mounted" : "no SD card");
 
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
+    boot_animate(40, "GPS serial...");
 
     spr.setColorDepth(16);
     spr.createSprite(DISP_W, DISP_H);
-    
+    boot_animate(45, "display ready");
+
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
         update_load_sag();
         get_filtered_voltage();
         delay(2);
     }
+    boot_animate(55, "battery cal...");
 
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, NULL, 1);
+    boot_animate(65, "BLE init...");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
-    if (!LittleFS.begin(true)) { littlefs_available = false; } 
-    else { 
+    if (!LittleFS.begin(true)) { littlefs_available = false; }
+    else {
         littlefs_available = true;
         load_session_from_flash();
         load_detections_from_flash();
     }
+    boot_animate(75, "loading data...");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5044,15 +5193,17 @@ void setup() {
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
-    NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    pBLEScan = NimBLEDevice::getScan(); pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
-    pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
-
     WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
+    boot_animate(85, "WiFi sniffer...");
+
+    NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    pBLEScan = NimBLEDevice::getScan(); pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+    pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
+    boot_animate(92, "BLE scanner...");
 
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
     // Task watchdog: 10-second timeout, panic on trigger
@@ -5068,6 +5219,8 @@ void setup() {
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
+    boot_animate(100, "ready");
+    delay(300);
 }
 
 // ============================================================================
@@ -5225,11 +5378,25 @@ void loop() {
                 }
             }
             else if (c == '`') {
-                is_muted = !is_muted; draw_current_screen(); spr.pushSprite(0,0);
-                if (!is_muted) beep(600, 50);
+                if (is_muted) {
+                    // Unmute — restore to a reasonable default if volume was zeroed
+                    is_muted = false;
+                    if (current_volume == 0) current_volume = 75;
+                    M5Cardputer.Speaker.setVolume(current_volume);
+                    beep(600, 50);
+                } else {
+                    // Mute — zero out volume
+                    is_muted = true;
+                    current_volume = 0;
+                    M5Cardputer.Speaker.setVolume(0);
+                }
+                draw_current_screen(); spr.pushSprite(0,0);
             }
             else if (c == ';') {
                 current_volume -= 15; if (current_volume < 0) current_volume = 0;
+                if (current_volume == 0 && !is_muted) {
+                    is_muted = true;
+                }
                 M5Cardputer.Speaker.setVolume(current_volume); beep(400, 50);
                 if (!show_vol_overlay) {
                     vol_overlay_start = millis(); show_vol_overlay = true;
@@ -5241,6 +5408,9 @@ void loop() {
             }
             else if (c == '.') {
                 current_volume += 15; if (current_volume > 255) current_volume = 255;
+                if (is_muted && current_volume > 0) {
+                    is_muted = false;
+                }
                 M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
                 if (!show_vol_overlay) {
                     vol_overlay_start = millis(); show_vol_overlay = true;
