@@ -80,6 +80,8 @@ static bool show_menu = false;
 static int  menu_selected = 0;
 static unsigned long menu_open_ms = 0;
 #define MENU_ITEM_COUNT 10
+static float menu_highlight_ease_y = 0.0f;  // current eased y position of highlight
+static bool  menu_highlight_init = false;   // true after first draw (prevents ease-from-zero)
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
 static bool low_power_mode = false;
@@ -2799,6 +2801,17 @@ void draw_help_overlay() {
     spr.print("TAB or DEL to close");
 }
 
+// Draw a dithered darkening overlay — fast checkerboard pattern that
+// darkens every-other pixel toward a target color, creating the visual
+// effect of semi-transparency without per-pixel alpha blending.
+static void draw_dither_overlay(int x0, int y0, int w, int h, uint16_t dark_color) {
+    for (int y = y0; y < y0 + h; y++) {
+        for (int x = x0 + ((y & 1) ? 1 : 0); x < x0 + w; x += 2) {
+            spr.drawPixel(x, y, dark_color);
+        }
+    }
+}
+
 void draw_menu_overlay() {
     unsigned long now_ms = millis();
 
@@ -2812,12 +2825,15 @@ void draw_menu_overlay() {
     }
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    // Solid backdrop below header
-    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
+    // Dithered dark overlay — lets the underlying screen bleed through
+    // at ~50% density, creating a frosted-glass effect.
+    uint16_t menu_dark = lgfx::color565(3, 6, 18);
+    draw_dither_overlay(0, 18, DISP_W, DISP_H - 18, menu_dark);
 
     // Overwrite the screen name area with "MENU"
-    spr.fillRect(0, 0, 80, 18, BG_COLOR);
-    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), BG_COLOR);
+    uint16_t menu_hdr_bg = lgfx::color565(4, 10, 28);
+    spr.fillRect(0, 0, 80, 18, menu_hdr_bg);
+    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), menu_hdr_bg);
     spr.setTextSize(1.2);
     spr.setCursor(4, 5);
     kprint(spr, "MENU");
@@ -2834,15 +2850,15 @@ void draw_menu_overlay() {
     snprintf(mute_label,  sizeof(mute_label),  "Mute: %s",       is_muted ? "ON" : "OFF");
 
     MenuLine items[MENU_ITEM_COUNT] = {
-        {"Scanner",       "1",  CAUTION_COLOR},
-        {"Locator",       "2",  GPS_COLOR},
-        {"Detections",    "3",  TEAL_COLOR},
-        {"GPS",           "4",  GPS_COLOR},
-        {"Stats",         "5",  ACCENT_COLOR},
-        {night_label,     "",   HEADER_COLOR},
-        {lp_label,        "",   HEADER_COLOR},
-        {mute_label,      "",   HEADER_COLOR},
-        {"WiFi Config",   "",   CAUTION_COLOR},
+        {"Scanner",       "1",  HEADER_COLOR},
+        {"Locator",       "2",  HEADER_COLOR},
+        {"Detections",    "3",  HEADER_COLOR},
+        {"GPS",           "4",  HEADER_COLOR},
+        {"Stats",         "5",  HEADER_COLOR},
+        {night_label,     "",   DIM_COLOR},
+        {lp_label,        "",   DIM_COLOR},
+        {mute_label,      "",   DIM_COLOR},
+        {"WiFi Config",   "",   DIM_COLOR},
         {"Export Data",   "",   export_mode_active ? ACCENT_COLOR : DIM_COLOR},
     };
 
@@ -2854,25 +2870,32 @@ void draw_menu_overlay() {
     const int start_y  = 22;
     const int left_bar = 3;
 
+    // Eased highlight position — lerps toward target row
+    float target_y = (float)(start_y + menu_selected * (row_h + row_gap));
+    if (!menu_highlight_init) {
+        menu_highlight_ease_y = target_y;
+        menu_highlight_init = true;
+    } else {
+        float diff = target_y - menu_highlight_ease_y;
+        menu_highlight_ease_y += diff * 0.28f;
+        if (fabsf(diff) < 0.5f) menu_highlight_ease_y = target_y;
+    }
+    int ease_y = (int)(menu_highlight_ease_y + 0.5f);
+
+    // ── Row grid (always at fixed positions) ──
+    uint16_t menu_row_bg = lgfx::color565(6, 14, 36);
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
         int y = start_y + i * (row_h + row_gap);
-        bool sel = (i == menu_selected);
 
-        uint16_t row_bg = sel ? ea(CARD_BORDER) : BG_COLOR;
+        uint16_t row_bg = menu_row_bg;
         spr.fillRect(0, y, DISP_W, row_h, row_bg);
+
+        // Left accent bar — thin 3px strip
         spr.fillRect(0, y, left_bar, row_h, ea(items[i].accent));
 
-        if (sel) {
-            spr.fillRect(0, y, left_bar + 2, row_h, ea(HEADER_COLOR));
-            int ay = y + row_h / 2;
-            for (int p = 0; p < 3; p++) {
-                spr.drawLine(left_bar + 3 + p, ay - (2 - p),
-                             left_bar + 3 + p, ay + (2 - p), ea(HEADER_COLOR));
-            }
-        }
-
-        int text_x = sel ? left_bar + 8 : left_bar + 4;
-        spr.setTextColor(sel ? ea(TEXT_COLOR) : ea(DIM_COLOR), row_bg);
+        // Label text — uniform left margin
+        int text_x = left_bar + 6;
+        spr.setTextColor(ea(DIM_COLOR), row_bg);
         spr.setTextSize(1.2);
         spr.setCursor(text_x, y + 2);
         spr.print(items[i].label);
@@ -2884,7 +2907,55 @@ void draw_menu_overlay() {
         }
     }
 
-    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    // ── Eased highlight bar — drawn ON TOP of the grid at eased position ──
+    {
+        uint16_t sel_bg = ea(lerp_col16(menu_row_bg, HEADER_COLOR, 0.18f));
+        spr.fillRect(0, ease_y, DISP_W, row_h, sel_bg);
+
+        // Left accent bar thickened + selection arrow
+        spr.fillRect(0, ease_y, left_bar + 2, row_h, ea(HEADER_COLOR));
+        int ay = ease_y + row_h / 2;
+        for (int p = 0; p < 3; p++) {
+            spr.drawLine(left_bar + 3 + p, ay - (2 - p),
+                         left_bar + 3 + p, ay + (2 - p), ea(HEADER_COLOR));
+        }
+
+        // Redraw the selected item's text on top of the highlight bar
+        int text_x = left_bar + 6;
+        spr.setTextColor(ea(TEXT_COLOR), sel_bg);
+        spr.setTextSize(1.2);
+        spr.setCursor(text_x, ease_y + 2);
+        spr.print(items[menu_selected].label);
+
+        if (items[menu_selected].right_text[0]) {
+            spr.setTextColor(ea(DIM_COLOR), sel_bg);
+            spr.setCursor(DISP_W - 14, ease_y + 2);
+            spr.print(items[menu_selected].right_text);
+        }
+    }
+
+    // ── Scrollbar track + thumb ──
+    {
+        const int track_x = DISP_W - 4;
+        const int track_y = start_y;
+        const int track_h = MENU_ITEM_COUNT * (row_h + row_gap) - row_gap;
+
+        spr.drawFastVLine(track_x + 1, track_y, track_h, ea(CARD_BORDER));
+
+        int thumb_h = max(8, track_h / MENU_ITEM_COUNT);
+        float scroll_t = (menu_highlight_ease_y - (float)start_y)
+                        / (float)((MENU_ITEM_COUNT - 1) * (row_h + row_gap));
+        if (scroll_t < 0.0f) scroll_t = 0.0f;
+        if (scroll_t > 1.0f) scroll_t = 1.0f;
+        int thumb_y = track_y + (int)(scroll_t * (float)(track_h - thumb_h));
+
+        spr.fillRect(track_x, thumb_y, 3, thumb_h, ea(HEADER_COLOR));
+    }
+
+    // Footer
+    uint16_t footer_bg = lgfx::color565(4, 10, 28);
+    spr.fillRect(0, DISP_H - 14, DISP_W, 14, footer_bg);
+    spr.setTextColor(ea(DIM_COLOR), footer_bg);
     spr.setTextSize(1);
     spr.setCursor(4, DISP_H - 10);
     spr.print(";/. nav  ENTER select  DEL close");
@@ -2925,6 +2996,7 @@ void handle_menu_select() {
             } else {
                 set_toast_direct("SET IN SOURCE CODE", CAUTION_COLOR);
             }
+            draw_current_screen(); spr.pushSprite(0, 0);
             break;
         case 9:
             show_menu = false;
@@ -5053,14 +5125,19 @@ void loop() {
             // ── Menu input intercept — when menu is open, swallow nav keys ──
             if (show_menu) {
                 if (c == ';') {
+                    int prev = menu_selected;
                     menu_selected--;
                     if (menu_selected < 0) menu_selected = 0;
+                    if (menu_selected != prev) beep(1600, 8);
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '.') {
+                    int prev = menu_selected;
                     menu_selected++;
                     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
+                    if (menu_selected != prev) beep(1600, 8);
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '\n' || c == '\r') {
+                    beep(1200, 15);
                     handle_menu_select();
                 } else if (c == 0x1B || c == 'm') {
                     show_menu = false;
@@ -5097,6 +5174,7 @@ void loop() {
                     show_menu = !show_menu;
                     if (show_menu) {
                         menu_open_ms = millis();
+                        menu_highlight_init = false;
                         show_feed_expanded = false;
                         show_help_overlay = false;
                     }
