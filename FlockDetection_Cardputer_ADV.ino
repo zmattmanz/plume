@@ -2847,15 +2847,10 @@ static void draw_dither_overlay(int x0, int y0, int w, int h, uint16_t dark_colo
     }
 }
 
-// Soft UI click — brief low-frequency tap at reduced volume.
+// Soft UI click — brief tone that reads as a tactile tick.
 static void menu_click() {
     if (stealth_mode || is_muted) return;
-    int prev_vol = current_volume;
-    int click_vol = max(10, current_volume / 5);
-    M5Cardputer.Speaker.setVolume(click_vol);
-    M5Cardputer.Speaker.tone(600, 4);
-    delay(5);
-    M5Cardputer.Speaker.setVolume(prev_vol);
+    M5Cardputer.Speaker.tone(500, 6);
 }
 
 void draw_menu_overlay() {
@@ -2863,14 +2858,12 @@ void draw_menu_overlay() {
     float alpha = ease_alpha(menu_open_ms, 150);
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    // Solid dark backdrop — fully opaque to block underlying animations
-    uint16_t menu_bg = lgfx::color565(5, 12, 32);
-    spr.fillRect(0, 18, DISP_W, DISP_H - 18, menu_bg);
+    // Solid backdrop matching the rest of the app
+    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
     // Overwrite the screen name area with "MENU"
-    uint16_t menu_hdr_bg = lgfx::color565(5, 12, 32);
-    spr.fillRect(0, 0, 80, 18, menu_hdr_bg);
-    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), menu_hdr_bg);
+    spr.fillRect(0, 0, 80, 18, BG_COLOR);
+    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
     spr.setTextSize(1.5);
     spr.setCursor(4, 5);
     kprint(spr, "MENU");
@@ -2908,7 +2901,7 @@ void draw_menu_overlay() {
     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
 
     const int row_h    = 14;
-    const int row_gap  = 1;
+    const int row_gap  = 3;
     const int start_y  = 20;
 
     // Scrollable viewport — compute how many items fit between start_y and footer
@@ -2941,38 +2934,33 @@ void draw_menu_overlay() {
     int ease_y = (int)(menu_highlight_ease_y + 0.5f);
 
     // ── Row grid — only draw visible items ──
-    uint16_t menu_row_bg = lgfx::color565(5, 12, 32);
     for (int vi = 0; vi < menu_visible_count && (vi + menu_scroll_offset) < MENU_ITEM_COUNT; vi++) {
         int i = vi + menu_scroll_offset;
         int y = start_y + vi * (row_h + row_gap);
 
-        spr.fillRect(0, y, DISP_W, row_h, menu_row_bg);
+        spr.fillRect(0, y, DISP_W, row_h, BG_COLOR);
 
         int text_x = 6;
-        spr.setTextColor(ea(DIM_COLOR), menu_row_bg);
+        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
         spr.setTextSize(1.5);
         spr.setCursor(text_x, y + 2);
-        spr.print(items[i].label);
+        kprint(spr, items[i].label);
     }
 
     // ── Eased highlight bar ──
     {
-        uint16_t sel_bg = ea(lerp_col16(menu_row_bg, HEADER_COLOR, 0.20f));
+        uint16_t sel_bg = ea(lerp_col16(BG_COLOR, HEADER_COLOR, 0.12f));
         spr.fillRect(0, ease_y, DISP_W, row_h, sel_bg);
 
-        // Selection arrow indicator
-        int ay = ease_y + row_h / 2;
-        spr.fillRect(0, ease_y, 3, row_h, ea(HEADER_COLOR));
-        for (int p = 0; p < 3; p++) {
-            spr.drawLine(4 + p, ay - (2 - p), 4 + p, ay + (2 - p), ea(HEADER_COLOR));
-        }
+        // Subtle left edge accent
+        spr.fillRect(0, ease_y, 2, row_h, ea(HEADER_COLOR));
 
         // Redraw selected item text on highlight
-        int text_x = 10;
+        int text_x = 6;
         spr.setTextColor(ea(TEXT_COLOR), sel_bg);
         spr.setTextSize(1.5);
         spr.setCursor(text_x, ease_y + 2);
-        spr.print(items[menu_selected].label);
+        kprint(spr, items[menu_selected].label);
     }
 
     // ── Scrollbar — only show if list exceeds viewport ──
@@ -2991,9 +2979,8 @@ void draw_menu_overlay() {
     }
 
     // Footer
-    uint16_t footer_bg = lgfx::color565(5, 12, 32);
-    spr.fillRect(0, DISP_H - 14, DISP_W, 14, footer_bg);
-    spr.setTextColor(ea(DIM_COLOR), footer_bg);
+    spr.fillRect(0, DISP_H - 14, DISP_W, 14, BG_COLOR);
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(1);
     spr.setCursor(4, DISP_H - 10);
     spr.print(";/. nav  ENTER select  DEL close");
@@ -5321,14 +5308,14 @@ void loop() {
             if (show_menu) {
                 if (c == ';') {
                     int prev = menu_selected;
-                    menu_selected--;
-                    if (menu_selected < 0) menu_selected = 0;
+                    menu_selected++;
+                    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
                     if (menu_selected != prev) menu_click();
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '.') {
                     int prev = menu_selected;
-                    menu_selected++;
-                    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
+                    menu_selected--;
+                    if (menu_selected < 0) menu_selected = 0;
                     if (menu_selected != prev) menu_click();
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '\n' || c == '\r') {
@@ -5393,11 +5380,11 @@ void loop() {
                 draw_current_screen(); spr.pushSprite(0,0);
             }
             else if (c == ';') {
-                current_volume -= 15; if (current_volume < 0) current_volume = 0;
-                if (current_volume == 0 && !is_muted) {
-                    is_muted = true;
+                current_volume += 15; if (current_volume > 255) current_volume = 255;
+                if (is_muted && current_volume > 0) {
+                    is_muted = false;
                 }
-                M5Cardputer.Speaker.setVolume(current_volume); beep(400, 50);
+                M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
                 if (!show_vol_overlay) {
                     vol_overlay_start = millis(); show_vol_overlay = true;
                 } else {
@@ -5407,11 +5394,11 @@ void loop() {
                 draw_current_screen(); spr.pushSprite(0, 0);
             }
             else if (c == '.') {
-                current_volume += 15; if (current_volume > 255) current_volume = 255;
-                if (is_muted && current_volume > 0) {
-                    is_muted = false;
+                current_volume -= 15; if (current_volume < 0) current_volume = 0;
+                if (current_volume == 0 && !is_muted) {
+                    is_muted = true;
                 }
-                M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
+                M5Cardputer.Speaker.setVolume(current_volume); beep(400, 50);
                 if (!show_vol_overlay) {
                     vol_overlay_start = millis(); show_vol_overlay = true;
                 } else {
@@ -5590,6 +5577,21 @@ void loop() {
                     }
                 }
                 // ENTER on other screens is a no-op (menu handles navigation)
+            }
+        }
+
+        // Fallback ENTER check — some Cardputer ADV firmware doesn't put
+        // ENTER in status.word. Check status.enter directly.
+        if (status.enter && !stealth_mode) {
+            if (show_menu) {
+                menu_click();
+                handle_menu_select();
+            } else if (current_screen == 2) {
+                int hist_total = sd_available ? sd_hist_count : capture_history_count;
+                if (hist_total > 0) {
+                    hist_detail_open = !hist_detail_open;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                }
             }
         }
 
