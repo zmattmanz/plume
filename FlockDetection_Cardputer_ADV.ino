@@ -1265,11 +1265,11 @@ static void sd_check_hotplug() {
     last_sd_check_ms = now;
 
     if (!sd_available) {
-        // Remount via the same dedicated sdSPI bus setup() uses at the same
-        // 15 MHz rate. No-arg SD.begin or the default global SPI route to
-        // wrong pins on the Cardputer.
+        // Remount via the same dedicated sdSPI bus setup() uses. No-arg
+        // SD.begin or the default global SPI route to wrong pins on the
+        // Cardputer. No frequency arg — matches the Launcher's default 4 MHz.
         bool mounted = false;
-        if (SD.begin(SD_CS_PIN, sdSPI, 15000000)) {
+        if (SD.begin(SD_CS_PIN, sdSPI)) {
             if (SD.cardType() != CARD_NONE) {
                 mounted = true;
             } else {
@@ -5198,13 +5198,20 @@ void setup() {
     gpio_reset_pin((gpio_num_t)SD_SPI_MOSI_PIN);  // GPIO14
     gpio_reset_pin((gpio_num_t)SD_CS_PIN);        // GPIO12
 
+    // GPIO5 enables the SD card slot on the Cardputer — the slot is physically
+    // disabled until this line is driven HIGH. Missed this because it lives in
+    // the Launcher's board init (_setup_gpio), not its SD code.
+    pinMode(5, OUTPUT);
+    digitalWrite(5, HIGH);
+
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);
     delay(100);
 
     sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
 
-    if (SD.begin(SD_CS_PIN, sdSPI, 15000000)) {
+    // Launcher uses SD.begin with no frequency arg (default 4 MHz) on this hardware.
+    if (SD.begin(SD_CS_PIN, sdSPI)) {
         sd_available = true;
         Serial.printf("[SD] OK! Type=%d Size=%lluMB\n",
                       SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
