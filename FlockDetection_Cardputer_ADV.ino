@@ -1261,10 +1261,11 @@ static void sd_check_hotplug() {
     last_sd_check_ms = now;
 
     if (!sd_available) {
-        // Pass SD_CS_PIN (GPIO 12) explicitly — no-arg SD.begin() defaults to
-        // GPIO 5, which the Cardputer doesn't use for SD and would silently fail.
+        // Remount using the same explicit SPI bus + speed setup() used.
+        // SD.begin() without the SPI reference falls back to pins the Cardputer
+        // doesn't wire, so a hot-swap would never remount.
         bool mounted = false;
-        if (SD.begin(SD_CS_PIN)) {
+        if (SD.begin(SD_CS_PIN, SPI, 20000000)) {
             if (SD.cardType() != CARD_NONE) {
                 mounted = true;
             } else {
@@ -5176,13 +5177,17 @@ void setup() {
 
     boot_animate(10, "SD card...");
 
-    // M5Cardputer.begin() already initialized the microSD bus and mount state on
-    // SPI3 with the correct pins — we just check whether a card is present.
-    // Doing our own SPI.begin() + SD.begin() here used to race the M5Unified init
-    // and occasionally tripped the hardware watchdog.
-    Serial.println("[SD] === Checking SD Card via M5Unified ===");
+    // M5Cardputer.begin() mounts the display/peripherals but does NOT route the
+    // global Arduino <SD.h> library to the Cardputer's SD pins — that library
+    // defaults to disconnected ESP32-S3 pins. Map the global SPI bus to the
+    // Cardputer's physical SD pins (SCK 40 / MISO 39 / MOSI 14), then mount SD
+    // over it at a stable 20 MHz (matches MSLauncher, well below the earlier
+    // 25 MHz that occasionally timed out).
+    Serial.println("[SD] === Initializing SPI & SD Card ===");
 
-    if (SD.cardType() != CARD_NONE) {
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, -1);
+
+    if (SD.begin(SD_CS_PIN, SPI, 20000000)) {
         sd_available = true;
         Serial.printf("[SD] OK! Type=%d Size=%lluMB\n",
                       SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
@@ -5227,7 +5232,7 @@ void setup() {
         }
     } else {
         sd_available = false;
-        Serial.println("[SD] Mount failed. No card detected or format unsupported.");
+        Serial.println("[SD] Mount failed. Check insertion or format.");
     }
     boot_animate(35, sd_available ? "SD mounted" : "no SD card");
     // Seed hot-plug state so the first poll doesn't fire a spurious "mounted" toast
