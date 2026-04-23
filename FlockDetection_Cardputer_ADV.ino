@@ -42,6 +42,7 @@ void apply_color_palette();
 void draw_help_overlay();
 void draw_menu_overlay();
 void handle_menu_select();
+void save_stats_to_sd();
 void draw_feed_expanded_overlay();
 void draw_gps_screen();
 void load_sd_history();
@@ -79,9 +80,10 @@ int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static bool show_menu = false;
 static int  menu_selected = 0;
 static unsigned long menu_open_ms = 0;
-#define MENU_ITEM_COUNT 10
+#define MENU_ITEM_COUNT 11
 static float menu_highlight_ease_y = 0.0f;  // current eased y position of highlight
 static bool  menu_highlight_init = false;   // true after first draw (prevents ease-from-zero)
+static int   menu_scroll_offset = 0;        // index of first visible item
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
 static bool low_power_mode = false;
@@ -229,6 +231,7 @@ static void safe_copy(char* dest, const char* src, size_t dest_size) {
 // GLOBALS & STRUCTS
 // ============================================================================
 M5Canvas spr(&M5Cardputer.Display);
+SPIClass sdSPI(SPI3_HOST);  // dedicated SPI bus for SD — avoids conflict with display on SPI2
 
 TaskHandle_t ScannerTaskHandle;
 TaskHandle_t GPSTaskHandle; 
@@ -255,9 +258,9 @@ int  sd_write_count = 0;
 unsigned long last_sd_flush = 0;
 static int flash_write_fail_count = 0; 
 
-String current_log_file = "/FLOCK/FlockLog.csv";
-String current_pcap_file = "/FLOCK/Threats.pcap";
-String current_ble_pcap_file = "/FLOCK/BLE_Threats.pcap";
+String current_log_file = "/FLOCK_FINDER/logs/FlockLog.csv";
+String current_pcap_file = "/FLOCK_FINDER/captures/Threats.pcap";
+String current_ble_pcap_file = "/FLOCK_FINDER/captures/BLE_Threats.pcap";
 
 // Export server state
 static WebServer* export_server = nullptr;
@@ -950,13 +953,13 @@ void export_server_setup_routes() {
     };
 
     export_server->on("/FlockLog.csv", HTTP_GET, [serve_sd_file]() {
-        serve_sd_file("/FlockLog.csv", "text/csv");
+        serve_sd_file("/FLOCK_FINDER/logs/FlockLog.csv", "text/csv");
     });
     export_server->on("/Threats.pcap", HTTP_GET, [serve_sd_file]() {
-        serve_sd_file("/Threats.pcap", "application/vnd.tcpdump.pcap");
+        serve_sd_file("/FLOCK_FINDER/captures/Threats.pcap", "application/vnd.tcpdump.pcap");
     });
     export_server->on("/BLE_Threats.pcap", HTTP_GET, [serve_sd_file]() {
-        serve_sd_file("/BLE_Threats.pcap", "application/vnd.tcpdump.pcap");
+        serve_sd_file("/FLOCK_FINDER/captures/BLE_Threats.pcap", "application/vnd.tcpdump.pcap");
     });
 
     export_server->onNotFound([]() {
@@ -1200,6 +1203,7 @@ void save_session_to_flash() {
         flash_write_fail_count = 0;
         last_persist_save = millis();
         save_detections_to_flash();
+        save_stats_to_sd();
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         lifetime_flash_writes = l_writes;
         xSemaphoreGive(dataMutex);
@@ -1213,6 +1217,19 @@ void save_session_to_flash() {
             last_persist_save = millis();
         }
     }
+}
+
+void save_stats_to_sd() {
+    if (!sd_available) return;
+    File f = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
+    if (!f) return;
+    f.printf("lifetime_wifi=%ld\n", lifetime_wifi);
+    f.printf("lifetime_ble=%ld\n", lifetime_ble);
+    f.printf("lifetime_seconds=%lu\n", lifetime_seconds);
+    f.printf("lifetime_flock_total=%ld\n", lifetime_flock_total);
+    f.printf("lifetime_boots=%ld\n", lifetime_boots);
+    f.printf("lifetime_flash_writes=%ld\n", lifetime_flash_writes);
+    f.close();
 }
 
 void load_session_from_flash() {
@@ -2812,6 +2829,17 @@ static void draw_dither_overlay(int x0, int y0, int w, int h, uint16_t dark_colo
     }
 }
 
+// Soft UI click — brief low-frequency tap at reduced volume.
+static void menu_click() {
+    if (stealth_mode || is_muted) return;
+    int prev_vol = current_volume;
+    int click_vol = max(10, current_volume / 5);
+    M5Cardputer.Speaker.setVolume(click_vol);
+    M5Cardputer.Speaker.tone(600, 4);
+    delay(5);
+    M5Cardputer.Speaker.setVolume(prev_vol);
+}
+
 void draw_menu_overlay() {
     unsigned long now_ms = millis();
 
@@ -2825,22 +2853,20 @@ void draw_menu_overlay() {
     }
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    // Dithered dark overlay — lets the underlying screen bleed through
-    // at ~50% density, creating a frosted-glass effect.
-    uint16_t menu_dark = lgfx::color565(3, 6, 18);
-    draw_dither_overlay(0, 18, DISP_W, DISP_H - 18, menu_dark);
+    // Solid dark backdrop — fully opaque to block underlying animations
+    uint16_t menu_bg = lgfx::color565(5, 12, 32);
+    spr.fillRect(0, 18, DISP_W, DISP_H - 18, menu_bg);
 
     // Overwrite the screen name area with "MENU"
-    uint16_t menu_hdr_bg = lgfx::color565(4, 10, 28);
+    uint16_t menu_hdr_bg = lgfx::color565(5, 12, 32);
     spr.fillRect(0, 0, 80, 18, menu_hdr_bg);
     spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), menu_hdr_bg);
-    spr.setTextSize(1.2);
+    spr.setTextSize(1.5);
     spr.setCursor(4, 5);
     kprint(spr, "MENU");
 
     struct MenuLine {
         const char* label;
-        const char* right_text;
         uint16_t    accent;
     };
 
@@ -2850,110 +2876,107 @@ void draw_menu_overlay() {
     snprintf(mute_label,  sizeof(mute_label),  "Mute: %s",       is_muted ? "ON" : "OFF");
 
     MenuLine items[MENU_ITEM_COUNT] = {
-        {"Scanner",       "1",  HEADER_COLOR},
-        {"Locator",       "2",  HEADER_COLOR},
-        {"Detections",    "3",  HEADER_COLOR},
-        {"GPS",           "4",  HEADER_COLOR},
-        {"Stats",         "5",  HEADER_COLOR},
-        {night_label,     "",   DIM_COLOR},
-        {lp_label,        "",   DIM_COLOR},
-        {mute_label,      "",   DIM_COLOR},
-        {"WiFi Config",   "",   DIM_COLOR},
-        {"Export Data",   "",   export_mode_active ? ACCENT_COLOR : DIM_COLOR},
+        {"Scanner",       HEADER_COLOR},
+        {"Locator",       HEADER_COLOR},
+        {"Detections",    HEADER_COLOR},
+        {"GPS",           HEADER_COLOR},
+        {"Stats",         HEADER_COLOR},
+        {night_label,     DIM_COLOR},
+        {lp_label,        DIM_COLOR},
+        {mute_label,      DIM_COLOR},
+        {"WiFi Config",   DIM_COLOR},
+        {"Export Data",   export_mode_active ? ACCENT_COLOR : DIM_COLOR},
+        {"Clear Stats",   CAUTION_COLOR},
     };
 
     if (menu_selected < 0) menu_selected = 0;
     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
 
-    const int row_h    = 11;
+    const int row_h    = 14;
     const int row_gap  = 1;
-    const int start_y  = 22;
-    const int left_bar = 3;
+    const int start_y  = 20;
 
-    // Eased highlight position — lerps toward target row
-    float target_y = (float)(start_y + menu_selected * (row_h + row_gap));
+    // Scrollable viewport — compute how many items fit between start_y and footer
+    const int footer_y = DISP_H - 14;
+    const int visible_h = footer_y - start_y;
+    const int menu_visible_count = visible_h / (row_h + row_gap);
+
+    if (menu_selected < menu_scroll_offset) {
+        menu_scroll_offset = menu_selected;
+    }
+    if (menu_selected >= menu_scroll_offset + menu_visible_count) {
+        menu_scroll_offset = menu_selected - menu_visible_count + 1;
+    }
+    if (menu_scroll_offset < 0) menu_scroll_offset = 0;
+    int max_scroll = MENU_ITEM_COUNT - menu_visible_count;
+    if (max_scroll < 0) max_scroll = 0;
+    if (menu_scroll_offset > max_scroll) menu_scroll_offset = max_scroll;
+
+    // Eased highlight — target is the screen position of the selected item
+    int sel_vi = menu_selected - menu_scroll_offset;
+    float target_y = (float)(start_y + sel_vi * (row_h + row_gap));
     if (!menu_highlight_init) {
         menu_highlight_ease_y = target_y;
         menu_highlight_init = true;
     } else {
         float diff = target_y - menu_highlight_ease_y;
-        menu_highlight_ease_y += diff * 0.28f;
+        menu_highlight_ease_y += diff * 0.30f;
         if (fabsf(diff) < 0.5f) menu_highlight_ease_y = target_y;
     }
     int ease_y = (int)(menu_highlight_ease_y + 0.5f);
 
-    // ── Row grid (always at fixed positions) ──
-    uint16_t menu_row_bg = lgfx::color565(6, 14, 36);
-    for (int i = 0; i < MENU_ITEM_COUNT; i++) {
-        int y = start_y + i * (row_h + row_gap);
+    // ── Row grid — only draw visible items ──
+    uint16_t menu_row_bg = lgfx::color565(5, 12, 32);
+    for (int vi = 0; vi < menu_visible_count && (vi + menu_scroll_offset) < MENU_ITEM_COUNT; vi++) {
+        int i = vi + menu_scroll_offset;
+        int y = start_y + vi * (row_h + row_gap);
 
-        uint16_t row_bg = menu_row_bg;
-        spr.fillRect(0, y, DISP_W, row_h, row_bg);
+        spr.fillRect(0, y, DISP_W, row_h, menu_row_bg);
 
-        // Left accent bar — thin 3px strip
-        spr.fillRect(0, y, left_bar, row_h, ea(items[i].accent));
-
-        // Label text — uniform left margin
-        int text_x = left_bar + 6;
-        spr.setTextColor(ea(DIM_COLOR), row_bg);
-        spr.setTextSize(1.2);
+        int text_x = 6;
+        spr.setTextColor(ea(DIM_COLOR), menu_row_bg);
+        spr.setTextSize(1.5);
         spr.setCursor(text_x, y + 2);
         spr.print(items[i].label);
-
-        if (items[i].right_text[0]) {
-            spr.setTextColor(ea(DIM_COLOR), row_bg);
-            spr.setCursor(DISP_W - 14, y + 2);
-            spr.print(items[i].right_text);
-        }
     }
 
-    // ── Eased highlight bar — drawn ON TOP of the grid at eased position ──
+    // ── Eased highlight bar ──
     {
-        uint16_t sel_bg = ea(lerp_col16(menu_row_bg, HEADER_COLOR, 0.18f));
+        uint16_t sel_bg = ea(lerp_col16(menu_row_bg, HEADER_COLOR, 0.20f));
         spr.fillRect(0, ease_y, DISP_W, row_h, sel_bg);
 
-        // Left accent bar thickened + selection arrow
-        spr.fillRect(0, ease_y, left_bar + 2, row_h, ea(HEADER_COLOR));
+        // Selection arrow indicator
         int ay = ease_y + row_h / 2;
+        spr.fillRect(0, ease_y, 3, row_h, ea(HEADER_COLOR));
         for (int p = 0; p < 3; p++) {
-            spr.drawLine(left_bar + 3 + p, ay - (2 - p),
-                         left_bar + 3 + p, ay + (2 - p), ea(HEADER_COLOR));
+            spr.drawLine(4 + p, ay - (2 - p), 4 + p, ay + (2 - p), ea(HEADER_COLOR));
         }
 
-        // Redraw the selected item's text on top of the highlight bar
-        int text_x = left_bar + 6;
+        // Redraw selected item text on highlight
+        int text_x = 10;
         spr.setTextColor(ea(TEXT_COLOR), sel_bg);
-        spr.setTextSize(1.2);
+        spr.setTextSize(1.5);
         spr.setCursor(text_x, ease_y + 2);
         spr.print(items[menu_selected].label);
-
-        if (items[menu_selected].right_text[0]) {
-            spr.setTextColor(ea(DIM_COLOR), sel_bg);
-            spr.setCursor(DISP_W - 14, ease_y + 2);
-            spr.print(items[menu_selected].right_text);
-        }
     }
 
-    // ── Scrollbar track + thumb ──
-    {
+    // ── Scrollbar — only show if list exceeds viewport ──
+    if (MENU_ITEM_COUNT > menu_visible_count) {
         const int track_x = DISP_W - 4;
         const int track_y = start_y;
-        const int track_h = MENU_ITEM_COUNT * (row_h + row_gap) - row_gap;
+        const int track_h = menu_visible_count * (row_h + row_gap) - row_gap;
 
         spr.drawFastVLine(track_x + 1, track_y, track_h, ea(CARD_BORDER));
 
-        int thumb_h = max(8, track_h / MENU_ITEM_COUNT);
-        float scroll_t = (menu_highlight_ease_y - (float)start_y)
-                        / (float)((MENU_ITEM_COUNT - 1) * (row_h + row_gap));
-        if (scroll_t < 0.0f) scroll_t = 0.0f;
-        if (scroll_t > 1.0f) scroll_t = 1.0f;
+        int thumb_h = max(8, (track_h * menu_visible_count) / MENU_ITEM_COUNT);
+        float scroll_t = (max_scroll > 0) ? (float)menu_scroll_offset / (float)max_scroll : 0.0f;
         int thumb_y = track_y + (int)(scroll_t * (float)(track_h - thumb_h));
 
         spr.fillRect(track_x, thumb_y, 3, thumb_h, ea(HEADER_COLOR));
     }
 
     // Footer
-    uint16_t footer_bg = lgfx::color565(4, 10, 28);
+    uint16_t footer_bg = lgfx::color565(5, 12, 32);
     spr.fillRect(0, DISP_H - 14, DISP_W, 14, footer_bg);
     spr.setTextColor(ea(DIM_COLOR), footer_bg);
     spr.setTextSize(1);
@@ -3007,6 +3030,24 @@ void handle_menu_select() {
             }
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
+        case 10: {
+            // Clear all stats — session and lifetime
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            session_wifi = 0; session_ble = 0;
+            session_flock_wifi = 0; session_flock_ble = 0;
+            session_raven = 0;
+            lifetime_wifi = 0; lifetime_ble = 0;
+            lifetime_flock_total = 0;
+            lifetime_seconds = 0;
+            lifetime_boots = 0;
+            lifetime_flash_writes = 0;
+            session_start_time = millis();
+            xSemaphoreGive(dataMutex);
+            save_session_to_flash();
+            set_toast_direct("STATS CLEARED", CAUTION_COLOR);
+            draw_current_screen(); spr.pushSprite(0, 0);
+            break;
+        }
     }
 }
 
@@ -4866,7 +4907,7 @@ void setup() {
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);   // deselect SD before SPI init
     delay(100);                       // let card power stabilize
-    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
+    sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
 
     Serial.println("[SD] === SD Card Mount Diagnostic ===");
     Serial.printf("[SD] Pins: SCK=%d MISO=%d MOSI=%d CS=%d\n",
@@ -4884,7 +4925,7 @@ void setup() {
     for (int si = 0; si < 5 && !mount_success; si++) {
         for (int attempt = 0; attempt < 3 && !mount_success; attempt++) {
             Serial.printf("[SD] Speed=%luHz attempt=%d... ", sd_speeds[si], attempt + 1);
-            if (SD.begin(SD_CS_PIN, SPI, sd_speeds[si])) {
+            if (SD.begin(SD_CS_PIN, sdSPI, sd_speeds[si])) {
                 mount_success = true;
                 Serial.printf("OK! Type=%d Size=%lluMB\n",
                               SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
@@ -4911,10 +4952,11 @@ void setup() {
 
     if (mount_success) {
         sd_available = true;
-        if (!SD.exists("/FLOCK")) {
-            SD.mkdir("/FLOCK");
-            Serial.println("[SD] Created /FLOCK directory");
-        }
+        if (!SD.exists("/FLOCK_FINDER"))           SD.mkdir("/FLOCK_FINDER");
+        if (!SD.exists("/FLOCK_FINDER/logs"))      SD.mkdir("/FLOCK_FINDER/logs");
+        if (!SD.exists("/FLOCK_FINDER/captures"))  SD.mkdir("/FLOCK_FINDER/captures");
+        if (!SD.exists("/FLOCK_FINDER/stats"))     SD.mkdir("/FLOCK_FINDER/stats");
+        Serial.println("[SD] Directory structure OK");
         if (!SD.exists(current_log_file.c_str())) {
             File file = SD.open(current_log_file.c_str(), FILE_WRITE);
             if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
@@ -5128,16 +5170,16 @@ void loop() {
                     int prev = menu_selected;
                     menu_selected--;
                     if (menu_selected < 0) menu_selected = 0;
-                    if (menu_selected != prev) beep(1600, 8);
+                    if (menu_selected != prev) menu_click();
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '.') {
                     int prev = menu_selected;
                     menu_selected++;
                     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
-                    if (menu_selected != prev) beep(1600, 8);
+                    if (menu_selected != prev) menu_click();
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '\n' || c == '\r') {
-                    beep(1200, 15);
+                    menu_click();
                     handle_menu_select();
                 } else if (c == 0x1B || c == 'm') {
                     show_menu = false;
@@ -5175,6 +5217,7 @@ void loop() {
                     if (show_menu) {
                         menu_open_ms = millis();
                         menu_highlight_init = false;
+                        menu_scroll_offset = 0;
                         show_feed_expanded = false;
                         show_help_overlay = false;
                     }
