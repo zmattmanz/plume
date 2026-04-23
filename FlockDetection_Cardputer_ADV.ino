@@ -244,6 +244,7 @@ static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms
 // GLOBALS & STRUCTS
 // ============================================================================
 M5Canvas spr(&M5Cardputer.Display);
+SPIClass sdSPI(SPI3_HOST);  // dedicated SPI3 bus for the microSD card — keeps it off the display's SPI
 
 TaskHandle_t ScannerTaskHandle;
 TaskHandle_t GPSTaskHandle; 
@@ -1261,11 +1262,10 @@ static void sd_check_hotplug() {
     last_sd_check_ms = now;
 
     if (!sd_available) {
-        // Remount using the same explicit SPI bus + speed setup() used.
-        // SD.begin() without the SPI reference falls back to pins the Cardputer
-        // doesn't wire, so a hot-swap would never remount.
+        // Remount via the same dedicated sdSPI bus setup() uses. No-arg SD.begin
+        // or the default global SPI route to wrong pins on the Cardputer.
         bool mounted = false;
-        if (SD.begin(SD_CS_PIN, SPI, 20000000)) {
+        if (SD.begin(SD_CS_PIN, sdSPI, 20000000)) {
             if (SD.cardType() != CARD_NONE) {
                 mounted = true;
             } else {
@@ -5177,17 +5177,14 @@ void setup() {
 
     boot_animate(10, "SD card...");
 
-    // M5Cardputer.begin() mounts the display/peripherals but does NOT route the
-    // global Arduino <SD.h> library to the Cardputer's SD pins — that library
-    // defaults to disconnected ESP32-S3 pins. Map the global SPI bus to the
-    // Cardputer's physical SD pins (SCK 40 / MISO 39 / MOSI 14), then mount SD
-    // over it at a stable 20 MHz (matches MSLauncher, well below the earlier
-    // 25 MHz that occasionally timed out).
+    // Route a dedicated SPI3 instance to the Cardputer's SD pins so the mount
+    // doesn't race the display bus that M5Cardputer.begin() owns. 20 MHz matches
+    // MSLauncher's stable operating point.
     Serial.println("[SD] === Initializing SPI & SD Card ===");
 
-    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, -1);
+    sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
 
-    if (SD.begin(SD_CS_PIN, SPI, 20000000)) {
+    if (SD.begin(SD_CS_PIN, sdSPI, 20000000)) {
         sd_available = true;
         Serial.printf("[SD] OK! Type=%d Size=%lluMB\n",
                       SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
@@ -5261,8 +5258,16 @@ void setup() {
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
-    if (!LittleFS.begin(true)) { littlefs_available = false; }
-    else {
+    // Disable the task watchdog before LittleFS in case the partition is corrupt
+    // and needs a 15s format pass — the default watchdog would panic-reboot us
+    // mid-format and cause an infinite boot loop. A fresh watchdog is configured
+    // right before the long-running tasks start at the end of setup().
+    esp_task_wdt_deinit();
+
+    if (!LittleFS.begin(true)) {
+        Serial.println("[FS] LittleFS format failed!");
+        littlefs_available = false;
+    } else {
         littlefs_available = true;
         load_session_from_flash();
         load_detections_from_flash();
