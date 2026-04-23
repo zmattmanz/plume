@@ -5362,8 +5362,14 @@ void setup() {
         .idle_core_mask = 0,
         .trigger_panic = true
     };
-    esp_task_wdt_init(&wdt_cfg);
-    // Note: if the struct API causes a compile error, fallback is: esp_task_wdt_init(10, true);
+    // Arduino-ESP32 3.x initializes TWDT before setup() runs. If it's already
+    // up, reconfigure instead of failing with ESP_ERR_INVALID_STATE.
+    esp_err_t wdt_err = esp_task_wdt_init(&wdt_cfg);
+    if (wdt_err == ESP_ERR_INVALID_STATE) {
+        esp_task_wdt_reconfigure(&wdt_cfg);
+    } else if (wdt_err != ESP_OK) {
+        Serial.printf("[WDT] init failed: %d\n", wdt_err);
+    }
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
