@@ -4906,78 +4906,79 @@ void transition_screen(int new_screen, int dir) {
 // ============================================================================
 
 // Boot progress screen — drawn directly to Display (not sprite).
-// Called at key milestones during setup() to show initialization progress.
+// Uses incremental redraws to avoid full-screen flicker between milestones.
 static int boot_prev_pct = -1;
-static unsigned long boot_pct_change_ms = 0;
+static float boot_eased_fill = 0.0f;
+static bool boot_first_draw = true;
 
 void draw_boot_screen(int pct, const char* status_text = nullptr) {
     auto& lcd = M5Cardputer.Display;
 
-    uint16_t bg      = lgfx::color565( 10,  20,  48);
-    uint16_t blue    = lgfx::color565(  0, 215, 235);
-    uint16_t dim     = lgfx::color565(100, 140, 180);
-    uint16_t text_c  = lgfx::color565(220, 232, 255);
+    uint16_t bg     = lgfx::color565( 10,  20,  48);
+    uint16_t blue   = lgfx::color565(  0, 215, 235);
+    uint16_t white  = lgfx::color565(255, 255, 255);
+    uint16_t dim    = lgfx::color565(140, 170, 200);
 
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
-    if (pct != boot_prev_pct) {
-        boot_pct_change_ms = millis();
-        boot_prev_pct = pct;
-    }
+    // Bar geometry
+    const int bar_w = 180;
+    const int bar_h = 10;
+    const int bar_x = (DISP_W - bar_w) / 2;
+    const int bar_y = 92;
+    const int bar_r = bar_h / 2;
 
-    lcd.fillScreen(bg);
+    // Number geometry
+    const int num_y = 50;
+    const int num_w = 80;
+    const int num_x = (DISP_W - num_w) / 2;
+    const int num_h = 24;
 
-    // Version string at top
-    lcd.setTextColor(dim, bg);
-    lcd.setTextSize(1);
-    lcd.setTextDatum(TC_DATUM);
-    lcd.drawString(VERSION_STRING, DISP_W / 2, 16);
+    // Status text geometry
+    const int status_y = 112;
+    const int status_h = 12;
 
-    // Percentage number with roll-up animation
-    {
-        unsigned long elapsed = millis() - boot_pct_change_ms;
-        const unsigned long ROLL_MS = 200;
+    // ── First draw: fill screen + paint static elements ──
+    if (boot_first_draw) {
+        lcd.fillScreen(bg);
 
-        char pct_str[8];
-        snprintf(pct_str, sizeof(pct_str), "%d%%", pct);
-
-        int num_y = 48;
-        int num_h = 24;
-
-        lcd.setClipRect(0, num_y - 2, DISP_W, num_h + 4);
-        lcd.setTextColor(text_c, bg);
-        lcd.setTextSize(3);
+        // Version string (static)
+        lcd.setTextColor(dim, bg);
+        lcd.setTextSize(1);
         lcd.setTextDatum(TC_DATUM);
+        lcd.drawString(VERSION_STRING, DISP_W / 2, 18);
 
-        if (elapsed < ROLL_MS) {
-            float t = (float)elapsed / (float)ROLL_MS;
-            float ease = 1.0f - (1.0f - t) * (1.0f - t);
-            int offset = (int)((1.0f - ease) * (float)num_h);
-            lcd.drawString(pct_str, DISP_W / 2, num_y + offset);
-        } else {
-            lcd.drawString(pct_str, DISP_W / 2, num_y);
-        }
-        lcd.clearClipRect();
-    }
-
-    // Progress bar
-    {
-        const int bar_w = 180;
-        const int bar_h = 10;
-        const int bar_x = (DISP_W - bar_w) / 2;
-        const int bar_y = 92;
-        const int bar_r = bar_h / 2;
-
+        // Bar outline (static)
         lcd.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, blue);
 
-        int target_fill = (pct * (bar_w - 4)) / 100;
-        static float eased_fill = 0.0f;
-        float diff = (float)target_fill - eased_fill;
-        eased_fill += diff * 0.25f;
-        if (fabsf(diff) < 0.5f) eased_fill = (float)target_fill;
-        int fill_w = (int)(eased_fill + 0.5f);
+        boot_first_draw = false;
+        boot_eased_fill = 0.0f;
+    }
 
+    // ── Update number only when pct changes ──
+    if (pct != boot_prev_pct) {
+        boot_prev_pct = pct;
+
+        lcd.fillRect(num_x, num_y, num_w, num_h, bg);
+
+        char pct_str[8];
+        snprintf(pct_str, sizeof(pct_str), "%d", pct);
+        lcd.setTextColor(white, bg);
+        lcd.setTextSize(3);
+        lcd.setTextDatum(TC_DATUM);
+        lcd.drawString(pct_str, DISP_W / 2, num_y);
+    }
+
+    // ── Update bar fill every frame (eased) ──
+    {
+        int target_fill = (pct * (bar_w - 4)) / 100;
+        float diff = (float)target_fill - boot_eased_fill;
+        boot_eased_fill += diff * 0.3f;
+        if (fabsf(diff) < 0.5f) boot_eased_fill = (float)target_fill;
+        int fill_w = (int)(boot_eased_fill + 0.5f);
+
+        lcd.fillRect(bar_x + 2, bar_y + 2, bar_w - 4, bar_h - 4, bg);
         if (fill_w > 0) {
             int fill_r = (bar_h - 4) / 2;
             if (fill_r < 1) fill_r = 1;
@@ -4989,21 +4990,23 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
+    // ── Status text only when provided ──
     if (status_text) {
-        lcd.setTextColor(dim, bg);
+        lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+        lcd.setTextColor(white, bg);
         lcd.setTextSize(1);
         lcd.setTextDatum(TC_DATUM);
-        lcd.drawString(status_text, DISP_W / 2, 110);
+        lcd.drawString(status_text, DISP_W / 2, status_y);
     }
 
     lcd.setTextDatum(TL_DATUM);
 }
 
-// Animate the boot progress bar for a brief moment so easing is visible.
-static void boot_animate(int pct, const char* status, int frames = 6) {
+// Animate the boot progress bar briefly so the eased fill is visible.
+static void boot_animate(int pct, const char* status, int frames = 8) {
     for (int i = 0; i < frames; i++) {
-        draw_boot_screen(pct, status);
-        delay(20);
+        draw_boot_screen(pct, (i == 0) ? status : nullptr);
+        delay(18);
     }
 }
 
@@ -5164,22 +5167,9 @@ void setup() {
 
     lifetime_boots++;
     save_session_to_flash();
-
     session_start_time = millis();
 
-    draw_current_screen(); spr.pushSprite(0,0);
-
-    if (!is_muted) {
-        // Vintage handheld boot — two short ascending blips, soft volume.
-        // Think Casio calculator power-on, not orchestral fanfare.
-        int boot_vol = current_volume > 25 ? 25 : current_volume;
-        M5Cardputer.Speaker.setVolume(boot_vol);
-        delay(120);
-        M5Cardputer.Speaker.tone(880,  60); delay(80);   // A5, brief
-        M5Cardputer.Speaker.tone(1318, 90); delay(140);  // E6, slightly longer
-    }
-    M5Cardputer.Speaker.setVolume(current_volume);
-
+    // WiFi promiscuous mode — complete before scanner screen appears
     WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
@@ -5187,13 +5177,15 @@ void setup() {
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
     boot_animate(85, "WiFi sniffer...");
 
+    // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    pBLEScan = NimBLEDevice::getScan(); pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+    pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
     boot_animate(92, "BLE scanner...");
 
+    // Tasks and watchdog
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    // Task watchdog: 10-second timeout, panic on trigger
     esp_task_wdt_deinit();
     esp_task_wdt_config_t wdt_cfg = {
         .timeout_ms = 10000,
@@ -5207,7 +5199,24 @@ void setup() {
     last_user_input_ms = millis();
     system_fully_booted = true;
     boot_animate(100, "ready");
-    delay(300);
+    delay(400);
+
+    // === Boot screen is done — now show the scanner ===
+    draw_current_screen(); spr.pushSprite(0, 0);
+
+    // Boot chime — plays after the scanner is visible
+    if (!is_muted) {
+        int boot_vol = current_volume > 25 ? 25 : current_volume;
+        M5Cardputer.Speaker.setVolume(boot_vol);
+        delay(120);
+        M5Cardputer.Speaker.tone(880,  60); delay(80);   // A5
+        M5Cardputer.Speaker.tone(1318, 90); delay(140);  // E6
+    }
+    M5Cardputer.Speaker.setVolume(current_volume);
+
+    if (lifetime_boots <= 3) {
+        set_toast_direct("TAB = help  M = menu", HEADER_COLOR);
+    }
 }
 
 // ============================================================================
