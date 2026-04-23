@@ -14,6 +14,7 @@
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "esp_task_wdt.h"
+#include "driver/gpio.h"
 #include <SPI.h>
 #include <SD.h>
 #include <LittleFS.h>
@@ -5180,15 +5181,26 @@ void setup() {
 
     // Route a dedicated SPI3 instance to the Cardputer's SD pins. 15 MHz is
     // the FAT32 sweet spot — slow enough for marginal cards, fast enough for
-    // pcap flushes. Manually idle CS high before SPI.begin so the card sees a
-    // clean deselect during the bus init.
+    // pcap flushes.
+    //
+    // ESP32-S3 boots GPIO 40/39/14/12 in their JTAG alternate function. If we
+    // jump straight into SPI.begin() they stay configured for JTAG and the
+    // SD mount silently fails. gpio_reset_pin returns them to default GPIO so
+    // the SPI peripheral can claim them cleanly — this is what the launcher
+    // apps do implicitly via their init path. Then idle CS high and wait
+    // 100ms for the card's internal controller to settle before clocking.
     Serial.println("[SD] === Initializing SPI3 for SD Card ===");
+
+    gpio_reset_pin((gpio_num_t)SD_SPI_SCK_PIN);   // GPIO40 — clear JTAG MTDO
+    gpio_reset_pin((gpio_num_t)SD_SPI_MISO_PIN);  // GPIO39 — clear JTAG MTCK
+    gpio_reset_pin((gpio_num_t)SD_SPI_MOSI_PIN);  // GPIO14
+    gpio_reset_pin((gpio_num_t)SD_CS_PIN);        // GPIO12
 
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);
-    delay(10);
+    delay(100);
 
-    sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CS_PIN);
+    sdSPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
 
     if (SD.begin(SD_CS_PIN, sdSPI, 15000000)) {
         sd_available = true;
