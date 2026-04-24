@@ -5157,9 +5157,33 @@ void setup() {
     M5Cardputer.begin(cfg);
     Serial.println("=== BOOT MARKER 1: M5Cardputer.begin done ===");
 
+    // Shrink speaker DMA buffers so I2S allocation doesn't eat the DMA pool.
+    {
+        auto spk_cfg = M5Cardputer.Speaker.config();
+        spk_cfg.dma_buf_count = 3;     // default 8
+        spk_cfg.dma_buf_len   = 256;   // default 512
+        M5Cardputer.Speaker.config(spk_cfg);
+    }
+
     // dataMutex MUST be created before any task that uses it is spawned.
     dataMutex = xSemaphoreCreateMutex();
     Serial.println("=== BOOT MARKER 2: dataMutex created ===");
+
+    // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
+    // heap. Force internal DMA-capable RAM and hard-fail on allocation failure.
+    spr.setColorDepth(16);
+    spr.setPsram(false);
+    void* sprite_buf = spr.createSprite(DISP_W, DISP_H);
+    Serial.printf(">>> Sprite alloc: buf=%p  free_internal=%u  free_dma=%u\n",
+                  sprite_buf,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    if (!sprite_buf) {
+        M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
+        M5Cardputer.Display.setCursor(10, 10);
+        M5Cardputer.Display.print("SPRITE ALLOC FAIL");
+        while (1) delay(1000);
+    }
 
     // LED: start dark. The breathing task is spawned at the very end of setup()
     // to avoid RMT/radio contention during WiFi + BLE init on core 0.
@@ -5265,10 +5289,9 @@ void setup() {
     boot_animate(40, "GPS serial...");
     Serial.println("=== BOOT MARKER 5: GPS serial + WiFi.mode done ===");
 
-    spr.setColorDepth(16);
-    spr.createSprite(DISP_W, DISP_H);
+    // Sprite was already created at the top of setup(). Kept marker for reference.
     boot_animate(45, "display ready");
-    Serial.println("=== BOOT MARKER 6: sprite created ===");
+    Serial.println("=== BOOT MARKER 6: sprite alloc already done ===");
 
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
@@ -5280,7 +5303,7 @@ void setup() {
 
     Serial.println("=== BOOT MARKER 7: before CPU freq + BLE queue ===");
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
-    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
     boot_animate(65, "BLE init...");
     Serial.println("=== BOOT MARKER 8: BLE worker task created ===");
 
@@ -5366,7 +5389,7 @@ void setup() {
     Serial.println("=== BOOT MARKER 17: before Scanner/GPS tasks ===");
     // Tasks — Arduino-ESP32 3.x owns the task watchdog; we don't re-init it.
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
+    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 3072, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
