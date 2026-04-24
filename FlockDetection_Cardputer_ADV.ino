@@ -2545,7 +2545,6 @@ void play_escalated_alarm(int confidence, int source) {
 // UI RENDERING - BASE COMPONENTS
 // ============================================================================
 void draw_header_spr(int screen_num) {
-    Serial.printf(">>> HEADER: screen=%d\n", screen_num);
     static const char* screen_names[NUM_SCREENS] = {
         "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "STATS"
     };
@@ -2695,15 +2694,88 @@ void draw_header_spr(int screen_num) {
 }
 
 void draw_toast_spr() {
-    Serial.println(">>> TOAST-STUB: entered");
-    Serial.flush();
-    // Body intentionally empty for diagnostic isolation.
-    // Do NOT read toast_active, toast_text, or any toast state.
-    // Do NOT call any spr.* methods.
-    // Do NOT take dataMutex.
-    Serial.println(">>> TOAST-STUB: returning");
-    Serial.flush();
-    return;
+    // Snapshot all toast state under mutex before rendering. Producer tasks
+    // on either core can write toast_text mid-strncpy; rendering from live
+    // globals would read torn data and crash spr.print() when it walks past
+    // a missing null terminator.
+    bool          active_snap;
+    char          text_snap[32];
+    uint16_t      accent_snap    = 0;
+    bool          is_action_snap = false;
+    unsigned long start_snap     = 0;
+    int           queue_count_snap = 0;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    active_snap = toast_active;
+    if (active_snap) {
+        strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
+        text_snap[sizeof(text_snap) - 1] = '\0';
+        accent_snap      = toast_accent_color;
+        is_action_snap   = toast_is_action;
+        start_snap       = toast_start;
+        queue_count_snap = toast_queue_count;
+    }
+    xSemaphoreGive(dataMutex);
+
+    if (!active_snap) return;
+
+    unsigned long elapsed = millis() - start_snap;
+
+    // Expiration handling — advance queue or clear under mutex
+    if (elapsed > TOAST_DURATION_MS) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (toast_queue_count > 0) {
+            toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
+            toast_queue_count--;
+        }
+        if (toast_queue_count > 0) {
+            strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
+            toast_text[sizeof(toast_text) - 1] = '\0';
+            toast_accent_color = toast_queue[toast_queue_head].accent;
+            toast_is_action    = toast_queue[toast_queue_head].is_action;
+            toast_start        = millis();
+            toast_active       = true;
+        } else {
+            toast_active = false;
+        }
+        xSemaphoreGive(dataMutex);
+        return;
+    }
+
+    // Render from snapshot — no global toast_* access below this point.
+    int y_pos = DISP_H - 34;
+
+    // Fade in over 150ms, hold, fade out over 200ms
+    float toast_alpha;
+    if (elapsed < 150) {
+        toast_alpha = ease_out_quad((float)elapsed / 150.0f);
+    } else if (elapsed > TOAST_DURATION_MS - 200) {
+        float fade_t = (float)(elapsed - (TOAST_DURATION_MS - 200)) / 200.0f;
+        toast_alpha = 1.0f - ease_out_quad(fade_t);
+    } else {
+        toast_alpha = 1.0f;
+    }
+    if (toast_alpha < 0.02f) return;
+
+    auto ta = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, toast_alpha); };
+
+    uint16_t accent = accent_snap ? accent_snap : CAUTION_COLOR;
+    int t_w = 210; int t_x = (DISP_W - t_w) / 2;
+
+    spr.fillRect(t_x, y_pos, t_w, 26, ta(CARD_COLOR));
+    spr.drawRect(t_x, y_pos, t_w, 26, ta(CARD_BORDER));
+
+    spr.setTextColor(ta(accent), ta(CARD_COLOR)); spr.setTextSize(1);
+    spr.setCursor(t_x + 6, y_pos + 9); spr.print(is_action_snap ? "[i]" : "[!]");
+    spr.setTextColor(ta(TEXT_COLOR), ta(CARD_COLOR));
+    spr.setCursor(t_x + 26, y_pos + 9); spr.print(text_snap);
+    if (queue_count_snap > 1) {
+        char qnum[6];
+        snprintf(qnum, sizeof(qnum), "+%d", queue_count_snap - 1);
+        spr.setTextColor(ta(DIM_COLOR), ta(CARD_COLOR));
+        spr.setCursor(t_x + t_w - 22, y_pos + 9);
+        spr.print(qnum);
+    }
 }
 
 void draw_vol_overlay() {
@@ -3114,7 +3186,6 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
-    Serial.println(">>> SCANNER: entered");
     int divider_x = 112;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
@@ -3191,8 +3262,9 @@ void draw_scanner_screen() {
         }
     }
 
-    float local_spikes[NUM_RADIAL_BANDS];
-    uint16_t local_colors[NUM_RADIAL_BANDS];
+    // Static to avoid stack pressure — rendering is single-threaded from loop().
+    static float local_spikes[NUM_RADIAL_BANDS];
+    static uint16_t local_colors[NUM_RADIAL_BANDS];
 
     static const float SPIKE_DECAY_PER_MS = 0.00004f;
     static unsigned long last_decay_ms = 0;
@@ -4724,8 +4796,9 @@ void draw_device_info_screen() {
 // EXPANDED FEED OVERLAY — fullscreen activity feed view
 // ============================================================================
 void draw_feed_expanded_overlay() {
-    // Snapshot feed under mutex
-    FeedEntry local_feed[FEED_SIZE];
+    // Snapshot feed under mutex. Static to avoid stack pressure — rendering
+    // is single-threaded from loop().
+    static FeedEntry local_feed[FEED_SIZE];
     int local_count, local_head;
     unsigned long local_now;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -4891,7 +4964,6 @@ void draw_feed_expanded_overlay() {
 // MAIN UI CONTROLLER
 // ============================================================================
 void draw_current_screen() {
-    Serial.printf(">>> DCS: screen=%d\n", current_screen);
     switch (current_screen) {
         case 0: draw_scanner_screen();         break;
         case 1: draw_locator_screen();         break;
@@ -4901,16 +4973,10 @@ void draw_current_screen() {
     }
     
     if (show_feed_expanded) draw_feed_expanded_overlay();
-    Serial.println(">>> DCS: after expanded");
     if (show_vol_overlay) draw_vol_overlay();
-    Serial.println(">>> DCS: after vol");
     if (show_help_overlay) draw_help_overlay();
-    Serial.println(">>> DCS: after help");
     if (show_menu) draw_menu_overlay();
-    Serial.println(">>> DCS: after menu");
     draw_toast_spr();
-    Serial.println(">>> DCS: after toast");
-    Serial.flush();
 }
 
 void transition_screen(int new_screen, int dir) {
@@ -5392,8 +5458,6 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-    static bool loop_first = true;
-    if (loop_first) { Serial.println(">>> LOOP: first iteration"); loop_first = false; }
     M5Cardputer.update(); yield();
 
     if (export_connecting) {
@@ -5942,39 +6006,9 @@ void loop() {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) {
-                Serial.println(">>> LOOP: calling DCS fast");
-                Serial.flush();
-                delay(10);   // force UART drain before next statement
-                draw_current_screen();
-                delay(10);   // force real serial barrier, prevents reorder
-                Serial.println(">>> LOOP: DCS fast returned");
-                Serial.flush();
-                delay(10);
-                Serial.println(">>> LOOP: about to call pushSprite");
-                Serial.flush();
-                delay(10);
-                spr.pushSprite(0, 0);
-                delay(10);
-                Serial.println(">>> LOOP: pushSprite returned");
-                Serial.flush();
-                delay(10);
-                last_fast_anim = now;
-            }
+            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; }
         }
-        else {
-            if (now - last_slow_ui >= 100) {
-                Serial.println(">>> LOOP: calling DCS slow");
-                Serial.flush();
-                draw_current_screen();
-                Serial.println(">>> LOOP: DCS slow returned");
-                Serial.flush();
-                spr.pushSprite(0, 0);
-                Serial.println(">>> LOOP: pushSprite slow done");
-                Serial.flush();
-                last_slow_ui = now;
-            }
-        }
+        else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
 }
