@@ -1185,9 +1185,32 @@ void load_sd_history() {
     }
 }
 
-void save_session_to_flash() {
+// Persist worker — runs save_session_to_flash on its own task so the main
+// loop never blocks on LittleFS or SD writes. One-shot: spawned, runs, exits.
+static volatile bool persist_in_flight = false;
+
+static void save_session_to_flash();  // forward decl
+
+static void PersistTask(void* pv) {
+    save_session_to_flash();
+    persist_in_flight = false;
+    vTaskDelete(NULL);
+}
+
+static void schedule_persist() {
+    if (persist_in_flight) return;  // already running, skip this cycle
+    persist_in_flight = true;
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        PersistTask, "PersistTask", 4096, NULL, 1, NULL, 1);
+    if (ok != pdPASS) {
+        // Couldn't spawn — clear the flag so next minute can retry.
+        persist_in_flight = false;
+    }
+}
+
+static void save_session_to_flash() {
     if (!littlefs_available) return;
-    
+
     long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes;
     int l_vol;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1224,8 +1247,12 @@ void save_session_to_flash() {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         lifetime_flash_writes = l_writes;
         xSemaphoreGive(dataMutex);
+        // Wear toasts: once at 80K (warning) and once at 100K (critical).
+        // Equality checks fire exactly once per crossing.
         if (l_writes == 80000) {
             set_toast_direct("FLASH WEAR HIGH", CAUTION_COLOR);
+        } else if (l_writes == 100000) {
+            set_toast_direct("FLASH WEAR CRIT", CAUTION_COLOR);
         }
     } else {
         flash_write_fail_count++;
@@ -2497,16 +2524,19 @@ void ScannerLoopTask(void* pvParameters) {
 
         bool scanning = pBLEScan ? pBLEScan->isScanning() : false;
 
-        // Hang detection: if a scan has been "active" for more than 2x its
-        // configured duration plus 3s headroom, the NimBLE stack is wedged.
-        // Force-stop so the next branch can restart cleanly.
+        // Hang detection: if isScanning() has been true for more than 2x the
+        // configured scan duration plus 3s headroom, the NimBLE stack has
+        // wedged. Force-stop and clear so the next branch can restart cleanly.
+        const unsigned long SCAN_HANG_LIMIT_MS =
+            (unsigned long)(BLE_SCAN_DURATION * 2000UL + 3000UL);
         if (scanning && pBLEScan && scan_start_ms > 0 &&
-            (now - scan_start_ms) > (unsigned long)(BLE_SCAN_DURATION * 2000UL + 3000UL)) {
+            (now - scan_start_ms) > SCAN_HANG_LIMIT_MS) {
+            Serial.println("[BLE] Scan hang detected — forcing stop");
             pBLEScan->stop();
             pBLEScan->clearResults();
             scanning = false;
             scan_start_ms = 0;
-            last_ble_scan = now;  // gate the next start by interval
+            last_ble_scan = now;  // delay next start by full interval
         }
 
         if (pBLEScan && millis() - last_ble_scan >= ble_interval) {
@@ -2520,8 +2550,10 @@ void ScannerLoopTask(void* pvParameters) {
                 scanning = true;  // we just started
             }
         }
-        if (pBLEScan && !scanning && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
+        if (pBLEScan && !scanning &&
+            (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
             pBLEScan->clearResults();
+            scan_start_ms = 0;  // clear so a stale value doesn't trip hang check
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
@@ -5929,7 +5961,10 @@ void loop() {
     }
 
     if (millis() - last_time_save >= 1000) { xSemaphoreTake(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGive(dataMutex); last_time_save = millis(); }
-    if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) save_session_to_flash();
+    if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) {
+        last_persist_save = millis();  // gate retry timing on schedule, not completion
+        schedule_persist();
+    }
     rssi_track_expire();
 
     // SD hot-plug: periodically attempt remount if card is absent, or probe if present
