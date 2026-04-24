@@ -4944,10 +4944,7 @@ void draw_current_screen() {
 void transition_screen(int new_screen, int dir) {
     if (stealth_mode) { current_screen = new_screen; return; }
     if (!is_muted) {
-        int prev_vol = current_volume;
-        M5Cardputer.Speaker.setVolume(max(prev_vol, 35));
-        M5Cardputer.Speaker.playRaw(ui_beep_pcm, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
-        M5Cardputer.Speaker.setVolume(prev_vol);
+        M5Cardputer.Speaker.tone(1500, 8);  // brief UI click (replaces playRaw for crash isolation)
     }
     if (new_screen == 2) {
         history_scroll_offset = 0;
