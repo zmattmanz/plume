@@ -555,49 +555,11 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // ============================================================================
-// CHARGE LED TASK — persistent FreeRTOS task (never created/deleted after boot).
-// Spawned once in setup(), lives on Core 0 at priority 5 forever.
-// led_breathing_on flag controls output; toggling it is the only lifecycle control.
-// Persistent task (not dynamic create/delete) eliminates the FreeRTOS scheduling
-// jitter that caused WS2812 corruption — the task never stops, it just sets dark.
-// Reference: BruceDevices/firmware src/core/led_control.cpp (ledEffectTask)
+// CHARGE LED TASK — DELETED for crash-isolation diagnostic.
+// The task body and its spawn call have been removed. LED stays dark.
+// If the device boots cleanly without it, add it back at priority 1 on
+// Core 1 (not priority 5 on Core 0).
 // ============================================================================
-static TaskHandle_t chargeLedTaskHandle = NULL;
-
-void chargeLedTask(void* pvParameters) {
-    for (;;) {
-        // Snapshot detection-flash state under mutex
-        bool   active_snap;
-        unsigned long until_snap;
-        uint8_t r_snap, g_snap, b_snap;
-        bool   expired_clear = false;
-
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        active_snap = led_detect_active;
-        until_snap  = led_detection_flash_until;
-        r_snap      = led_detect_r;
-        g_snap      = led_detect_g;
-        b_snap      = led_detect_b;
-        if (active_snap && millis() >= until_snap) {
-            led_detect_active = false;
-            expired_clear = true;
-        }
-        xSemaphoreGive(dataMutex);
-
-        if (active_snap && !expired_clear) {
-            set_cardputer_led(r_snap, g_snap, b_snap);
-        } else if (expired_clear) {
-            set_cardputer_led(0, 0, 0);
-        } else if (led_breathing_on) {
-            float phase = sinf((millis() / 1000.0f) * (float)M_PI);
-            uint8_t val = (uint8_t)((phase + 1.0f) * 100.0f); // 0..200
-            set_cardputer_led((led_r * val) / 200, (led_g * val) / 200, (led_b * val) / 200);
-        } else {
-            set_cardputer_led(0, 0, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
 
 // ============================================================================
 // BATTERY ENGINE (OPTIMIZED)
@@ -5410,11 +5372,8 @@ void setup() {
     system_fully_booted = true;
     Serial.println("=== BOOT MARKER 18: system_fully_booted ===");
 
-    // Spawn the persistent LED breathing task only after WiFi + BLE are up, so
-    // the RMT peripheral (neopixelWrite) can't collide with radio init on core 0.
-    // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
-    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
-    Serial.println("=== BOOT MARKER 19: chargeLedTask spawned ===");
+    // DIAGNOSTIC: chargeLedTask deleted entirely for crash isolation.
+    Serial.println("=== BOOT MARKER 19: chargeLedTask SKIPPED ===");
     boot_animate(100, "ready");
     delay(400);
 
