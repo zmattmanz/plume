@@ -5156,13 +5156,11 @@ void setup() {
     M5Cardputer.begin(cfg);
 
     // dataMutex MUST be created before any task that uses it is spawned.
-    // chargeLedTask (started just below) takes this mutex on every loop iteration.
     dataMutex = xSemaphoreCreateMutex();
 
-    // LED: start dark, then spawn the persistent breathing task.
+    // LED: start dark. The breathing task is spawned at the very end of setup()
+    // to avoid RMT/radio contention during WiFi + BLE init on core 0.
     set_cardputer_led(0, 0, 0);
-    // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
-    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
 
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
@@ -5356,6 +5354,11 @@ void setup() {
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
+
+    // Spawn the persistent LED breathing task only after WiFi + BLE are up, so
+    // the RMT peripheral (neopixelWrite) can't collide with radio init on core 0.
+    // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
+    xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
     boot_animate(100, "ready");
     delay(400);
 
