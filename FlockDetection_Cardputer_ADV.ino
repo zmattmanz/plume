@@ -565,7 +565,10 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
+    Serial.println(">>> LED: task started");
+    int led_iter = 0;
     for (;;) {
+        if (led_iter < 3) { Serial.printf(">>> LED iter %d\n", led_iter); led_iter++; }
         // Snapshot detection-flash state under mutex
         bool   active_snap;
         unsigned long until_snap;
@@ -2440,7 +2443,10 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
 void ScannerLoopTask(void* pvParameters) {
+    Serial.println(">>> SCN: task started");
+    int scn_iter = 0;
     for (;;) {
+        if (scn_iter < 5) Serial.printf(">>> SCN iter %d top\n", scn_iter);
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
             unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
@@ -2457,7 +2463,9 @@ void ScannerLoopTask(void* pvParameters) {
             ? BLE_SCAN_INTERVAL_LOCK
             : base_interval;
 
+        if (scn_iter < 5) Serial.printf(">>> SCN iter %d pre-isScanning\n", scn_iter);
         bool scanning = pBLEScan ? pBLEScan->isScanning() : false;
+        if (scn_iter < 5) Serial.printf(">>> SCN iter %d post-isScanning=%d\n", scn_iter, scanning);
         if (pBLEScan && millis() - last_ble_scan >= ble_interval) {
             if (!scanning) {
                 bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
@@ -2471,11 +2479,13 @@ void ScannerLoopTask(void* pvParameters) {
         if (pBLEScan && !scanning && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
             pBLEScan->clearResults();
         }
+        if (scn_iter < 5) { Serial.printf(">>> SCN iter %d end\n", scn_iter); scn_iter++; }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
 void GPSLoopTask(void* pvParameters) {
+    Serial.println(">>> GPS: task started");
     for (;;) {
         int avail = SerialGPS.available();
         if (avail > 0) {
@@ -5153,13 +5163,19 @@ static void boot_animate(int pct, const char* status, int frames = 8) {
 }
 
 void setup() {
-    // Kill the framework's TWDT entirely before anything else so no task in
-    // this program can ever trip it. Arduino-ESP32 3.x arms it for us and
-    // a later abort() signature pointed at the TWDT subsystem on core 0.
-    esp_task_wdt_deinit();
+    // Kill the framework's TWDT fully. esp_task_wdt_deinit() alone silently
+    // returns ESP_ERR_INVALID_STATE while the IDLE tasks are still subscribed
+    // (which Arduino-ESP32 3.x does by default on both cores). Unsubscribe
+    // each core's IDLE task first, then deinit.
+    TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
+    TaskHandle_t idle1 = xTaskGetIdleTaskHandleForCPU(1);
+    if (idle0) esp_task_wdt_delete(idle0);
+    if (idle1) esp_task_wdt_delete(idle1);
+    esp_err_t wdt_err = esp_task_wdt_deinit();
 
     Serial.begin(115200);
     delay(500);
+    Serial.printf(">>> TWDT deinit result: %d (0 = OK)\n", wdt_err);
     Serial.println("=== BOOT MARKER 0: entering setup ===");
 
     auto cfg = M5.config();
