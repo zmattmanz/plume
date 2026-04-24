@@ -13,7 +13,6 @@
 #include <new>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
-#include "esp_task_wdt.h"
 #include "esp_partition.h"
 #include "driver/gpio.h"
 #include <SPI.h>
@@ -2440,9 +2439,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
 void ScannerLoopTask(void* pvParameters) {
-    esp_task_wdt_add(NULL);
     for (;;) {
-        esp_task_wdt_reset();
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
             unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
@@ -2478,9 +2475,7 @@ void ScannerLoopTask(void* pvParameters) {
 }
 
 void GPSLoopTask(void* pvParameters) {
-    esp_task_wdt_add(NULL);
     for (;;) {
-        esp_task_wdt_reset();
         int avail = SerialGPS.available();
         if (avail > 0) {
             uint8_t buf[128];
@@ -5355,21 +5350,8 @@ void setup() {
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
     boot_animate(92, "BLE scanner...");
 
-    // Tasks and watchdog
+    // Tasks — Arduino-ESP32 3.x owns the task watchdog; we don't re-init it.
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    esp_task_wdt_config_t wdt_cfg = {
-        .timeout_ms = 10000,
-        .idle_core_mask = 0,
-        .trigger_panic = true
-    };
-    // Arduino-ESP32 3.x initializes TWDT before setup() runs. If it's already
-    // up, reconfigure instead of failing with ESP_ERR_INVALID_STATE.
-    esp_err_t wdt_err = esp_task_wdt_init(&wdt_cfg);
-    if (wdt_err == ESP_ERR_INVALID_STATE) {
-        esp_task_wdt_reconfigure(&wdt_cfg);
-    } else if (wdt_err != ESP_OK) {
-        Serial.printf("[WDT] init failed: %d\n", wdt_err);
-    }
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
