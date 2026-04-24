@@ -5423,7 +5423,13 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-    M5Cardputer.update(); yield();
+    static bool first_loop = true;
+    if (first_loop) { Serial.println(">>> LOOP ENTRY"); first_loop = false; }
+
+    M5Cardputer.update();
+    static bool lm1 = true; if (lm1) { Serial.println(">>> L1 after M5.update"); lm1 = false; }
+    yield();
+    static bool lm2 = true; if (lm2) { Serial.println(">>> L2 after yield"); lm2 = false; }
 
     if (export_connecting) {
         export_tick_connect();
@@ -5434,11 +5440,14 @@ void loop() {
             export_mode_stop();
         }
     }
+    static bool lm3 = true; if (lm3) { Serial.println(">>> L3 after export"); lm3 = false; }
 
     // Dynamically calculate expected hardware voltage sag for this loop iteration
     update_load_sag();
+    static bool lm4 = true; if (lm4) { Serial.println(">>> L4 after update_load_sag"); lm4 = false; }
 
     int32_t loop_mv = get_filtered_voltage();
+    static bool lm5 = true; if (lm5) { Serial.println(">>> L5 after get_filtered_voltage"); lm5 = false; }
 
     // Low-battery voltage warnings — once per crossing, 100mV hysteresis to re-arm.
     {
@@ -5454,9 +5463,12 @@ void loop() {
             last_battery_warning_mv = 9999;
         }
     }
+    static bool lm6 = true; if (lm6) { Serial.println(">>> L6 after batt warnings"); lm6 = false; }
 
     process_wifi_event_queue();
+    static bool lm7 = true; if (lm7) { Serial.println(">>> L7 after process_wifi_queue"); lm7 = false; }
     feed_commit_pending();
+    static bool lm8 = true; if (lm8) { Serial.println(">>> L8 after feed_commit"); lm8 = false; }
 
     int conf_snapshot = 0;
     int src_snapshot = 0;
@@ -5472,6 +5484,7 @@ void loop() {
     if (conf_snapshot >= 50) {
         play_escalated_alarm(conf_snapshot, src_snapshot);
     }
+    static bool lm9 = true; if (lm9) { Serial.println(">>> L9 after alarm snapshot"); lm9 = false; }
 
     if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
         last_user_input_ms = millis();
@@ -5975,5 +5988,6 @@ void loop() {
         }
         else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
     }
+    static bool lm_end = true; if (lm_end) { Serial.println(">>> L_END: first iteration complete"); lm_end = false; }
     vTaskDelay(10 / portTICK_PERIOD_MS);
 }
