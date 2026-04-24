@@ -2696,6 +2696,8 @@ void draw_header_spr(int screen_num) {
 
 void draw_toast_spr() {
     Serial.println(">>> TOAST: entered");
+
+    Serial.println(">>> TOAST: A pre-mutex");
     // Snapshot all toast state under mutex before rendering. Producer tasks
     // on either core can write toast_text mid-strncpy; rendering from live
     // globals would read torn data and crash spr.print() when it walks past
@@ -2708,23 +2710,35 @@ void draw_toast_spr() {
     int           queue_count_snap = 0;
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
+    Serial.println(">>> TOAST: B mutex taken");
     active_snap = toast_active;
+    Serial.printf(">>> TOAST: C active_snap=%d\n", active_snap);
     if (active_snap) {
+        Serial.printf(">>> TOAST: D1 toast_text ptr=%p\n", (void*)toast_text);
         strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
         text_snap[sizeof(text_snap) - 1] = '\0';
+        Serial.printf(">>> TOAST: D2 text='%s'\n", text_snap);
         accent_snap      = toast_accent_color;
         is_action_snap   = toast_is_action;
         start_snap       = toast_start;
         queue_count_snap = toast_queue_count;
+        Serial.printf(">>> TOAST: D3 accent=0x%04x action=%d qcount=%d\n",
+                      accent_snap, is_action_snap, queue_count_snap);
     }
     xSemaphoreGive(dataMutex);
+    Serial.println(">>> TOAST: E mutex released");
 
-    if (!active_snap) return;
+    if (!active_snap) {
+        Serial.println(">>> TOAST: F returning (not active)");
+        return;
+    }
 
     unsigned long elapsed = millis() - start_snap;
+    Serial.printf(">>> TOAST: G elapsed=%lu\n", elapsed);
 
     // Expiration handling — advance queue or clear under mutex
     if (elapsed > TOAST_DURATION_MS) {
+        Serial.println(">>> TOAST: H expired, advancing queue");
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (toast_queue_count > 0) {
             toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
@@ -2757,27 +2771,43 @@ void draw_toast_spr() {
     } else {
         toast_alpha = 1.0f;
     }
-    if (toast_alpha < 0.02f) return;
+    Serial.printf(">>> TOAST: I y_pos=%d alpha=%.3f\n", y_pos, toast_alpha);
+    if (toast_alpha < 0.02f) {
+        Serial.println(">>> TOAST: I2 alpha too low, returning");
+        return;
+    }
 
     auto ta = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, toast_alpha); };
 
     uint16_t accent = accent_snap ? accent_snap : CAUTION_COLOR;
     int t_w = 210; int t_x = (DISP_W - t_w) / 2;
 
+    Serial.println(">>> TOAST: J before fillRect");
     spr.fillRect(t_x, y_pos, t_w, 26, ta(CARD_COLOR));
+    Serial.println(">>> TOAST: K before drawRect");
     spr.drawRect(t_x, y_pos, t_w, 26, ta(CARD_BORDER));
 
+    Serial.println(">>> TOAST: L before icon");
     spr.setTextColor(ta(accent), ta(CARD_COLOR)); spr.setTextSize(1);
     spr.setCursor(t_x + 6, y_pos + 9); spr.print(is_action_snap ? "[i]" : "[!]");
+    Serial.println(">>> TOAST: M icon done");
+
+    Serial.println(">>> TOAST: N before text print");
     spr.setTextColor(ta(TEXT_COLOR), ta(CARD_COLOR));
     spr.setCursor(t_x + 26, y_pos + 9); spr.print(text_snap);
+    Serial.println(">>> TOAST: O text done");
+
     if (queue_count_snap > 1) {
+        Serial.println(">>> TOAST: P before qnum");
         char qnum[6];
         snprintf(qnum, sizeof(qnum), "+%d", queue_count_snap - 1);
         spr.setTextColor(ta(DIM_COLOR), ta(CARD_COLOR));
         spr.setCursor(t_x + t_w - 22, y_pos + 9);
         spr.print(qnum);
+        Serial.println(">>> TOAST: Q qnum done");
     }
+
+    Serial.println(">>> TOAST: R done");
 }
 
 void draw_vol_overlay() {
