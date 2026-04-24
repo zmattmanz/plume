@@ -3663,6 +3663,7 @@ void draw_scanner_screen() {
     }
 
     static bool scn_once_d = true; if (scn_once_d) { Serial.println("SCN: before feed"); scn_once_d = false; }
+    static bool feed_m_enter = true; if (feed_m_enter) { Serial.println("FEED: block enter"); feed_m_enter = false; }
     // ── Live device feed (right column) ──
     // List is anchored at the BOTTOM of the column. Existing rows stay still.
     // When a new entry arrives, it appears at the top: fades in with slight
@@ -3691,11 +3692,13 @@ void draw_scanner_screen() {
         const unsigned long FEED_DISPLAY_REFRESH_MS = 2000;
 
         if ((local_now - display_last_refresh) >= FEED_DISPLAY_REFRESH_MS || !display_ever_populated) {
+            static bool feed_m_snap_pre = true; if (feed_m_snap_pre) { Serial.println("FEED: before snapshot"); feed_m_snap_pre = false; }
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             display_count = feed_count;
             display_head = feed_head;
             for (int i = 0; i < display_count; i++) display_feed[i] = feed_entries[i];
             xSemaphoreGive(dataMutex);
+            static bool feed_m_snap_post = true; if (feed_m_snap_post) { Serial.printf("FEED: snapshot done, count=%d head=%d\n", display_count, display_head); feed_m_snap_post = false; }
             display_last_refresh = local_now;
             if (display_count > 0) {
                 display_ever_populated = true;
@@ -3726,8 +3729,12 @@ void draw_scanner_screen() {
             int rows_to_draw = (local_count < max_visible) ? local_count : max_visible;
 
             for (int i = 0; i < rows_to_draw; i++) {
+                static int feed_m_row_start_log = 0;
+                if (feed_m_row_start_log < 4) { Serial.printf("FEED: row %d start\n", i); feed_m_row_start_log++; }
                 int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
                 FeedEntry& e = local_feed[idx];
+                static int feed_m_row_got_log = 0;
+                if (feed_m_row_got_log < 4) { Serial.printf("FEED: row %d got entry idx=%d\n", i, idx); feed_m_row_got_log++; }
 
                 int row_y;
                 if (i == 0 && display_shift_ms != 0) {
@@ -3767,6 +3774,8 @@ void draw_scanner_screen() {
                 // Prefix is a small colored symbol (filled triangle/diamond)
                 // instead of a bracketed letter — more visually distinctive,
                 // uses less width, frees name space.
+                static int feed_m_row_sym_log = 0;
+                if (feed_m_row_sym_log < 4) { Serial.printf("FEED: row %d before symbol proto=%d\n", i, (int)e.proto); feed_m_row_sym_log++; }
                 int sym_x = feed_col_left;
                 int sym_y = row_y + 1;
                 uint16_t sym_col = proto_col;
@@ -3807,6 +3816,8 @@ void draw_scanner_screen() {
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
+                static int feed_m_row_done_log = 0;
+                if (feed_m_row_done_log < 4) { Serial.printf("FEED: row %d done\n", i); feed_m_row_done_log++; }
 
             }
 
