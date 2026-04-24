@@ -13,6 +13,7 @@
 #include <new>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
+#include "esp_task_wdt.h"
 #include "esp_partition.h"
 #include "driver/gpio.h"
 #include <SPI.h>
@@ -5152,6 +5153,11 @@ static void boot_animate(int pct, const char* status, int frames = 8) {
 }
 
 void setup() {
+    // Kill the framework's TWDT entirely before anything else so no task in
+    // this program can ever trip it. Arduino-ESP32 3.x arms it for us and
+    // a later abort() signature pointed at the TWDT subsystem on core 0.
+    esp_task_wdt_deinit();
+
     Serial.begin(115200);
     delay(500);
     Serial.println("=== BOOT MARKER 0: entering setup ===");
@@ -5368,7 +5374,7 @@ void setup() {
 
     Serial.println("=== BOOT MARKER 17: before Scanner/GPS tasks ===");
     // Tasks — Arduino-ESP32 3.x owns the task watchdog; we don't re-init it.
-    last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
+    last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
