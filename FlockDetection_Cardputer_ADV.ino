@@ -2555,6 +2555,7 @@ void play_escalated_alarm(int confidence, int source) {
 // UI RENDERING - BASE COMPONENTS
 // ============================================================================
 void draw_header_spr(int screen_num) {
+    static bool hdr_once = true; if (hdr_once) { Serial.printf("HDR: enter screen=%d\n", screen_num); hdr_once = false; }
     static const char* screen_names[NUM_SCREENS] = {
         "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "STATS"
     };
@@ -3170,9 +3171,12 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
+    static bool scn_once_a = true; if (scn_once_a) { Serial.println("SCN: enter"); scn_once_a = false; }
     int divider_x = 112;
     spr.fillSprite(BG_COLOR);
+    static bool scn_once_b = true; if (scn_once_b) { Serial.println("SCN: after fillSprite"); scn_once_b = false; }
     draw_header_spr(0);
+    static bool scn_once_c = true; if (scn_once_c) { Serial.println("SCN: after header"); scn_once_c = false; }
     unsigned long frame_ms = millis();
     spr.setClipRect(0, 18, divider_x, DISP_H - 18);
     
@@ -3658,6 +3662,7 @@ void draw_scanner_screen() {
         }
     }
 
+    static bool scn_once_d = true; if (scn_once_d) { Serial.println("SCN: before feed"); scn_once_d = false; }
     // ── Live device feed (right column) ──
     // List is anchored at the BOTTOM of the column. Existing rows stay still.
     // When a new entry arrives, it appears at the top: fades in with slight
@@ -3825,6 +3830,7 @@ void draw_scanner_screen() {
             spr.print(load_str);
         }
     }
+    static bool scn_once_e = true; if (scn_once_e) { Serial.println("SCN: after feed"); scn_once_e = false; }
 
 }
 
