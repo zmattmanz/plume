@@ -565,10 +565,7 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 static TaskHandle_t chargeLedTaskHandle = NULL;
 
 void chargeLedTask(void* pvParameters) {
-    Serial.println(">>> LED: task started");
-    int led_iter = 0;
     for (;;) {
-        if (led_iter < 3) { Serial.printf(">>> LED iter %d\n", led_iter); led_iter++; }
         // Snapshot detection-flash state under mutex
         bool   active_snap;
         unsigned long until_snap;
@@ -2443,10 +2440,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
 void ScannerLoopTask(void* pvParameters) {
-    Serial.println(">>> SCN: task started");
-    int scn_iter = 0;
     for (;;) {
-        if (scn_iter < 5) Serial.printf(">>> SCN iter %d top\n", scn_iter);
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
             unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
@@ -2463,9 +2457,7 @@ void ScannerLoopTask(void* pvParameters) {
             ? BLE_SCAN_INTERVAL_LOCK
             : base_interval;
 
-        if (scn_iter < 5) Serial.printf(">>> SCN iter %d pre-isScanning\n", scn_iter);
         bool scanning = pBLEScan ? pBLEScan->isScanning() : false;
-        if (scn_iter < 5) Serial.printf(">>> SCN iter %d post-isScanning=%d\n", scn_iter, scanning);
         if (pBLEScan && millis() - last_ble_scan >= ble_interval) {
             if (!scanning) {
                 bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
@@ -2479,13 +2471,11 @@ void ScannerLoopTask(void* pvParameters) {
         if (pBLEScan && !scanning && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
             pBLEScan->clearResults();
         }
-        if (scn_iter < 5) { Serial.printf(">>> SCN iter %d end\n", scn_iter); scn_iter++; }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
 void GPSLoopTask(void* pvParameters) {
-    Serial.println(">>> GPS: task started");
     for (;;) {
         int avail = SerialGPS.available();
         if (avail > 0) {
@@ -2555,7 +2545,6 @@ void play_escalated_alarm(int confidence, int source) {
 // UI RENDERING - BASE COMPONENTS
 // ============================================================================
 void draw_header_spr(int screen_num) {
-    static bool hdr_once = true; if (hdr_once) { Serial.printf("HDR: enter screen=%d\n", screen_num); hdr_once = false; }
     static const char* screen_names[NUM_SCREENS] = {
         "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "STATS"
     };
@@ -2705,11 +2694,36 @@ void draw_header_spr(int screen_num) {
 }
 
 void draw_toast_spr() {
-    if (!toast_active) return;
-    unsigned long elapsed = millis() - toast_start;
+    // Snapshot all toast state under mutex before rendering. Producer tasks
+    // on either core can write toast_text mid-strncpy; rendering from live
+    // globals would read torn data and crash spr.print() when it walks past
+    // a missing null terminator. See: StoreProhibited at EXCVADDR 0x00000004.
+    bool          active_snap;
+    char          text_snap[32];
+    uint16_t      accent_snap    = 0;
+    bool          is_action_snap = false;
+    unsigned long start_snap     = 0;
+    int           queue_count_snap = 0;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    active_snap = toast_active;
+    if (active_snap) {
+        strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
+        text_snap[sizeof(text_snap) - 1] = '\0';
+        accent_snap      = toast_accent_color;
+        is_action_snap   = toast_is_action;
+        start_snap       = toast_start;
+        queue_count_snap = toast_queue_count;
+    }
+    xSemaphoreGive(dataMutex);
+
+    if (!active_snap) return;
+
+    unsigned long elapsed = millis() - start_snap;
+
+    // Expiration handling — advance queue or clear under mutex
     if (elapsed > TOAST_DURATION_MS) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        // Advance queue
         if (toast_queue_count > 0) {
             toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
             toast_queue_count--;
@@ -2718,9 +2732,9 @@ void draw_toast_spr() {
             strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
             toast_text[sizeof(toast_text) - 1] = '\0';
             toast_accent_color = toast_queue[toast_queue_head].accent;
-            toast_is_action = toast_queue[toast_queue_head].is_action;
-            toast_start = millis();
-            toast_active = true;
+            toast_is_action    = toast_queue[toast_queue_head].is_action;
+            toast_start        = millis();
+            toast_active       = true;
         } else {
             toast_active = false;
         }
@@ -2728,6 +2742,7 @@ void draw_toast_spr() {
         return;
     }
 
+    // Render from snapshot — no global toast_* access below this point.
     int y_pos = DISP_H - 34;
 
     // Fade in over 150ms, hold, fade out over 200ms
@@ -2744,19 +2759,19 @@ void draw_toast_spr() {
 
     auto ta = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, toast_alpha); };
 
-    uint16_t accent = toast_accent_color ? toast_accent_color : CAUTION_COLOR;
+    uint16_t accent = accent_snap ? accent_snap : CAUTION_COLOR;
     int t_w = 210; int t_x = (DISP_W - t_w) / 2;
 
     spr.fillRect(t_x, y_pos, t_w, 26, ta(CARD_COLOR));
     spr.drawRect(t_x, y_pos, t_w, 26, ta(CARD_BORDER));
 
     spr.setTextColor(ta(accent), ta(CARD_COLOR)); spr.setTextSize(1);
-    spr.setCursor(t_x + 6, y_pos + 9); spr.print(toast_is_action ? "[i]" : "[!]");
+    spr.setCursor(t_x + 6, y_pos + 9); spr.print(is_action_snap ? "[i]" : "[!]");
     spr.setTextColor(ta(TEXT_COLOR), ta(CARD_COLOR));
-    spr.setCursor(t_x + 26, y_pos + 9); spr.print(toast_text);
-    if (toast_queue_count > 1) {
+    spr.setCursor(t_x + 26, y_pos + 9); spr.print(text_snap);
+    if (queue_count_snap > 1) {
         char qnum[6];
-        snprintf(qnum, sizeof(qnum), "+%d", toast_queue_count - 1);
+        snprintf(qnum, sizeof(qnum), "+%d", queue_count_snap - 1);
         spr.setTextColor(ta(DIM_COLOR), ta(CARD_COLOR));
         spr.setCursor(t_x + t_w - 22, y_pos + 9);
         spr.print(qnum);
@@ -3171,12 +3186,9 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
-    static bool scn_once_a = true; if (scn_once_a) { Serial.println("SCN: enter"); scn_once_a = false; }
     int divider_x = 112;
     spr.fillSprite(BG_COLOR);
-    static bool scn_once_b = true; if (scn_once_b) { Serial.println("SCN: after fillSprite"); scn_once_b = false; }
     draw_header_spr(0);
-    static bool scn_once_c = true; if (scn_once_c) { Serial.println("SCN: after header"); scn_once_c = false; }
     unsigned long frame_ms = millis();
     spr.setClipRect(0, 18, divider_x, DISP_H - 18);
     
@@ -3512,7 +3524,6 @@ void draw_scanner_screen() {
         // Diagonal "wedge" of WiFi color extending into the seam area —
         // matches the slope of the slash divider so the fill respects the
         // diagonal boundary, eliminating triangle gaps.
-#if 0  // DIAGNOSTIC: commented out to test crash theory (drawFastHLine / sprite state corruption)
         for (int dy = 0; dy < badge_h; dy++) {
             // Slash goes from (seam_x + 4, badge_y + 2) to (seam_x - 4, badge_y + badge_h - 3)
             // For each y row, compute the x where the slash crosses
@@ -3526,7 +3537,6 @@ void draw_scanner_screen() {
                                   slash_x - wfill_right, wf_fill);
             }
         }
-#endif
     }
 
     // Step 4: outer rounded outline
@@ -3565,14 +3575,12 @@ void draw_scanner_screen() {
         spr.print("BLE");
     }
 
-    static bool stats_m_enter = true; if (stats_m_enter) { Serial.println("STATS: block enter"); stats_m_enter = false; }
     // ── Stats block — labels above, symbol + number inline below ──
     // Both blocks left-aligned at a fixed column split. Symbols are
     // filled + outlined for legibility against the dark background.
     {
         long sw_local = sw;
         long sb_local = sb;
-        static bool stats_m_vals = true; if (stats_m_vals) { Serial.printf("STATS: sw=%ld sb=%ld\n", sw_local, sb_local); stats_m_vals = false; }
 
         const int stats_label_y = 48;       // top of size-1 labels
         const int stats_num_y   = 64;       // top of size-3 numbers
@@ -3627,7 +3635,6 @@ void draw_scanner_screen() {
             }
             spr.clearClipRect();
         }
-        static bool stats_m_wifi_done = true; if (stats_m_wifi_done) { Serial.println("STATS: wifi block done"); stats_m_wifi_done = false; }
 
         // ── BLE label ──
         spr.setTextSize(1.2);
@@ -3665,11 +3672,8 @@ void draw_scanner_screen() {
             }
             spr.clearClipRect();
         }
-        static bool stats_m_ble_done = true; if (stats_m_ble_done) { Serial.println("STATS: ble block done"); stats_m_ble_done = false; }
     }
 
-    static bool scn_once_d = true; if (scn_once_d) { Serial.println("SCN: before feed"); scn_once_d = false; }
-    static bool feed_m_enter = true; if (feed_m_enter) { Serial.println("FEED: block enter"); feed_m_enter = false; }
     // ── Live device feed (right column) ──
     // List is anchored at the BOTTOM of the column. Existing rows stay still.
     // When a new entry arrives, it appears at the top: fades in with slight
@@ -3698,13 +3702,11 @@ void draw_scanner_screen() {
         const unsigned long FEED_DISPLAY_REFRESH_MS = 2000;
 
         if ((local_now - display_last_refresh) >= FEED_DISPLAY_REFRESH_MS || !display_ever_populated) {
-            static bool feed_m_snap_pre = true; if (feed_m_snap_pre) { Serial.println("FEED: before snapshot"); feed_m_snap_pre = false; }
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             display_count = feed_count;
             display_head = feed_head;
             for (int i = 0; i < display_count; i++) display_feed[i] = feed_entries[i];
             xSemaphoreGive(dataMutex);
-            static bool feed_m_snap_post = true; if (feed_m_snap_post) { Serial.printf("FEED: snapshot done, count=%d head=%d\n", display_count, display_head); feed_m_snap_post = false; }
             display_last_refresh = local_now;
             if (display_count > 0) {
                 display_ever_populated = true;
@@ -3735,12 +3737,8 @@ void draw_scanner_screen() {
             int rows_to_draw = (local_count < max_visible) ? local_count : max_visible;
 
             for (int i = 0; i < rows_to_draw; i++) {
-                static int feed_m_row_start_log = 0;
-                if (feed_m_row_start_log < 4) { Serial.printf("FEED: row %d start\n", i); feed_m_row_start_log++; }
                 int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
                 FeedEntry& e = local_feed[idx];
-                static int feed_m_row_got_log = 0;
-                if (feed_m_row_got_log < 4) { Serial.printf("FEED: row %d got entry idx=%d\n", i, idx); feed_m_row_got_log++; }
 
                 int row_y;
                 if (i == 0 && display_shift_ms != 0) {
@@ -3780,8 +3778,6 @@ void draw_scanner_screen() {
                 // Prefix is a small colored symbol (filled triangle/diamond)
                 // instead of a bracketed letter — more visually distinctive,
                 // uses less width, frees name space.
-                static int feed_m_row_sym_log = 0;
-                if (feed_m_row_sym_log < 4) { Serial.printf("FEED: row %d before symbol proto=%d\n", i, (int)e.proto); feed_m_row_sym_log++; }
                 int sym_x = feed_col_left;
                 int sym_y = row_y + 1;
                 uint16_t sym_col = proto_col;
@@ -3822,8 +3818,6 @@ void draw_scanner_screen() {
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
-                static int feed_m_row_done_log = 0;
-                if (feed_m_row_done_log < 4) { Serial.printf("FEED: row %d done\n", i); feed_m_row_done_log++; }
 
             }
 
@@ -3831,20 +3825,22 @@ void draw_scanner_screen() {
 
         spr.clearClipRect();
 
-        // DIAGNOSTIC: the "scanning..." empty-state render is temporarily
-        // bypassed to test whether spr.print() on this code path is the
-        // source of the crash. Restore the original block once the cause
-        // is identified.
+        // Show "scanning..." only until the first snapshot captures data
         if (!display_ever_populated) {
-            static bool feed_m_empty_enter = true; if (feed_m_empty_enter) { Serial.println("FEED: empty state enter"); feed_m_empty_enter = false; }
-            // Draw nothing — bypass for crash diagnosis
-            static bool feed_m_empty_skip = true; if (feed_m_empty_skip) { Serial.println("FEED: empty state skipped"); feed_m_empty_skip = false; }
+            spr.fillRect(feed_col_left, feed_top_y,
+                         feed_col_right - feed_col_left,
+                         max_visible * feed_row_h, BG_COLOR);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(1.2);
+            int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
+            int nd = (int)(local_now / 500) % 4;
+            char load_str[20];
+            snprintf(load_str, sizeof(load_str), "scanning%s",
+                     nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
+            spr.setCursor(feed_col_left + 8, load_y);
+            spr.print(load_str);
         }
-        static bool feed_m_exit = true; if (feed_m_exit) { Serial.println("FEED: block exit"); feed_m_exit = false; }
     }
-    static bool scn_once_e = true; if (scn_once_e) { Serial.println("SCN: after feed"); scn_once_e = false; }
-    static bool scn_once_exit = true; if (scn_once_exit) { Serial.println("SCN: exit"); scn_once_exit = false; }
-
 }
 
 void draw_locator_screen() {
@@ -4974,14 +4970,11 @@ void draw_current_screen() {
         case 4: draw_device_info_screen();     break;
     }
     
-    static bool dcs_before_ov = true; if (dcs_before_ov) { Serial.println("DCS: before overlays"); dcs_before_ov = false; }
     if (show_feed_expanded) draw_feed_expanded_overlay();
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
     if (show_menu) draw_menu_overlay();
-    static bool dcs_before_toast = true; if (dcs_before_toast) { Serial.println("DCS: before toast"); dcs_before_toast = false; }
     draw_toast_spr();
-    static bool dcs_after_toast = true; if (dcs_after_toast) { Serial.println("DCS: after toast"); dcs_after_toast = false; }
 }
 
 void transition_screen(int new_screen, int dir) {
@@ -5463,13 +5456,7 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-    static bool first_loop = true;
-    if (first_loop) { Serial.println(">>> LOOP ENTRY"); first_loop = false; }
-
-    M5Cardputer.update();
-    static bool lm1 = true; if (lm1) { Serial.println(">>> L1 after M5.update"); lm1 = false; }
-    yield();
-    static bool lm2 = true; if (lm2) { Serial.println(">>> L2 after yield"); lm2 = false; }
+    M5Cardputer.update(); yield();
 
     if (export_connecting) {
         export_tick_connect();
@@ -5480,14 +5467,11 @@ void loop() {
             export_mode_stop();
         }
     }
-    static bool lm3 = true; if (lm3) { Serial.println(">>> L3 after export"); lm3 = false; }
 
     // Dynamically calculate expected hardware voltage sag for this loop iteration
     update_load_sag();
-    static bool lm4 = true; if (lm4) { Serial.println(">>> L4 after update_load_sag"); lm4 = false; }
 
     int32_t loop_mv = get_filtered_voltage();
-    static bool lm5 = true; if (lm5) { Serial.println(">>> L5 after get_filtered_voltage"); lm5 = false; }
 
     // Low-battery voltage warnings — once per crossing, 100mV hysteresis to re-arm.
     {
@@ -5503,12 +5487,9 @@ void loop() {
             last_battery_warning_mv = 9999;
         }
     }
-    static bool lm6 = true; if (lm6) { Serial.println(">>> L6 after batt warnings"); lm6 = false; }
 
     process_wifi_event_queue();
-    static bool lm7 = true; if (lm7) { Serial.println(">>> L7 after process_wifi_queue"); lm7 = false; }
     feed_commit_pending();
-    static bool lm8 = true; if (lm8) { Serial.println(">>> L8 after feed_commit"); lm8 = false; }
 
     int conf_snapshot = 0;
     int src_snapshot = 0;
@@ -5524,7 +5505,6 @@ void loop() {
     if (conf_snapshot >= 50) {
         play_escalated_alarm(conf_snapshot, src_snapshot);
     }
-    static bool lm9 = true; if (lm9) { Serial.println(">>> L9 after alarm snapshot"); lm9 = false; }
 
     if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
         last_user_input_ms = millis();
@@ -6028,6 +6008,5 @@ void loop() {
         }
         else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
     }
-    static bool lm_end = true; if (lm_end) { Serial.println(">>> L_END: first iteration complete"); lm_end = false; }
     vTaskDelay(10 / portTICK_PERIOD_MS);
 }
