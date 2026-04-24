@@ -3825,23 +3825,19 @@ void draw_scanner_screen() {
 
         spr.clearClipRect();
 
-        // Show "scanning..." only until the first snapshot captures data
+        // DIAGNOSTIC: the "scanning..." empty-state render is temporarily
+        // bypassed to test whether spr.print() on this code path is the
+        // source of the crash. Restore the original block once the cause
+        // is identified.
         if (!display_ever_populated) {
-            spr.fillRect(feed_col_left, feed_top_y,
-                         feed_col_right - feed_col_left,
-                         max_visible * feed_row_h, BG_COLOR);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(1.2);
-            int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
-            int nd = (int)(local_now / 500) % 4;
-            char load_str[20];
-            snprintf(load_str, sizeof(load_str), "scanning%s",
-                     nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
-            spr.setCursor(feed_col_left + 8, load_y);
-            spr.print(load_str);
+            static bool feed_m_empty_enter = true; if (feed_m_empty_enter) { Serial.println("FEED: empty state enter"); feed_m_empty_enter = false; }
+            // Draw nothing — bypass for crash diagnosis
+            static bool feed_m_empty_skip = true; if (feed_m_empty_skip) { Serial.println("FEED: empty state skipped"); feed_m_empty_skip = false; }
         }
+        static bool feed_m_exit = true; if (feed_m_exit) { Serial.println("FEED: block exit"); feed_m_exit = false; }
     }
     static bool scn_once_e = true; if (scn_once_e) { Serial.println("SCN: after feed"); scn_once_e = false; }
+    static bool scn_once_exit = true; if (scn_once_exit) { Serial.println("SCN: exit"); scn_once_exit = false; }
 
 }
 
@@ -4972,11 +4968,14 @@ void draw_current_screen() {
         case 4: draw_device_info_screen();     break;
     }
     
+    static bool dcs_before_ov = true; if (dcs_before_ov) { Serial.println("DCS: before overlays"); dcs_before_ov = false; }
     if (show_feed_expanded) draw_feed_expanded_overlay();
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
     if (show_menu) draw_menu_overlay();
+    static bool dcs_before_toast = true; if (dcs_before_toast) { Serial.println("DCS: before toast"); dcs_before_toast = false; }
     draw_toast_spr();
+    static bool dcs_after_toast = true; if (dcs_after_toast) { Serial.println("DCS: after toast"); dcs_after_toast = false; }
 }
 
 void transition_screen(int new_screen, int dir) {
