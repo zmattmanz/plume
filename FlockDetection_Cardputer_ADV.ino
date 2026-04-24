@@ -3153,6 +3153,7 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
+    static bool drew_scanner = false; if (!drew_scanner) { Serial.println(">>> DRAW: scanner enter"); Serial.flush(); drew_scanner = true; }
     int divider_x = 112;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
@@ -3812,6 +3813,7 @@ void draw_scanner_screen() {
 }
 
 void draw_locator_screen() {
+    static bool drew_locator = false; if (!drew_locator) { Serial.println(">>> DRAW: locator enter"); Serial.flush(); drew_locator = true; }
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
@@ -4101,6 +4103,7 @@ static void hist_type_info(const char* type, const char** lbl, uint16_t* col) {
 }
 
 void draw_capture_history_screen() {
+    static bool drew_hist = false; if (!drew_hist) { Serial.println(">>> DRAW: history enter"); Serial.flush(); drew_hist = true; }
     // Use SD history when available, fall back to in-memory capture_history
     bool use_sd = sd_available && sd_hist_count > 0;
 
@@ -4338,6 +4341,7 @@ void draw_capture_history_screen() {
 }
 
 void draw_gps_screen() {
+    static bool drew_gps = false; if (!drew_gps) { Serial.println(">>> DRAW: gps enter"); Serial.flush(); drew_gps = true; }
     spr.fillSprite(BG_COLOR);
     draw_header_spr(3);
     unsigned long frame_ms = millis();
@@ -4593,6 +4597,7 @@ void draw_gps_screen() {
 }
 
 void draw_device_info_screen() {
+    static bool drew_devinfo = false; if (!drew_devinfo) { Serial.println(">>> DRAW: devinfo enter"); Serial.flush(); drew_devinfo = true; }
     unsigned long frame_ms = millis();
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     long lt = lifetime_flock_total;
@@ -4947,14 +4952,22 @@ void draw_current_screen() {
 }
 
 void transition_screen(int new_screen, int dir) {
-    if (stealth_mode) { current_screen = new_screen; return; }
+    Serial.printf(">>> TRANS: enter, old=%d new=%d dir=%d\n", current_screen, new_screen, dir);
+    Serial.flush();
+    if (stealth_mode) { current_screen = new_screen; Serial.println(">>> TRANS: stealth short-circuit"); Serial.flush(); return; }
     if (!is_muted && ui_beep_pcm_dma) {
+        Serial.println(">>> TRANS: pre-audio");
+        Serial.flush();
         int prev_vol = current_volume;
         M5Cardputer.Speaker.setVolume(max(prev_vol, 35));
         M5Cardputer.Speaker.playRaw(ui_beep_pcm_dma, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
         M5Cardputer.Speaker.setVolume(prev_vol);
+        Serial.println(">>> TRANS: post-audio");
+        Serial.flush();
     }
     if (new_screen == 2) {
+        Serial.println(">>> TRANS: loading sd history");
+        Serial.flush();
         history_scroll_offset = 0;
         history_selected_idx = 0;
         hist_detail_open = false;
@@ -4966,7 +4979,11 @@ void transition_screen(int new_screen, int dir) {
     }
     if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
     current_screen = new_screen;
+    Serial.println(">>> TRANS: current_screen assigned, calling draw");
+    Serial.flush();
     draw_current_screen();
+    Serial.println(">>> TRANS: draw done, entering slide anim");
+    Serial.flush();
 
     const int STEP = 30;
     const unsigned long FRAME_MS = 5;
@@ -4974,7 +4991,7 @@ void transition_screen(int new_screen, int dir) {
 
     if (dir > 0) {
         for (int x = DISP_W; x >= 0; x -= STEP) {
-            if (trigger_alarm_confidence > 0) break; 
+            if (trigger_alarm_confidence > 0) break;
             while (millis() < frame_due) { vTaskDelay(1 / portTICK_PERIOD_MS); }
             spr.pushSprite(x, 0);
             frame_due += FRAME_MS;
@@ -4988,6 +5005,8 @@ void transition_screen(int new_screen, int dir) {
         }
     }
     spr.pushSprite(0, 0);
+    Serial.println(">>> TRANS: done");
+    Serial.flush();
 }
 
 // ============================================================================
@@ -5528,12 +5547,16 @@ void loop() {
     }
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+        Serial.println(">>> KEY: change detected");
+        Serial.flush();
         last_user_input_ms = millis();
         if (ambient_mode) {
             ambient_mode = false;
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
         }
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+        Serial.printf(">>> KEY: state read, word.size=%u\n", (unsigned)status.word.size());
+        Serial.flush();
         
         if (status.tab && !stealth_mode) {
             show_help_overlay = !show_help_overlay;
