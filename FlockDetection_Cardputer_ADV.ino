@@ -2456,8 +2456,8 @@ void ScannerLoopTask(void* pvParameters) {
             ? BLE_SCAN_INTERVAL_LOCK
             : base_interval;
 
-        bool scanning = pBLEScan->isScanning();
-        if (millis() - last_ble_scan >= ble_interval) {
+        bool scanning = pBLEScan ? pBLEScan->isScanning() : false;
+        if (pBLEScan && millis() - last_ble_scan >= ble_interval) {
             if (!scanning) {
                 bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
                 pBLEScan->setActiveScan(active);
@@ -2467,7 +2467,7 @@ void ScannerLoopTask(void* pvParameters) {
                 scanning = true;  // we just started
             }
         }
-        if (!scanning && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
+        if (pBLEScan && !scanning && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
             pBLEScan->clearResults();
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -3438,7 +3438,7 @@ void draw_scanner_screen() {
 
     int right_text_x = divider_x + 5;
 
-    bool ble_active = pBLEScan->isScanning();
+    bool ble_active = pBLEScan ? pBLEScan->isScanning() : false;
     bool wifi_active = !ble_active;
 
     uint16_t inactive_col = CARD_BORDER;
@@ -5152,11 +5152,17 @@ static void boot_animate(int pct, const char* status, int frames = 8) {
 }
 
 void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("=== BOOT MARKER 0: entering setup ===");
+
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
+    Serial.println("=== BOOT MARKER 1: M5Cardputer.begin done ===");
 
     // dataMutex MUST be created before any task that uses it is spawned.
     dataMutex = xSemaphoreCreateMutex();
+    Serial.println("=== BOOT MARKER 2: dataMutex created ===");
 
     // LED: start dark. The breathing task is spawned at the very end of setup()
     // to avoid RMT/radio contention during WiFi + BLE init on core 0.
@@ -5169,10 +5175,9 @@ void setup() {
     brightness_level = 2;
     apply_color_palette();
 
-    // Serial early for SD mount diagnostics
-    Serial.begin(115200); delay(200);
     boot_animate(5, "serial ok");
 
+    Serial.println("=== BOOT MARKER 3: before SD init ===");
     boot_animate(10, "SD card...");
 
     // Route a dedicated SPI3 instance to the Cardputer's SD pins. 15 MHz is
@@ -5253,6 +5258,7 @@ void setup() {
         Serial.println("[SD] Mount failed. Verify card is FAT32 and fully inserted.");
     }
     boot_animate(35, sd_available ? "SD mounted" : "no SD card");
+    Serial.println("=== BOOT MARKER 4: after SD init ===");
     // Seed hot-plug state so the first poll doesn't fire a spurious "mounted" toast
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
@@ -5260,10 +5266,12 @@ void setup() {
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
     boot_animate(40, "GPS serial...");
+    Serial.println("=== BOOT MARKER 5: GPS serial + WiFi.mode done ===");
 
     spr.setColorDepth(16);
     spr.createSprite(DISP_W, DISP_H);
     boot_animate(45, "display ready");
+    Serial.println("=== BOOT MARKER 6: sprite created ===");
 
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
@@ -5273,12 +5281,15 @@ void setup() {
     }
     boot_animate(55, "battery cal...");
 
+    Serial.println("=== BOOT MARKER 7: before CPU freq + BLE queue ===");
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 6144, NULL, 1, NULL, 1);
     boot_animate(65, "BLE init...");
+    Serial.println("=== BOOT MARKER 8: BLE worker task created ===");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
+    Serial.println("=== BOOT MARKER 9: before LittleFS ===");
     // Robust LittleFS mount: try begin(true) which auto-formats on corruption.
     // If that fails (known ESP32-S3 issue where block 0x0 reports as bad),
     // manually erase the partition bytes and retry.
@@ -5316,6 +5327,7 @@ void setup() {
         load_detections_from_flash();
     }
     boot_animate(75, "loading data...");
+    Serial.println("=== BOOT MARKER 10: LittleFS mount path complete ===");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5333,6 +5345,7 @@ void setup() {
     }
     session_start_time = millis();
 
+    Serial.println("=== BOOT MARKER 11: before WiFi promisc ===");
     // WiFi promiscuous mode — complete before scanner screen appears
     WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
@@ -5340,25 +5353,33 @@ void setup() {
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
     boot_animate(85, "WiFi sniffer...");
+    Serial.println("=== BOOT MARKER 12: WiFi promisc done ===");
 
+    Serial.println("=== BOOT MARKER 13: before NimBLE init ===");
     // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    Serial.println("=== BOOT MARKER 14: NimBLE init done ===");
     pBLEScan = NimBLEDevice::getScan();
+    Serial.println("=== BOOT MARKER 15: got pBLEScan ===");
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
     boot_animate(92, "BLE scanner...");
+    Serial.println("=== BOOT MARKER 16: BLE scan configured ===");
 
+    Serial.println("=== BOOT MARKER 17: before Scanner/GPS tasks ===");
     // Tasks — Arduino-ESP32 3.x owns the task watchdog; we don't re-init it.
     last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
+    Serial.println("=== BOOT MARKER 18: system_fully_booted ===");
 
     // Spawn the persistent LED breathing task only after WiFi + BLE are up, so
     // the RMT peripheral (neopixelWrite) can't collide with radio init on core 0.
     // Task runs forever on Core 0 / priority 5. Never deleted — toggle led_breathing_on.
     xTaskCreatePinnedToCore(chargeLedTask, "ChargeLed", 4096, NULL, 5, &chargeLedTaskHandle, 0);
+    Serial.println("=== BOOT MARKER 19: chargeLedTask spawned ===");
     boot_animate(100, "ready");
     delay(400);
 
