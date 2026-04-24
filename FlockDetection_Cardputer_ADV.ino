@@ -5945,12 +5945,20 @@ void loop() {
             if (now - last_fast_anim >= 15) {
                 Serial.println(">>> LOOP: calling DCS fast");
                 Serial.flush();
+                delay(10);   // force UART drain before next statement
                 draw_current_screen();
+                delay(10);   // force real serial barrier, prevents reorder
                 Serial.println(">>> LOOP: DCS fast returned");
                 Serial.flush();
-                spr.pushSprite(0, 0);
-                Serial.println(">>> LOOP: pushSprite fast done");
+                delay(10);
+                Serial.println(">>> LOOP: about to call pushSprite");
                 Serial.flush();
+                delay(10);
+                spr.pushSprite(0, 0);
+                delay(10);
+                Serial.println(">>> LOOP: pushSprite returned");
+                Serial.flush();
+                delay(10);
                 last_fast_anim = now;
             }
         }
