@@ -5418,26 +5418,14 @@ void setup() {
     boot_animate(100, "ready");
     delay(400);
 
-    // Gate: wait for the WiFi sniffer to confirm radios are up (~15 packets) or
-    // 4 seconds, whichever comes first. Pump event queues during the wait so the
-    // live feed buffer pre-populates before the scanner screen appears.
-    {
-        unsigned long feed_gate_start = millis();
-        const unsigned long FEED_GATE_MAX_MS = 4000;
-        while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
-            if (ambient_packet_count >= 15) break;
-            draw_boot_screen(100, "scanning...");
-            delay(30);
-            M5Cardputer.update();
-            process_wifi_event_queue();
-            feed_commit_pending();
-        }
-        // Reset so a later boot-screen draw (shouldn't happen) would repaint cleanly
-        boot_prev_fill_w = 0;
-    }
+    // DIAGNOSTIC: feed gate disabled
+    Serial.println(">>> DIAG: feed gate SKIPPED");
+    delay(500);  // brief pause so boot screen at 100% is visible
 
-    // === Boot screen is done — now show the scanner ===
-    draw_current_screen(); spr.pushSprite(0, 0);
+    // === DIAGNOSTIC: skip first draw, let loop() handle it ===
+    Serial.println(">>> DIAG: skipping first draw_current_screen()");
+    // Fill screen with BG_COLOR so user sees something, but don't touch sprite render path
+    M5Cardputer.Display.fillScreen(BG_COLOR);
 
     // Boot chime — plays after the scanner is visible
     if (!is_muted) {
@@ -5458,6 +5446,12 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
+    static bool first_loop = true;
+    if (first_loop) {
+        Serial.println(">>> LOOP: first entry");
+        Serial.flush();
+        first_loop = false;
+    }
     M5Cardputer.update(); yield();
 
     if (export_connecting) {
@@ -6004,9 +5998,17 @@ void loop() {
         }
     } else {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
+        static int draw_count = 0;
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; }
+            if (now - last_fast_anim >= 15) {
+                if (draw_count < 3) { Serial.printf(">>> LOOP-DCS #%d pre\n", draw_count); Serial.flush(); }
+                draw_current_screen();
+                if (draw_count < 3) { Serial.printf(">>> LOOP-DCS #%d post-DCS\n", draw_count); Serial.flush(); }
+                spr.pushSprite(0, 0);
+                if (draw_count < 3) { Serial.printf(">>> LOOP-DCS #%d post-push\n", draw_count); Serial.flush(); draw_count++; }
+                last_fast_anim = now;
+            }
         }
         else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
     }
