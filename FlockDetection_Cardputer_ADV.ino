@@ -231,7 +231,7 @@ static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms
 #define SD_CS_PIN       12
 
 // Version string — single source of truth
-#define VERSION_STRING "FLOCK DETECTOR v9.3 [ADV]"
+#define VERSION_STRING "FLOCK DETECTOR v9.6"
 
 // Pre-configure WiFi credentials for export mode. User edits these in source
 // once, then they're saved to flash on first boot. To change later, edit
@@ -5143,9 +5143,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         lcd.setTextDatum(TC_DATUM);
         lcd.drawString(VERSION_STRING, DISP_W / 2, 18);
 
-        // Bar outline — 2px stroke (outer + inset inner)
-        lcd.drawRoundRect(bar_x,     bar_y,     bar_w,     bar_h,     bar_r,     blue);
-        lcd.drawRoundRect(bar_x + 1, bar_y + 1, bar_w - 2, bar_h - 2, bar_r - 1, blue);
+        // Bar outline — 1px stroke
+        lcd.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, blue);
 
         boot_first_draw = false;
         boot_eased_fill = 0.0f;
@@ -5170,44 +5169,73 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             boot_prev_pct = pct;
         }
 
-        // Clear the number area
-        lcd.fillRect(num_x, num_y, num_w, num_h, bg);
-
         // Each character ~18px wide at textSize 3
         const int char_w = 18;
         int total_w = n_chars * char_w;
-        int start_x = (DISP_W - total_w) / 2;
+        int start_x_abs = (DISP_W - total_w) / 2;
         const unsigned long ROLL_MS = 200;
 
-        lcd.setClipRect(num_x, num_y, num_w, num_h);
-        lcd.setTextColor(white, bg);
-        lcd.setTextSize(3);
-        lcd.setTextDatum(TL_DATUM);
-
-        for (int di = 0; di < n_chars && di < 8; di++) {
-            int dx = start_x + di * char_w;
-
-            int y_off = 0;
-            if (boot_digit_anim_ms[di] > 0) {
-                unsigned long elapsed = millis() - boot_digit_anim_ms[di];
-                if (elapsed < ROLL_MS) {
-                    float t    = (float)elapsed / (float)ROLL_MS;
-                    float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                    y_off = (int)((1.0f - ease) * (float)num_h);
-                }
-            }
-
-            char ch[2] = { pct_str[di], '\0' };
-            lcd.drawString(ch, dx, num_y + y_off);
+        // Render the number into a dedicated back-buffer sprite for flicker-free
+        // atomic push. Lazy-allocated on first call; ~5KB held for the life of
+        // the program — negligible and avoids per-call alloc churn.
+        static M5Canvas boot_num_spr(&M5Cardputer.Display);
+        static bool boot_num_spr_ok = false;
+        if (!boot_num_spr_ok) {
+            boot_num_spr.setColorDepth(16);
+            boot_num_spr.setPsram(false);
+            if (boot_num_spr.createSprite(num_w, num_h)) boot_num_spr_ok = true;
         }
 
-        lcd.clearClipRect();
+        if (boot_num_spr_ok) {
+            boot_num_spr.fillSprite(bg);
+            boot_num_spr.setTextColor(white, bg);
+            boot_num_spr.setTextSize(3);
+            boot_num_spr.setTextDatum(TL_DATUM);
+            for (int di = 0; di < n_chars && di < 8; di++) {
+                int dx_local = (start_x_abs - num_x) + di * char_w;
+                int y_off = 0;
+                if (boot_digit_anim_ms[di] > 0) {
+                    unsigned long elapsed = millis() - boot_digit_anim_ms[di];
+                    if (elapsed < ROLL_MS) {
+                        float t    = (float)elapsed / (float)ROLL_MS;
+                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                        y_off = (int)((1.0f - ease) * (float)num_h);
+                    }
+                }
+                char ch[2] = { pct_str[di], '\0' };
+                boot_num_spr.drawString(ch, dx_local, y_off);
+            }
+            boot_num_spr.pushSprite(num_x, num_y);
+        } else {
+            // Fallback: direct draw (flickers). Shouldn't normally happen.
+            lcd.fillRect(num_x, num_y, num_w, num_h, bg);
+            lcd.setClipRect(num_x, num_y, num_w, num_h);
+            lcd.setTextColor(white, bg);
+            lcd.setTextSize(3);
+            lcd.setTextDatum(TL_DATUM);
+            for (int di = 0; di < n_chars && di < 8; di++) {
+                int dx = start_x_abs + di * char_w;
+                int y_off = 0;
+                if (boot_digit_anim_ms[di] > 0) {
+                    unsigned long elapsed = millis() - boot_digit_anim_ms[di];
+                    if (elapsed < ROLL_MS) {
+                        float t    = (float)elapsed / (float)ROLL_MS;
+                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                        y_off = (int)((1.0f - ease) * (float)num_h);
+                    }
+                }
+                char ch[2] = { pct_str[di], '\0' };
+                lcd.drawString(ch, dx, num_y + y_off);
+            }
+            lcd.clearClipRect();
+        }
         lcd.setTextDatum(TL_DATUM);
     }
 
     // ── Update bar fill (incremental — extend forward only, no clear) ──
     {
-        int target_fill = (pct * (bar_w - 8)) / 100;
+        // Fill margin widened to 5px per side for more breathing room inside the stroke.
+        int target_fill = (pct * (bar_w - 10)) / 100;
         float diff = (float)target_fill - boot_eased_fill;
         boot_eased_fill += diff * 0.3f;
         if (fabsf(diff) < 0.5f) boot_eased_fill = (float)target_fill;
@@ -5217,34 +5245,45 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
         if (fill_w > boot_prev_fill_w) {
-            int fill_r = (bar_h - 8) / 2;
+            int fill_r = (bar_h - 10) / 2;
             if (fill_r < 1) fill_r = 1;
             if (fill_w < fill_r * 2) {
-                lcd.fillRect(bar_x + 4, bar_y + 4, fill_w, bar_h - 8, blue);
+                lcd.fillRect(bar_x + 5, bar_y + 5, fill_w, bar_h - 10, blue);
             } else {
-                lcd.fillRoundRect(bar_x + 4, bar_y + 4, fill_w, bar_h - 8, fill_r, blue);
+                lcd.fillRoundRect(bar_x + 5, bar_y + 5, fill_w, bar_h - 10, fill_r, blue);
             }
             boot_prev_fill_w = fill_w;
         }
     }
 
-    // ── Status text only when provided ──
-    if (status_text) {
+    // ── Status text: update on change, ease-in every frame using ease_alpha ──
+    static char boot_cur_status[32] = "";
+    static unsigned long boot_status_change_ms = 0;
+    if (status_text && strcmp(status_text, boot_cur_status) != 0) {
+        strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
+        boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
+        boot_status_change_ms = millis();
+    }
+    if (boot_cur_status[0] != '\0') {
+        const unsigned long STATUS_FADE_MS = 350;
+        float alpha = ease_alpha(boot_status_change_ms, STATUS_FADE_MS);
+        uint16_t status_col = lerp_col16(bg, white, alpha);
         lcd.fillRect(0, status_y, DISP_W, status_h, bg);
-        lcd.setTextColor(white, bg);
+        lcd.setTextColor(status_col, bg);
         lcd.setTextSize(1);
         lcd.setTextDatum(TC_DATUM);
-        lcd.drawString(status_text, DISP_W / 2, status_y);
+        lcd.drawString(boot_cur_status, DISP_W / 2, status_y);
     }
 
     lcd.setTextDatum(TL_DATUM);
 }
 
-// Animate the boot progress bar briefly so the eased fill is visible.
+// Animate the boot progress bar so the eased fill is visible.
+// Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
 static void boot_animate(int pct, const char* status, int frames = 8) {
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
-        delay(18);
+        delay(25);
     }
 }
 
@@ -5303,13 +5342,13 @@ void setup() {
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
     M5Cardputer.Display.setBrightness(255);
-    boot_animate(0, "starting...");
+    boot_animate(0, "starting");
     brightness_level = 2;
     apply_color_palette();
 
     boot_animate(5, "serial ok");
 
-    boot_animate(10, "SD card...");
+    boot_animate(10, "SD card");
 
     // Route a dedicated SPI3 instance to the Cardputer's SD pins. 15 MHz is
     // the FAT32 sweet spot — slow enough for marginal cards, fast enough for
@@ -5395,7 +5434,7 @@ void setup() {
 
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
-    boot_animate(40, "GPS serial...");
+    boot_animate(40, "GPS serial");
 
     // Sprite was already created at the top of setup().
     boot_animate(45, "display ready");
@@ -5406,11 +5445,11 @@ void setup() {
         get_filtered_voltage();
         delay(2);
     }
-    boot_animate(55, "battery cal...");
+    boot_animate(55, "battery cal");
 
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
-    boot_animate(65, "BLE init...");
+    boot_animate(65, "BLE init");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
@@ -5455,7 +5494,7 @@ void setup() {
         load_session_from_flash();
         load_detections_from_flash();
     }
-    boot_animate(75, "loading data...");
+    boot_animate(75, "loading data");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5479,14 +5518,14 @@ void setup() {
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
-    boot_animate(85, "WiFi sniffer...");
+    boot_animate(85, "WiFi sniffer");
 
     // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
-    boot_animate(92, "BLE scanner...");
+    boot_animate(92, "BLE scanner");
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
@@ -5513,7 +5552,7 @@ void setup() {
         const unsigned long FEED_GATE_MAX_MS = 4000;
         while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
             if (ambient_packet_count >= 15) break;
-            draw_boot_screen(100, "scanning...");
+            draw_boot_screen(100, "scanning");
             delay(30);
             M5Cardputer.update();
             process_wifi_event_queue();
@@ -5523,8 +5562,31 @@ void setup() {
         boot_prev_fill_w = 0;
     }
 
-    // === Boot screen is done — now show the scanner ===
-    draw_current_screen(); spr.pushSprite(0, 0);
+    // ── Crossfade from boot screen to scanner via the backlight PWM ──
+    // Fade-out: ramp brightness to 0 over ~400ms, so the still-rendered boot
+    // content dims away. Swap sprite contents while the screen is dark.
+    // Fade-in: ramp brightness back to the user's target over ~400ms.
+    {
+        int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
+        const int FADE_STEPS   = 20;
+        const int FADE_STEP_MS = 20;   // 20 × 20ms = 400ms per phase
+
+        for (int i = 1; i <= FADE_STEPS; i++) {
+            int b = (start_brightness * (FADE_STEPS - i)) / FADE_STEPS;
+            M5Cardputer.Display.setBrightness(b);
+            delay(FADE_STEP_MS);
+        }
+
+        // Screen is dark — swap to the scanner content
+        draw_current_screen();
+        spr.pushSprite(0, 0);
+
+        for (int i = 1; i <= FADE_STEPS; i++) {
+            int b = (start_brightness * i) / FADE_STEPS;
+            M5Cardputer.Display.setBrightness(b);
+            delay(FADE_STEP_MS);
+        }
+    }
 
     // Boot chime — plays after the scanner is visible
     if (!is_muted) {
