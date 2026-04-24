@@ -2545,6 +2545,7 @@ void play_escalated_alarm(int confidence, int source) {
 // UI RENDERING - BASE COMPONENTS
 // ============================================================================
 void draw_header_spr(int screen_num) {
+    Serial.printf(">>> HEADER: screen=%d\n", screen_num);
     static const char* screen_names[NUM_SCREENS] = {
         "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "STATS"
     };
@@ -2694,6 +2695,7 @@ void draw_header_spr(int screen_num) {
 }
 
 void draw_toast_spr() {
+    Serial.println(">>> TOAST: entered");
     // Snapshot all toast state under mutex before rendering. Producer tasks
     // on either core can write toast_text mid-strncpy; rendering from live
     // globals would read torn data and crash spr.print() when it walks past
@@ -3186,6 +3188,7 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
+    Serial.println(">>> SCANNER: entered");
     int divider_x = 112;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
@@ -4962,6 +4965,7 @@ void draw_feed_expanded_overlay() {
 // MAIN UI CONTROLLER
 // ============================================================================
 void draw_current_screen() {
+    Serial.printf(">>> DCS: screen=%d\n", current_screen);
     switch (current_screen) {
         case 0: draw_scanner_screen();         break;
         case 1: draw_locator_screen();         break;
@@ -5456,6 +5460,8 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
+    static bool loop_first = true;
+    if (loop_first) { Serial.println(">>> LOOP: first iteration"); loop_first = false; }
     M5Cardputer.update(); yield();
 
     if (export_connecting) {
