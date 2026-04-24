@@ -5163,14 +5163,10 @@ static void boot_animate(int pct, const char* status, int frames = 8) {
 }
 
 void setup() {
-    // Kill the framework's TWDT fully. esp_task_wdt_deinit() alone silently
-    // returns ESP_ERR_INVALID_STATE while the IDLE tasks are still subscribed
-    // (which Arduino-ESP32 3.x does by default on both cores). Unsubscribe
-    // each core's IDLE task first, then deinit.
-    TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
-    TaskHandle_t idle1 = xTaskGetIdleTaskHandleForCPU(1);
-    if (idle0) esp_task_wdt_delete(idle0);
-    if (idle1) esp_task_wdt_delete(idle1);
+    // Kill the framework's TWDT. On IDF 5.x (Arduino-ESP32 3.x),
+    // esp_task_wdt_deinit() unsubscribes the per-core IDLE tasks internally
+    // via an ESP_ERROR_CHECK-wrapped call — so we MUST NOT pre-delete them
+    // ourselves or deinit aborts with ESP_ERR_NOT_FOUND (unsubscribe_idle).
     esp_err_t wdt_err = esp_task_wdt_deinit();
 
     Serial.begin(115200);
