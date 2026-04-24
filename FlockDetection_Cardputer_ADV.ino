@@ -3512,6 +3512,7 @@ void draw_scanner_screen() {
         // Diagonal "wedge" of WiFi color extending into the seam area —
         // matches the slope of the slash divider so the fill respects the
         // diagonal boundary, eliminating triangle gaps.
+#if 0  // DIAGNOSTIC: commented out to test crash theory (drawFastHLine / sprite state corruption)
         for (int dy = 0; dy < badge_h; dy++) {
             // Slash goes from (seam_x + 4, badge_y + 2) to (seam_x - 4, badge_y + badge_h - 3)
             // For each y row, compute the x where the slash crosses
@@ -3525,6 +3526,7 @@ void draw_scanner_screen() {
                                   slash_x - wfill_right, wf_fill);
             }
         }
+#endif
     }
 
     // Step 4: outer rounded outline
@@ -3563,12 +3565,14 @@ void draw_scanner_screen() {
         spr.print("BLE");
     }
 
+    static bool stats_m_enter = true; if (stats_m_enter) { Serial.println("STATS: block enter"); stats_m_enter = false; }
     // ── Stats block — labels above, symbol + number inline below ──
     // Both blocks left-aligned at a fixed column split. Symbols are
     // filled + outlined for legibility against the dark background.
     {
         long sw_local = sw;
         long sb_local = sb;
+        static bool stats_m_vals = true; if (stats_m_vals) { Serial.printf("STATS: sw=%ld sb=%ld\n", sw_local, sb_local); stats_m_vals = false; }
 
         const int stats_label_y = 48;       // top of size-1 labels
         const int stats_num_y   = 64;       // top of size-3 numbers
@@ -3623,6 +3627,7 @@ void draw_scanner_screen() {
             }
             spr.clearClipRect();
         }
+        static bool stats_m_wifi_done = true; if (stats_m_wifi_done) { Serial.println("STATS: wifi block done"); stats_m_wifi_done = false; }
 
         // ── BLE label ──
         spr.setTextSize(1.2);
@@ -3660,6 +3665,7 @@ void draw_scanner_screen() {
             }
             spr.clearClipRect();
         }
+        static bool stats_m_ble_done = true; if (stats_m_ble_done) { Serial.println("STATS: ble block done"); stats_m_ble_done = false; }
     }
 
     static bool scn_once_d = true; if (scn_once_d) { Serial.println("SCN: before feed"); scn_once_d = false; }
