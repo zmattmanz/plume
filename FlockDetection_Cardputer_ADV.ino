@@ -1199,12 +1199,21 @@ void save_session_to_flash() {
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
         File f = LittleFS.open(PERSIST_FILE, "w");
-        if (!f) { delay(5); continue; }
+        if (!f) {
+            Serial.printf("[FS] PERSIST_FILE open failed (attempt %d)\n", attempt);
+            delay(5);
+            continue;
+        }
         size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n",
                                   l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes,
                                   export_ssid, export_pass);
         f.close();
-        if (written > 10) write_ok = true;
+        if (written > 10) {
+            write_ok = true;
+        } else {
+            Serial.printf("[FS] Write truncated: %u bytes (attempt %d)\n",
+                          (unsigned)written, attempt);
+        }
     }
 
     if (write_ok) {
@@ -1229,14 +1238,28 @@ void save_session_to_flash() {
 
 void save_stats_to_sd() {
     if (!sd_available) return;
+
+    // Snapshot lifetime values under the mutex so the SD write doesn't see a
+    // half-updated set (other tasks bump these counters concurrently).
+    long          l_wifi, l_ble, l_flock, l_boots, l_writes;
+    unsigned long l_sec;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    l_wifi   = lifetime_wifi;
+    l_ble    = lifetime_ble;
+    l_sec    = lifetime_seconds;
+    l_flock  = lifetime_flock_total;
+    l_boots  = lifetime_boots;
+    l_writes = lifetime_flash_writes;
+    xSemaphoreGive(dataMutex);
+
     File f = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
     if (!f) return;
-    f.printf("lifetime_wifi=%ld\n", lifetime_wifi);
-    f.printf("lifetime_ble=%ld\n", lifetime_ble);
-    f.printf("lifetime_seconds=%lu\n", lifetime_seconds);
-    f.printf("lifetime_flock_total=%ld\n", lifetime_flock_total);
-    f.printf("lifetime_boots=%ld\n", lifetime_boots);
-    f.printf("lifetime_flash_writes=%ld\n", lifetime_flash_writes);
+    f.printf("lifetime_wifi=%ld\n",          l_wifi);
+    f.printf("lifetime_ble=%ld\n",           l_ble);
+    f.printf("lifetime_seconds=%lu\n",       l_sec);
+    f.printf("lifetime_flock_total=%ld\n",   l_flock);
+    f.printf("lifetime_boots=%ld\n",         l_boots);
+    f.printf("lifetime_flash_writes=%ld\n",  l_writes);
     f.close();
 }
 
@@ -2200,11 +2223,13 @@ struct BleEventData {
 };
 
 static void ble_worker_task(void* pvParameters) {
-    static bool wdt_subscribed = false;
+    bool wdt_subscribed = false;
     BleEventData* ev;
     for (;;) {
-        if (!wdt_subscribed) { esp_task_wdt_add(NULL); wdt_subscribed = true; }
-        esp_task_wdt_reset();
+        if (!wdt_subscribed) {
+            if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+        }
+        if (wdt_subscribed) esp_task_wdt_reset();
         // 1s timeout so the WDT reset above can fire even when the queue is idle.
         if (xQueueReceive(ble_event_queue, &ev, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
 
@@ -2447,8 +2472,13 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
 void ScannerLoopTask(void* pvParameters) {
+    bool wdt_subscribed = false;
+    unsigned long scan_start_ms = 0;
     for (;;) {
-        esp_task_wdt_reset();
+        if (!wdt_subscribed) {
+            if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+        }
+        if (wdt_subscribed) esp_task_wdt_reset();
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
             unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
@@ -2466,11 +2496,25 @@ void ScannerLoopTask(void* pvParameters) {
             : base_interval;
 
         bool scanning = pBLEScan ? pBLEScan->isScanning() : false;
+
+        // Hang detection: if a scan has been "active" for more than 2x its
+        // configured duration plus 3s headroom, the NimBLE stack is wedged.
+        // Force-stop so the next branch can restart cleanly.
+        if (scanning && pBLEScan && scan_start_ms > 0 &&
+            (now - scan_start_ms) > (unsigned long)(BLE_SCAN_DURATION * 2000UL + 3000UL)) {
+            pBLEScan->stop();
+            pBLEScan->clearResults();
+            scanning = false;
+            scan_start_ms = 0;
+            last_ble_scan = now;  // gate the next start by interval
+        }
+
         if (pBLEScan && millis() - last_ble_scan >= ble_interval) {
             if (!scanning) {
                 bool active = low_power_mode ? false : (ble_scan_cycle % 3 == 0);
                 pBLEScan->setActiveScan(active);
                 pBLEScan->start(BLE_SCAN_DURATION, false);
+                scan_start_ms = millis();
                 last_ble_scan = millis();
                 ble_scan_cycle++;
                 scanning = true;  // we just started
@@ -2484,8 +2528,12 @@ void ScannerLoopTask(void* pvParameters) {
 }
 
 void GPSLoopTask(void* pvParameters) {
+    bool wdt_subscribed = false;
     for (;;) {
-        esp_task_wdt_reset();
+        if (!wdt_subscribed) {
+            if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+        }
+        if (wdt_subscribed) esp_task_wdt_reset();
         int avail = SerialGPS.available();
         if (avail > 0) {
             uint8_t buf[128];
@@ -3446,7 +3494,7 @@ void draw_scanner_screen() {
             }
         }
     }
-    hud_rotation += 0.0033f;
+    hud_rotation = fmodf(hud_rotation + 0.0033f, 2.0f * (float)M_PI);
 
     spr.clearClipRect();
 
@@ -5189,6 +5237,18 @@ void setup() {
         M5Cardputer.Speaker.config(spk_cfg);
     }
 
+    // Init WDT EARLY — before any task that will call esp_task_wdt_reset().
+    // 30s timeout gives SD/LittleFS GC stalls and marginal-card retries
+    // plenty of headroom without sacrificing real hang detection.
+    {
+        esp_task_wdt_config_t wdt_cfg = {
+            .timeout_ms     = 30000,
+            .idle_core_mask = 0,
+            .trigger_panic  = true,
+        };
+        esp_task_wdt_init(&wdt_cfg);
+    }
+
     // dataMutex MUST be created before any task that uses it is spawned.
     dataMutex = xSemaphoreCreateMutex();
 
@@ -5322,36 +5382,41 @@ void setup() {
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
-    // Robust LittleFS mount: try begin(true) which auto-formats on corruption.
-    // If that fails (known ESP32-S3 issue where block 0x0 reports as bad),
-    // manually erase the partition bytes and retry.
-    if (!LittleFS.begin(true)) {
-        Serial.println("[FS] LittleFS begin(true) failed — erasing partition...");
-        const esp_partition_t* part = esp_partition_find_first(
-            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
-        if (part) {
-            Serial.printf("[FS] Erasing partition '%s' (%lu bytes)...\n",
-                          part->label, (unsigned long)part->size);
-            esp_err_t err = esp_partition_erase_range(part, 0, part->size);
-            if (err == ESP_OK) {
-                Serial.println("[FS] Partition erased. Retrying mount...");
-                if (LittleFS.begin(true)) {
-                    Serial.println("[FS] LittleFS recovered after partition erase");
-                    littlefs_available = true;
+    // Robust LittleFS mount with verbose recovery logging. begin(true)
+    // auto-formats on corruption; if it still fails (known ESP32-S3 issue
+    // where block 0x0 reports bad), erase the spiffs partition manually
+    // and retry. Every branch logs an actionable line.
+    {
+        Serial.println("[FS] Attempting LittleFS.begin(true)...");
+        bool ok = LittleFS.begin(true);
+        if (!ok) {
+            Serial.println("[FS] First begin(true) failed — trying partition erase...");
+            const esp_partition_t* part = esp_partition_find_first(
+                ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+            if (!part) {
+                Serial.println("[FS] spiffs partition NOT FOUND in partition table!");
+                littlefs_available = false;
+            } else {
+                Serial.printf("[FS] Found partition '%s' addr=0x%lx size=%lu\n",
+                              part->label, (unsigned long)part->address,
+                              (unsigned long)part->size);
+                esp_err_t err = esp_partition_erase_range(part, 0, part->size);
+                Serial.printf("[FS] erase_range returned: %d (%s)\n",
+                              err, esp_err_to_name(err));
+                if (err == ESP_OK) {
+                    bool ok2 = LittleFS.begin(true);
+                    Serial.printf("[FS] Retry begin(true): %s\n", ok2 ? "OK" : "FAIL");
+                    littlefs_available = ok2;
                 } else {
-                    Serial.println("[FS] LittleFS still failed after erase!");
                     littlefs_available = false;
                 }
-            } else {
-                Serial.printf("[FS] Partition erase failed: %d\n", err);
-                littlefs_available = false;
             }
         } else {
-            Serial.println("[FS] No spiffs partition found in partition table!");
-            littlefs_available = false;
+            littlefs_available = true;
+            Serial.printf("[FS] Mounted. total=%u used=%u\n",
+                          (unsigned)LittleFS.totalBytes(),
+                          (unsigned)LittleFS.usedBytes());
         }
-    } else {
-        littlefs_available = true;
     }
 
     if (littlefs_available) {
@@ -5402,18 +5467,8 @@ void setup() {
     // are up so RMT/radio contention is avoided.
     xTaskCreatePinnedToCore(LedTask, "LedTask", 2048, NULL, 1, &LedTaskHandle, 1);
 
-    // Re-arm the task watchdog now that the runtime topology is final.
-    {
-        esp_task_wdt_config_t wdt_cfg = {
-            .timeout_ms     = 15000,
-            .idle_core_mask = 0,           // don't watch idle tasks
-            .trigger_panic  = true,
-        };
-        esp_task_wdt_init(&wdt_cfg);
-        if (ScannerTaskHandle) esp_task_wdt_add(ScannerTaskHandle);
-        if (GPSTaskHandle)     esp_task_wdt_add(GPSTaskHandle);
-        // BLE worker + main loop subscribe themselves from inside their loops.
-    }
+    // WDT was already initialized early in setup(); each watched task
+    // self-subscribes via esp_task_wdt_add(NULL) inside its loop.
 
     boot_animate(100, "ready");
     delay(400);
@@ -5459,8 +5514,10 @@ void setup() {
 // ============================================================================
 void loop() {
     static bool wdt_subscribed = false;
-    if (!wdt_subscribed) { esp_task_wdt_add(NULL); wdt_subscribed = true; }
-    esp_task_wdt_reset();
+    if (!wdt_subscribed) {
+        if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+    }
+    if (wdt_subscribed) esp_task_wdt_reset();
     M5Cardputer.update(); yield();
 
     if (export_connecting) {
