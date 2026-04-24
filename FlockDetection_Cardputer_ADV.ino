@@ -4947,19 +4947,11 @@ void draw_current_screen() {
 }
 
 void transition_screen(int new_screen, int dir) {
-    Serial.printf(">>> TRANS: enter, old=%d new=%d dir=%d\n", current_screen, new_screen, dir);
-    Serial.flush();
-    if (stealth_mode) { current_screen = new_screen; Serial.println(">>> TRANS: stealth short-circuit"); Serial.flush(); return; }
+    if (stealth_mode) { current_screen = new_screen; return; }
     if (!is_muted) {
-        Serial.println(">>> TRANS: pre-audio");
-        Serial.flush();
         M5Cardputer.Speaker.tone(1500, 8);  // brief UI click
-        Serial.println(">>> TRANS: post-audio");
-        Serial.flush();
     }
     if (new_screen == 2) {
-        Serial.println(">>> TRANS: loading sd history");
-        Serial.flush();
         history_scroll_offset = 0;
         history_selected_idx = 0;
         hist_detail_open = false;
@@ -4971,34 +4963,11 @@ void transition_screen(int new_screen, int dir) {
     }
     if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
     current_screen = new_screen;
-    Serial.println(">>> TRANS: current_screen assigned, calling draw");
-    Serial.flush();
     draw_current_screen();
-    Serial.println(">>> TRANS: draw done, entering slide anim");
-    Serial.flush();
-
-    const int STEP = 30;
-    const unsigned long FRAME_MS = 5;
-    unsigned long frame_due = millis();
-
-    if (dir > 0) {
-        for (int x = DISP_W; x >= 0; x -= STEP) {
-            if (trigger_alarm_confidence > 0) break;
-            while (millis() < frame_due) { vTaskDelay(1 / portTICK_PERIOD_MS); }
-            spr.pushSprite(x, 0);
-            frame_due += FRAME_MS;
-        }
-    } else {
-        for (int x = -DISP_W; x <= 0; x += STEP) {
-            if (trigger_alarm_confidence > 0) break;
-            while (millis() < frame_due) { vTaskDelay(1 / portTICK_PERIOD_MS); }
-            spr.pushSprite(x, 0);
-            frame_due += FRAME_MS;
-        }
-    }
-    spr.pushSprite(0, 0);
-    Serial.println(">>> TRANS: done");
-    Serial.flush();
+    spr.pushSprite(0, 0);   // single on-screen push — safe
+    (void)dir;              // slide animation removed — first frame at x=DISP_W
+                            // triggered a LovyanGFX GDMA null-deref when the
+                            // clipped destination rect collapsed to zero width.
 }
 
 // ============================================================================
