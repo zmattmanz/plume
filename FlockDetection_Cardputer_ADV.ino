@@ -4901,10 +4901,16 @@ void draw_current_screen() {
     }
     
     if (show_feed_expanded) draw_feed_expanded_overlay();
+    Serial.println(">>> DCS: after expanded");
     if (show_vol_overlay) draw_vol_overlay();
+    Serial.println(">>> DCS: after vol");
     if (show_help_overlay) draw_help_overlay();
+    Serial.println(">>> DCS: after help");
     if (show_menu) draw_menu_overlay();
+    Serial.println(">>> DCS: after menu");
     draw_toast_spr();
+    Serial.println(">>> DCS: after toast");
+    Serial.flush();
 }
 
 void transition_screen(int new_screen, int dir) {
@@ -5936,9 +5942,31 @@ void loop() {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; }
+            if (now - last_fast_anim >= 15) {
+                Serial.println(">>> LOOP: calling DCS fast");
+                Serial.flush();
+                draw_current_screen();
+                Serial.println(">>> LOOP: DCS fast returned");
+                Serial.flush();
+                spr.pushSprite(0, 0);
+                Serial.println(">>> LOOP: pushSprite fast done");
+                Serial.flush();
+                last_fast_anim = now;
+            }
         }
-        else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
+        else {
+            if (now - last_slow_ui >= 100) {
+                Serial.println(">>> LOOP: calling DCS slow");
+                Serial.flush();
+                draw_current_screen();
+                Serial.println(">>> LOOP: DCS slow returned");
+                Serial.flush();
+                spr.pushSprite(0, 0);
+                Serial.println(">>> LOOP: pushSprite slow done");
+                Serial.flush();
+                last_slow_ui = now;
+            }
+        }
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
 }
