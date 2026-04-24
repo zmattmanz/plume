@@ -555,11 +555,35 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // ============================================================================
-// CHARGE LED TASK — DELETED for crash-isolation diagnostic.
-// The task body and its spawn call have been removed. LED stays dark.
-// If the device boots cleanly without it, add it back at priority 1 on
-// Core 1 (not priority 5 on Core 0).
+// LED TASK — drives the WS2812 charge LED. Re-introduced at priority 1 on
+// Core 1 with a 2048-byte stack after the original Core-0/priority-5 build
+// proved racy with the radio init.
 // ============================================================================
+static TaskHandle_t LedTaskHandle = nullptr;
+
+void LedTask(void* pv) {
+    for (;;) {
+        uint8_t r = 0, g = 0, b = 0;
+        unsigned long now = millis();
+        if (led_detect_active && now < led_detection_flash_until) {
+            float pulse = (sinf((float)now / 100.0f) + 1.0f) * 0.5f;
+            r = (uint8_t)((float)led_detect_r * pulse);
+            g = (uint8_t)((float)led_detect_g * pulse);
+            b = (uint8_t)((float)led_detect_b * pulse);
+        } else {
+            led_detect_active = false;
+            if (led_breathing_on && !stealth_mode && brightness_level >= 2) {
+                float breath = (sinf((float)now / 1500.0f) + 1.0f) * 0.5f;
+                float dim    = 0.15f + breath * 0.35f;
+                r = (uint8_t)((float)led_r * dim);
+                g = (uint8_t)((float)led_g * dim);
+                b = (uint8_t)((float)led_b * dim);
+            }
+        }
+        set_cardputer_led(r, g, b);
+        vTaskDelay(30 / portTICK_PERIOD_MS);
+    }
+}
 
 // ============================================================================
 // BATTERY ENGINE (OPTIMIZED)
@@ -1583,12 +1607,29 @@ void flush_sd_buffer() {
 // Does NOT touch the queue — it only sets the currently-displayed toast.
 static void set_toast_direct(const char* text, uint16_t accent) {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
+    // If a queued toast is already active, replace the head entry so the
+    // expiry handler in draw_toast_spr doesn't pop a phantom slot.
+    if (toast_active && toast_queue_count > 0) {
+        strncpy(toast_queue[toast_queue_head].text, text,
+                sizeof(toast_queue[toast_queue_head].text) - 1);
+        toast_queue[toast_queue_head].text[sizeof(toast_queue[toast_queue_head].text) - 1] = '\0';
+        toast_queue[toast_queue_head].accent    = accent;
+        toast_queue[toast_queue_head].is_action = true;
+    } else if (toast_queue_count == 0) {
+        // No queue activity — push one so expiry accounting matches.
+        toast_queue_head = 0;
+        strncpy(toast_queue[0].text, text, sizeof(toast_queue[0].text) - 1);
+        toast_queue[0].text[sizeof(toast_queue[0].text) - 1] = '\0';
+        toast_queue[0].accent    = accent;
+        toast_queue[0].is_action = true;
+        toast_queue_count = 1;
+    }
     strncpy(toast_text, text, sizeof(toast_text) - 1);
     toast_text[sizeof(toast_text) - 1] = '\0';
     toast_accent_color = accent;
-    toast_is_action = true;
-    toast_start = millis();
-    toast_active = true;
+    toast_is_action    = true;
+    toast_start        = millis();
+    toast_active       = true;
     xSemaphoreGive(dataMutex);
 }
 
@@ -2159,9 +2200,13 @@ struct BleEventData {
 };
 
 static void ble_worker_task(void* pvParameters) {
+    static bool wdt_subscribed = false;
     BleEventData* ev;
     for (;;) {
-        if (xQueueReceive(ble_event_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
+        if (!wdt_subscribed) { esp_task_wdt_add(NULL); wdt_subscribed = true; }
+        esp_task_wdt_reset();
+        // 1s timeout so the WDT reset above can fire even when the queue is idle.
+        if (xQueueReceive(ble_event_queue, &ev, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
 
         if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); continue; }
 
@@ -2403,6 +2448,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // ============================================================================
 void ScannerLoopTask(void* pvParameters) {
     for (;;) {
+        esp_task_wdt_reset();
         unsigned long now = millis();
         if ((long)(now - channel_lock_until) > 0) {
             unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
@@ -2439,6 +2485,7 @@ void ScannerLoopTask(void* pvParameters) {
 
 void GPSLoopTask(void* pvParameters) {
     for (;;) {
+        esp_task_wdt_reset();
         int avail = SerialGPS.available();
         if (avail > 0) {
             uint8_t buf[128];
@@ -3148,7 +3195,6 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
-    static bool drew_scanner = false; if (!drew_scanner) { Serial.println(">>> DRAW: scanner enter"); Serial.flush(); drew_scanner = true; }
     int divider_x = 112;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
@@ -3808,7 +3854,6 @@ void draw_scanner_screen() {
 }
 
 void draw_locator_screen() {
-    static bool drew_locator = false; if (!drew_locator) { Serial.println(">>> DRAW: locator enter"); Serial.flush(); drew_locator = true; }
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
@@ -4098,7 +4143,6 @@ static void hist_type_info(const char* type, const char** lbl, uint16_t* col) {
 }
 
 void draw_capture_history_screen() {
-    static bool drew_hist = false; if (!drew_hist) { Serial.println(">>> DRAW: history enter"); Serial.flush(); drew_hist = true; }
     // Use SD history when available, fall back to in-memory capture_history
     bool use_sd = sd_available && sd_hist_count > 0;
 
@@ -4336,7 +4380,6 @@ void draw_capture_history_screen() {
 }
 
 void draw_gps_screen() {
-    static bool drew_gps = false; if (!drew_gps) { Serial.println(">>> DRAW: gps enter"); Serial.flush(); drew_gps = true; }
     spr.fillSprite(BG_COLOR);
     draw_header_spr(3);
     unsigned long frame_ms = millis();
@@ -4592,7 +4635,6 @@ void draw_gps_screen() {
 }
 
 void draw_device_info_screen() {
-    static bool drew_devinfo = false; if (!drew_devinfo) { Serial.println(">>> DRAW: devinfo enter"); Serial.flush(); drew_devinfo = true; }
     unsigned long frame_ms = millis();
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     long lt = lifetime_flock_total;
@@ -5131,16 +5173,13 @@ void setup() {
     // esp_task_wdt_deinit() unsubscribes the per-core IDLE tasks internally
     // via an ESP_ERROR_CHECK-wrapped call — so we MUST NOT pre-delete them
     // ourselves or deinit aborts with ESP_ERR_NOT_FOUND (unsubscribe_idle).
-    esp_err_t wdt_err = esp_task_wdt_deinit();
+    esp_task_wdt_deinit();
 
     Serial.begin(115200);
     delay(500);
-    Serial.printf(">>> TWDT deinit result: %d (0 = OK)\n", wdt_err);
-    Serial.println("=== BOOT MARKER 0: entering setup ===");
 
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
-    Serial.println("=== BOOT MARKER 1: M5Cardputer.begin done ===");
 
     // Shrink speaker DMA buffers so I2S allocation doesn't eat the DMA pool.
     {
@@ -5152,17 +5191,12 @@ void setup() {
 
     // dataMutex MUST be created before any task that uses it is spawned.
     dataMutex = xSemaphoreCreateMutex();
-    Serial.println("=== BOOT MARKER 2: dataMutex created ===");
 
     // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
     // heap. Force internal DMA-capable RAM and hard-fail on allocation failure.
     spr.setColorDepth(16);
     spr.setPsram(false);
     void* sprite_buf = spr.createSprite(DISP_W, DISP_H);
-    Serial.printf(">>> Sprite alloc: buf=%p  free_internal=%u  free_dma=%u\n",
-                  sprite_buf,
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
     if (!sprite_buf) {
         M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
         M5Cardputer.Display.setCursor(10, 10);
@@ -5183,7 +5217,6 @@ void setup() {
 
     boot_animate(5, "serial ok");
 
-    Serial.println("=== BOOT MARKER 3: before SD init ===");
     boot_animate(10, "SD card...");
 
     // Route a dedicated SPI3 instance to the Cardputer's SD pins. 15 MHz is
@@ -5264,7 +5297,6 @@ void setup() {
         Serial.println("[SD] Mount failed. Verify card is FAT32 and fully inserted.");
     }
     boot_animate(35, sd_available ? "SD mounted" : "no SD card");
-    Serial.println("=== BOOT MARKER 4: after SD init ===");
     // Seed hot-plug state so the first poll doesn't fire a spurious "mounted" toast
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
@@ -5272,11 +5304,9 @@ void setup() {
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
     boot_animate(40, "GPS serial...");
-    Serial.println("=== BOOT MARKER 5: GPS serial + WiFi.mode done ===");
 
-    // Sprite was already created at the top of setup(). Kept marker for reference.
+    // Sprite was already created at the top of setup().
     boot_animate(45, "display ready");
-    Serial.println("=== BOOT MARKER 6: sprite alloc already done ===");
 
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
@@ -5286,15 +5316,12 @@ void setup() {
     }
     boot_animate(55, "battery cal...");
 
-    Serial.println("=== BOOT MARKER 7: before CPU freq + BLE queue ===");
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
     boot_animate(65, "BLE init...");
-    Serial.println("=== BOOT MARKER 8: BLE worker task created ===");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
-    Serial.println("=== BOOT MARKER 9: before LittleFS ===");
     // Robust LittleFS mount: try begin(true) which auto-formats on corruption.
     // If that fails (known ESP32-S3 issue where block 0x0 reports as bad),
     // manually erase the partition bytes and retry.
@@ -5332,7 +5359,6 @@ void setup() {
         load_detections_from_flash();
     }
     boot_animate(75, "loading data...");
-    Serial.println("=== BOOT MARKER 10: LittleFS mount path complete ===");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5350,7 +5376,6 @@ void setup() {
     }
     session_start_time = millis();
 
-    Serial.println("=== BOOT MARKER 11: before WiFi promisc ===");
     // WiFi promiscuous mode — complete before scanner screen appears
     WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
@@ -5358,41 +5383,61 @@ void setup() {
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
     boot_animate(85, "WiFi sniffer...");
-    Serial.println("=== BOOT MARKER 12: WiFi promisc done ===");
 
-    Serial.println("=== BOOT MARKER 13: before NimBLE init ===");
     // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    Serial.println("=== BOOT MARKER 14: NimBLE init done ===");
     pBLEScan = NimBLEDevice::getScan();
-    Serial.println("=== BOOT MARKER 15: got pBLEScan ===");
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
     boot_animate(92, "BLE scanner...");
-    Serial.println("=== BOOT MARKER 16: BLE scan configured ===");
 
-    Serial.println("=== BOOT MARKER 17: before Scanner/GPS tasks ===");
-    // Tasks — Arduino-ESP32 3.x owns the task watchdog; we don't re-init it.
+    // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 3072, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
-    Serial.println("=== BOOT MARKER 18: system_fully_booted ===");
 
-    // DIAGNOSTIC: chargeLedTask deleted entirely for crash isolation.
-    Serial.println("=== BOOT MARKER 19: chargeLedTask SKIPPED ===");
+    // Spawn the LED task at priority 1 on Core 1 — must come after WiFi+BLE
+    // are up so RMT/radio contention is avoided.
+    xTaskCreatePinnedToCore(LedTask, "LedTask", 2048, NULL, 1, &LedTaskHandle, 1);
+
+    // Re-arm the task watchdog now that the runtime topology is final.
+    {
+        esp_task_wdt_config_t wdt_cfg = {
+            .timeout_ms     = 15000,
+            .idle_core_mask = 0,           // don't watch idle tasks
+            .trigger_panic  = true,
+        };
+        esp_task_wdt_init(&wdt_cfg);
+        if (ScannerTaskHandle) esp_task_wdt_add(ScannerTaskHandle);
+        if (GPSTaskHandle)     esp_task_wdt_add(GPSTaskHandle);
+        // BLE worker + main loop subscribe themselves from inside their loops.
+    }
+
     boot_animate(100, "ready");
     delay(400);
 
-    // DIAGNOSTIC: feed gate disabled
-    Serial.println(">>> DIAG: feed gate SKIPPED");
-    delay(500);  // brief pause so boot screen at 100% is visible
+    // Gate: wait for the WiFi sniffer to confirm radios are up (~15 packets) or
+    // 4 seconds, whichever comes first. Pump event queues during the wait so the
+    // live feed buffer pre-populates before the scanner screen appears.
+    {
+        unsigned long feed_gate_start = millis();
+        const unsigned long FEED_GATE_MAX_MS = 4000;
+        while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
+            if (ambient_packet_count >= 15) break;
+            draw_boot_screen(100, "scanning...");
+            delay(30);
+            M5Cardputer.update();
+            process_wifi_event_queue();
+            feed_commit_pending();
+        }
+        // Reset so a later boot-screen draw (shouldn't happen) would repaint cleanly
+        boot_prev_fill_w = 0;
+    }
 
-    // === DIAGNOSTIC: skip first draw, let loop() handle it ===
-    Serial.println(">>> DIAG: skipping first draw_current_screen()");
-    // Fill screen with BG_COLOR so user sees something, but don't touch sprite render path
-    M5Cardputer.Display.fillScreen(BG_COLOR);
+    // === Boot screen is done — now show the scanner ===
+    draw_current_screen(); spr.pushSprite(0, 0);
 
     // Boot chime — plays after the scanner is visible
     if (!is_muted) {
@@ -5413,12 +5458,9 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-    static bool first_loop = true;
-    if (first_loop) {
-        Serial.println(">>> LOOP: first entry");
-        Serial.flush();
-        first_loop = false;
-    }
+    static bool wdt_subscribed = false;
+    if (!wdt_subscribed) { esp_task_wdt_add(NULL); wdt_subscribed = true; }
+    esp_task_wdt_reset();
     M5Cardputer.update(); yield();
 
     if (export_connecting) {
@@ -5492,16 +5534,12 @@ void loop() {
     }
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-        Serial.println(">>> KEY: change detected");
-        Serial.flush();
         last_user_input_ms = millis();
         if (ambient_mode) {
             ambient_mode = false;
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
         }
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
-        Serial.printf(">>> KEY: state read, word.size=%u\n", (unsigned)status.word.size());
-        Serial.flush();
         
         if (status.tab && !stealth_mode) {
             show_help_overlay = !show_help_overlay;
@@ -5969,17 +6007,9 @@ void loop() {
         }
     } else {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
-        static int draw_count = 0;
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) {
-                if (draw_count < 3) { Serial.printf(">>> LOOP-DCS #%d pre\n", draw_count); Serial.flush(); }
-                draw_current_screen();
-                if (draw_count < 3) { Serial.printf(">>> LOOP-DCS #%d post-DCS\n", draw_count); Serial.flush(); }
-                spr.pushSprite(0, 0);
-                if (draw_count < 3) { Serial.printf(">>> LOOP-DCS #%d post-push\n", draw_count); Serial.flush(); draw_count++; }
-                last_fast_anim = now;
-            }
+            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; }
         }
         else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
     }
