@@ -24,6 +24,11 @@
 #include <math.h>
 #include "ui_beep.h"  // PCM sound for screen transitions
 
+// PCM sample lives in flash (PROGMEM); the I2S DMA can't read from flash
+// directly. Allocate a DMA-capable copy in internal RAM at boot and play
+// from that. Null when the allocation failed — playback is skipped.
+static int16_t* ui_beep_pcm_dma = nullptr;
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -4943,8 +4948,11 @@ void draw_current_screen() {
 
 void transition_screen(int new_screen, int dir) {
     if (stealth_mode) { current_screen = new_screen; return; }
-    if (!is_muted) {
-        M5Cardputer.Speaker.tone(1500, 8);  // brief UI click (replaces playRaw for crash isolation)
+    if (!is_muted && ui_beep_pcm_dma) {
+        int prev_vol = current_volume;
+        M5Cardputer.Speaker.setVolume(max(prev_vol, 35));
+        M5Cardputer.Speaker.playRaw(ui_beep_pcm_dma, UI_BEEP_SAMPLES, UI_BEEP_RATE, false, 1, 0, false);
+        M5Cardputer.Speaker.setVolume(prev_vol);
     }
     if (new_screen == 2) {
         history_scroll_offset = 0;
@@ -5180,6 +5188,22 @@ void setup() {
         M5Cardputer.Display.setCursor(10, 10);
         M5Cardputer.Display.print("SPRITE ALLOC FAIL");
         while (1) delay(1000);
+    }
+
+    // Copy the PCM UI click from PROGMEM flash to DMA-capable internal RAM.
+    // playRaw needs a DMA-readable source; reading the PROGMEM buffer directly
+    // is what caused the audio-related crashes on screen transitions.
+    {
+        size_t pcm_bytes = (size_t)UI_BEEP_SAMPLES * sizeof(int16_t);
+        ui_beep_pcm_dma = (int16_t*)heap_caps_malloc(pcm_bytes,
+                                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (ui_beep_pcm_dma) {
+            memcpy(ui_beep_pcm_dma, ui_beep_pcm, pcm_bytes);
+            Serial.printf(">>> PCM copied to DMA RAM: %p (%u bytes)\n",
+                          ui_beep_pcm_dma, (unsigned)pcm_bytes);
+        } else {
+            Serial.println(">>> PCM DMA alloc FAILED — playRaw disabled");
+        }
     }
 
     // LED: start dark. The breathing task is spawned at the very end of setup()
