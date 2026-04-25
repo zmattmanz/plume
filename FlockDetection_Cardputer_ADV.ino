@@ -5194,7 +5194,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
     // ── Title: slide down + fade in over 350ms, settled at y=24 ──
     {
-        const int TITLE_FINAL_Y = 24;
+        // textSize 2 is integer-scaled (6×8 → 12×16) so strokes are uniform.
+        // textSize 1.5 produced uneven strokes — fractional scaling rounds some
+        // pixel rows up and others down. y bumped up to maintain ~13px gaps.
+        const int TITLE_FINAL_Y  = 20;
         const int TITLE_SLIDE_PX = 10;
 
         if (intro_elapsed < UI_ANIM_NORMAL) {
@@ -5203,19 +5206,19 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             uint16_t col = lerp_col16(bg, blue, ease);
 
             lcd.startWrite();
-            lcd.setClipRect(0, 12, DISP_W, 28);
-            lcd.fillRect(0, 12, DISP_W, 28, bg);
+            lcd.setClipRect(0, 6, DISP_W, 36);
+            lcd.fillRect(0, 6, DISP_W, 36, bg);
             lcd.setTextColor(col, bg);
-            lcd.setTextSize(1.5);
+            lcd.setTextSize(2);
             lcd.setTextDatum(TC_DATUM);
             lcd.drawString(VERSION_STRING, DISP_W / 2, y);
             lcd.clearClipRect();
             lcd.endWrite();
         } else if (!boot_title_drawn) {
-            // Settled: paint once at full color, then never touch again
+            // Settled: paint once at full color, then never touch again.
             lcd.startWrite();
             lcd.setTextColor(blue, bg);
-            lcd.setTextSize(1.5);
+            lcd.setTextSize(2);
             lcd.setTextDatum(TC_DATUM);
             lcd.drawString(VERSION_STRING, DISP_W / 2, TITLE_FINAL_Y);
             lcd.endWrite();
@@ -5279,14 +5282,14 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int total_w = n_chars * char_w;
         int start_x = (DISP_W - total_w) / 2;
 
-        // Detect which digits actually changed in value (skip the trailing %).
+        // On every pct change, animate ALL visible digits with a left-to-right
+        // stagger — each digit starts 30ms after the one to its left, creating
+        // a cascading "reel" effect like an odometer rolling forward.
         unsigned long now_t = millis();
         if (pct != boot_prev_pct) {
+            const unsigned long DIGIT_STAGGER_MS = 30;
             for (int di = 0; di < n_chars - 1 && di < 8; di++) {
-                bool prev_exists = (di < (int)strlen(boot_prev_digits));
-                if (!prev_exists || pct_str[di] != boot_prev_digits[di]) {
-                    boot_digit_anim_ms[di] = now_t;
-                }
+                boot_digit_anim_ms[di] = now_t + di * DIGIT_STAGGER_MS;
             }
             strncpy(boot_prev_digits, pct_str, sizeof(boot_prev_digits) - 1);
             boot_prev_digits[sizeof(boot_prev_digits) - 1] = '\0';
@@ -5317,10 +5320,12 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             pct_symbol_x = new_pct_x;
         }
 
-        // Animate each digit independently. Only redraw a digit if it's
-        // currently within its ROLL_MS animation window.
+        // Animate each digit independently. Skip if not yet started (staggered
+        // start time is in the future) or already finished (past ROLL_MS).
         for (int di = 0; di < n_chars - 1 && di < 8; di++) {
             if (boot_digit_anim_ms[di] == 0) continue;
+            // Future start time — staggered digit hasn't begun rolling yet.
+            if ((long)(now_t - boot_digit_anim_ms[di]) < 0) continue;
             unsigned long elapsed = now_t - boot_digit_anim_ms[di];
             if (elapsed > ROLL_MS) continue;
 
@@ -5359,7 +5364,9 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             fill_anim_start = millis();
         }
 
-        float ease = ui_progress(fill_anim_start, UI_ANIM_NORMAL);
+        // Bar fill uses UI_ANIM_QUICK so it settles before the next pct change
+        // arrives — prevents perpetual catch-up lag.
+        float ease = ui_progress(fill_anim_start, UI_ANIM_QUICK);
         boot_eased_fill = (float)fill_anim_from + (float)(fill_anim_to - fill_anim_from) * ease;
 
         int fill_w = (int)(boot_eased_fill + 0.5f);
@@ -5387,9 +5394,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     // When the status changes, the new text slides UP into position from
     // ~14px below while the old text slides UP and out, fading as it goes.
     // Same vocabulary as the live feed (ease_out_quad over 320ms).
-    static char boot_cur_status[32]  = "";
-    static char boot_prev_status[32] = "";
+    static char boot_cur_status[32]   = "";
+    static char boot_prev_status[32]  = "";
     static unsigned long boot_status_change_ms = 0;
+    static bool boot_status_settled_drawn = false;  // true once settled state has been painted
 
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
         strncpy(boot_prev_status, boot_cur_status, sizeof(boot_prev_status) - 1);
@@ -5397,6 +5405,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
         boot_status_change_ms = millis();
+        boot_status_settled_drawn = false;
     }
 
     if (boot_cur_status[0] != '\0') {
@@ -5431,46 +5440,48 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         const int region_y = status_y - SLIDE_PX;
         const int region_h = status_h + SLIDE_PX;
 
-        lcd.startWrite();
-        lcd.setClipRect(0, region_y, DISP_W, region_h);
-        lcd.fillRect(0, region_y, DISP_W, region_h, bg);
-        lcd.setTextSize(1);
-        lcd.setTextDatum(TL_DATUM);
+        bool animating = (elapsed < SLIDE_MS && prev_len > 0);
+        bool need_draw = animating || !boot_status_settled_drawn;
 
-        if (elapsed < SLIDE_MS && prev_len > 0) {
-            float ease = ui_ease((float)elapsed / (float)SLIDE_MS);
+        if (need_draw) {
+            lcd.startWrite();
+            lcd.setClipRect(0, region_y, DISP_W, region_h);
+            lcd.fillRect(0, region_y, DISP_W, region_h, bg);
+            lcd.setTextSize(1);
+            lcd.setTextDatum(TL_DATUM);
 
-            // New text: starts SLIDE_PX below status_y, lands at status_y.
-            int new_y = status_y + SLIDE_PX - (int)(ease * (float)SLIDE_PX);
-            // Old text: starts at status_y, slides UP by SLIDE_PX, fading.
-            int old_y = status_y - (int)(ease * (float)SLIDE_PX);
+            if (animating) {
+                // Animating — redraw every frame.
+                float ease = ui_ease((float)elapsed / (float)SLIDE_MS);
+                int new_y = status_y + SLIDE_PX - (int)(ease * (float)SLIDE_PX);
+                int old_y = status_y - (int)(ease * (float)SLIDE_PX);
 
-            // Old text fades from white → bg as it slides out.
-            uint16_t old_col = lerp_col16(white, bg, ease);
-            lcd.setTextColor(old_col, bg);
-            for (int i = 0; i < prev_len; i++) {
-                char ch[2] = { prev_buf[i], '\0' };
-                lcd.drawString(ch, prev_x + i * 7, old_y);
+                uint16_t old_col = lerp_col16(white, bg, ease);
+                lcd.setTextColor(old_col, bg);
+                for (int i = 0; i < prev_len; i++) {
+                    char ch[2] = { prev_buf[i], '\0' };
+                    lcd.drawString(ch, prev_x + i * 7, old_y);
+                }
+                uint16_t new_col = lerp_col16(bg, white, ease);
+                lcd.setTextColor(new_col, bg);
+                for (int i = 0; i < cur_len; i++) {
+                    char ch[2] = { cur_buf[i], '\0' };
+                    lcd.drawString(ch, cur_x + i * 7, new_y);
+                }
+            } else {
+                // Just settled — draw final state once, then never touch until next change.
+                lcd.setTextColor(white, bg);
+                for (int i = 0; i < cur_len; i++) {
+                    char ch[2] = { cur_buf[i], '\0' };
+                    lcd.drawString(ch, cur_x + i * 7, status_y);
+                }
+                boot_status_settled_drawn = true;
             }
 
-            // New text fades from bg → white as it slides in.
-            uint16_t new_col = lerp_col16(bg, white, ease);
-            lcd.setTextColor(new_col, bg);
-            for (int i = 0; i < cur_len; i++) {
-                char ch[2] = { cur_buf[i], '\0' };
-                lcd.drawString(ch, cur_x + i * 7, new_y);
-            }
-        } else {
-            // Settled state — just draw the current text in white at status_y.
-            lcd.setTextColor(white, bg);
-            for (int i = 0; i < cur_len; i++) {
-                char ch[2] = { cur_buf[i], '\0' };
-                lcd.drawString(ch, cur_x + i * 7, status_y);
-            }
+            lcd.clearClipRect();
+            lcd.endWrite();
         }
-
-        lcd.clearClipRect();
-        lcd.endWrite();
+        // else: already settled and drawn — skip everything (no flicker).
     }
 
     lcd.setTextDatum(TL_DATUM);
@@ -5548,10 +5559,26 @@ void setup() {
 
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
-    M5Cardputer.Display.setBrightness(255);
-    boot_animate(0, "starting");
     brightness_level = 2;
     apply_color_palette();
+
+    // Ease the screen in: brightness ramps from 0 → target over UI_ANIM_NORMAL
+    // while the title intro animation runs simultaneously. Reads as a "wakeup"
+    // — screen and title come alive together rather than the layout popping in.
+    M5Cardputer.Display.setBrightness(0);
+    {
+        const int FADE_STEPS   = 16;
+        const int FADE_STEP_MS = (int)UI_ANIM_NORMAL / FADE_STEPS;
+        const int target_b     = BRIGHTNESS_LEVELS[brightness_level];
+        for (int i = 0; i <= FADE_STEPS; i++) {
+            int b = (target_b * i) / FADE_STEPS;
+            M5Cardputer.Display.setBrightness(b);
+            // First call kicks off the staggered intro animation; subsequent
+            // calls advance it. Status only set on first draw.
+            draw_boot_screen(0, (i == 0) ? "starting" : nullptr);
+            delay(FADE_STEP_MS);
+        }
+    }
 
     boot_animate(7, "serial ok");
 
@@ -5701,7 +5728,7 @@ void setup() {
         load_session_from_flash();
         load_detections_from_flash();
     }
-    boot_animate(78, "loading data");
+    boot_animate(78, "reticulating splines");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5800,8 +5827,12 @@ void setup() {
         int boot_vol = current_volume > 25 ? 25 : current_volume;
         M5Cardputer.Speaker.setVolume(boot_vol);
         delay(120);
-        M5Cardputer.Speaker.tone(880,  60); delay(80);   // A5
-        M5Cardputer.Speaker.tone(1318, 90); delay(140);  // E6
+        // Vintage chime — F major arpeggio rising slowly. Lower octave + longer
+        // note duration matches the deliberate rhythm of the boot animations
+        // (each note ≈ UI_ANIM_QUICK; gaps ≈ UI_ANIM_QUICK/4).
+        M5Cardputer.Speaker.tone(349, 180); delay(220);  // F4
+        M5Cardputer.Speaker.tone(440, 180); delay(220);  // A4
+        M5Cardputer.Speaker.tone(523, 260); delay(300);  // C5
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
