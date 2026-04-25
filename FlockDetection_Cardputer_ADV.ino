@@ -294,6 +294,9 @@ static uint8_t current_channel = 1;
 static unsigned long last_channel_hop = 0;
 static volatile unsigned long channel_lock_until = 0; 
 static unsigned long last_ble_scan = 0;
+// Periodic BLE stack health restart — see loop().
+static unsigned long last_ble_restart_ms = 0;
+static const unsigned long BLE_RESTART_INTERVAL_MS = 1800000UL;  // 30 minutes
 static unsigned long last_buzzer_time = 0;
 static NimBLEScan* pBLEScan;
 static uint32_t ble_scan_cycle = 0;
@@ -2674,6 +2677,12 @@ void GPSLoopTask(void* pvParameters) {
 }
 
 void AlarmTask(void* pvParameters) {
+    // Flush any stale I2S DMA state before playing — prevents an assertion
+    // inside the M5Unified speaker driver when tone() is called after the
+    // peripheral has been idle for extended periods (e.g. ambient mode).
+    M5Cardputer.Speaker.stop();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+
     // Pack: low 16 bits = confidence, bit 16 = source (0=WiFi, 1=BLE)
     intptr_t param = (intptr_t)pvParameters;
     int conf    = (int)(param & 0xFFFF);
@@ -2708,6 +2717,10 @@ void AlarmTask(void* pvParameters) {
 }
 
 void LocatorChimeTask(void* pvParameters) {
+    // Same I2S flush as AlarmTask — see comment there.
+    M5Cardputer.Speaker.stop();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+
     if (!stealth_mode && !is_muted) {
         M5Cardputer.Speaker.tone(660, 70);
         vTaskDelay(80 / portTICK_PERIOD_MS);
@@ -3286,7 +3299,7 @@ void draw_menu_overlay() {
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(1);
     spr.setCursor(4, DISP_H - 10);
-    spr.print(";/. nav  ENTER select  DEL close");
+    spr.print("^/v nav  ENTER select  DEL close");
 }
 
 void handle_menu_select() {
@@ -5807,6 +5820,7 @@ void setup() {
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
+    last_ble_restart_ms = millis();
     boot_animate(96, "arming scanner");
 
     // Tasks
@@ -5930,8 +5944,27 @@ void loop() {
         }
     }
 
+    // Heap health: warn (and toast) when free internal heap drops below 8KB.
+    // Catches slow leaks / FAT-driver mallocs piling up before they cause
+    // an unrecoverable abort.
+    {
+        size_t free_heap = esp_get_free_heap_size();
+        static size_t min_heap_seen = 999999;
+        if (free_heap < min_heap_seen) min_heap_seen = free_heap;
+        if (free_heap < 8192) {
+            static unsigned long last_heap_warn = 0;
+            if (millis() - last_heap_warn > 30000) {
+                Serial.printf("[HEAP] CRITICAL: %u bytes free (min: %u)\n",
+                              (unsigned)free_heap, (unsigned)min_heap_seen);
+                set_toast_direct("LOW MEMORY", CAUTION_COLOR);
+                last_heap_warn = millis();
+            }
+        }
+    }
+
     process_wifi_event_queue();
     feed_commit_pending();
+    if (wdt_subscribed) esp_task_wdt_reset();
 
     int conf_snapshot = 0;
     int src_snapshot = 0;
@@ -5947,12 +5980,16 @@ void loop() {
     if (conf_snapshot >= 50) {
         play_escalated_alarm(conf_snapshot, src_snapshot);
     }
+    if (wdt_subscribed) esp_task_wdt_reset();
 
     if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
         last_user_input_ms = millis();
         if (ambient_mode) {
             ambient_mode = false;
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+            // Wake the I2S peripheral from idle so the next tone() call
+            // (often a UI click or alarm chime) doesn't hit a DMA assertion.
+            M5Cardputer.Speaker.stop();
         }
         if (show_menu) {
             show_menu = false;
@@ -5975,6 +6012,8 @@ void loop() {
         if (ambient_mode) {
             ambient_mode = false;
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+            // Same I2S wake as the BtnA path.
+            M5Cardputer.Speaker.stop();
         }
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         
@@ -6365,6 +6404,7 @@ void loop() {
             }
         }
     }
+    if (wdt_subscribed) esp_task_wdt_reset();
 
     // Fire pending '\' single-press action if double-tap window expired
     if (bs_pending_exists && millis() >= bs_pending_until) {
@@ -6381,8 +6421,30 @@ void loop() {
     }
     rssi_track_expire();
 
+    // Periodic BLE stack health restart — prevents NimBLE internal state
+    // corruption that can build up during multi-hour continuous scanning.
+    if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
+        last_ble_restart_ms = millis();
+        if (pBLEScan) {
+            pBLEScan->stop();
+            pBLEScan->clearResults();
+        }
+        NimBLEDevice::deinit(true);
+        delay(100);
+        NimBLEDevice::init("");
+        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+        pBLEScan = NimBLEDevice::getScan();
+        pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+        pBLEScan->setActiveScan(false);
+        pBLEScan->setInterval(97);
+        pBLEScan->setWindow(97);
+        last_ble_scan = millis();
+        Serial.println("[BLE] Periodic stack restart completed");
+    }
+
     // SD hot-plug: periodically attempt remount if card is absent, or probe if present
     sd_check_hotplug();
+    if (wdt_subscribed) esp_task_wdt_reset();
 
     if (millis() - last_sd_flush_check >= 500) {
         last_sd_flush_check = millis(); 
@@ -6399,6 +6461,7 @@ void loop() {
         
         if (should_flush) flush_sd_buffer();
     }
+    if (wdt_subscribed) esp_task_wdt_reset();
 
     {
         bool need_update;
