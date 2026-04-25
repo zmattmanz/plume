@@ -5116,11 +5116,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
-    // Bar geometry — taller bar, 9px padding per side for generous breathing room
+    // Bar geometry — 26px tall with 2px outline and 11px interior padding.
     const int bar_w = 180;
-    const int bar_h = 22;
+    const int bar_h = 26;
     const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = 84;
+    const int bar_y = 82;
     const int bar_r = bar_h / 2;
 
     // Number geometry
@@ -5129,64 +5129,104 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     const int num_x = (DISP_W - num_w) / 2;
     const int num_h = 24;
 
-    // Status text geometry
-    const int status_y = 112;
+    // Status text geometry — lowered slightly for more breathing room under bar
+    const int status_y = 122;
     const int status_h = 12;
 
     // ── First draw: fill screen + paint static elements ──
     if (boot_first_draw) {
         lcd.fillScreen(bg);
 
-        // Version string (static) — blue for pop against dark background
+        // Version string (static) — blue for pop against dark background.
+        // Lowered slightly and enlarged to size 1.5 for visual weight.
         lcd.setTextColor(blue, bg);
-        lcd.setTextSize(1);
+        lcd.setTextSize(1.5);
         lcd.setTextDatum(TC_DATUM);
-        lcd.drawString(VERSION_STRING, DISP_W / 2, 18);
+        lcd.drawString(VERSION_STRING, DISP_W / 2, 24);
 
-        // Bar outline — 1px stroke
-        lcd.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, blue);
+        // Bar outline — 2px stroke (outer + inset inner) for prominence
+        lcd.drawRoundRect(bar_x,     bar_y,     bar_w,     bar_h,     bar_r,     blue);
+        lcd.drawRoundRect(bar_x + 1, bar_y + 1, bar_w - 2, bar_h - 2, bar_r - 1, blue);
 
         boot_first_draw = false;
         boot_eased_fill = 0.0f;
         boot_prev_fill_w = 0;
     }
 
-    // ── Percentage number — direct LCD draw, only on pct change ──
-    // Batched in startWrite/endWrite to minimize the visible flicker window.
+    // ── Percentage number — both digits roll up on pct change ──
+    // Whole sequence is wrapped in startWrite/endWrite so the SPI transaction
+    // is atomic — no visible "blank then text" flicker between fillRect and
+    // drawString. Both digits animate, regardless of which actually changed.
     {
+        char pct_str[8];
+        snprintf(pct_str, sizeof(pct_str), "%d%%", pct);
+        int n_chars = (int)strlen(pct_str);
+
+        // On pct change, kick off animation for ALL visible digits so they
+        // roll together (not just the ones whose values changed).
         if (pct != boot_prev_pct) {
+            unsigned long now_t = millis();
+            for (int di = 0; di < n_chars && di < 8; di++) {
+                boot_digit_anim_ms[di] = now_t;
+            }
             boot_prev_pct = pct;
+        }
 
-            char pct_str[8];
-            snprintf(pct_str, sizeof(pct_str), "%d%%", pct);
-            int n_chars = (int)strlen(pct_str);
-            const int char_w = 18;
-            int total_w = n_chars * char_w;
-            int start_x = (DISP_W - total_w) / 2;
+        const int char_w = 18;
+        int total_w = n_chars * char_w;
+        int start_x = (DISP_W - total_w) / 2;
+        const unsigned long ROLL_MS = 200;
 
+        // Only redraw if at least one digit is currently rolling.
+        unsigned long now_t = millis();
+        bool any_animating = false;
+        for (int di = 0; di < n_chars && di < 8; di++) {
+            if (boot_digit_anim_ms[di] > 0 &&
+                (now_t - boot_digit_anim_ms[di]) < ROLL_MS) {
+                any_animating = true;
+                break;
+            }
+        }
+
+        if (any_animating) {
             lcd.startWrite();
+            lcd.setClipRect(num_x, num_y, num_w, num_h);
             lcd.fillRect(num_x, num_y, num_w, num_h, bg);
             lcd.setTextColor(white, bg);
             lcd.setTextSize(3);
             lcd.setTextDatum(TL_DATUM);
-            lcd.drawString(pct_str, start_x, num_y);
+            for (int di = 0; di < n_chars && di < 8; di++) {
+                int dx = start_x + di * char_w;
+                int y_off = 0;
+                if (boot_digit_anim_ms[di] > 0) {
+                    unsigned long elapsed = now_t - boot_digit_anim_ms[di];
+                    if (elapsed < ROLL_MS) {
+                        float t    = (float)elapsed / (float)ROLL_MS;
+                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                        y_off = (int)((1.0f - ease) * (float)num_h);
+                    }
+                }
+                char ch[2] = { pct_str[di], '\0' };
+                lcd.drawString(ch, dx, num_y + y_off);
+            }
+            lcd.clearClipRect();
             lcd.endWrite();
         }
     }
 
     // ── Update bar fill (incremental — extend forward only, no clear) ──
     {
-        // 9px padding per side; fill_h = bar_h - 18 = 4
-        int target_fill = (pct * (bar_w - 18)) / 100;
+        // 11px padding per side; fill_h = bar_h - 22 = 4
+        int target_fill = (pct * (bar_w - 22)) / 100;
         float diff = (float)target_fill - boot_eased_fill;
         boot_eased_fill += diff * 0.3f;
         if (fabsf(diff) < 0.5f) boot_eased_fill = (float)target_fill;
         int fill_w = (int)(boot_eased_fill + 0.5f);
         if (fill_w < 0) fill_w = 0;
 
-        const int fill_x = bar_x + 9;
-        const int fill_y = bar_y + 9;
-        const int fill_h = bar_h - 18;
+        const int fill_x = bar_x + 11;
+        const int fill_y = bar_y + 11;
+        const int fill_h = bar_h - 22;
 
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
@@ -5202,9 +5242,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: direct LCD draw with color ease-in ──
-    // Fades from background color to white over STATUS_FADE_MS each time
-    // the status string changes.
+    // ── Status text: UPPERCASE with +1px kerning, color ease-in ──
+    // Same kerning (6+1=7px per char) used by kprint() elsewhere in the UI.
     static char boot_cur_status[32] = "";
     static unsigned long boot_status_change_ms = 0;
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
@@ -5216,12 +5255,29 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         const unsigned long STATUS_FADE_MS = 350;
         float alpha = ease_alpha(boot_status_change_ms, STATUS_FADE_MS);
         uint16_t status_col = lerp_col16(bg, white, alpha);
+
+        // Build uppercase copy
+        char upper_buf[32];
+        int slen = 0;
+        for (const char* p = boot_cur_status; *p && slen < 31; p++) {
+            upper_buf[slen++] = (char)toupper((unsigned char)*p);
+        }
+        upper_buf[slen] = '\0';
+
+        // Center using kerned width: 6px char + 1px kern = 7px per char,
+        // minus the trailing kern after the last char.
+        int kerned_w = (slen > 0) ? (slen * 7 - 1) : 0;
+        int x0 = (DISP_W - kerned_w) / 2;
+
         lcd.startWrite();
         lcd.fillRect(0, status_y, DISP_W, status_h, bg);
         lcd.setTextColor(status_col, bg);
         lcd.setTextSize(1);
-        lcd.setTextDatum(TC_DATUM);
-        lcd.drawString(boot_cur_status, DISP_W / 2, status_y);
+        lcd.setTextDatum(TL_DATUM);
+        for (int i = 0; i < slen; i++) {
+            char ch[2] = { upper_buf[i], '\0' };
+            lcd.drawString(ch, x0 + i * 7, status_y);
+        }
         lcd.endWrite();
     }
 
