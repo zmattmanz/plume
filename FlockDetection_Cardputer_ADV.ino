@@ -5991,7 +5991,7 @@ void setup() {
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 3072, NULL, 1, &ScannerTaskHandle, 0);
-    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 4096, NULL, 1, &GPSTaskHandle, 0);
+    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 2560, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
 
@@ -6116,7 +6116,7 @@ void loop() {
         size_t free_heap = esp_get_free_heap_size();
         static size_t min_heap_seen = 999999;
         if (free_heap < min_heap_seen) min_heap_seen = free_heap;
-        if (free_heap < 8192) {
+        if (free_heap < 6000) {
             static unsigned long last_heap_warn = 0;
             if (millis() - last_heap_warn > 30000) {
                 Serial.printf("[HEAP] CRITICAL: %u bytes free (min: %u)\n",
