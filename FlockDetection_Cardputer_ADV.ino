@@ -461,7 +461,7 @@ int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
 static int device_info_scroll = 0;
-static const int DEVICE_INFO_CONTENT_HEIGHT = 302;
+static const int DEVICE_INFO_CONTENT_HEIGHT = 320;
 volatile bool sd_hist_dirty = false;
 
 #define TOAST_QUEUE_SIZE 3
@@ -4243,7 +4243,22 @@ void draw_locator_screen() {
     if (ar_dt > 100) ar_dt = 15;
     last_ar_ms = now_ms;
 
-    if (active && has_est) {
+    if (north_mode && gps_valid) {
+        // Compass mode while moving: rotate by the negative of travel heading
+        // so the arrow always points to true north regardless of orientation.
+        float tgt = radians(-gps_course - 90.0f);
+        float d = tgt - ease_arrow;
+        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
+        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
+        ease_arrow += 0.08f * d;
+    } else if (north_mode && !gps_valid) {
+        // No GPS heading available — arrow defaults to "up" (screen-relative north).
+        float tgt = radians(-90.0f);
+        float d = tgt - ease_arrow;
+        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
+        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
+        ease_arrow += 0.08f * d;
+    } else if (active && has_est) {
         float rel = brng - (gps_valid ? gps_course : 0.0f);
         float tgt = radians(rel - 90.0f);
         float d = tgt - ease_arrow;
@@ -4422,6 +4437,9 @@ void draw_locator_screen() {
         spr.setCursor(rpx, 92);
         if (sd < 0) {
             spr.print("--");
+            spr.setTextSize(1.2);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.print("ft");
         } else {
             char db[12];
             if (sd < 300) {
@@ -4649,58 +4667,87 @@ void draw_capture_history_screen() {
         const char* proto_lbl; uint16_t proto_col;
         hist_type_info(d_type, &proto_lbl, &proto_col);
 
-        // Dim backdrop
-        for (int dy = 21; dy < DISP_H; dy += 2)
-            spr.drawFastHLine(0, dy, DISP_W, lgfx::color565(8, 8, 14));
+        // Solid backdrop below header — matches menu/help/feed expanded style.
+        spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
-        // Card
-        int cx = 6, cy = 19, cw = DISP_W - 12, ch = DISP_H - 25;
-        spr.fillRoundRect(cx, cy, cw, ch, 6, CARD_COLOR);
-        spr.drawRoundRect(cx, cy, cw, ch, 6, proto_col);
+        // Override header with detection type (and name when meaningful).
+        spr.fillRect(0, 0, 120, 18, BG_COLOR);
+        spr.setTextColor(proto_col, BG_COLOR);
+        spr.setTextSize(1.2);
+        spr.setCursor(4, 5);
+        bool dn_ok = (d_name[0] != '\0'
+                      && strcmp(d_name, "Hidden")  != 0
+                      && strcmp(d_name, "Unknown") != 0);
+        if (dn_ok) {
+            char hdr_str[32];
+            snprintf(hdr_str, sizeof(hdr_str), "%s / %s", proto_lbl, d_name);
+            kprint(spr, hdr_str);
+        } else {
+            kprint(spr, proto_lbl);
+        }
 
-        // Header bar inside card
-        spr.fillRoundRect(cx, cy, cw, 16, 6, proto_col);
-        spr.fillRect(cx, cy + 10, cw, 6, proto_col);  // square bottom of header
-        spr.setTextColor(BG_COLOR, proto_col); spr.setTextSize(1);
-        spr.setCursor(cx + 6, cy + 4); spr.print(proto_lbl);
-        bool dn_ok = (d_name[0] != '\0' && strcmp(d_name,"Hidden")!=0 && strcmp(d_name,"Unknown")!=0);
-        if (dn_ok) { spr.setCursor(cx + 30, cy + 4); spr.print(d_name); }
+        // Content rows — ACCENT label + TEXT value, drawn directly on BG.
+        int fy = 26;
+        const int row_gap = 16;
+        const int label_x = 8;
+        const int value_x = 70;
 
-        // Fields
-        int fy = cy + 22;
-        auto det_row = [&](const char* lbl, const char* val) {
-            spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-            spr.setCursor(cx + 6, fy);
+        auto detail_row = [&](const char* lbl, const char* val, uint16_t val_col = TEXT_COLOR) {
+            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+            spr.setTextSize(1.2);
+            spr.setCursor(label_x, fy);
             kprint(spr, lbl);
-            spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-            spr.setCursor(cx + 6 + (int)strlen(lbl) * 7 + 4, fy);
+            spr.setTextColor(val_col, BG_COLOR);
+            spr.setCursor(value_x, fy);
             spr.print(val);
+            fy += row_gap;
         };
-        char tmp[32];
-        det_row("MAC: ", d_mac); fy += 14;
-        snprintf(tmp, sizeof(tmp), "%d dBm", d_rssi); det_row("RSSI: ", tmp); fy += 14;
+
+        detail_row("MAC", d_mac);
+
+        char rssi_str[12];
+        snprintf(rssi_str, sizeof(rssi_str), "%d dBm", d_rssi);
+        uint16_t rssi_col = (d_rssi > -60) ? ACCENT_COLOR
+                          : (d_rssi > -80) ? CAUTION_COLOR
+                                           : DIM_COLOR;
+        detail_row("RSSI", rssi_str, rssi_col);
+
         {
             const char* band;
-            if      (d_conf >= CONFIDENCE_CERTAIN)         band = "CERTAIN";
-            else if (d_conf >= CONFIDENCE_HIGH)            band = "HIGH";
-            else if (d_conf >= CONFIDENCE_ALARM_THRESHOLD) band = "MEDIUM";
-            else                                           band = "below alarm";
-            snprintf(tmp, sizeof(tmp), "%d%% (%s)", d_conf, band);
-            det_row("CONF: ", tmp);
-            fy += 14;
+            uint16_t conf_col;
+            if      (d_conf >= CONFIDENCE_CERTAIN)         { band = "CERTAIN"; conf_col = ACCENT_COLOR;  }
+            else if (d_conf >= CONFIDENCE_HIGH)            { band = "HIGH";    conf_col = ACCENT_COLOR;  }
+            else if (d_conf >= CONFIDENCE_ALARM_THRESHOLD) { band = "MEDIUM";  conf_col = CAUTION_COLOR; }
+            else                                           { band = "LOW";     conf_col = DIM_COLOR;     }
+            char conf_str[24];
+            snprintf(conf_str, sizeof(conf_str), "%d%% %s", d_conf, band);
+            detail_row("CONF", conf_str, conf_col);
         }
+
         if (d_method[0]) {
             char human[48];
             methods_to_human(d_method, human, sizeof(human));
-            det_row("MATCH:", human);
-            fy += 14;
+            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+            spr.setTextSize(1.2);
+            spr.setCursor(label_x, fy);
+            kprint(spr, "MATCH");
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setTextSize(1);
+            spr.setCursor(value_x, fy);
+            spr.print(human);
+            fy += row_gap;
         }
+
         const char* d_ts = use_sd ? sd_hist[di].timestamp : "";
-        if (d_ts[0]) { det_row("TIME: ", d_ts); fy += 14; }
+        if (d_ts[0]) {
+            detail_row("TIME", d_ts);
+        }
 
         // Footer hint
-        spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(cx + 6, cy + ch - 11); spr.print("DEL or ENTER to close");
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(8, DISP_H - 10);
+        spr.print("DEL or ENTER to close");
     }
 }
 
@@ -4807,6 +4854,9 @@ void draw_gps_screen() {
     spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
 
     // ── Multi-plane orbital satellite animation ──────────────────────────────
+    // Skipped entirely when no GPS lock — the spinning globe alone reads as
+    // "searching" without the visual noise of orbiting placeholders.
+    if (sats > 0)
     {
         // 3 orbital planes: inclinations, radii, speeds, satellite counts
         struct OrbPlane {
@@ -4868,25 +4918,37 @@ void draw_gps_screen() {
                     float trail_ang = base_ang - (float)(tr + 1) * 0.12f;
                     int tpx, tpy;
                     float ttz = orb_proj_p(trail_ang, &tpx, &tpy);
-                    if (ttz > 0.0f) {
+                    if (ttz > -0.3f) {
+                        // Smooth fade: full at z>=0.3, transitions to 0 across [-0.3, 0.3].
+                        float depth_fade = (ttz > 0.3f) ? 1.0f : (ttz + 0.3f) / 0.6f;
+                        if (depth_fade < 0.0f) depth_fade = 0.0f;
+                        if (depth_fade > 1.0f) depth_fade = 1.0f;
                         float fade = 1.0f - (float)(tr + 1) / 5.0f;
-                        // Brighter for acquired sats, dimmer for ghost
-                        bool acquired = (si < sats);
-                        uint16_t trail_col = acquired
-                            ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.5f)
-                            : lerp_col16(BG_COLOR, DIM_COLOR, fade * 0.3f);
-                        spr.drawPixel(tpx, tpy, trail_col);
+                        fade *= depth_fade;
+                        if (fade > 0.03f) {
+                            bool acquired = (si < sats);
+                            uint16_t trail_col = acquired
+                                ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.5f)
+                                : lerp_col16(BG_COLOR, DIM_COLOR, fade * 0.3f);
+                            spr.drawPixel(tpx, tpy, trail_col);
+                        }
                     }
                 }
-                // Main satellite dot
+                // Main satellite dot — fades near the horizon for 3D depth.
                 int dpx, dpy;
                 float tz2 = orb_proj_p(base_ang, &dpx, &dpy);
-                if (tz2 > 0.0f) {
+                if (tz2 > -0.3f) {
+                    float depth_fade = (tz2 > 0.3f) ? 1.0f : (tz2 + 0.3f) / 0.6f;
+                    if (depth_fade < 0.0f) depth_fade = 0.0f;
+                    if (depth_fade > 1.0f) depth_fade = 1.0f;
                     bool acquired = (si < sats);
-                    uint16_t sat_col = acquired
+                    uint16_t base_col = acquired
                         ? lgfx::color565(255, 255, 255)
                         : lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
-                    spr.fillCircle(dpx, dpy, acquired ? 2 : 1, sat_col);
+                    uint16_t sat_col = lerp_col16(BG_COLOR, base_col, depth_fade);
+                    if (depth_fade > 0.05f) {
+                        spr.fillCircle(dpx, dpy, acquired ? 2 : 1, sat_col);
+                    }
                 }
             }
         }
@@ -4979,126 +5041,137 @@ void draw_device_info_screen() {
 
     int yoff = 19 - device_info_scroll;
 
-    // 2-column grid layout
-    const int CARD_W = 112;
-    const int COL_L  = 4;
-    const int COL_R  = 124;
-    const int CARD_H = 38;
+    const int COL_L   = 4;
+    const int COL_R   = 124;
+    const int CARD_W  = 112;
+    const int CARD_H  = 42;
+    const int ROW_GAP = 4;
 
-    // Version card (full width)
+    // Helper: stat card with kerned ACCENT label + value below.
+    auto stat_card = [&](int x, int y, const char* label, const char* value,
+                         uint16_t val_col = TEXT_COLOR, float val_size = 2.0f) {
+        drawCard(x, y, CARD_W, CARD_H);
+        spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(x + 4, y + 4);
+        kprint(spr, label);
+        spr.setTextColor(val_col, CARD_COLOR);
+        spr.setTextSize(val_size);
+        spr.setCursor(x + 4, y + 18);
+        spr.print(value);
+    };
+
+    // Row 0: Version (full width, shorter)
     drawCard(COL_L, yoff, DISP_W - 8, 20);
-    spr.setTextColor(HEADER_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(10, yoff + 5); spr.print(VERSION_STRING);
+    spr.setTextColor(HEADER_COLOR, CARD_COLOR);
+    spr.setTextSize(1);
+    spr.setCursor(10, yoff + 5);
+    spr.print(VERSION_STRING);
 
-    // Row 1: BOOTS (left), LIFETIME (right)
-    int row1_y = yoff + 24;
-    drawCard(COL_L, row1_y, CARD_W, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row1_y + 4); kprint(spr, "BOOTS");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row1_y + 14); spr.print(lb);
+    int row_y;
 
-    drawCard(COL_R, row1_y, CARD_W, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row1_y + 4); kprint(spr, "LIFETIME");
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row1_y + 16);
-    { char tb[9]; format_time_buf(lifetime_seconds, tb, sizeof(tb)); spr.print(tb); }
-
-    // Row 1.5: SESSION TIME (full width) — migrated from scanner screen
-    int row_sess_y = yoff + 66;
-    drawCard(COL_L, row_sess_y, DISP_W - 8, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(COL_L + 4, row_sess_y + 4); kprint(spr, "SESSION");
+    // Row 1: BOOTS / LIFETIME
+    row_y = yoff + 24;
     {
-        char sess_buf[9];
-        format_time_buf((frame_ms - session_start_time) / 1000, sess_buf, sizeof(sess_buf));
-        spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
-        spr.setCursor(COL_L + 4, row_sess_y + 14); spr.print(sess_buf);
+        char boots_str[12];
+        snprintf(boots_str, sizeof(boots_str), "%ld", lb);
+        stat_card(COL_L, row_y, "BOOTS", boots_str);
+    }
+    {
+        char time_str[9];
+        format_time_buf(lifetime_seconds, time_str, sizeof(time_str));
+        stat_card(COL_R, row_y, "LIFETIME", time_str, TEXT_COLOR, 1.5f);
     }
 
-    // Row 2: ALL-TIME (left), RAVEN (right)
-    int row2_y = yoff + 108;
-    drawCard(COL_L, row2_y, CARD_W, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row2_y + 4); kprint(spr, "ALL-TIME");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row2_y + 14); spr.print(lt);
+    // Row 2: SESSION / ALL-TIME
+    row_y += CARD_H + ROW_GAP;
+    {
+        char sess_str[9];
+        format_time_buf((frame_ms - session_start_time) / 1000, sess_str, sizeof(sess_str));
+        stat_card(COL_L, row_y, "SESSION", sess_str, TEXT_COLOR, 1.5f);
+    }
+    {
+        char total_str[12];
+        snprintf(total_str, sizeof(total_str), "%ld", lt);
+        stat_card(COL_R, row_y, "ALL-TIME", total_str, CAUTION_COLOR);
+    }
 
-    drawCard(COL_R, row2_y, CARD_W, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row2_y + 4); kprint(spr, "RAVEN");
-    spr.setTextColor(TEAL_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_R + 4, row2_y + 14); spr.print(sr);
+    // Row 3: WIFI SESS / BLE SESS
+    row_y += CARD_H + ROW_GAP;
+    {
+        char wifi_str[12];
+        snprintf(wifi_str, sizeof(wifi_str), "%ld", sw);
+        stat_card(COL_L, row_y, "WIFI SESS", wifi_str, CAUTION_COLOR);
+    }
+    {
+        char ble_str[12];
+        snprintf(ble_str, sizeof(ble_str), "%ld", sb);
+        stat_card(COL_R, row_y, "BLE SESS", ble_str, PURPLE_COLOR);
+    }
 
-    // Row 3: WIFI SESS (left), BLE SESS (right)
-    int row3_y = yoff + 150;
-    drawCard(COL_L, row3_y, CARD_W, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_L + 4, row3_y + 4); kprint(spr, "WIFI SESS");
-    spr.setTextColor(CAUTION_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_L + 4, row3_y + 14); spr.print(sw);
+    // Row 4: RAVEN / FLASH
+    row_y += CARD_H + ROW_GAP;
+    {
+        char raven_str[12];
+        snprintf(raven_str, sizeof(raven_str), "%ld", sr);
+        stat_card(COL_L, row_y, "RAVEN", raven_str, TEAL_COLOR);
+    }
+    {
+        int wear_pct = (int)((lfw * 100) / 100000);
+        if (wear_pct > 100) wear_pct = 100;
+        uint16_t wear_col = (wear_pct >= 80) ? CAUTION_COLOR : ACCENT_COLOR;
+        char fw_str[12];
+        snprintf(fw_str, sizeof(fw_str), "%ld", lfw);
 
-    drawCard(COL_R, row3_y, CARD_W, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1); spr.setCursor(COL_R + 4, row3_y + 4); kprint(spr, "BLE SESS");
-    spr.setTextColor(PURPLE_COLOR, CARD_COLOR); spr.setTextSize(2); spr.setCursor(COL_R + 4, row3_y + 14); spr.print(sb);
+        drawCard(COL_R, row_y, CARD_W, CARD_H);
+        spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(COL_R + 4, row_y + 4);
+        kprint(spr, "FLASH");
+        spr.setTextColor(TEXT_COLOR, CARD_COLOR);
+        spr.setTextSize(1.5);
+        spr.setCursor(COL_R + 4, row_y + 16);
+        spr.print(fw_str);
 
-    // Row 4 label area: FLASH WRITES (full width)
-    int row4fw_y = yoff + 192;
-    drawCard(COL_L, row4fw_y, DISP_W - 8, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(COL_L + 4, row4fw_y + 4); kprint(spr, "FLASH WRITES");
+        // Mini progress bar — runs along the bottom of the card.
+        int bar_x = COL_R + 60, bar_y2 = row_y + 20, bar_w = 46, bar_h2 = 6;
+        spr.drawRect(bar_x, bar_y2, bar_w, bar_h2, CARD_BORDER);
+        int fill = (wear_pct * (bar_w - 2)) / 100;
+        if (fill > 0) spr.fillRect(bar_x + 1, bar_y2 + 1, fill, bar_h2 - 2, wear_col);
+        char pct_str[6];
+        snprintf(pct_str, sizeof(pct_str), "%d%%", wear_pct);
+        spr.setTextColor(wear_col, CARD_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(bar_x, bar_y2 + bar_h2 + 2);
+        spr.print(pct_str);
+    }
 
-    int wear_pct = (int)((lfw * 100) / 100000);
-    if (wear_pct > 100) wear_pct = 100;
-    uint16_t wear_col = (wear_pct >= 80) ? CAUTION_COLOR
-                      : (wear_pct >= 50) ? CAUTION_COLOR
-                      : ACCENT_COLOR;
-
-    spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(2);
-    spr.setCursor(COL_L + 4, row4fw_y + 14); spr.print(lfw);
-    spr.setTextColor(DIM_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(COL_L + 4, row4fw_y + 30); spr.print("writes");
-
-    int bar_x = 110, bar_y = row4fw_y + 16, bar_w = 116, bar_h = 8;
-    spr.drawRect(bar_x, bar_y, bar_w, bar_h, CARD_BORDER);
-    int fill = (wear_pct * (bar_w - 2)) / 100;
-    if (fill > 0) spr.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, wear_col);
-    char pct_str[8]; snprintf(pct_str, sizeof(pct_str), "%d%%", wear_pct);
-    spr.setTextColor(wear_col, CARD_COLOR);
-    spr.setCursor(bar_x + bar_w - 28, bar_y + bar_h + 4); spr.print(pct_str);
-
-    // Row 5: VOLTAGE (left) + POWER SOURCE (right)
-    int row5_y = yoff + 234;
+    // Row 5: VOLTAGE / POWER
+    row_y += CARD_H + ROW_GAP;
     {
         int32_t bat_mv_snap = get_filtered_voltage();
-
-        // Voltage card (left)
-        drawCard(COL_L, row5_y, CARD_W, CARD_H);
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_L + 4, row5_y + 4); kprint(spr, "VOLTAGE");
         uint16_t v_col;
         if      (bat_mv_snap >= 3800) v_col = ACCENT_COLOR;
         else if (bat_mv_snap >= 3600) v_col = CAUTION_COLOR;
         else                          v_col = lgfx::color565(220, 60, 60);
-        spr.setTextColor(v_col, CARD_COLOR); spr.setTextSize(2);
-        spr.setCursor(COL_L + 4, row5_y + 14);
-        char volt_str[10]; snprintf(volt_str, sizeof(volt_str), "%.2fV", bat_mv_snap / 1000.0f);
-        spr.print(volt_str);
+        char volt_str[10];
+        snprintf(volt_str, sizeof(volt_str), "%.2fV", bat_mv_snap / 1000.0f);
+        stat_card(COL_L, row_y, "VOLTAGE", volt_str, v_col);
 
-        // Power source card (right) — best-effort indication
-        drawCard(COL_R, row5_y, CARD_W, CARD_H);
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 4); kprint(spr, "POWER");
-        spr.setTextColor(TEXT_COLOR, CARD_COLOR); spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row5_y + 16);
         const char* pwr_label = (bat_mv_snap >= 4200) ? "USB" : "BATTERY";
-        spr.print(pwr_label);
-        spr.setTextColor(DIM_COLOR, CARD_COLOR);
-        spr.setCursor(COL_R + 4, row5_y + 28); spr.print("(estimated)");
+        stat_card(COL_R, row_y, "POWER", pwr_label, TEXT_COLOR, 1.5f);
     }
 
-    // Row 6: SD STATUS — full width
-    int row6_y = yoff + 276;
-    drawCard(COL_L, row6_y, DISP_W - 8, CARD_H);
-    spr.setTextColor(ACCENT_COLOR, CARD_COLOR); spr.setTextSize(1);
-    spr.setCursor(COL_L + 4, row6_y + 4); kprint(spr, "SD CARD");
-    spr.setTextColor(sd_available ? ACCENT_COLOR : DIM_COLOR, CARD_COLOR);
-    spr.setCursor(COL_L + 58, row6_y + 4);
-    spr.print(sd_available ? "MOUNTED" : "NOT FOUND");
-    spr.setTextColor(DIM_COLOR, CARD_COLOR);
-    spr.setCursor(150, row6_y + 4);
-    spr.print(littlefs_available ? "FS OK" : "FS ERR");
+    // Row 6: SD STATUS (left only — second column reserved for future use)
+    row_y += CARD_H + ROW_GAP;
+    {
+        char sd_str[24];
+        snprintf(sd_str, sizeof(sd_str), "%s  %s",
+                 sd_available ? "MOUNTED" : "NO CARD",
+                 littlefs_available ? "FS OK" : "FS ERR");
+        uint16_t sd_col = sd_available ? ACCENT_COLOR : DIM_COLOR;
+        stat_card(COL_L, row_y, "SD CARD", sd_str, sd_col, 1.0f);
+    }
 
     spr.clearClipRect();
 
