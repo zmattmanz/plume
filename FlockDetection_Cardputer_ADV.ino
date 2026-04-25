@@ -5151,10 +5151,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
-    // Bar geometry — ~10% smaller overall (162×24 vs 180×26).
-    // Positioned for equidistant ~13px vertical gaps between all elements.
-    const int bar_w = 162;
-    const int bar_h = 24;
+    // Bar geometry — another 10% smaller (146×22). Padding 6 each side
+    // (was 10) so the visible infill is 10px tall instead of 4px — reads
+    // as a more substantial fill bar, not a thin sliver.
+    const int bar_w = 146;
+    const int bar_h = 22;
     const int bar_x = (DISP_W - bar_w) / 2;
     const int bar_y = 78;
     const int bar_r = bar_h / 2;
@@ -5206,19 +5207,19 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             uint16_t col = lerp_col16(bg, blue, ease);
 
             lcd.startWrite();
-            lcd.setClipRect(0, 6, DISP_W, 36);
-            lcd.fillRect(0, 6, DISP_W, 36, bg);
+            lcd.setClipRect(0, 14, DISP_W, 22);
+            lcd.fillRect(0, 14, DISP_W, 22, bg);
             lcd.setTextColor(col, bg);
-            lcd.setTextSize(2);
+            lcd.setTextSize(1);  // integer-scaled, clean uniform strokes
             lcd.setTextDatum(TC_DATUM);
             lcd.drawString(VERSION_STRING, DISP_W / 2, y);
             lcd.clearClipRect();
             lcd.endWrite();
         } else if (!boot_title_drawn) {
-            // Settled: paint once at full color, then never touch again.
+            // Settled: paint once at full color, then never touch again
             lcd.startWrite();
             lcd.setTextColor(blue, bg);
-            lcd.setTextSize(2);
+            lcd.setTextSize(1);
             lcd.setTextDatum(TC_DATUM);
             lcd.drawString(VERSION_STRING, DISP_W / 2, TITLE_FINAL_Y);
             lcd.endWrite();
@@ -5351,7 +5352,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     // Each pct change kicks off a new UI_ANIM_NORMAL animation from the
     // current fill width to the new target. Frame-rate independent.
     {
-        const int fill_max_w = bar_w - 20;
+        const int fill_max_w = bar_w - 12;  // matches 6px padding each side
         int target_fill = (pct * fill_max_w) / 100;
 
         static int           fill_anim_from   = 0;
@@ -5372,9 +5373,9 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int fill_w = (int)(boot_eased_fill + 0.5f);
         if (fill_w < 0) fill_w = 0;
 
-        const int fill_x = bar_x + 10;
-        const int fill_y = bar_y + 10;
-        const int fill_h = bar_h - 20;
+        const int fill_x = bar_x + 6;
+        const int fill_y = bar_y + 6;
+        const int fill_h = bar_h - 12;  // 10px tall — thicker, more substantial
 
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
@@ -5489,17 +5490,17 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
 // Animate the boot progress bar so the eased fill is visible.
 // Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
-static void boot_animate(int pct, const char* status, int frames = 14) {
-    // More frames at shorter delays — animations get enough draw samples
-    // to look smooth without changing the total stage duration meaningfully.
-    // Per-frame delay varies subtly with a gentle curve so successive boot
-    // stages don't all tick at exactly the same cadence.
+static void boot_animate(int pct, const char* status, int frames = 24) {
+    // 24 frames per stage at ~12–18ms each = ~360ms total stage time —
+    // similar overall pace as before, but ~70% more redraws inside the
+    // window, so the bar fill ease and per-digit roll feel continuous
+    // instead of stepped.
     static uint8_t delay_phase = 0;
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
         float t = (float)i / (float)(frames - 1);
         float curve = 1.0f - 0.4f * (1.0f - fabsf(2.0f * t - 1.0f));
-        int per_frame = (int)(20.0f + 8.0f * curve);  // ~20–28ms per frame
+        int per_frame = (int)(12.0f + 6.0f * curve);  // ~12–18ms per frame
         per_frame += (delay_phase++ & 0x03);
         delay(per_frame);
     }
