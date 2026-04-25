@@ -3166,7 +3166,7 @@ static void draw_dither_overlay(int x0, int y0, int w, int h, uint16_t dark_colo
 // Soft UI click — brief tone that reads as a tactile tick.
 static void menu_click() {
     if (stealth_mode || is_muted) return;
-    M5Cardputer.Speaker.tone(500, 6);
+    M5Cardputer.Speaker.tone(1200, 4);  // soft mechanical-keyboard tick
 }
 
 void draw_menu_overlay() {
@@ -3180,7 +3180,7 @@ void draw_menu_overlay() {
     // Overwrite the screen name area with "MENU"
     spr.fillRect(0, 0, 80, 18, BG_COLOR);
     spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(1.5);
+    spr.setTextSize(1.2);  // matches draw_header_spr style
     spr.setCursor(4, 5);
     kprint(spr, "MENU");
 
@@ -3216,12 +3216,13 @@ void draw_menu_overlay() {
     if (menu_selected < 0) menu_selected = 0;
     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
 
-    const int row_h    = 14;
-    const int row_gap  = 3;
+    const int row_h    = 18;  // textSize 2 = 16px tall + 2px breathing room
+    const int row_gap  = 2;
     const int start_y  = 20;
 
-    // Scrollable viewport — compute how many items fit between start_y and footer
-    const int footer_y = DISP_H - 14;
+    // Scrollable viewport — compute how many items fit between start_y and bottom
+    // (footer was removed; the row space extends to the bottom of the screen).
+    const int footer_y = DISP_H - 2;
     const int visible_h = footer_y - start_y;
     const int menu_visible_count = visible_h / (row_h + row_gap);
 
@@ -3256,10 +3257,10 @@ void draw_menu_overlay() {
 
         spr.fillRect(0, y, DISP_W, row_h, BG_COLOR);
 
-        int text_x = 6;
+        int text_x = 16;  // padded to clear the selection-indicator dash area
         spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-        spr.setTextSize(1.5);
-        spr.setCursor(text_x, y + 2);
+        spr.setTextSize(2);
+        spr.setCursor(text_x, y + 1);  // center 16px text in 18px row
         kprint(spr, items[i].label);
     }
 
@@ -3268,14 +3269,16 @@ void draw_menu_overlay() {
         uint16_t sel_bg = ea(lerp_col16(BG_COLOR, HEADER_COLOR, 0.12f));
         spr.fillRect(0, ease_y, DISP_W, row_h, sel_bg);
 
-        // Subtle left edge accent
-        spr.fillRect(0, ease_y, 2, row_h, ea(HEADER_COLOR));
+        // Selection indicator: 6×2px horizontal dash, vertically centered.
+        int dash_y = ease_y + row_h / 2;
+        spr.drawFastHLine(4, dash_y,     6, ea(HEADER_COLOR));
+        spr.drawFastHLine(4, dash_y - 1, 6, ea(HEADER_COLOR));
 
-        // Redraw selected item text on highlight
-        int text_x = 6;
+        // Redraw selected item text on highlight.
+        int text_x = 16;
         spr.setTextColor(ea(TEXT_COLOR), sel_bg);
-        spr.setTextSize(1.5);
-        spr.setCursor(text_x, ease_y + 2);
+        spr.setTextSize(2);
+        spr.setCursor(text_x, ease_y + 1);
         kprint(spr, items[menu_selected].label);
     }
 
@@ -3294,12 +3297,9 @@ void draw_menu_overlay() {
         spr.fillRect(track_x, thumb_y, 3, thumb_h, ea(HEADER_COLOR));
     }
 
-    // Footer
-    spr.fillRect(0, DISP_H - 14, DISP_W, 14, BG_COLOR);
-    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(4, DISP_H - 10);
-    spr.print("^/v nav  ENTER select  DEL close");
+    // Footer removed — extra row space goes to menu items. The keys are
+    // documented in the help overlay (TAB) and are intuitive: ; / . scroll,
+    // ENTER selects, DEL closes.
 }
 
 void handle_menu_select() {
@@ -3644,28 +3644,67 @@ void draw_scanner_screen() {
 
     spr.clearClipRect();
 
-    // ── Ambient packet counter — two-line label + value, centered under radar ──
+    // ── Ambient packet counter — kerned green label + white number, with
+    // throttled roll-up animation when the displayed value updates ──
     {
         uint32_t pkts = ambient_packet_count;
-        char pkt_str[20];
-        if (pkts >= 1000000) {
-            snprintf(pkt_str, sizeof(pkt_str), "%.1fM", pkts / 1000000.0f);
-        } else if (pkts >= 1000) {
-            snprintf(pkt_str, sizeof(pkt_str), "%.1fk", pkts / 1000.0f);
-        } else {
-            snprintf(pkt_str, sizeof(pkt_str), "%lu", pkts);
-        }
+        char pkt_str[12];
 
-        // Line 1: green label
+        // Roll-up animation state — throttled so the count doesn't animate
+        // every frame as new packets arrive.
+        static uint32_t pkt_display_val = 0;
+        static unsigned long pkt_anim_start = 0;
+        static unsigned long pkt_last_update = 0;
+        const unsigned long PKT_UPDATE_INTERVAL = 3000;
+        const unsigned long PKT_ROLL_MS = 300;
+
+        if (frame_ms - pkt_last_update >= PKT_UPDATE_INTERVAL || pkt_display_val == 0) {
+            if (pkts != pkt_display_val) {
+                pkt_display_val = pkts;
+                pkt_anim_start = frame_ms;
+            }
+            pkt_last_update = frame_ms;
+        }
+        snprintf(pkt_str, sizeof(pkt_str), "%lu", (unsigned long)pkt_display_val);
+
+        // Line 1: green label, kerned (6+1=7px per char) and centered.
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setTextSize(1);
-        spr.setTextDatum(TC_DATUM);
-        spr.drawString("PACKETS SCANNED", radar_cx, DISP_H - 18);
+        {
+            const char* label = "PACKETS SCANNED";
+            int label_w = (int)strlen(label) * 7;  // 6px char + 1px kern
+            int label_x = radar_cx - label_w / 2;
+            spr.setTextDatum(TL_DATUM);
+            spr.setCursor(label_x, DISP_H - 20);
+            kprint(spr, label);
+        }
 
-        // Line 2: white number
-        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-        spr.setTextSize(1);
-        spr.drawString(pkt_str, radar_cx, DISP_H - 9);
+        // Line 2: white number with optional roll-up animation.
+        {
+            int num_w = (int)strlen(pkt_str) * 6;
+            int num_x = radar_cx - num_w / 2;
+            int num_y = DISP_H - 9;
+            int num_h = 8;  // textSize 1 height
+
+            spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
+            spr.setTextSize(1);
+
+            if (pkt_anim_start > 0 && (frame_ms - pkt_anim_start) < PKT_ROLL_MS) {
+                float t = (float)(frame_ms - pkt_anim_start) / (float)PKT_ROLL_MS;
+                float ease = ui_ease(t);
+                int y_offset = (int)((1.0f - ease) * (float)num_h);
+                spr.setClipRect(0, num_y, divider_x, num_h);
+                spr.fillRect(0, num_y, divider_x, num_h, BG_COLOR);
+                spr.setTextDatum(TL_DATUM);
+                spr.setCursor(num_x, num_y + y_offset);
+                spr.print(pkt_str);
+                spr.clearClipRect();
+            } else {
+                spr.setTextDatum(TL_DATUM);
+                spr.setCursor(num_x, num_y);
+                spr.print(pkt_str);
+            }
+        }
 
         spr.setTextDatum(TL_DATUM);
     }
@@ -5378,7 +5417,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         // a cascading "reel" effect like an odometer rolling forward.
         unsigned long now_t = millis();
         if (pct != boot_prev_pct) {
-            const unsigned long DIGIT_STAGGER_MS = 120;
+            const unsigned long DIGIT_STAGGER_MS = 30;
             for (int di = 0; di < n_chars - 1 && di < 8; di++) {
                 boot_digit_anim_ms[di] = now_t + di * DIGIT_STAGGER_MS;
             }
@@ -5486,17 +5525,21 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: 200ms roll-up. Clipped region + per-frame redraw with
-    // bg as text background means each glyph self-clears, no flicker.
+    // ── Status text: 200ms roll-up. Anti-flicker — fillRect runs ONLY on
+    // the first frame after a string change (to wipe leftover chars from a
+    // wider previous status). Subsequent slide frames just redraw glyphs
+    // with bg as text background, so each glyph self-clears in place.
     static char boot_cur_status[32] = "";
     static unsigned long boot_status_anim_start = 0;
     static bool boot_status_settled_drawn = false;
+    static bool boot_status_needs_clear   = false;
 
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
         boot_status_anim_start = millis();
         boot_status_settled_drawn = false;
+        boot_status_needs_clear = true;
     }
 
     if (boot_cur_status[0] != '\0' && !boot_status_settled_drawn) {
@@ -5518,7 +5561,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
         lcd.startWrite();
         lcd.setClipRect(0, status_y, DISP_W, status_h);
-        lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+        if (boot_status_needs_clear) {
+            lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+            boot_status_needs_clear = false;
+        }
         lcd.setTextColor(white, bg);
         lcd.setTextSize(1);
         lcd.setTextDatum(TL_DATUM);
@@ -5537,7 +5583,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
 // Animate the boot progress bar so the eased fill is visible.
 // Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
-static void boot_animate(int pct, const char* status, int frames = 36) {
+static void boot_animate(int pct, const char* status, int frames = 30) {
     // Randomized: frames vary by ±4 and per-frame delay gets a 0–7ms jitter
     // so each boot stage takes a slightly different wall-clock time. The
     // percentage counter ends up hitting different numbers at different
@@ -5553,7 +5599,7 @@ static void boot_animate(int pct, const char* status, int frames = 36) {
         // Sine-wave speed variation: slow at start, fast in middle, slow at end —
         // reads like a physical mechanism ramping up and back down.
         float wave = sinf(t * (float)M_PI);                // 0 → 1 → 0
-        int per_frame = (int)(22.0f - 8.0f * wave);        // 22ms edges, 14ms middle
+        int per_frame = (int)(18.0f - 6.0f * wave);        // 18ms edges, 12ms middle
         per_frame += (delay_phase++ & 0x03);
         per_frame += random(0, 8);                     // 0–7ms jitter
         delay(per_frame);
