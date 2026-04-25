@@ -229,7 +229,7 @@ static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms
 #define BUZZER_COOLDOWN 60000
 #define IGNORE_WEAK_RSSI -80
 
-#define MAX_LOG_BUFFER 10
+#define MAX_LOG_BUFFER 6
 #define MAX_PCAP_BUFFER 5
 #define SD_FLUSH_INTERVAL 10000
 #define CHANNEL_DWELL_MS 400
@@ -313,7 +313,7 @@ volatile int trigger_alarm_confidence = 0;
 volatile int trigger_alarm_source = 0;   // 0 = WiFi, 1 = BLE
 volatile bool is_alarming = false;
 
-#define SD_LINE_LEN 512
+#define SD_LINE_LEN 384
 char sd_write_buffer[MAX_LOG_BUFFER][SD_LINE_LEN];
 int  sd_write_count = 0;
 unsigned long last_sd_flush = 0;
@@ -360,7 +360,7 @@ long lifetime_flock_total = 0;
 long lifetime_boots = 0;
 long lifetime_flash_writes = 0;
 
-#define MAX_SEEN_MACS 200
+#define MAX_SEEN_MACS 100
 
 struct SeenMacEntry {
     char   mac[18];
@@ -1253,6 +1253,14 @@ static void schedule_persist() {
 static void save_session_to_flash() {
     if (!littlefs_available) return;
 
+    // Same guard as flush_sd_buffer — LittleFS internally mallocs cache pages
+    // during open/write and will abort() on a NULL return. Skip this cycle
+    // and let the next persist tick try again when heap recovers.
+    if (esp_get_free_heap_size() < 12000) {
+        Serial.println("[FS] Skipping persist — heap too low");
+        return;
+    }
+
     long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes;
     int l_vol;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1683,6 +1691,14 @@ void flush_sd_buffer() {
     xSemaphoreGive(dataMutex);
 
     if (!sd_available) return;
+
+    // Skip flush if heap is critically low — the SD FAT driver mallocs
+    // internally and will abort() if it gets NULL. Better to drop a flush
+    // cycle than crash; the buffers will retry next interval.
+    if (esp_get_free_heap_size() < 12000) {
+        Serial.println("[SD] Skipping flush — heap too low");
+        return;
+    }
 
     // Timed take — if PersistTask or hot-plug holds the SD mutex too long,
     // drop this flush cycle. The same buffers will retry on the next
@@ -5794,7 +5810,12 @@ void setup() {
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
 
-    delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
+    delay(100);
+    // NMEA sentences max ~82 chars — 1024-byte default RX is 2× too big.
+    // setRxBufferSize must be called BEFORE begin() to take effect.
+    SerialGPS.setRxBufferSize(512);
+    SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    delay(100);
     WiFi.mode(WIFI_STA); delay(50);
     boot_animate(40, "connecting GPS");
     boot_animate(44 + random(0, 3), "drawing interface");
@@ -5812,7 +5833,7 @@ void setup() {
 
     setCpuFrequencyMhz(240);
     boot_animate(62 + random(0, 3), "boosting CPU");
-    ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
+    ble_event_queue = xQueueCreate(8, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
     boot_animate(68, "starting Bluetooth");
 
