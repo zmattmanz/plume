@@ -5977,6 +5977,10 @@ void setup() {
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
+    // Don't store results internally — every advertisement is already handled
+    // via the callback -> ble_event_queue -> ble_worker_task pipeline. The
+    // default cache can hit 10–20 KB in a busy RF environment for no benefit.
+    pBLEScan->setMaxResults(0);
     last_ble_restart_ms = millis();
     boot_animate(96, "arming scanner");
 
@@ -6595,6 +6599,7 @@ void loop() {
         pBLEScan->setActiveScan(false);
         pBLEScan->setInterval(97);
         pBLEScan->setWindow(97);
+        pBLEScan->setMaxResults(0);  // see setup() — callback handles everything
         last_ble_scan = millis();
         Serial.println("[BLE] Periodic stack restart completed");
     }
