@@ -1256,7 +1256,7 @@ static void save_session_to_flash() {
     // Same guard as flush_sd_buffer — LittleFS internally mallocs cache pages
     // during open/write and will abort() on a NULL return. Skip this cycle
     // and let the next persist tick try again when heap recovers.
-    if (esp_get_free_heap_size() < 12000) {
+    if (esp_get_free_heap_size() < 6000) {
         Serial.println("[FS] Skipping persist — heap too low");
         return;
     }
@@ -1695,7 +1695,7 @@ void flush_sd_buffer() {
     // Skip flush if heap is critically low — the SD FAT driver mallocs
     // internally and will abort() if it gets NULL. Better to drop a flush
     // cycle than crash; the buffers will retry next interval.
-    if (esp_get_free_heap_size() < 12000) {
+    if (esp_get_free_heap_size() < 6000) {
         Serial.println("[SD] Skipping flush — heap too low");
         return;
     }
