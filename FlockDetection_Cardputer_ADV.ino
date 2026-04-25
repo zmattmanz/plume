@@ -5116,11 +5116,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
-    // Bar geometry — 26px tall with 2px outline and 11px interior padding.
-    const int bar_w = 180;
-    const int bar_h = 26;
+    // Bar geometry — ~10% smaller overall (162×24 vs 180×26).
+    const int bar_w = 162;
+    const int bar_h = 24;
     const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = 82;
+    const int bar_y = 84;
     const int bar_r = bar_h / 2;
 
     // Number geometry
@@ -5153,62 +5153,79 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         boot_prev_fill_w = 0;
     }
 
-    // ── Percentage number — both digits roll up on pct change ──
-    // Whole sequence is wrapped in startWrite/endWrite so the SPI transaction
-    // is atomic — no visible "blank then text" flicker between fillRect and
-    // drawString. Both digits animate, regardless of which actually changed.
+    // ── Percentage — digits roll individually, % symbol stays static ──
+    // Each digit gets its own clipped redraw window. The % symbol is drawn
+    // once on first frame (when boot_first_draw cleared the screen) and
+    // never touched again — no flicker, no movement.
+    //
+    // Per-digit independence: when pct changes, only digits whose VALUE
+    // changed get a new animation start time. Unchanged digits stay still.
+    // Each digit's redraw is its own startWrite/endWrite transaction so the
+    // SPI burst is small and atomic.
     {
         char pct_str[8];
         snprintf(pct_str, sizeof(pct_str), "%d%%", pct);
         int n_chars = (int)strlen(pct_str);
 
-        // On pct change, kick off animation for ALL visible digits so they
-        // roll together (not just the ones whose values changed).
-        if (pct != boot_prev_pct) {
-            unsigned long now_t = millis();
-            for (int di = 0; di < n_chars && di < 8; di++) {
-                boot_digit_anim_ms[di] = now_t;
-            }
-            boot_prev_pct = pct;
-        }
-
+        // Layout: digits left-justified inside the number area. The % symbol
+        // sits to the right of the digits and never moves — only the digits
+        // animate. We compute total width based on (n_chars - 1) digits + the
+        // %, then center the whole block.
         const int char_w = 18;
         int total_w = n_chars * char_w;
         int start_x = (DISP_W - total_w) / 2;
-        const unsigned long ROLL_MS = 200;
 
-        // Only redraw if at least one digit is currently rolling.
+        // Detect which digits actually changed in value (skip the trailing %).
         unsigned long now_t = millis();
-        bool any_animating = false;
-        for (int di = 0; di < n_chars && di < 8; di++) {
-            if (boot_digit_anim_ms[di] > 0 &&
-                (now_t - boot_digit_anim_ms[di]) < ROLL_MS) {
-                any_animating = true;
-                break;
+        if (pct != boot_prev_pct) {
+            for (int di = 0; di < n_chars - 1 && di < 8; di++) {
+                bool prev_exists = (di < (int)strlen(boot_prev_digits));
+                if (!prev_exists || pct_str[di] != boot_prev_digits[di]) {
+                    boot_digit_anim_ms[di] = now_t;
+                }
             }
+            strncpy(boot_prev_digits, pct_str, sizeof(boot_prev_digits) - 1);
+            boot_prev_digits[sizeof(boot_prev_digits) - 1] = '\0';
+            boot_prev_pct = pct;
         }
 
-        if (any_animating) {
+        const unsigned long ROLL_MS = 250;
+
+        // Draw the % symbol once on first appearance. It's static — never
+        // re-rendered unless the screen was cleared (boot_first_draw path).
+        static bool pct_symbol_drawn = false;
+        if (!pct_symbol_drawn) {
+            int pct_x = start_x + (n_chars - 1) * char_w;
             lcd.startWrite();
-            lcd.setClipRect(num_x, num_y, num_w, num_h);
-            lcd.fillRect(num_x, num_y, num_w, num_h, bg);
             lcd.setTextColor(white, bg);
             lcd.setTextSize(3);
             lcd.setTextDatum(TL_DATUM);
-            for (int di = 0; di < n_chars && di < 8; di++) {
-                int dx = start_x + di * char_w;
-                int y_off = 0;
-                if (boot_digit_anim_ms[di] > 0) {
-                    unsigned long elapsed = now_t - boot_digit_anim_ms[di];
-                    if (elapsed < ROLL_MS) {
-                        float t    = (float)elapsed / (float)ROLL_MS;
-                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                        y_off = (int)((1.0f - ease) * (float)num_h);
-                    }
-                }
-                char ch[2] = { pct_str[di], '\0' };
-                lcd.drawString(ch, dx, num_y + y_off);
-            }
+            lcd.drawString("%", pct_x, num_y);
+            lcd.endWrite();
+            pct_symbol_drawn = true;
+        }
+
+        // Animate each digit independently. Only redraw a digit if it's
+        // currently within its ROLL_MS animation window.
+        for (int di = 0; di < n_chars - 1 && di < 8; di++) {
+            if (boot_digit_anim_ms[di] == 0) continue;
+            unsigned long elapsed = now_t - boot_digit_anim_ms[di];
+            if (elapsed > ROLL_MS) continue;
+
+            float t    = (float)elapsed / (float)ROLL_MS;
+            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+            int y_off = (int)((1.0f - ease) * (float)num_h);
+
+            int dx = start_x + di * char_w;
+
+            lcd.startWrite();
+            lcd.setClipRect(dx, num_y, char_w, num_h);
+            lcd.fillRect(dx, num_y, char_w, num_h, bg);
+            lcd.setTextColor(white, bg);
+            lcd.setTextSize(3);
+            lcd.setTextDatum(TL_DATUM);
+            char ch[2] = { pct_str[di], '\0' };
+            lcd.drawString(ch, dx, num_y + y_off);
             lcd.clearClipRect();
             lcd.endWrite();
         }
@@ -5216,17 +5233,17 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
     // ── Update bar fill (incremental — extend forward only, no clear) ──
     {
-        // 11px padding per side; fill_h = bar_h - 22 = 4
-        int target_fill = (pct * (bar_w - 22)) / 100;
+        // 10px padding per side; fill_h = bar_h - 20 = 4
+        int target_fill = (pct * (bar_w - 20)) / 100;
         float diff = (float)target_fill - boot_eased_fill;
         boot_eased_fill += diff * 0.3f;
         if (fabsf(diff) < 0.5f) boot_eased_fill = (float)target_fill;
         int fill_w = (int)(boot_eased_fill + 0.5f);
         if (fill_w < 0) fill_w = 0;
 
-        const int fill_x = bar_x + 11;
-        const int fill_y = bar_y + 11;
-        const int fill_h = bar_h - 22;
+        const int fill_x = bar_x + 10;
+        const int fill_y = bar_y + 10;
+        const int fill_h = bar_h - 20;
 
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
@@ -5242,17 +5259,24 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: UPPERCASE with +1px kerning, color ease-in ──
-    // Same kerning (6+1=7px per char) used by kprint() elsewhere in the UI.
+    // ── Status text: UPPERCASE with +1px kerning, smooth color ease-in ──
+    // Smoother because: (1) longer fade duration → finer alpha steps,
+    // (2) only fillRect on string change, not every frame. Subsequent frames
+    // overdraw the text with the lerped color using bg as the text background
+    // — so each glyph cell self-clears as it redraws. No row-wide flash.
     static char boot_cur_status[32] = "";
     static unsigned long boot_status_change_ms = 0;
+    static bool boot_status_needs_clear = false;
+
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
         boot_status_change_ms = millis();
+        boot_status_needs_clear = true;
     }
+
     if (boot_cur_status[0] != '\0') {
-        const unsigned long STATUS_FADE_MS = 350;
+        const unsigned long STATUS_FADE_MS = 600;  // longer = smoother steps
         float alpha = ease_alpha(boot_status_change_ms, STATUS_FADE_MS);
         uint16_t status_col = lerp_col16(bg, white, alpha);
 
@@ -5264,13 +5288,16 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
         upper_buf[slen] = '\0';
 
-        // Center using kerned width: 6px char + 1px kern = 7px per char,
-        // minus the trailing kern after the last char.
         int kerned_w = (slen > 0) ? (slen * 7 - 1) : 0;
         int x0 = (DISP_W - kerned_w) / 2;
 
         lcd.startWrite();
-        lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+        // Only flash-clear the row when the string actually changed —
+        // subsequent fade frames just overdraw the glyphs with the new color.
+        if (boot_status_needs_clear) {
+            lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+            boot_status_needs_clear = false;
+        }
         lcd.setTextColor(status_col, bg);
         lcd.setTextSize(1);
         lcd.setTextDatum(TL_DATUM);
@@ -5289,7 +5316,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 static void boot_animate(int pct, const char* status, int frames = 8) {
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
-        delay(25);
+        delay(33);
     }
 }
 
