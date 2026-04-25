@@ -5676,7 +5676,7 @@ void setup() {
         while (1) delay(1000);
     }
     Serial.printf("[GFX] Sprite allocated in %s, free heap: %u\n",
-                  spr.psram() ? "PSRAM" : "internal",
+                  (ESP.getPsramSize() > 0 && (uint32_t)sprite_buf >= 0x3C000000) ? "PSRAM" : "internal",
                   (unsigned)esp_get_free_heap_size());
 
     // LED: start dark. The breathing task is spawned at the very end of setup()
