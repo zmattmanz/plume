@@ -5169,66 +5169,38 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             boot_prev_pct = pct;
         }
 
+        // Clear the number area
+        lcd.fillRect(num_x, num_y, num_w, num_h, bg);
+
         // Each character ~18px wide at textSize 3
         const int char_w = 18;
         int total_w = n_chars * char_w;
-        int start_x_abs = (DISP_W - total_w) / 2;
+        int start_x = (DISP_W - total_w) / 2;
         const unsigned long ROLL_MS = 200;
 
-        // Render the number into a dedicated back-buffer sprite for flicker-free
-        // atomic push. Lazy-allocated on first call; ~5KB held for the life of
-        // the program — negligible and avoids per-call alloc churn.
-        static M5Canvas boot_num_spr(&M5Cardputer.Display);
-        static bool boot_num_spr_ok = false;
-        if (!boot_num_spr_ok) {
-            boot_num_spr.setColorDepth(16);
-            boot_num_spr.setPsram(false);
-            if (boot_num_spr.createSprite(num_w, num_h)) boot_num_spr_ok = true;
+        lcd.setClipRect(num_x, num_y, num_w, num_h);
+        lcd.setTextColor(white, bg);
+        lcd.setTextSize(3);
+        lcd.setTextDatum(TL_DATUM);
+
+        for (int di = 0; di < n_chars && di < 8; di++) {
+            int dx = start_x + di * char_w;
+
+            int y_off = 0;
+            if (boot_digit_anim_ms[di] > 0) {
+                unsigned long elapsed = millis() - boot_digit_anim_ms[di];
+                if (elapsed < ROLL_MS) {
+                    float t    = (float)elapsed / (float)ROLL_MS;
+                    float ease = 1.0f - (1.0f - t) * (1.0f - t);
+                    y_off = (int)((1.0f - ease) * (float)num_h);
+                }
+            }
+
+            char ch[2] = { pct_str[di], '\0' };
+            lcd.drawString(ch, dx, num_y + y_off);
         }
 
-        if (boot_num_spr_ok) {
-            boot_num_spr.fillSprite(bg);
-            boot_num_spr.setTextColor(white, bg);
-            boot_num_spr.setTextSize(3);
-            boot_num_spr.setTextDatum(TL_DATUM);
-            for (int di = 0; di < n_chars && di < 8; di++) {
-                int dx_local = (start_x_abs - num_x) + di * char_w;
-                int y_off = 0;
-                if (boot_digit_anim_ms[di] > 0) {
-                    unsigned long elapsed = millis() - boot_digit_anim_ms[di];
-                    if (elapsed < ROLL_MS) {
-                        float t    = (float)elapsed / (float)ROLL_MS;
-                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                        y_off = (int)((1.0f - ease) * (float)num_h);
-                    }
-                }
-                char ch[2] = { pct_str[di], '\0' };
-                boot_num_spr.drawString(ch, dx_local, y_off);
-            }
-            boot_num_spr.pushSprite(num_x, num_y);
-        } else {
-            // Fallback: direct draw (flickers). Shouldn't normally happen.
-            lcd.fillRect(num_x, num_y, num_w, num_h, bg);
-            lcd.setClipRect(num_x, num_y, num_w, num_h);
-            lcd.setTextColor(white, bg);
-            lcd.setTextSize(3);
-            lcd.setTextDatum(TL_DATUM);
-            for (int di = 0; di < n_chars && di < 8; di++) {
-                int dx = start_x_abs + di * char_w;
-                int y_off = 0;
-                if (boot_digit_anim_ms[di] > 0) {
-                    unsigned long elapsed = millis() - boot_digit_anim_ms[di];
-                    if (elapsed < ROLL_MS) {
-                        float t    = (float)elapsed / (float)ROLL_MS;
-                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                        y_off = (int)((1.0f - ease) * (float)num_h);
-                    }
-                }
-                char ch[2] = { pct_str[di], '\0' };
-                lcd.drawString(ch, dx, num_y + y_off);
-            }
-            lcd.clearClipRect();
-        }
+        lcd.clearClipRect();
         lcd.setTextDatum(TL_DATUM);
     }
 
