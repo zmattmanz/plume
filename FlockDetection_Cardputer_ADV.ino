@@ -5375,17 +5375,17 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             fill_anim_start = millis();
         }
 
-        // Bar fill uses UI_ANIM_QUICK so it settles before the next pct change
-        // arrives — prevents perpetual catch-up lag.
-        float ease = ui_progress(fill_anim_start, UI_ANIM_QUICK);
+        // Bar fill uses UI_ANIM_NORMAL for a smoother eased expansion across
+        // the boot stage's frames.
+        float ease = ui_progress(fill_anim_start, UI_ANIM_NORMAL);
         boot_eased_fill = (float)fill_anim_from + (float)(fill_anim_to - fill_anim_from) * ease;
 
         int fill_w = (int)(boot_eased_fill + 0.5f);
         if (fill_w < 0) fill_w = 0;
 
         const int fill_x = bar_x + 6;
-        const int fill_y = bar_y + 6;
-        const int fill_h = bar_h - 12;  // 10px tall — thicker, more substantial
+        const int fill_y = bar_y + 8;
+        const int fill_h = bar_h - 16;  // 6px tall — thinner, more refined
 
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
@@ -5453,6 +5453,17 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
         bool animating = (elapsed < SLIDE_MS && prev_len > 0);
         bool need_draw = animating || !boot_status_settled_drawn;
+
+        // Rate-limit the redraw while animating — back-to-back fillRect+drawString
+        // on the LCD at full draw speed produces visible flicker. ~40ms minimum
+        // gap (~25 fps) is fast enough for the slide to feel smooth, slow enough
+        // for each frame's text to actually persist on screen.
+        static unsigned long last_status_redraw_ms = 0;
+        if (animating && need_draw) {
+            unsigned long since_last = millis() - last_status_redraw_ms;
+            if (since_last < 40) need_draw = false;
+        }
+        if (need_draw) last_status_redraw_ms = millis();
 
         if (need_draw) {
             lcd.startWrite();
@@ -5815,8 +5826,8 @@ void setup() {
     // Fade-in: ramp brightness back to the user's target over ~400ms.
     {
         int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
-        const int FADE_STEPS   = 20;
-        const int FADE_STEP_MS = 20;   // 20 × 20ms = 400ms per phase
+        const int FADE_STEPS   = 12;
+        const int FADE_STEP_MS = 16;   // 12 × 16ms ≈ 192ms per phase
 
         for (int i = 1; i <= FADE_STEPS; i++) {
             int b = (start_brightness * (FADE_STEPS - i)) / FADE_STEPS;
