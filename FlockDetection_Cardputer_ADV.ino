@@ -5123,34 +5123,105 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     const int bar_y = 84;
     const int bar_r = bar_h / 2;
 
-    // Number geometry
-    const int num_y = 50;
-    const int num_w = 100;
+    // Number geometry — textSize 2 (matches stats/values typography stack).
+    // textSize 2 = 12px char width, 16px char height.
+    const int num_y = 56;
+    const int num_w = 80;
     const int num_x = (DISP_W - num_w) / 2;
-    const int num_h = 24;
+    const int num_h = 16;
 
-    // Status text geometry — lowered slightly for more breathing room under bar
-    const int status_y = 122;
-    const int status_h = 12;
+    // Status text geometry — extra breathing room below bar.
+    const int status_y = 127;
+    const int status_h = 8;
 
-    // ── First draw: fill screen + paint static elements ──
+    // ── Staggered intro — each element fades in at its own offset ──
+    // Sequence (offsets relative to first call):
+    //   0ms   → screen filled, layout starts blank
+    //   0ms   → title begins fading in (+slide down) over 350ms
+    //   220ms → bar outline begins drawing over 350ms
+    //   500ms → percentage + status text begin allowed to render
+    static unsigned long boot_intro_start_ms = 0;
+    static bool          boot_title_drawn    = false;
+    static int           boot_outline_drawn_to = 0;  // pixels of outline drawn so far
+
     if (boot_first_draw) {
         lcd.fillScreen(bg);
+        boot_first_draw      = false;
+        boot_eased_fill      = 0.0f;
+        boot_prev_fill_w     = 0;
+        boot_intro_start_ms  = millis();
+        boot_title_drawn     = false;
+        boot_outline_drawn_to = 0;
+    }
 
-        // Version string (static) — blue for pop against dark background.
-        // Lowered slightly and enlarged to size 1.5 for visual weight.
-        lcd.setTextColor(blue, bg);
-        lcd.setTextSize(1.5);
-        lcd.setTextDatum(TC_DATUM);
-        lcd.drawString(VERSION_STRING, DISP_W / 2, 24);
+    unsigned long intro_elapsed = millis() - boot_intro_start_ms;
 
-        // Bar outline — 2px stroke (outer + inset inner) for prominence
-        lcd.drawRoundRect(bar_x,     bar_y,     bar_w,     bar_h,     bar_r,     blue);
-        lcd.drawRoundRect(bar_x + 1, bar_y + 1, bar_w - 2, bar_h - 2, bar_r - 1, blue);
+    // ── Title: slide down + fade in over 350ms, settled at y=24 ──
+    {
+        const unsigned long TITLE_DUR = 350;
+        const int           TITLE_FINAL_Y = 24;
+        const int           TITLE_SLIDE_PX = 10;
 
-        boot_first_draw = false;
-        boot_eased_fill = 0.0f;
-        boot_prev_fill_w = 0;
+        if (intro_elapsed < TITLE_DUR) {
+            float t    = (float)intro_elapsed / (float)TITLE_DUR;
+            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+            int   y    = TITLE_FINAL_Y - TITLE_SLIDE_PX + (int)(ease * (float)TITLE_SLIDE_PX);
+            uint16_t col = lerp_col16(bg, blue, ease);
+
+            lcd.startWrite();
+            lcd.setClipRect(0, 12, DISP_W, 28);
+            lcd.fillRect(0, 12, DISP_W, 28, bg);
+            lcd.setTextColor(col, bg);
+            lcd.setTextSize(1.5);
+            lcd.setTextDatum(TC_DATUM);
+            lcd.drawString(VERSION_STRING, DISP_W / 2, y);
+            lcd.clearClipRect();
+            lcd.endWrite();
+        } else if (!boot_title_drawn) {
+            // Settled: paint once at full color, then never touch again
+            lcd.startWrite();
+            lcd.setTextColor(blue, bg);
+            lcd.setTextSize(1.5);
+            lcd.setTextDatum(TC_DATUM);
+            lcd.drawString(VERSION_STRING, DISP_W / 2, TITLE_FINAL_Y);
+            lcd.endWrite();
+            boot_title_drawn = true;
+        }
+    }
+
+    // ── Bar outline: draws across 350ms starting at +220ms ──
+    // Implemented as a left-to-right reveal — each frame extends the drawn
+    // outline rightward to match the eased progress. The completed outline
+    // stays drawn afterward.
+    {
+        const unsigned long OUTLINE_DELAY = 220;
+        const unsigned long OUTLINE_DUR   = 350;
+
+        if (intro_elapsed >= OUTLINE_DELAY && boot_outline_drawn_to < bar_w) {
+            unsigned long oe = intro_elapsed - OUTLINE_DELAY;
+            float t = (oe < OUTLINE_DUR) ? (float)oe / (float)OUTLINE_DUR : 1.0f;
+            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+            int target = (int)(ease * (float)bar_w);
+            if (target > bar_w) target = bar_w;
+
+            // Draw the full outline once we cross any progress threshold,
+            // but clip the rendering to the revealed portion only.
+            lcd.startWrite();
+            lcd.setClipRect(bar_x, bar_y, target, bar_h);
+            lcd.drawRoundRect(bar_x,     bar_y,     bar_w,     bar_h,     bar_r,     blue);
+            lcd.drawRoundRect(bar_x + 1, bar_y + 1, bar_w - 2, bar_h - 2, bar_r - 1, blue);
+            lcd.clearClipRect();
+            lcd.endWrite();
+            boot_outline_drawn_to = target;
+        }
+    }
+
+    // Gate everything else (percentage, status text, bar fill) until +500ms.
+    // This is the staggered slot for the lower elements to come alive.
+    const unsigned long LOWER_GATE_MS = 500;
+    if (intro_elapsed < LOWER_GATE_MS) {
+        // Still in intro — title and outline are animating; defer the rest.
+        return;
     }
 
     // ── Percentage — digits roll individually, % symbol stays static ──
@@ -5171,7 +5242,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         // sits to the right of the digits and never moves — only the digits
         // animate. We compute total width based on (n_chars - 1) digits + the
         // %, then center the whole block.
-        const int char_w = 18;
+        const int char_w = 12;  // textSize 2 char width
         int total_w = n_chars * char_w;
         int start_x = (DISP_W - total_w) / 2;
 
@@ -5198,7 +5269,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             int pct_x = start_x + (n_chars - 1) * char_w;
             lcd.startWrite();
             lcd.setTextColor(white, bg);
-            lcd.setTextSize(3);
+            lcd.setTextSize(2);
             lcd.setTextDatum(TL_DATUM);
             lcd.drawString("%", pct_x, num_y);
             lcd.endWrite();
@@ -5222,7 +5293,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             lcd.setClipRect(dx, num_y, char_w, num_h);
             lcd.fillRect(dx, num_y, char_w, num_h, bg);
             lcd.setTextColor(white, bg);
-            lcd.setTextSize(3);
+            lcd.setTextSize(2);
             lcd.setTextDatum(TL_DATUM);
             char ch[2] = { pct_str[di], '\0' };
             lcd.drawString(ch, dx, num_y + y_off);
@@ -5259,52 +5330,92 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: UPPERCASE with +1px kerning, smooth color ease-in ──
-    // Smoother because: (1) longer fade duration → finer alpha steps,
-    // (2) only fillRect on string change, not every frame. Subsequent frames
-    // overdraw the text with the lerped color using bg as the text background
-    // — so each glyph cell self-clears as it redraws. No row-wide flash.
-    static char boot_cur_status[32] = "";
+    // ── Status text: feed-style slide-up with eased fade ──
+    // When the status changes, the new text slides UP into position from
+    // ~14px below while the old text slides UP and out, fading as it goes.
+    // Same vocabulary as the live feed (ease_out_quad over 320ms).
+    static char boot_cur_status[32]  = "";
+    static char boot_prev_status[32] = "";
     static unsigned long boot_status_change_ms = 0;
-    static bool boot_status_needs_clear = false;
 
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
+        strncpy(boot_prev_status, boot_cur_status, sizeof(boot_prev_status) - 1);
+        boot_prev_status[sizeof(boot_prev_status) - 1] = '\0';
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
         boot_status_change_ms = millis();
-        boot_status_needs_clear = true;
     }
 
     if (boot_cur_status[0] != '\0') {
-        const unsigned long STATUS_FADE_MS = 600;  // longer = smoother steps
-        float alpha = ease_alpha(boot_status_change_ms, STATUS_FADE_MS);
-        uint16_t status_col = lerp_col16(bg, white, alpha);
+        const unsigned long SLIDE_MS = 320;
+        const int           SLIDE_PX = 14;
+        unsigned long elapsed = millis() - boot_status_change_ms;
 
-        // Build uppercase copy
-        char upper_buf[32];
-        int slen = 0;
-        for (const char* p = boot_cur_status; *p && slen < 31; p++) {
-            upper_buf[slen++] = (char)toupper((unsigned char)*p);
-        }
-        upper_buf[slen] = '\0';
+        // Build uppercase + center geometry for both strings.
+        auto build_upper = [](const char* src, char* dst, int dst_size) -> int {
+            int n = 0;
+            for (const char* p = src; *p && n < dst_size - 1; p++) {
+                dst[n++] = (char)toupper((unsigned char)*p);
+            }
+            dst[n] = '\0';
+            return n;
+        };
 
-        int kerned_w = (slen > 0) ? (slen * 7 - 1) : 0;
-        int x0 = (DISP_W - kerned_w) / 2;
+        char  cur_buf[32];
+        int   cur_len = build_upper(boot_cur_status, cur_buf, sizeof(cur_buf));
+        int   cur_w   = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
+        int   cur_x   = (DISP_W - cur_w) / 2;
+
+        char  prev_buf[32];
+        int   prev_len = build_upper(boot_prev_status, prev_buf, sizeof(prev_buf));
+        int   prev_w   = (prev_len > 0) ? (prev_len * 7 - 1) : 0;
+        int   prev_x   = (DISP_W - prev_w) / 2;
+
+        // Allow a few extra pixels above status_y so the outgoing text can
+        // slide upward into a clipped area without being abruptly cut off.
+        const int region_y = status_y - SLIDE_PX;
+        const int region_h = status_h + SLIDE_PX;
 
         lcd.startWrite();
-        // Only flash-clear the row when the string actually changed —
-        // subsequent fade frames just overdraw the glyphs with the new color.
-        if (boot_status_needs_clear) {
-            lcd.fillRect(0, status_y, DISP_W, status_h, bg);
-            boot_status_needs_clear = false;
-        }
-        lcd.setTextColor(status_col, bg);
+        lcd.setClipRect(0, region_y, DISP_W, region_h);
+        lcd.fillRect(0, region_y, DISP_W, region_h, bg);
         lcd.setTextSize(1);
         lcd.setTextDatum(TL_DATUM);
-        for (int i = 0; i < slen; i++) {
-            char ch[2] = { upper_buf[i], '\0' };
-            lcd.drawString(ch, x0 + i * 7, status_y);
+
+        if (elapsed < SLIDE_MS && prev_len > 0) {
+            float t    = (float)elapsed / (float)SLIDE_MS;
+            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+
+            // New text: starts SLIDE_PX below status_y, lands at status_y.
+            int new_y = status_y + SLIDE_PX - (int)(ease * (float)SLIDE_PX);
+            // Old text: starts at status_y, slides UP by SLIDE_PX, fading.
+            int old_y = status_y - (int)(ease * (float)SLIDE_PX);
+
+            // Old text fades from white → bg as it slides out.
+            uint16_t old_col = lerp_col16(white, bg, ease);
+            lcd.setTextColor(old_col, bg);
+            for (int i = 0; i < prev_len; i++) {
+                char ch[2] = { prev_buf[i], '\0' };
+                lcd.drawString(ch, prev_x + i * 7, old_y);
+            }
+
+            // New text fades from bg → white as it slides in.
+            uint16_t new_col = lerp_col16(bg, white, ease);
+            lcd.setTextColor(new_col, bg);
+            for (int i = 0; i < cur_len; i++) {
+                char ch[2] = { cur_buf[i], '\0' };
+                lcd.drawString(ch, cur_x + i * 7, new_y);
+            }
+        } else {
+            // Settled state — just draw the current text in white at status_y.
+            lcd.setTextColor(white, bg);
+            for (int i = 0; i < cur_len; i++) {
+                char ch[2] = { cur_buf[i], '\0' };
+                lcd.drawString(ch, cur_x + i * 7, status_y);
+            }
         }
+
+        lcd.clearClipRect();
         lcd.endWrite();
     }
 
@@ -5314,9 +5425,20 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 // Animate the boot progress bar so the eased fill is visible.
 // Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
 static void boot_animate(int pct, const char* status, int frames = 8) {
+    // Per-frame delay varies subtly so successive boot stages don't all
+    // tick at exactly the same cadence — adds organic feel without changing
+    // total duration meaningfully. Range: ~36–48ms per frame.
+    static uint8_t delay_phase = 0;
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
-        delay(33);
+        // Slight curve: faster mid-stage, slower at start/end of each call.
+        float t = (float)i / (float)(frames - 1);
+        float curve = 1.0f - 0.4f * (1.0f - fabsf(2.0f * t - 1.0f));
+        int per_frame = (int)(36.0f + 12.0f * curve);
+        // Add a tiny phase wobble so consecutive boot_animate calls don't
+        // share identical micro-timing.
+        per_frame += (delay_phase++ & 0x03);
+        delay(per_frame);
     }
 }
 
@@ -5379,7 +5501,7 @@ void setup() {
     brightness_level = 2;
     apply_color_palette();
 
-    boot_animate(5, "serial ok");
+    boot_animate(7, "serial ok");
 
     boot_animate(10, "SD card");
 
@@ -5470,7 +5592,7 @@ void setup() {
     boot_animate(40, "GPS serial");
 
     // Sprite was already created at the top of setup().
-    boot_animate(45, "display ready");
+    boot_animate(48, "display ready");
 
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
@@ -5478,7 +5600,7 @@ void setup() {
         get_filtered_voltage();
         delay(2);
     }
-    boot_animate(55, "battery cal");
+    boot_animate(58, "battery cal");
 
     setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
@@ -5527,7 +5649,7 @@ void setup() {
         load_session_from_flash();
         load_detections_from_flash();
     }
-    boot_animate(75, "loading data");
+    boot_animate(78, "loading data");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5558,7 +5680,7 @@ void setup() {
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
-    boot_animate(92, "BLE scanner");
+    boot_animate(94, "BLE scanner");
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
@@ -5575,14 +5697,14 @@ void setup() {
     // self-subscribes via esp_task_wdt_add(NULL) inside its loop.
 
     boot_animate(100, "ready");
-    delay(400);
+    delay(900);
 
     // Gate: wait for the WiFi sniffer to confirm radios are up (~15 packets) or
     // 4 seconds, whichever comes first. Pump event queues during the wait so the
     // live feed buffer pre-populates before the scanner screen appears.
     {
         unsigned long feed_gate_start = millis();
-        const unsigned long FEED_GATE_MAX_MS = 4000;
+        const unsigned long FEED_GATE_MAX_MS = 4500;
         while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
             if (ambient_packet_count >= 15) break;
             draw_boot_screen(100, "scanning");
