@@ -246,12 +246,6 @@ static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms
 // GLOBALS & STRUCTS
 // ============================================================================
 M5Canvas spr(&M5Cardputer.Display);
-
-// Boot screen helper sprites — pre-allocated in setup() for atomic, flicker-free
-// updates. Both fall back to direct LCD draw if allocation fails.
-static M5Canvas* boot_num_spr_ptr    = nullptr;
-static M5Canvas* boot_status_spr_ptr = nullptr;
-
 SPIClass sdSPI(FSPI);  // FSPI (SPI2_HOST) — matches the bmorcelli Launcher reference;
                        // M5GFX talks to the display via the ESP-IDF SPI driver directly, so
                        // sharing FSPI with a separate Arduino SPIClass for SD is safe.
@@ -5157,9 +5151,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         boot_prev_fill_w = 0;
     }
 
-    // ── Percentage number — atomic sprite push, only on pct change ──
-    // Renders into a back-buffer sprite then pushes as a single DMA blit.
-    // Eliminates the visible "blank then text" window of direct LCD draws.
+    // ── Percentage number — direct LCD draw, only on pct change ──
+    // Batched in startWrite/endWrite to minimize the visible flicker window.
     {
         if (pct != boot_prev_pct) {
             boot_prev_pct = pct;
@@ -5169,27 +5162,15 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             int n_chars = (int)strlen(pct_str);
             const int char_w = 18;
             int total_w = n_chars * char_w;
+            int start_x = (DISP_W - total_w) / 2;
 
-            if (boot_num_spr_ptr) {
-                // Sprite is 100×24, centered horizontally at num_x
-                int local_x = (100 - total_w) / 2;
-                boot_num_spr_ptr->fillSprite(bg);
-                boot_num_spr_ptr->setTextColor(white, bg);
-                boot_num_spr_ptr->setTextSize(3);
-                boot_num_spr_ptr->setTextDatum(TL_DATUM);
-                boot_num_spr_ptr->drawString(pct_str, local_x, 0);
-                boot_num_spr_ptr->pushSprite(num_x, num_y);
-            } else {
-                // Fallback: direct LCD draw (will flicker)
-                int start_x = (DISP_W - total_w) / 2;
-                lcd.startWrite();
-                lcd.fillRect(num_x, num_y, num_w, num_h, bg);
-                lcd.setTextColor(white, bg);
-                lcd.setTextSize(3);
-                lcd.setTextDatum(TL_DATUM);
-                lcd.drawString(pct_str, start_x, num_y);
-                lcd.endWrite();
-            }
+            lcd.startWrite();
+            lcd.fillRect(num_x, num_y, num_w, num_h, bg);
+            lcd.setTextColor(white, bg);
+            lcd.setTextSize(3);
+            lcd.setTextDatum(TL_DATUM);
+            lcd.drawString(pct_str, start_x, num_y);
+            lcd.endWrite();
         }
     }
 
@@ -5221,55 +5202,27 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: feed-style slide-in via sprite ──
-    // When status changes, new text slides DOWN from above into position
-    // while the previous text slides DOWN out of frame — same vocabulary
-    // as the live activity feed.
-    static char boot_cur_status[32]  = "";
-    static char boot_prev_status[32] = "";
+    // ── Status text: direct LCD draw with color ease-in ──
+    // Fades from background color to white over STATUS_FADE_MS each time
+    // the status string changes.
+    static char boot_cur_status[32] = "";
     static unsigned long boot_status_change_ms = 0;
-
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
-        strncpy(boot_prev_status, boot_cur_status, sizeof(boot_prev_status) - 1);
-        boot_prev_status[sizeof(boot_prev_status) - 1] = '\0';
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
         boot_status_change_ms = millis();
     }
-
     if (boot_cur_status[0] != '\0') {
-        const unsigned long SLIDE_MS  = 280;
-        const int           SLIDE_PX  = 12;   // == sprite height
-        unsigned long elapsed = millis() - boot_status_change_ms;
-
-        if (boot_status_spr_ptr) {
-            boot_status_spr_ptr->fillSprite(bg);
-            boot_status_spr_ptr->setTextColor(white, bg);
-            boot_status_spr_ptr->setTextSize(1);
-            boot_status_spr_ptr->setTextDatum(TC_DATUM);
-
-            if (elapsed < SLIDE_MS) {
-                float t    = (float)elapsed / (float)SLIDE_MS;
-                float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                int new_y = -SLIDE_PX + (int)(ease * (float)SLIDE_PX);  // -12 → 0
-                int old_y = (int)(ease * (float)SLIDE_PX);              //   0 → +12
-
-                if (boot_prev_status[0] != '\0') {
-                    boot_status_spr_ptr->drawString(boot_prev_status, DISP_W / 2, old_y);
-                }
-                boot_status_spr_ptr->drawString(boot_cur_status, DISP_W / 2, new_y);
-            } else {
-                boot_status_spr_ptr->drawString(boot_cur_status, DISP_W / 2, 0);
-            }
-            boot_status_spr_ptr->pushSprite(0, status_y);
-        } else {
-            // Fallback: direct LCD draw (no slide animation)
-            lcd.fillRect(0, status_y, DISP_W, status_h, bg);
-            lcd.setTextColor(white, bg);
-            lcd.setTextSize(1);
-            lcd.setTextDatum(TC_DATUM);
-            lcd.drawString(boot_cur_status, DISP_W / 2, status_y);
-        }
+        const unsigned long STATUS_FADE_MS = 350;
+        float alpha = ease_alpha(boot_status_change_ms, STATUS_FADE_MS);
+        uint16_t status_col = lerp_col16(bg, white, alpha);
+        lcd.startWrite();
+        lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+        lcd.setTextColor(status_col, bg);
+        lcd.setTextSize(1);
+        lcd.setTextDatum(TC_DATUM);
+        lcd.drawString(boot_cur_status, DISP_W / 2, status_y);
+        lcd.endWrite();
     }
 
     lcd.setTextDatum(TL_DATUM);
@@ -5339,30 +5292,6 @@ void setup() {
     M5Cardputer.Speaker.setVolume(0);
     M5Cardputer.Display.setRotation(1);
     M5Cardputer.Display.setBrightness(255);
-
-    // Pre-allocate boot screen helper sprites BEFORE the first boot_animate.
-    // These let draw_boot_screen do atomic pushSprite updates instead of
-    // flickery fillRect+drawString sequences. Allocation failure is non-fatal —
-    // the function falls back to direct LCD draws.
-    boot_num_spr_ptr = new(std::nothrow) M5Canvas(&M5Cardputer.Display);
-    if (boot_num_spr_ptr) {
-        boot_num_spr_ptr->setColorDepth(16);
-        boot_num_spr_ptr->setPsram(false);
-        if (!boot_num_spr_ptr->createSprite(100, 24)) {
-            delete boot_num_spr_ptr;
-            boot_num_spr_ptr = nullptr;
-        }
-    }
-    boot_status_spr_ptr = new(std::nothrow) M5Canvas(&M5Cardputer.Display);
-    if (boot_status_spr_ptr) {
-        boot_status_spr_ptr->setColorDepth(16);
-        boot_status_spr_ptr->setPsram(false);
-        if (!boot_status_spr_ptr->createSprite(DISP_W, 12)) {
-            delete boot_status_spr_ptr;
-            boot_status_spr_ptr = nullptr;
-        }
-    }
-
     boot_animate(0, "starting");
     brightness_level = 2;
     apply_color_palette();
