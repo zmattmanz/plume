@@ -1588,7 +1588,7 @@ void rssi_track_expire() {
 // THREAT EQUALIZER DATA
 // ============================================================================
 #define radar_cx 58
-#define radar_cy 66
+#define radar_cy 52
 #define radar_r  42
 #define inner_r  18
 
@@ -3250,7 +3250,7 @@ static void draw_dither_overlay(int x0, int y0, int w, int h, uint16_t dark_colo
 // Soft UI click — brief tone that reads as a tactile tick.
 static void menu_click() {
     if (stealth_mode || is_muted) return;
-    M5Cardputer.Speaker.tone(1200, 4);  // soft mechanical-keyboard tick
+    M5Cardputer.Speaker.tone(660, 5);  // soft mechanical-keyboard tick
 }
 
 void draw_menu_overlay() {
@@ -3301,7 +3301,7 @@ void draw_menu_overlay() {
     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
 
     const int row_h    = 18;  // textSize 2 = 16px tall + 2px breathing room
-    const int row_gap  = 2;
+    const int row_gap  = 4;
     const int start_y  = 20;
 
     // Scrollable viewport — compute how many items fit between start_y and bottom
@@ -3328,9 +3328,7 @@ void draw_menu_overlay() {
         menu_highlight_ease_y = target_y;
         menu_highlight_init = true;
     } else {
-        float diff = target_y - menu_highlight_ease_y;
-        menu_highlight_ease_y += diff * 0.30f;
-        if (fabsf(diff) < 0.5f) menu_highlight_ease_y = target_y;
+        menu_highlight_ease_y = target_y;
     }
     int ease_y = (int)(menu_highlight_ease_y + 0.5f);
 
@@ -3350,8 +3348,7 @@ void draw_menu_overlay() {
 
     // ── Eased highlight bar ──
     {
-        uint16_t sel_bg = ea(lerp_col16(BG_COLOR, HEADER_COLOR, 0.12f));
-        spr.fillRect(0, ease_y, DISP_W, row_h, sel_bg);
+        uint16_t sel_bg = BG_COLOR;
 
         // Selection indicator: 6×2px horizontal dash, vertically centered.
         int dash_y = ease_y + row_h / 2;
@@ -3360,7 +3357,7 @@ void draw_menu_overlay() {
 
         // Redraw selected item text on highlight.
         int text_x = 16;
-        spr.setTextColor(ea(TEXT_COLOR), sel_bg);
+        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
         spr.setTextSize(2);
         spr.setCursor(text_x, ease_y + 1);
         spr.print(items[menu_selected].label);  // see row-grid path
@@ -3728,71 +3725,6 @@ void draw_scanner_screen() {
 
     spr.clearClipRect();
 
-    // ── Ambient packet counter — kerned green label + white number, with
-    // throttled roll-up animation when the displayed value updates ──
-    {
-        uint32_t pkts = ambient_packet_count;
-        char pkt_str[12];
-
-        // Roll-up animation state — throttled so the count doesn't animate
-        // every frame as new packets arrive.
-        static uint32_t pkt_display_val = 0;
-        static unsigned long pkt_anim_start = 0;
-        static unsigned long pkt_last_update = 0;
-        const unsigned long PKT_UPDATE_INTERVAL = 3000;
-        const unsigned long PKT_ROLL_MS = 300;
-
-        if (frame_ms - pkt_last_update >= PKT_UPDATE_INTERVAL || pkt_display_val == 0) {
-            if (pkts != pkt_display_val) {
-                pkt_display_val = pkts;
-                pkt_anim_start = frame_ms;
-            }
-            pkt_last_update = frame_ms;
-        }
-        snprintf(pkt_str, sizeof(pkt_str), "%lu", (unsigned long)pkt_display_val);
-
-        // Line 1: green label, kerned (6+1=7px per char) and centered.
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(1);
-        {
-            const char* label = "PACKETS SCANNED";
-            int label_w = (int)strlen(label) * 7;  // 6px char + 1px kern
-            int label_x = radar_cx - label_w / 2;
-            spr.setTextDatum(TL_DATUM);
-            spr.setCursor(label_x, DISP_H - 20);
-            kprint(spr, label);
-        }
-
-        // Line 2: white number with optional roll-up animation.
-        {
-            int num_w = (int)strlen(pkt_str) * 6;
-            int num_x = radar_cx - num_w / 2;
-            int num_y = DISP_H - 9;
-            int num_h = 8;  // textSize 1 height
-
-            spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-            spr.setTextSize(1);
-
-            if (pkt_anim_start > 0 && (frame_ms - pkt_anim_start) < PKT_ROLL_MS) {
-                float t = (float)(frame_ms - pkt_anim_start) / (float)PKT_ROLL_MS;
-                float ease = ui_ease(t);
-                int y_offset = (int)((1.0f - ease) * (float)num_h);
-                spr.setClipRect(0, num_y, divider_x, num_h);
-                spr.fillRect(0, num_y, divider_x, num_h, BG_COLOR);
-                spr.setTextDatum(TL_DATUM);
-                spr.setCursor(num_x, num_y + y_offset);
-                spr.print(pkt_str);
-                spr.clearClipRect();
-            } else {
-                spr.setTextDatum(TL_DATUM);
-                spr.setCursor(num_x, num_y);
-                spr.print(pkt_str);
-            }
-        }
-
-        spr.setTextDatum(TL_DATUM);
-    }
-
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     long sw = session_flock_wifi; long sb = session_flock_ble;
     xSemaphoreGive(dataMutex);
@@ -4008,6 +3940,71 @@ void draw_scanner_screen() {
         }
     }
 
+    // ── Ambient packet counter — kerned green label + white number, with
+    // throttled roll-up animation when the displayed value updates ──
+    {
+        const int stats_num_y = 64;  // mirrors stats block top-of-numbers
+
+        uint32_t pkts = ambient_packet_count;
+        char pkt_str[12];
+
+        // Roll-up animation state — throttled so the count doesn't animate
+        // every frame as new packets arrive.
+        static uint32_t pkt_display_val = 0;
+        static unsigned long pkt_anim_start = 0;
+        static unsigned long pkt_last_update = 0;
+        const unsigned long PKT_UPDATE_INTERVAL = 3000;
+        const unsigned long PKT_ROLL_MS = 300;
+
+        if (frame_ms - pkt_last_update >= PKT_UPDATE_INTERVAL || pkt_display_val == 0) {
+            if (pkts != pkt_display_val) {
+                pkt_display_val = pkts;
+                pkt_anim_start = frame_ms;
+            }
+            pkt_last_update = frame_ms;
+        }
+        snprintf(pkt_str, sizeof(pkt_str), "%lu", (unsigned long)pkt_display_val);
+
+        // Line 1: green label, kerned — positioned below stats block
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        {
+            const char* label = "PACKETS";
+            int label_x = right_text_x + 2;
+            spr.setTextDatum(TL_DATUM);
+            spr.setCursor(label_x, stats_num_y + 28);
+            kprint(spr, label);
+        }
+
+        // Line 2: white number with optional roll-up animation.
+        {
+            int num_x = right_text_x + 2;
+            int num_y = stats_num_y + 38;
+            int num_h = 8;  // textSize 1 height
+
+            spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
+            spr.setTextSize(1);
+
+            if (pkt_anim_start > 0 && (frame_ms - pkt_anim_start) < PKT_ROLL_MS) {
+                float t = (float)(frame_ms - pkt_anim_start) / (float)PKT_ROLL_MS;
+                float ease = ui_ease(t);
+                int y_offset = (int)((1.0f - ease) * (float)num_h);
+                spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
+                spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
+                spr.setTextDatum(TL_DATUM);
+                spr.setCursor(num_x, num_y + y_offset);
+                spr.print(pkt_str);
+                spr.clearClipRect();
+            } else {
+                spr.setTextDatum(TL_DATUM);
+                spr.setCursor(num_x, num_y);
+                spr.print(pkt_str);
+            }
+        }
+
+        spr.setTextDatum(TL_DATUM);
+    }
+
     // ── Live device feed (right column) ──
     // List is anchored at the BOTTOM of the column. Existing rows stay still.
     // When a new entry arrives, it appears at the top: fades in with slight
@@ -4015,8 +4012,8 @@ void draw_scanner_screen() {
     // bottom (oldest) row fades out as it scrolls off. This matches the
     // mental model of a notification/activity feed (Twitter, Slack, etc).
     {
-        const int feed_col_left   = right_text_x;
-        const int feed_col_right  = DISP_W - 4;
+        const int feed_col_left   = 4;
+        const int feed_col_right  = divider_x - 4;
         const int feed_row_h      = 12;
         const int max_visible     = 3;
         const int feed_top_y      = 100;
@@ -5244,6 +5241,9 @@ void draw_feed_expanded_overlay() {
     spr.setCursor(56, 5);
     kprint(spr, "/ LIVE FEED");
 
+    // Gate content rendering until fade-in is underway
+    if (expand_alpha < 0.3f) return;
+
     // Empty state
     if (local_count == 0) {
         spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
@@ -5389,7 +5389,7 @@ void draw_current_screen() {
 void transition_screen(int new_screen, int dir) {
     if (stealth_mode) { current_screen = new_screen; return; }
     if (!is_muted) {
-        M5Cardputer.Speaker.tone(800, 6);   // soft warm tap, lower pitch than menu click
+        M5Cardputer.Speaker.tone(660, 5);   // soft warm tap, matches menu click
     }
     if (new_screen == 2) {
         history_scroll_offset = 0;
@@ -5746,9 +5746,9 @@ static void boot_animate(int pct, const char* status, int frames = 30) {
     // so each boot stage takes a slightly different wall-clock time. The
     // percentage counter ends up hitting different numbers at different
     // moments — each boot reads as organic rather than mechanical.
-    frames += random(-4, 5);
-    if (frames < 12) frames = 12;
-    if (frames > 48) frames = 48;
+    frames += random(-8, 10);
+    if (frames < 8) frames = 8;
+    if (frames > 55) frames = 55;
 
     static uint8_t delay_phase = 0;
     for (int i = 0; i < frames; i++) {
@@ -5859,9 +5859,9 @@ void setup() {
         }
     }
 
-    boot_animate(7, "opening serial");
+    boot_animate(5 + random(0, 4), "opening serial");
 
-    boot_animate(10, "searching for SD");
+    boot_animate(12 + random(0, 3), "searching for SD");
 
     // Route a dedicated SPI3 instance to the Cardputer's SD pins. 15 MHz is
     // the FAT32 sweet spot — slow enough for marginal cards, fast enough for
@@ -5954,11 +5954,11 @@ void setup() {
     SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     delay(100);
     WiFi.mode(WIFI_STA); delay(50);
-    boot_animate(40, "connecting GPS");
-    boot_animate(44 + random(0, 3), "drawing interface");
+    boot_animate(38 + random(0, 4), "connecting GPS");
+    boot_animate(46 + random(0, 4), "drawing interface");
 
     // Sprite was already created at the top of setup().
-    boot_animate(52, "preparing display");
+    boot_animate(50 + random(0, 5), "preparing display");
 
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
@@ -6551,8 +6551,8 @@ void loop() {
             static unsigned long arrow_hold_start = 0;
             static unsigned long arrow_last_repeat = 0;
             static char arrow_held_key = 0;
-            const unsigned long HOLD_DELAY      = 400;  // ms before repeat starts
-            const unsigned long REPEAT_INTERVAL = 80;   // ms between repeats
+            const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
+            const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
 
             bool up_held = false, down_held = false;
             for (auto c : status.word) {
