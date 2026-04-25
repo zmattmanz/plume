@@ -5117,21 +5117,22 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     if (pct > 100) pct = 100;
 
     // Bar geometry — ~10% smaller overall (162×24 vs 180×26).
+    // Positioned for equidistant ~13px vertical gaps between all elements.
     const int bar_w = 162;
     const int bar_h = 24;
     const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = 84;
+    const int bar_y = 78;
     const int bar_r = bar_h / 2;
 
     // Number geometry — textSize 2 (matches stats/values typography stack).
     // textSize 2 = 12px char width, 16px char height.
-    const int num_y = 56;
+    const int num_y = 49;
     const int num_w = 80;
     const int num_x = (DISP_W - num_w) / 2;
     const int num_h = 16;
 
-    // Status text geometry — extra breathing room below bar.
-    const int status_y = 127;
+    // Status text geometry — moved up for tighter overall composition.
+    const int status_y = 116;
     const int status_h = 8;
 
     // ── Staggered intro — each element fades in at its own offset ──
@@ -5260,20 +5261,27 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             boot_prev_pct = pct;
         }
 
-        const unsigned long ROLL_MS = 250;
+        const unsigned long ROLL_MS = 180;  // was 250 — snappier per-digit roll
 
-        // Draw the % symbol once on first appearance. It's static — never
-        // re-rendered unless the screen was cleared (boot_first_draw path).
-        static bool pct_symbol_drawn = false;
-        if (!pct_symbol_drawn) {
-            int pct_x = start_x + (n_chars - 1) * char_w;
+        // Draw the % symbol whenever its position needs to change (which
+        // happens on first appearance and when the digit count changes:
+        // 9% → 10% shifts everything left, 99% → 100% shifts again).
+        // Tracking by position, not a one-shot flag, prevents the symbol
+        // from being orphaned when the layout reflows.
+        static int pct_symbol_x = -1;
+        int new_pct_x = start_x + (n_chars - 1) * char_w;
+        if (new_pct_x != pct_symbol_x) {
             lcd.startWrite();
+            // Clear the old position (if any) so the previous % is erased.
+            if (pct_symbol_x >= 0) {
+                lcd.fillRect(pct_symbol_x, num_y, char_w, num_h, bg);
+            }
             lcd.setTextColor(white, bg);
             lcd.setTextSize(2);
             lcd.setTextDatum(TL_DATUM);
-            lcd.drawString("%", pct_x, num_y);
+            lcd.drawString("%", new_pct_x, num_y);
             lcd.endWrite();
-            pct_symbol_drawn = true;
+            pct_symbol_x = new_pct_x;
         }
 
         // Animate each digit independently. Only redraw a digit if it's
@@ -5307,7 +5315,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         // 10px padding per side; fill_h = bar_h - 20 = 4
         int target_fill = (pct * (bar_w - 20)) / 100;
         float diff = (float)target_fill - boot_eased_fill;
-        boot_eased_fill += diff * 0.3f;
+        boot_eased_fill += diff * 0.5f;  // was 0.3f — tightens settle time
         if (fabsf(diff) < 0.5f) boot_eased_fill = (float)target_fill;
         int fill_w = (int)(boot_eased_fill + 0.5f);
         if (fill_w < 0) fill_w = 0;
@@ -5424,19 +5432,17 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
 // Animate the boot progress bar so the eased fill is visible.
 // Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
-static void boot_animate(int pct, const char* status, int frames = 8) {
-    // Per-frame delay varies subtly so successive boot stages don't all
-    // tick at exactly the same cadence — adds organic feel without changing
-    // total duration meaningfully. Range: ~36–48ms per frame.
+static void boot_animate(int pct, const char* status, int frames = 14) {
+    // More frames at shorter delays — animations get enough draw samples
+    // to look smooth without changing the total stage duration meaningfully.
+    // Per-frame delay varies subtly with a gentle curve so successive boot
+    // stages don't all tick at exactly the same cadence.
     static uint8_t delay_phase = 0;
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
-        // Slight curve: faster mid-stage, slower at start/end of each call.
         float t = (float)i / (float)(frames - 1);
         float curve = 1.0f - 0.4f * (1.0f - fabsf(2.0f * t - 1.0f));
-        int per_frame = (int)(36.0f + 12.0f * curve);
-        // Add a tiny phase wobble so consecutive boot_animate calls don't
-        // share identical micro-timing.
+        int per_frame = (int)(20.0f + 8.0f * curve);  // ~20–28ms per frame
         per_frame += (delay_phase++ & 0x03);
         delay(per_frame);
     }
