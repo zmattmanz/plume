@@ -5161,11 +5161,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
-    // Bar geometry — another 10% smaller (146×22). Padding 6 each side
-    // (was 10) so the visible infill is 10px tall instead of 4px — reads
-    // as a more substantial fill bar, not a thin sliver.
-    const int bar_w = 146;
-    const int bar_h = 22;
+    // Bar geometry — ~10% smaller again (130×20). Single 1px outline
+    // (the inset inner stroke is dropped — looks cleaner at this size).
+    const int bar_w = 130;
+    const int bar_h = 20;
     const int bar_x = (DISP_W - bar_w) / 2;
     const int bar_y = 78;
     const int bar_r = bar_h / 2;
@@ -5254,11 +5253,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             if (target > bar_w) target = bar_w;
 
             // Draw the full outline once we cross any progress threshold,
-            // but clip the rendering to the revealed portion only.
+            // but clip the rendering to the revealed portion only. Single
+            // 1px stroke — looks cleaner at the smaller bar size.
             lcd.startWrite();
             lcd.setClipRect(bar_x, bar_y, target, bar_h);
-            lcd.drawRoundRect(bar_x,     bar_y,     bar_w,     bar_h,     bar_r,     blue);
-            lcd.drawRoundRect(bar_x + 1, bar_y + 1, bar_w - 2, bar_h - 2, bar_r - 1, blue);
+            lcd.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, blue);
             lcd.clearClipRect();
             lcd.endWrite();
             boot_outline_drawn_to = target;
@@ -5384,8 +5383,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         if (fill_w < 0) fill_w = 0;
 
         const int fill_x = bar_x + 6;
-        const int fill_y = bar_y + 8;
-        const int fill_h = bar_h - 16;  // 6px tall — thinner, more refined
+        const int fill_y = bar_y + 9;
+        const int fill_h = bar_h - 18;  // 4px tall — even thinner, the most refined
 
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
@@ -5455,13 +5454,13 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         bool need_draw = animating || !boot_status_settled_drawn;
 
         // Rate-limit the redraw while animating — back-to-back fillRect+drawString
-        // on the LCD at full draw speed produces visible flicker. ~40ms minimum
-        // gap (~25 fps) is fast enough for the slide to feel smooth, slow enough
-        // for each frame's text to actually persist on screen.
+        // on the LCD at full draw speed produces visible flicker. ~60ms minimum
+        // gap (~16 fps) is slow enough for each frame's text to actually persist
+        // on screen, still smooth enough for the slide to read as motion.
         static unsigned long last_status_redraw_ms = 0;
         if (animating && need_draw) {
             unsigned long since_last = millis() - last_status_redraw_ms;
-            if (since_last < 40) need_draw = false;
+            if (since_last < 60) need_draw = false;
         }
         if (need_draw) last_status_redraw_ms = millis();
 
@@ -5511,17 +5510,17 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
 // Animate the boot progress bar so the eased fill is visible.
 // Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
-static void boot_animate(int pct, const char* status, int frames = 24) {
-    // 24 frames per stage at ~12–18ms each = ~360ms total stage time —
-    // similar overall pace as before, but ~70% more redraws inside the
-    // window, so the bar fill ease and per-digit roll feel continuous
-    // instead of stepped.
+static void boot_animate(int pct, const char* status, int frames = 36) {
+    // 36 frames per stage at ~16–24ms each ≈ ~720ms total stage time —
+    // ~50% more frames than before so the percentage counter increments
+    // smoothly and the bar fill easing curve has more samples to work with.
+    // Per-frame delay is also bumped up for a more deliberate boot pace.
     static uint8_t delay_phase = 0;
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
         float t = (float)i / (float)(frames - 1);
         float curve = 1.0f - 0.4f * (1.0f - fabsf(2.0f * t - 1.0f));
-        int per_frame = (int)(12.0f + 6.0f * curve);  // ~12–18ms per frame
+        int per_frame = (int)(16.0f + 8.0f * curve);  // ~16–24ms per frame
         per_frame += (delay_phase++ & 0x03);
         delay(per_frame);
     }
@@ -5693,9 +5692,10 @@ void setup() {
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
     boot_animate(40, "GPS serial");
+    boot_animate(44, "display ready");
 
     // Sprite was already created at the top of setup().
-    boot_animate(48, "display ready");
+    boot_animate(52, "display ready");
 
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
@@ -5705,9 +5705,11 @@ void setup() {
     }
     boot_animate(58, "battery cal");
 
-    setCpuFrequencyMhz(240); ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
+    setCpuFrequencyMhz(240);
+    boot_animate(62, "CPU 240MHz");
+    ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
-    boot_animate(65, "BLE init");
+    boot_animate(68, "BLE init");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
@@ -5763,6 +5765,7 @@ void setup() {
         strncpy(export_pass, EXPORT_WIFI_PASS, sizeof(export_pass) - 1);
         export_pass[sizeof(export_pass) - 1] = '\0';
     }
+    boot_animate(82, "credentials");
 
     lifetime_boots++;
     if (littlefs_available) {
@@ -5776,14 +5779,14 @@ void setup() {
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
-    boot_animate(85, "WiFi sniffer");
+    boot_animate(88, "WiFi sniffer");
 
     // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
-    boot_animate(94, "BLE scanner");
+    boot_animate(96, "BLE scanner");
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
