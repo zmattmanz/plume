@@ -1681,9 +1681,9 @@ void rssi_track_expire() {
 // THREAT EQUALIZER DATA
 // ============================================================================
 #define radar_cx 58
-#define radar_cy 52
-#define radar_r  42
-#define inner_r  18
+#define radar_cy 46
+#define radar_r  38
+#define inner_r  16
 
 #define NUM_RADIAL_BANDS 36
 float radial_spikes[NUM_RADIAL_BANDS] = {0};
@@ -3724,7 +3724,7 @@ void draw_scanner_screen() {
     float TILT = 0.55f;
     int rcx = radar_cx;
     int rcy = radar_cy;
-    int THICKNESS = 10;
+    int THICKNESS = 8;
 
     // Shadow below cylinder
     spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
@@ -4092,6 +4092,72 @@ void draw_scanner_screen() {
         spr.print("BLE");
     }
 
+    // ── Ambient packet counter — kerned green label + white number, with
+    // throttled roll-up animation when the displayed value updates ──
+    // Sits between the WiFi/BLE pill and the stats scorecards.
+    {
+        uint32_t pkts = ambient_packet_count;
+        char pkt_str[12];
+
+        // Roll-up animation state — throttled so the count doesn't animate
+        // every frame as new packets arrive.
+        static uint32_t pkt_display_val = 0;
+        static unsigned long pkt_anim_start = 0;
+        static unsigned long pkt_last_update = 0;
+        const unsigned long PKT_UPDATE_INTERVAL = 3000;
+        const unsigned long PKT_ROLL_MS = 300;
+
+        if (frame_ms - pkt_last_update >= PKT_UPDATE_INTERVAL || pkt_display_val == 0) {
+            if (pkts != pkt_display_val) {
+                pkt_display_val = pkts;
+                pkt_anim_start = frame_ms;
+            }
+            pkt_last_update = frame_ms;
+        }
+        snprintf(pkt_str, sizeof(pkt_str), "%lu", (unsigned long)pkt_display_val);
+
+        int pkt_label_y = badge_y + badge_h + 4;  // 4px below the WiFi/BLE pill
+
+        // Line 1: green label, kerned
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        {
+            const char* label = "PACKETS SCANNED";
+            int label_x = right_text_x + 2;
+            spr.setTextDatum(TL_DATUM);
+            spr.setCursor(label_x, pkt_label_y);
+            kprint(spr, label);
+        }
+
+        // Line 2: white number with optional roll-up animation.
+        {
+            int num_x = right_text_x + 2;
+            int num_y = pkt_label_y + 10;
+            int num_h = 8;  // textSize 1 height
+
+            spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
+            spr.setTextSize(1);
+
+            if (pkt_anim_start > 0 && (frame_ms - pkt_anim_start) < PKT_ROLL_MS) {
+                float t = (float)(frame_ms - pkt_anim_start) / (float)PKT_ROLL_MS;
+                float ease = ui_ease(t);
+                int y_offset = (int)((1.0f - ease) * (float)num_h);
+                spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
+                spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
+                spr.setTextDatum(TL_DATUM);
+                spr.setCursor(num_x, num_y + y_offset);
+                spr.print(pkt_str);
+                spr.clearClipRect();
+            } else {
+                spr.setTextDatum(TL_DATUM);
+                spr.setCursor(num_x, num_y);
+                spr.print(pkt_str);
+            }
+        }
+
+        spr.setTextDatum(TL_DATUM);
+    }
+
     // ── Stats block — labels above, symbol + number inline below ──
     // Both blocks left-aligned at a fixed column split. Symbols are
     // filled + outlined for legibility against the dark background.
@@ -4099,8 +4165,8 @@ void draw_scanner_screen() {
         long sw_local = sw;
         long sb_local = sb;
 
-        const int stats_label_y = 48;       // top of size-1 labels
-        const int stats_num_y   = 64;       // top of size-3 numbers
+        const int stats_label_y = 62;       // top of size-1 labels
+        const int stats_num_y   = 74;       // top of size-3 numbers
         const int sd_left       = right_text_x + 2;
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
@@ -4191,71 +4257,6 @@ void draw_scanner_screen() {
         }
     }
 
-    // ── Ambient packet counter — kerned green label + white number, with
-    // throttled roll-up animation when the displayed value updates ──
-    {
-        const int stats_num_y = 64;  // mirrors stats block top-of-numbers
-
-        uint32_t pkts = ambient_packet_count;
-        char pkt_str[12];
-
-        // Roll-up animation state — throttled so the count doesn't animate
-        // every frame as new packets arrive.
-        static uint32_t pkt_display_val = 0;
-        static unsigned long pkt_anim_start = 0;
-        static unsigned long pkt_last_update = 0;
-        const unsigned long PKT_UPDATE_INTERVAL = 3000;
-        const unsigned long PKT_ROLL_MS = 300;
-
-        if (frame_ms - pkt_last_update >= PKT_UPDATE_INTERVAL || pkt_display_val == 0) {
-            if (pkts != pkt_display_val) {
-                pkt_display_val = pkts;
-                pkt_anim_start = frame_ms;
-            }
-            pkt_last_update = frame_ms;
-        }
-        snprintf(pkt_str, sizeof(pkt_str), "%lu", (unsigned long)pkt_display_val);
-
-        // Line 1: green label, kerned — positioned below stats block
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(1);
-        {
-            const char* label = "PACKETS";
-            int label_x = right_text_x + 2;
-            spr.setTextDatum(TL_DATUM);
-            spr.setCursor(label_x, stats_num_y + 28);
-            kprint(spr, label);
-        }
-
-        // Line 2: white number with optional roll-up animation.
-        {
-            int num_x = right_text_x + 2;
-            int num_y = stats_num_y + 38;
-            int num_h = 8;  // textSize 1 height
-
-            spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-            spr.setTextSize(1);
-
-            if (pkt_anim_start > 0 && (frame_ms - pkt_anim_start) < PKT_ROLL_MS) {
-                float t = (float)(frame_ms - pkt_anim_start) / (float)PKT_ROLL_MS;
-                float ease = ui_ease(t);
-                int y_offset = (int)((1.0f - ease) * (float)num_h);
-                spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
-                spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
-                spr.setTextDatum(TL_DATUM);
-                spr.setCursor(num_x, num_y + y_offset);
-                spr.print(pkt_str);
-                spr.clearClipRect();
-            } else {
-                spr.setTextDatum(TL_DATUM);
-                spr.setCursor(num_x, num_y);
-                spr.print(pkt_str);
-            }
-        }
-
-        spr.setTextDatum(TL_DATUM);
-    }
-
     // ── Live device feed (right column) ──
     // List is anchored at the BOTTOM of the column. Existing rows stay still.
     // When a new entry arrives, it appears at the top: fades in with slight
@@ -4267,7 +4268,7 @@ void draw_scanner_screen() {
         const int feed_col_right  = divider_x - 4;
         const int feed_row_h      = 12;
         const int max_visible     = 3;
-        const int feed_top_y      = 100;
+        const int feed_top_y      = 104;
 
         // Throttled display snapshot — only refreshes every 2 seconds.
         // Eliminates flicker caused by rapid feed_entries mutations between frames.
@@ -4309,6 +4310,12 @@ void draw_scanner_screen() {
         FeedEntry* local_feed = display_feed;
         int local_count = display_count;
         int local_head = display_head;
+
+        // Feed section label
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(1);
+        spr.setCursor(feed_col_left, feed_top_y - 10);
+        kprint(spr, "LIVE FEED");
 
         // Always render feed — overlay covers it during startup warm-up
         spr.setClipRect(feed_col_left, feed_top_y - 1,
@@ -6012,6 +6019,16 @@ static void boot_animate(int pct, const char* status, int frames = 30) {
         int per_frame = (int)(18.0f - 6.0f * wave);        // 18ms edges, 12ms middle
         per_frame += (delay_phase++ & 0x03);
         per_frame += random(0, 8);                     // 0–7ms jitter
+
+        // Random lurches: ~15% chance of a stall (heavy load feel),
+        // ~10% chance of a burst (catching up after stall)
+        int roll = random(0, 100);
+        if (roll < 15) {
+            per_frame += random(40, 120);  // stall: 40-120ms pause
+        } else if (roll < 25) {
+            per_frame = random(2, 5);      // burst: nearly instant frame
+        }
+
         delay(per_frame);
     }
 }
