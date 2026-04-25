@@ -2140,6 +2140,7 @@ struct WifiEvent {
     uint16_t seq_num;
     char     ssid[33];
     bool     is_beacon;
+    bool     is_probe_req;   // mgmt subtype 4 — required for the wildcard-probe signature
     uint8_t  payload_snap[256];
     uint16_t payload_snap_len;
     uint16_t orig_len;
@@ -2197,6 +2198,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->channel          = (uint8_t)ppkt->rx_ctrl.channel;
     ev->seq_num          = (uint16_t)(hdr->sequence_ctrl >> 4);
     ev->is_beacon        = is_beacon;
+    ev->is_probe_req     = is_probe_req;
     ev->orig_len         = (uint16_t)ppkt->rx_ctrl.sig_len;
     ev->payload_snap_len = (ppkt->rx_ctrl.sig_len < 256) ? (uint16_t)ppkt->rx_ctrl.sig_len : 256;
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
@@ -2305,9 +2307,11 @@ void process_wifi_event_queue() {
 
         // ── Wildcard probe request from a known OUI — DeFlockJoplin signature ──
         // Flock cameras hop channels and spam Probe Requests with empty SSID.
-        // OUI match + non-beacon + empty SSID is a tight definitive signal.
+        // Strict subtype check — !is_beacon would also match probe responses,
+        // action frames, etc., which can carry empty SSIDs and trigger false
+        // positives. Only mgmt subtype 4 (Probe Request) qualifies.
         // Field-tested: 11/12 cameras caught with 2 false positives (Joplin).
-        if (!local.is_beacon && mac_score > 0 && strlen(local.ssid) == 0) {
+        if (local.is_probe_req && mac_score > 0 && strlen(local.ssid) == 0) {
             confidence = SCORE_DEFINITIVE;
             strlcat(methods, "wildcard_probe ", sizeof(methods));
         }
