@@ -2591,6 +2591,11 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     }
 };
 
+// Single shared instance — passed to setAdvertisedDeviceCallbacks at boot
+// and on every periodic NimBLE restart. Avoids the slow heap leak that
+// `new AdvertisedDeviceCallbacks()` produced every restart cycle.
+static AdvertisedDeviceCallbacks ble_cb_singleton;
+
 // ============================================================================
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
@@ -5645,9 +5650,12 @@ void setup() {
     sdMutex   = xSemaphoreCreateMutex();
 
     // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
-    // heap. Force internal DMA-capable RAM and hard-fail on allocation failure.
+    // heap. Hard-fail on allocation failure.
+    // Use PSRAM for the sprite buffer. ESP32-S3's GDMA can access PSRAM
+    // natively, and LovyanGFX handles the transfer transparently. Frees
+    // ~64KB of internal SRAM for the WiFi/BLE radio stacks.
     spr.setColorDepth(16);
-    spr.setPsram(false);
+    spr.setPsram(true);
     void* sprite_buf = spr.createSprite(DISP_W, DISP_H);
     if (!sprite_buf) {
         M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
@@ -5864,7 +5872,7 @@ void setup() {
     // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     pBLEScan = NimBLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+    pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
     last_ble_restart_ms = millis();
     boot_animate(96, "arming scanner");
@@ -6480,7 +6488,7 @@ void loop() {
         NimBLEDevice::init("");
         NimBLEDevice::setPower(ESP_PWR_LVL_P9);
         pBLEScan = NimBLEDevice::getScan();
-        pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
         pBLEScan->setInterval(97);
         pBLEScan->setWindow(97);
