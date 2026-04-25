@@ -1166,6 +1166,9 @@ void load_sd_history() {
     char buf[SD_LINE_LEN];
 
     while (f.available()) {
+        // Long log files can take many ms to scan — keep the WDT alive every
+        // ~32 lines so a big history load doesn't trip the 30s timeout.
+        if ((total & 0x1F) == 0) esp_task_wdt_reset();
         int len = 0;
         while (len < SD_LINE_LEN - 1 && f.available()) {
             char c = (char)f.read();
@@ -1365,6 +1368,7 @@ static void sd_check_hotplug() {
                 SD.end();
             }
         }
+        esp_task_wdt_reset();  // SD.begin can take several hundred ms
 
         if (mounted) {
             sd_available = true;
@@ -1373,6 +1377,7 @@ static void sd_check_hotplug() {
             if (!SD.exists("/FLOCK_FINDER/logs"))     SD.mkdir("/FLOCK_FINDER/logs");
             if (!SD.exists("/FLOCK_FINDER/captures")) SD.mkdir("/FLOCK_FINDER/captures");
             if (!SD.exists("/FLOCK_FINDER/stats"))    SD.mkdir("/FLOCK_FINDER/stats");
+            esp_task_wdt_reset();
 
             if (!SD.exists(current_log_file.c_str())) {
                 File f = SD.open(current_log_file.c_str(), FILE_WRITE);
@@ -1381,6 +1386,7 @@ static void sd_check_hotplug() {
                     f.close();
                 }
             }
+            esp_task_wdt_reset();
 
             auto ensure_pcap = [](const String& path, uint32_t link_type) {
                 bool need_hdr = !SD.exists(path.c_str());
@@ -1399,6 +1405,7 @@ static void sd_check_hotplug() {
             };
             ensure_pcap(current_pcap_file,     0x00000069);  // WiFi 802.11
             ensure_pcap(current_ble_pcap_file, 0x000000fb);  // Bluetooth LE
+            esp_task_wdt_reset();
 
             // load_sd_history & save_stats_to_sd both touch SD. We already
             // hold sdMutex, so call load_sd_history directly (it doesn't
@@ -1684,7 +1691,10 @@ void flush_sd_buffer() {
     if (log_count > 0) {
         File file = SD.open(current_log_file.c_str(), FILE_APPEND);
         if (file) {
-            for (int i = 0; i < log_count; i++) file.println(local_log_buf[i]);
+            for (int i = 0; i < log_count; i++) {
+                if ((i & 0x0F) == 0) esp_task_wdt_reset();  // every 16 lines
+                file.println(local_log_buf[i]);
+            }
             file.close();
         } else if (sd_available) {
             // Soft failure: controller may be doing GC or a brief voltage dip.
@@ -1699,6 +1709,7 @@ void flush_sd_buffer() {
         File pfile = SD.open(current_pcap_file.c_str(), FILE_APPEND);
         if (pfile) {
             for (int i = 0; i < pcap_count; i++) {
+                esp_task_wdt_reset();  // pcap writes can be large per packet
                 pcap_packet_header pph;
                 pph.ts_sec = local_pcap_buf[i].ts_sec;
                 pph.ts_usec = local_pcap_buf[i].ts_usec;
@@ -1714,6 +1725,7 @@ void flush_sd_buffer() {
         File bfile = SD.open(current_ble_pcap_file.c_str(), FILE_APPEND);
         if (bfile) {
             for (int i = 0; i < ble_pcap_count; i++) {
+                esp_task_wdt_reset();
                 pcap_packet_header pph;
                 pph.ts_sec = local_ble_pcap_buf[i].ts_sec;
                 pph.ts_usec = local_ble_pcap_buf[i].ts_usec;
@@ -5404,7 +5416,9 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     // Each pct change kicks off a new UI_ANIM_NORMAL animation from the
     // current fill width to the new target. Frame-rate independent.
     {
-        const int fill_max_w = bar_w - 12;  // matches 6px padding each side
+        // Inset by bar_h/2 on each side so the fill never enters the rounded
+        // corner radius region. Maximum reachable width is bar_w - bar_h.
+        const int fill_max_w = bar_w - bar_h;
         int target_fill = (pct * fill_max_w) / 100;
 
         static int           fill_anim_from   = 0;
@@ -5425,7 +5439,9 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int fill_w = (int)(boot_eased_fill + 0.5f);
         if (fill_w < 0) fill_w = 0;
 
-        const int fill_x = bar_x + 6;
+        // Horizontal inset matches the corner radius so the pill-shaped fill
+        // sits flush inside the rounded outline.
+        const int fill_x = bar_x + bar_h / 2;
         const int fill_y = bar_y + 10;
         int fill_h = bar_h - 20;       // 2px tall — thin accent line inside outline
         if (fill_h < 2) fill_h = 2;    // clamp to a visible minimum
@@ -5444,19 +5460,24 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: instant swap, drawn exactly once per status change ──
-    // Slide animations on this LCD flickered no matter the rate limit, so
-    // we just clear the row and paint the final text once. boot_status_settled_drawn
-    // gates the draw so subsequent frames are a no-op (zero flicker).
+    // ── Status text: 200ms fade-in via lerped color, no per-frame flicker ──
+    // Anti-flicker technique: the second arg of setTextColor is the bg color,
+    // so each drawString fills its own glyph cells in a single pass — no
+    // separate fillRect is needed during the fade. The only fillRect happens
+    // ONCE per status change to clear leftover chars from a longer previous
+    // string. Subsequent fade frames just overdraw glyphs at progressively
+    // brighter colors.
     static char boot_cur_status[32]   = "";
-    static unsigned long boot_status_change_ms = 0;
+    static unsigned long boot_status_fade_start = 0;
     static bool boot_status_settled_drawn = false;
+    static bool boot_status_needs_clear   = false;
 
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
-        boot_status_change_ms = millis();
+        boot_status_fade_start = millis();
         boot_status_settled_drawn = false;
+        boot_status_needs_clear   = true;
     }
 
     if (boot_cur_status[0] != '\0' && !boot_status_settled_drawn) {
@@ -5471,9 +5492,19 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int cur_w = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
         int cur_x = (DISP_W - cur_w) / 2;
 
+        const unsigned long FADE_MS = 200;
+        unsigned long elapsed = millis() - boot_status_fade_start;
+        float alpha = (elapsed >= FADE_MS) ? 1.0f : (float)elapsed / (float)FADE_MS;
+        uint16_t col = lerp_col16(bg, white, alpha);
+
         lcd.startWrite();
-        lcd.fillRect(0, status_y, DISP_W, status_h, bg);
-        lcd.setTextColor(white, bg);
+        // One-shot row clear on string change so leftover chars from a wider
+        // previous string don't poke out at the edges of the new text.
+        if (boot_status_needs_clear) {
+            lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+            boot_status_needs_clear = false;
+        }
+        lcd.setTextColor(col, bg);  // bg as second arg = each glyph self-clears
         lcd.setTextSize(1);
         lcd.setTextDatum(TL_DATUM);
         for (int i = 0; i < cur_len; i++) {
@@ -5482,7 +5513,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
         lcd.endWrite();
 
-        boot_status_settled_drawn = true;
+        if (alpha >= 1.0f) boot_status_settled_drawn = true;
     }
 
     lcd.setTextDatum(TL_DATUM);
@@ -5504,7 +5535,7 @@ static void boot_animate(int pct, const char* status, int frames = 36) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
         float t = (float)i / (float)(frames - 1);
         float curve = 1.0f - 0.4f * (1.0f - fabsf(2.0f * t - 1.0f));
-        int per_frame = (int)(20.0f + 10.0f * curve);  // ~20–30ms base
+        int per_frame = (int)(16.0f + 8.0f * curve);   // ~16–24ms base
         per_frame += (delay_phase++ & 0x03);
         per_frame += random(0, 8);                     // 0–7ms jitter
         delay(per_frame);
