@@ -288,6 +288,7 @@ SPIClass sdSPI(FSPI);  // FSPI (SPI2_HOST) — matches the bmorcelli Launcher re
 TaskHandle_t ScannerTaskHandle;
 TaskHandle_t GPSTaskHandle; 
 SemaphoreHandle_t dataMutex;
+SemaphoreHandle_t sdMutex;    // guards all SD card I/O — FAT is not thread-safe
 
 static uint8_t current_channel = 1;
 static unsigned long last_channel_hop = 0;
@@ -1314,15 +1315,18 @@ void save_stats_to_sd() {
     l_writes = lifetime_flash_writes;
     xSemaphoreGive(dataMutex);
 
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
     File f = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
-    if (!f) return;
-    f.printf("lifetime_wifi=%ld\n",          l_wifi);
-    f.printf("lifetime_ble=%ld\n",           l_ble);
-    f.printf("lifetime_seconds=%lu\n",       l_sec);
-    f.printf("lifetime_flock_total=%ld\n",   l_flock);
-    f.printf("lifetime_boots=%ld\n",         l_boots);
-    f.printf("lifetime_flash_writes=%ld\n",  l_writes);
-    f.close();
+    if (f) {
+        f.printf("lifetime_wifi=%ld\n",          l_wifi);
+        f.printf("lifetime_ble=%ld\n",           l_ble);
+        f.printf("lifetime_seconds=%lu\n",       l_sec);
+        f.printf("lifetime_flock_total=%ld\n",   l_flock);
+        f.printf("lifetime_boots=%ld\n",         l_boots);
+        f.printf("lifetime_flash_writes=%ld\n",  l_writes);
+        f.close();
+    }
+    xSemaphoreGive(sdMutex);
 }
 
 // ── SD hot-plug: attempt remount when absent, detect silent removal ──────────
@@ -1637,6 +1641,8 @@ void flush_sd_buffer() {
 
     if (!sd_available) return;
 
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+
     if (log_count > 0) {
         File file = SD.open(current_log_file.c_str(), FILE_APPEND);
         if (file) {
@@ -1681,6 +1687,8 @@ void flush_sd_buffer() {
             bfile.close();
         }
     }
+
+    xSemaphoreGive(sdMutex);
 
     if (log_count > 0 || pcap_count > 0 || ble_pcap_count > 0) {
         last_sd_flush = millis();
@@ -3298,7 +3306,9 @@ void handle_menu_select() {
             lifetime_flash_writes = 0;
             session_start_time = millis();
             xSemaphoreGive(dataMutex);
-            save_session_to_flash();
+            if (!persist_in_flight) {  // skip if PersistTask is already writing
+                save_session_to_flash();
+            }
             set_toast_direct("STATS CLEARED", CAUTION_COLOR);
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
@@ -5507,11 +5517,24 @@ static void boot_animate(int pct, const char* status, int frames = 24) {
 }
 
 void setup() {
-    // Kill the framework's TWDT. On IDF 5.x (Arduino-ESP32 3.x),
-    // esp_task_wdt_deinit() unsubscribes the per-core IDLE tasks internally
-    // via an ESP_ERROR_CHECK-wrapped call — so we MUST NOT pre-delete them
-    // ourselves or deinit aborts with ESP_ERR_NOT_FOUND (unsubscribe_idle).
-    esp_task_wdt_deinit();
+    // ── Safe WDT reconfiguration ────────────────────────────────────
+    // esp_task_wdt_deinit() is NOT safe on IDF 5.x — it wraps IDLE
+    // task unsubscription in ESP_ERROR_CHECK, which aborts if the
+    // tasks aren't subscribed (common after warm reboots / crash
+    // resets). esp_task_wdt_reconfigure() uses ESP_GOTO_ON_ERROR
+    // instead — safe to call in any WDT state.
+    {
+        esp_task_wdt_config_t wdt_cfg = {
+            .timeout_ms     = 30000,
+            .idle_core_mask = 0,
+            .trigger_panic  = true,
+        };
+        esp_err_t err = esp_task_wdt_reconfigure(&wdt_cfg);
+        if (err != ESP_OK) {
+            // WDT wasn't initialized at all — fresh init.
+            esp_task_wdt_init(&wdt_cfg);
+        }
+    }
 
     Serial.begin(115200);
     delay(500);
@@ -5527,20 +5550,9 @@ void setup() {
         M5Cardputer.Speaker.config(spk_cfg);
     }
 
-    // Init WDT EARLY — before any task that will call esp_task_wdt_reset().
-    // 30s timeout gives SD/LittleFS GC stalls and marginal-card retries
-    // plenty of headroom without sacrificing real hang detection.
-    {
-        esp_task_wdt_config_t wdt_cfg = {
-            .timeout_ms     = 30000,
-            .idle_core_mask = 0,
-            .trigger_panic  = true,
-        };
-        esp_task_wdt_init(&wdt_cfg);
-    }
-
     // dataMutex MUST be created before any task that uses it is spawned.
     dataMutex = xSemaphoreCreateMutex();
+    sdMutex   = xSemaphoreCreateMutex();
 
     // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
     // heap. Force internal DMA-capable RAM and hard-fail on allocation failure.
