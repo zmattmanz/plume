@@ -15,6 +15,7 @@
 #include "esp_wifi_types.h"
 #include "esp_task_wdt.h"
 #include "esp_partition.h"
+#include "esp_mac.h"
 #include "driver/gpio.h"
 #include <SPI.h>
 #include <SD.h>
@@ -46,6 +47,9 @@ void draw_menu_overlay();
 void handle_menu_select();
 void save_stats_to_sd();
 void draw_feed_expanded_overlay();
+void draw_wifi_config_overlay();
+static void save_wifi_credentials();
+static void load_wifi_credentials();
 void draw_gps_screen();
 void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
@@ -77,6 +81,15 @@ static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
 bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
+
+// ── WiFi Config overlay state ──
+static bool wifi_config_open = false;
+static int  wifi_config_field = 0;        // 0 = SSID, 1 = Password, 2 = Save, 3 = Clear
+static bool wifi_config_editing = false;   // true = text input mode active
+static char wifi_config_ssid_buf[33] = "";
+static char wifi_config_pass_buf[65] = "";
+static int  wifi_config_cursor = 0;        // cursor position in active field
+static unsigned long wifi_config_open_ms = 0;
 
 // ── Menu overlay state ──
 static bool show_menu = false;
@@ -1497,6 +1510,86 @@ void load_session_from_flash() {
     f.close();
 }
 
+// ── Simple XOR cipher using the ESP32 eFuse MAC as key ──
+// Not cryptographically strong, but prevents casual reading of
+// credentials from a removed SD card or flash dump. The MAC is
+// unique per physical device and lives in one-time-programmable
+// eFuse — not in any user-accessible storage.
+static void xor_cipher(char* data, size_t len) {
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    uint8_t key[16];
+    for (int i = 0; i < 16; i++) {
+        key[i] = mac[i % 6] ^ (uint8_t)(i * 0x5A + 0x37);
+    }
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= key[i % 16];
+    }
+}
+
+#define WIFI_CRED_FILE "/wifi_cred.dat"
+
+static void save_wifi_credentials() {
+    if (!littlefs_available) return;
+    char enc_ssid[33], enc_pass[65];
+    strncpy(enc_ssid, export_ssid, sizeof(enc_ssid) - 1);
+    enc_ssid[sizeof(enc_ssid) - 1] = '\0';
+    strncpy(enc_pass, export_pass, sizeof(enc_pass) - 1);
+    enc_pass[sizeof(enc_pass) - 1] = '\0';
+
+    size_t ssid_len = strlen(enc_ssid);
+    size_t pass_len = strlen(enc_pass);
+
+    xor_cipher(enc_ssid, ssid_len);
+    xor_cipher(enc_pass, pass_len);
+
+    File f = LittleFS.open(WIFI_CRED_FILE, "w");
+    if (!f) return;
+    f.write((uint8_t)ssid_len);
+    f.write((uint8_t)pass_len);
+    f.write((const uint8_t*)enc_ssid, ssid_len);
+    f.write((const uint8_t*)enc_pass, pass_len);
+    f.close();
+}
+
+static void load_wifi_credentials() {
+    if (!littlefs_available) return;
+    if (!LittleFS.exists(WIFI_CRED_FILE)) return;
+    File f = LittleFS.open(WIFI_CRED_FILE, "r");
+    if (!f) return;
+
+    int ssid_len_raw = f.read();
+    int pass_len_raw = f.read();
+    if (ssid_len_raw < 0 || pass_len_raw < 0) { f.close(); return; }
+    uint8_t ssid_len = (uint8_t)ssid_len_raw;
+    uint8_t pass_len = (uint8_t)pass_len_raw;
+
+    if (ssid_len > 32 || pass_len > 64) { f.close(); return; }
+
+    char enc_ssid[33] = {0}, enc_pass[65] = {0};
+    f.readBytes(enc_ssid, ssid_len);
+    f.readBytes(enc_pass, pass_len);
+    f.close();
+
+    xor_cipher(enc_ssid, ssid_len);
+    xor_cipher(enc_pass, pass_len);
+
+    // Validate: if decrypted result contains non-printable chars,
+    // the file is corrupt or from a different device — discard.
+    bool valid = true;
+    for (int i = 0; i < (int)ssid_len; i++) {
+        if ((unsigned char)enc_ssid[i] < 32 || (unsigned char)enc_ssid[i] > 126) {
+            valid = false; break;
+        }
+    }
+    if (valid) {
+        strncpy(export_ssid, enc_ssid, sizeof(export_ssid) - 1);
+        export_ssid[sizeof(export_ssid) - 1] = '\0';
+        strncpy(export_pass, enc_pass, sizeof(export_pass) - 1);
+        export_pass[sizeof(export_pass) - 1] = '\0';
+    }
+}
+
 void rssi_track_update(const char* mac, int rssi) {
     unsigned long now = millis();
     xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -2897,6 +2990,19 @@ void draw_header_spr(int screen_num) {
         }
     }
 
+    // WiFi connected indicator — small 10px arcs + dot, green when active
+    if (export_mode_active) {
+        int ix = icon_right - 12;
+        uint16_t wc = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.9f);
+        spr.drawPixel(ix + 5, icon_y + 9, wc);
+        spr.drawPixel(ix + 5, icon_y + 8, wc);
+        spr.drawLine(ix + 3, icon_y + 6, ix + 5, icon_y + 4, wc);
+        spr.drawLine(ix + 5, icon_y + 4, ix + 7, icon_y + 6, wc);
+        spr.drawLine(ix + 1, icon_y + 5, ix + 5, icon_y + 1, wc);
+        spr.drawLine(ix + 5, icon_y + 1, ix + 9, icon_y + 5, wc);
+        icon_right -= 16;
+    }
+
     // Muted icon — larger 10×10 speaker with slash
     if (should_draw(ease_muted)) {
         int ix = icon_right - 12;
@@ -3383,6 +3489,148 @@ void draw_menu_overlay() {
     // ENTER selects, DEL closes.
 }
 
+void draw_wifi_config_overlay() {
+    float alpha = ease_alpha(wifi_config_open_ms, 150);
+    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+
+    // Solid backdrop
+    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
+
+    // Overwrite header with "WIFI CONFIG"
+    spr.fillRect(0, 0, 100, 18, BG_COLOR);
+    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+    spr.setTextSize(1.2);
+    spr.setCursor(4, 5);
+    kprint(spr, "WIFI CONFIG");
+
+    // Card background
+    int cx = 4, cy = 22, cw = DISP_W - 8, ch = DISP_H - 26;
+    spr.fillRoundRect(cx, cy, cw, ch, 4, ea(CARD_COLOR));
+    spr.drawRoundRect(cx, cy, cw, ch, 4, ea(CARD_BORDER));
+
+    unsigned long now_ms = millis();
+    bool cursor_visible = ((now_ms / 500) % 2 == 0);
+
+    // ── SSID field ──
+    int field_y = cy + 6;
+    bool ssid_selected = (wifi_config_field == 0);
+    bool ssid_editing = ssid_selected && wifi_config_editing;
+
+    spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
+    spr.setTextSize(1);
+    spr.setCursor(cx + 6, field_y);
+    kprint(spr, "SSID");
+
+    int input_y = field_y + 12;
+    uint16_t field_bg = ssid_selected ? ea(lerp_col16(CARD_COLOR, HEADER_COLOR, 0.08f)) : ea(CARD_COLOR);
+    uint16_t field_border = ssid_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
+    spr.fillRect(cx + 6, input_y, cw - 12, 16, field_bg);
+    spr.drawRect(cx + 6, input_y, cw - 12, 16, field_border);
+
+    const char* ssid_display = (wifi_config_editing && ssid_selected)
+        ? wifi_config_ssid_buf
+        : export_ssid;
+    bool ssid_empty = (strlen(ssid_display) == 0);
+
+    spr.setTextColor(ssid_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
+    spr.setTextSize(1);
+    spr.setCursor(cx + 9, input_y + 4);
+
+    if (ssid_empty && !ssid_editing) {
+        spr.print("(not set)");
+    } else {
+        char display[34];
+        strncpy(display, ssid_display, 32);
+        display[32] = '\0';
+        spr.print(display);
+        if (ssid_editing && cursor_visible) {
+            int cursor_x = cx + 9 + wifi_config_cursor * 6;
+            spr.drawFastVLine(cursor_x, input_y + 3, 10, ea(HEADER_COLOR));
+        }
+    }
+
+    // ── Password field ──
+    field_y = input_y + 22;
+    bool pass_selected = (wifi_config_field == 1);
+    bool pass_editing = pass_selected && wifi_config_editing;
+
+    spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
+    spr.setTextSize(1);
+    spr.setCursor(cx + 6, field_y);
+    kprint(spr, "PASSWORD");
+
+    input_y = field_y + 12;
+    field_bg = pass_selected ? ea(lerp_col16(CARD_COLOR, HEADER_COLOR, 0.08f)) : ea(CARD_COLOR);
+    field_border = pass_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
+    spr.fillRect(cx + 6, input_y, cw - 12, 16, field_bg);
+    spr.drawRect(cx + 6, input_y, cw - 12, 16, field_border);
+
+    const char* pass_src = (wifi_config_editing && pass_selected)
+        ? wifi_config_pass_buf
+        : export_pass;
+    bool pass_empty = (strlen(pass_src) == 0);
+
+    spr.setTextColor(pass_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
+    spr.setTextSize(1);
+    spr.setCursor(cx + 9, input_y + 4);
+
+    if (pass_empty && !pass_editing) {
+        spr.print("(not set)");
+    } else {
+        if (pass_editing) {
+            char display[66];
+            strncpy(display, pass_src, 64);
+            display[64] = '\0';
+            spr.print(display);
+        } else {
+            int plen = strlen(pass_src);
+            for (int i = 0; i < plen && i < 32; i++) spr.print("*");
+        }
+        if (pass_editing && cursor_visible) {
+            int cursor_x = cx + 9 + wifi_config_cursor * 6;
+            spr.drawFastVLine(cursor_x, input_y + 3, 10, ea(HEADER_COLOR));
+        }
+    }
+
+    // ── Action buttons: Save / Clear ──
+    int btn_y = input_y + 24;
+    int btn_w = 70;
+    int btn_h = 16;
+    int btn_gap = 10;
+    int btn_x1 = cx + (cw - btn_w * 2 - btn_gap) / 2;
+    int btn_x2 = btn_x1 + btn_w + btn_gap;
+
+    bool save_sel = (wifi_config_field == 2);
+    uint16_t save_bg = save_sel ? ea(lerp_col16(CARD_COLOR, ACCENT_COLOR, 0.2f)) : ea(CARD_COLOR);
+    uint16_t save_border = save_sel ? ea(ACCENT_COLOR) : ea(CARD_BORDER);
+    spr.fillRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_bg);
+    spr.drawRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_border);
+    spr.setTextColor(save_sel ? ea(ACCENT_COLOR) : ea(TEXT_COLOR), save_bg);
+    spr.setTextSize(1);
+    spr.setCursor(btn_x1 + 18, btn_y + 4);
+    spr.print("SAVE");
+
+    bool clear_sel = (wifi_config_field == 3);
+    uint16_t clear_bg = clear_sel ? ea(lerp_col16(CARD_COLOR, CAUTION_COLOR, 0.2f)) : ea(CARD_COLOR);
+    uint16_t clear_border = clear_sel ? ea(CAUTION_COLOR) : ea(CARD_BORDER);
+    spr.fillRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_bg);
+    spr.drawRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_border);
+    spr.setTextColor(clear_sel ? ea(CAUTION_COLOR) : ea(TEXT_COLOR), clear_bg);
+    spr.setTextSize(1);
+    spr.setCursor(btn_x2 + 14, btn_y + 4);
+    spr.print("CLEAR");
+
+    // Footer hint
+    spr.setTextColor(ea(DIM_COLOR), ea(CARD_COLOR));
+    spr.setTextSize(1);
+    spr.setCursor(cx + 6, cy + ch - 11);
+    if (wifi_config_editing) {
+        spr.print("type to edit  ENTER done  DEL bksp");
+    } else {
+        spr.print("ENTER edit/select  DEL close");
+    }
+}
+
 void handle_menu_select() {
     switch (menu_selected) {
         case 0: case 1: case 2: case 3: case 4: {
@@ -3411,13 +3659,16 @@ void handle_menu_select() {
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
         case 8:
-            if (strlen(export_ssid) > 0) {
-                char info[32];
-                snprintf(info, sizeof(info), "SSID: %.20s", export_ssid);
-                set_toast_direct(info, HEADER_COLOR);
-            } else {
-                set_toast_direct("SET IN SOURCE CODE", CAUTION_COLOR);
-            }
+            show_menu = false;
+            wifi_config_open = true;
+            wifi_config_open_ms = millis();
+            wifi_config_field = 0;
+            wifi_config_editing = false;
+            strncpy(wifi_config_ssid_buf, export_ssid, sizeof(wifi_config_ssid_buf) - 1);
+            wifi_config_ssid_buf[sizeof(wifi_config_ssid_buf) - 1] = '\0';
+            strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
+            wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
+            wifi_config_cursor = 0;
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
         case 9:
@@ -5383,6 +5634,7 @@ void draw_current_screen() {
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
     if (show_menu) draw_menu_overlay();
+    if (wifi_config_open) draw_wifi_config_overlay();
     draw_toast_spr();
 }
 
@@ -6015,6 +6267,7 @@ void setup() {
 
     if (littlefs_available) {
         load_session_from_flash();
+        load_wifi_credentials();
         load_detections_from_flash();
     }
     Serial.printf("[BOOT] Free heap after LittleFS: %u\n",
@@ -6265,6 +6518,99 @@ void loop() {
         }
 
         for (auto c : status.word) {
+
+            // ── WiFi Config input intercept ──
+            // When the wifi config overlay is open, all keys are routed here.
+            // In editing mode, printable chars feed the active text buffer.
+            // In navigation mode, ; / . move between fields and ENTER acts.
+            if (wifi_config_open) {
+                if (wifi_config_editing) {
+                    char* buf;
+                    int max_len;
+                    if (wifi_config_field == 0) {
+                        buf = wifi_config_ssid_buf;
+                        max_len = 32;
+                    } else {
+                        buf = wifi_config_pass_buf;
+                        max_len = 64;
+                    }
+                    int cur_len = strlen(buf);
+
+                    if (c == '\n' || c == '\r') {
+                        // Confirm edit — exit text input mode
+                        wifi_config_editing = false;
+                        M5Cardputer.Speaker.tone(660, 5);
+                    } else if (c == 0x1B) {
+                        // ESC — cancel edit, revert to stored value
+                        if (wifi_config_field == 0) {
+                            strncpy(wifi_config_ssid_buf, export_ssid, sizeof(wifi_config_ssid_buf) - 1);
+                            wifi_config_ssid_buf[sizeof(wifi_config_ssid_buf) - 1] = '\0';
+                        } else {
+                            strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
+                            wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
+                        }
+                        wifi_config_editing = false;
+                        wifi_config_cursor = 0;
+                    } else if (c >= 32 && c <= 126 && cur_len < max_len) {
+                        // Insert at cursor
+                        for (int i = cur_len + 1; i > wifi_config_cursor; i--) {
+                            buf[i] = buf[i - 1];
+                        }
+                        buf[wifi_config_cursor] = c;
+                        wifi_config_cursor++;
+                    }
+                    // DEL handled in status.del block below
+                } else {
+                    // Navigation mode — arrow keys move between fields
+                    if (c == ';') {
+                        wifi_config_field--;
+                        if (wifi_config_field < 0) wifi_config_field = 0;
+                        M5Cardputer.Speaker.tone(660, 5);
+                    } else if (c == '.') {
+                        wifi_config_field++;
+                        if (wifi_config_field > 3) wifi_config_field = 3;
+                        M5Cardputer.Speaker.tone(660, 5);
+                    } else if (c == '\n' || c == '\r') {
+                        if (wifi_config_field == 0 || wifi_config_field == 1) {
+                            wifi_config_editing = true;
+                            if (wifi_config_field == 0) {
+                                strncpy(wifi_config_ssid_buf, export_ssid, sizeof(wifi_config_ssid_buf) - 1);
+                                wifi_config_ssid_buf[sizeof(wifi_config_ssid_buf) - 1] = '\0';
+                                wifi_config_cursor = strlen(wifi_config_ssid_buf);
+                            } else {
+                                strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
+                                wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
+                                wifi_config_cursor = strlen(wifi_config_pass_buf);
+                            }
+                            M5Cardputer.Speaker.tone(660, 5);
+                        } else if (wifi_config_field == 2) {
+                            // Save
+                            strncpy(export_ssid, wifi_config_ssid_buf, sizeof(export_ssid) - 1);
+                            export_ssid[sizeof(export_ssid) - 1] = '\0';
+                            strncpy(export_pass, wifi_config_pass_buf, sizeof(export_pass) - 1);
+                            export_pass[sizeof(export_pass) - 1] = '\0';
+                            save_wifi_credentials();
+                            if (!persist_in_flight) schedule_persist();
+                            set_toast_direct("WIFI SAVED", ACCENT_COLOR);
+                            wifi_config_open = false;
+                        } else if (wifi_config_field == 3) {
+                            // Clear
+                            export_ssid[0] = '\0';
+                            export_pass[0] = '\0';
+                            wifi_config_ssid_buf[0] = '\0';
+                            wifi_config_pass_buf[0] = '\0';
+                            save_wifi_credentials();
+                            if (!persist_in_flight) schedule_persist();
+                            set_toast_direct("WIFI CLEARED", CAUTION_COLOR);
+                            wifi_config_open = false;
+                        }
+                    } else if (c == 0x1B) {
+                        wifi_config_open = false;
+                    }
+                }
+                draw_current_screen(); spr.pushSprite(0, 0);
+                continue;  // swallow all keys while wifi config is open
+            }
 
             // ── Menu input intercept — when menu is open, swallow nav keys ──
             // ; is up-arrow, . is down-arrow on the M5Cardputer keyboard.
@@ -6625,7 +6971,22 @@ void loop() {
 
         if (status.del && !stealth_mode) {
             // DEL = universal "close / go back" — priority order:
-            if (show_feed_expanded) {
+            if (wifi_config_open) {
+                if (wifi_config_editing) {
+                    // Backspace within text input
+                    char* buf = (wifi_config_field == 0) ? wifi_config_ssid_buf : wifi_config_pass_buf;
+                    if (wifi_config_cursor > 0) {
+                        int cur_len = strlen(buf);
+                        for (int i = wifi_config_cursor - 1; i < cur_len; i++) {
+                            buf[i] = buf[i + 1];
+                        }
+                        wifi_config_cursor--;
+                    }
+                } else {
+                    wifi_config_open = false;
+                }
+                draw_current_screen(); spr.pushSprite(0, 0);
+            } else if (show_feed_expanded) {
                 show_feed_expanded = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (show_help_overlay) {
