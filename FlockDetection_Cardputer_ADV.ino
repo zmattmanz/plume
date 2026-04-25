@@ -612,7 +612,7 @@ void LedTask(void* pv) {
         } else {
             led_detect_active = false;
             if (led_breathing_on && !stealth_mode && brightness_level >= 2) {
-                float breath = (sinf((float)now / 1500.0f) + 1.0f) * 0.5f;
+                float breath = (sinf((float)now / 600.0f) + 1.0f) * 0.5f;
                 float dim    = 0.15f + breath * 0.35f;
                 r = (uint8_t)((float)led_r * dim);
                 g = (uint8_t)((float)led_g * dim);
