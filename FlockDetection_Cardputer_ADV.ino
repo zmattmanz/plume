@@ -5637,6 +5637,14 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
+    // PSRAM availability + heap snapshot. Total PSRAM = 0 means PSRAM
+    // isn't enabled in the board config; setPsram(true) will silently fall
+    // through to internal RAM and the sprite-fallback path will kick in.
+    Serial.printf("[MEM] Total PSRAM: %u, Free PSRAM: %u, Free internal: %u\n",
+                  (unsigned)ESP.getPsramSize(),
+                  (unsigned)ESP.getFreePsram(),
+                  (unsigned)esp_get_free_heap_size());
+
     // Shrink speaker DMA buffers so I2S allocation doesn't eat the DMA pool.
     {
         auto spk_cfg = M5Cardputer.Speaker.config();
@@ -5650,19 +5658,26 @@ void setup() {
     sdMutex   = xSemaphoreCreateMutex();
 
     // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
-    // heap. Hard-fail on allocation failure.
-    // Use PSRAM for the sprite buffer. ESP32-S3's GDMA can access PSRAM
-    // natively, and LovyanGFX handles the transfer transparently. Frees
-    // ~64KB of internal SRAM for the WiFi/BLE radio stacks.
+    // heap. Try PSRAM first (frees ~64KB of internal SRAM for the WiFi/BLE
+    // radio stacks); fall back to internal SRAM on boards without PSRAM
+    // configured. Hard-fail on total allocation failure.
     spr.setColorDepth(16);
     spr.setPsram(true);
     void* sprite_buf = spr.createSprite(DISP_W, DISP_H);
+    if (!sprite_buf) {
+        Serial.println("[GFX] PSRAM sprite failed, falling back to internal");
+        spr.setPsram(false);
+        sprite_buf = spr.createSprite(DISP_W, DISP_H);
+    }
     if (!sprite_buf) {
         M5Cardputer.Display.fillScreen(lgfx::color565(255, 0, 0));
         M5Cardputer.Display.setCursor(10, 10);
         M5Cardputer.Display.print("SPRITE ALLOC FAIL");
         while (1) delay(1000);
     }
+    Serial.printf("[GFX] Sprite allocated in %s, free heap: %u\n",
+                  spr.psram() ? "PSRAM" : "internal",
+                  (unsigned)esp_get_free_heap_size());
 
     // LED: start dark. The breathing task is spawned at the very end of setup()
     // to avoid RMT/radio contention during WiFi + BLE init on core 0.
@@ -5729,6 +5744,8 @@ void setup() {
         sd_available = true;
         Serial.printf("[SD] OK! Type=%d Size=%lluMB\n",
                       SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
+        Serial.printf("[BOOT] Free heap after SD init: %u\n",
+                      (unsigned)esp_get_free_heap_size());
 
         if (!SD.exists("/FLOCK_FINDER"))           SD.mkdir("/FLOCK_FINDER");
         if (!SD.exists("/FLOCK_FINDER/logs"))      SD.mkdir("/FLOCK_FINDER/logs");
@@ -5842,6 +5859,8 @@ void setup() {
         load_session_from_flash();
         load_detections_from_flash();
     }
+    Serial.printf("[BOOT] Free heap after LittleFS: %u\n",
+                  (unsigned)esp_get_free_heap_size());
     boot_animate(78 + random(0, 3), "loading session");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
@@ -5867,10 +5886,14 @@ void setup() {
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
+    Serial.printf("[BOOT] Free heap after WiFi promisc: %u\n",
+                  (unsigned)esp_get_free_heap_size());
     boot_animate(88, "starting sniffer");
 
     // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    Serial.printf("[BOOT] Free heap after NimBLE init: %u\n",
+                  (unsigned)esp_get_free_heap_size());
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
