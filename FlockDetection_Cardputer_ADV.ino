@@ -1315,7 +1315,12 @@ void save_stats_to_sd() {
     l_writes = lifetime_flash_writes;
     xSemaphoreGive(dataMutex);
 
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    // Timed take — if the lock is held for too long, skip this cycle. The
+    // next persist tick will retry. Keeps PersistTask's WDT alive even when
+    // the main loop is mid-flush.
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return;
+    }
     File f = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
     if (f) {
         f.printf("lifetime_wifi=%ld\n",          l_wifi);
@@ -1340,6 +1345,14 @@ static void sd_check_hotplug() {
     if (now - last_sd_check_ms < SD_CHECK_INTERVAL_MS) return;
     last_sd_check_ms = now;
 
+    // Timed take so the main loop's WDT can still reset if PersistTask is
+    // mid-write. If we can't grab the mutex within 5s, bail — the next
+    // 5-second poll will retry. Single exit point below ensures the give
+    // always pairs with this take.
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return;
+    }
+
     if (!sd_available) {
         // Remount via the same dedicated sdSPI bus setup() uses. No-arg
         // SD.begin or the default global SPI route to wrong pins on the
@@ -1353,51 +1366,69 @@ static void sd_check_hotplug() {
             }
         }
 
-        if (!mounted) return;
+        if (mounted) {
+            sd_available = true;
 
-        sd_available = true;
+            if (!SD.exists("/FLOCK_FINDER"))          SD.mkdir("/FLOCK_FINDER");
+            if (!SD.exists("/FLOCK_FINDER/logs"))     SD.mkdir("/FLOCK_FINDER/logs");
+            if (!SD.exists("/FLOCK_FINDER/captures")) SD.mkdir("/FLOCK_FINDER/captures");
+            if (!SD.exists("/FLOCK_FINDER/stats"))    SD.mkdir("/FLOCK_FINDER/stats");
 
-        if (!SD.exists("/FLOCK_FINDER"))          SD.mkdir("/FLOCK_FINDER");
-        if (!SD.exists("/FLOCK_FINDER/logs"))     SD.mkdir("/FLOCK_FINDER/logs");
-        if (!SD.exists("/FLOCK_FINDER/captures")) SD.mkdir("/FLOCK_FINDER/captures");
-        if (!SD.exists("/FLOCK_FINDER/stats"))    SD.mkdir("/FLOCK_FINDER/stats");
-
-        if (!SD.exists(current_log_file.c_str())) {
-            File f = SD.open(current_log_file.c_str(), FILE_WRITE);
-            if (f) {
-                f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM");
-                f.close();
-            }
-        }
-
-        auto ensure_pcap = [](const String& path, uint32_t link_type) {
-            bool need_hdr = !SD.exists(path.c_str());
-            if (!need_hdr) {
-                File pcheck = SD.open(path.c_str(), FILE_READ);
-                if (pcheck) { need_hdr = (pcheck.size() < 24); pcheck.close(); }
-            }
-            if (need_hdr) {
-                File pf = SD.open(path.c_str(), FILE_WRITE);
-                if (pf) {
-                    uint32_t hdr[6] = {0xa1b2c3d4, 0x00040002, 0, 0, 0x0000ffff, link_type};
-                    pf.write((const uint8_t*)hdr, 24);
-                    pf.close();
+            if (!SD.exists(current_log_file.c_str())) {
+                File f = SD.open(current_log_file.c_str(), FILE_WRITE);
+                if (f) {
+                    f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM");
+                    f.close();
                 }
             }
-        };
-        ensure_pcap(current_pcap_file,     0x00000069);  // WiFi 802.11
-        ensure_pcap(current_ble_pcap_file, 0x000000fb);  // Bluetooth LE
 
-        load_sd_history();
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        sd_hist_dirty = false;
-        xSemaphoreGive(dataMutex);
+            auto ensure_pcap = [](const String& path, uint32_t link_type) {
+                bool need_hdr = !SD.exists(path.c_str());
+                if (!need_hdr) {
+                    File pcheck = SD.open(path.c_str(), FILE_READ);
+                    if (pcheck) { need_hdr = (pcheck.size() < 24); pcheck.close(); }
+                }
+                if (need_hdr) {
+                    File pf = SD.open(path.c_str(), FILE_WRITE);
+                    if (pf) {
+                        uint32_t hdr[6] = {0xa1b2c3d4, 0x00040002, 0, 0, 0x0000ffff, link_type};
+                        pf.write((const uint8_t*)hdr, 24);
+                        pf.close();
+                    }
+                }
+            };
+            ensure_pcap(current_pcap_file,     0x00000069);  // WiFi 802.11
+            ensure_pcap(current_ble_pcap_file, 0x000000fb);  // Bluetooth LE
 
-        save_stats_to_sd();
+            // load_sd_history & save_stats_to_sd both touch SD. We already
+            // hold sdMutex, so call load_sd_history directly (it doesn't
+            // self-lock) and inline the stats write rather than recursing
+            // into save_stats_to_sd which would try to take the mutex again.
+            load_sd_history();
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            sd_hist_dirty = false;
+            long          l_wifi   = lifetime_wifi;
+            long          l_ble    = lifetime_ble;
+            unsigned long l_sec    = lifetime_seconds;
+            long          l_flock  = lifetime_flock_total;
+            long          l_boots  = lifetime_boots;
+            long          l_writes = lifetime_flash_writes;
+            xSemaphoreGive(dataMutex);
 
-        set_toast_direct("SD CARD MOUNTED", ACCENT_COLOR);
-        Serial.println("[SD] Hot-plug mount succeeded");
+            File sf = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
+            if (sf) {
+                sf.printf("lifetime_wifi=%ld\n",          l_wifi);
+                sf.printf("lifetime_ble=%ld\n",           l_ble);
+                sf.printf("lifetime_seconds=%lu\n",       l_sec);
+                sf.printf("lifetime_flock_total=%ld\n",   l_flock);
+                sf.printf("lifetime_boots=%ld\n",         l_boots);
+                sf.printf("lifetime_flash_writes=%ld\n",  l_writes);
+                sf.close();
+            }
 
+            set_toast_direct("SD CARD MOUNTED", ACCENT_COLOR);
+            Serial.println("[SD] Hot-plug mount succeeded");
+        }
     } else {
         // Card was present — probe a known file as a cheap presence check
         File probe = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_READ);
@@ -1411,6 +1442,8 @@ static void sd_check_hotplug() {
     }
 
     sd_was_available = sd_available;
+
+    xSemaphoreGive(sdMutex);
 }
 
 void load_session_from_flash() {
@@ -1641,7 +1674,12 @@ void flush_sd_buffer() {
 
     if (!sd_available) return;
 
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    // Timed take — if PersistTask or hot-plug holds the SD mutex too long,
+    // drop this flush cycle. The same buffers will retry on the next
+    // FLUSH_INTERVAL_MS tick. Keeps the main loop's WDT alive.
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return;
+    }
 
     if (log_count > 0) {
         File file = SD.open(current_log_file.c_str(), FILE_APPEND);
@@ -5122,8 +5160,13 @@ void transition_screen(int new_screen, int dir) {
         history_scroll_offset = 0;
         history_selected_idx = 0;
         hist_detail_open = false;
-        load_sd_history();
-        sd_hist_dirty = false;
+        // Timed take so a stuck PersistTask can't freeze the UI on screen
+        // change. Stale history is acceptable — next detection re-marks it dirty.
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            load_sd_history();
+            xSemaphoreGive(sdMutex);
+            sd_hist_dirty = false;
+        }
     }
     if (new_screen == 4) {
         device_info_scroll = 0;
@@ -6296,7 +6339,15 @@ void loop() {
             }
             xSemaphoreGive(dataMutex);
         }
-        if (was_dirty) load_sd_history();
+        if (was_dirty) {
+            // Same timed-take pattern — skip the load if PersistTask is busy;
+            // sd_hist_dirty has already been cleared, so this iteration just
+            // shows the previous snapshot until the next dirty cycle.
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                load_sd_history();
+                xSemaphoreGive(sdMutex);
+            }
+        }
     }
 
     if (locator_announce_pending) {
