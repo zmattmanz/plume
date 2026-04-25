@@ -3164,7 +3164,7 @@ void draw_help_overlay() {
     static const HelpKey locator_keys[] = {
         {"l", "Start/stop"},
         {"t", "Cycle target"},
-        {"g", "N-mode"},
+        {"n", "N-mode"},
     };
     static const HelpKey detections_keys[] = {
         {"^/v", "Navigate"},
@@ -3345,7 +3345,7 @@ void draw_menu_overlay() {
         spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
         spr.setTextSize(2);
         spr.setCursor(text_x, y + 1);  // center 16px text in 18px row
-        kprint(spr, items[i].label);
+        spr.print(items[i].label);  // no kerning at size 2 — keeps glyphs crisp
     }
 
     // ── Eased highlight bar ──
@@ -3363,7 +3363,7 @@ void draw_menu_overlay() {
         spr.setTextColor(ea(TEXT_COLOR), sel_bg);
         spr.setTextSize(2);
         spr.setCursor(text_x, ease_y + 1);
-        kprint(spr, items[menu_selected].label);
+        spr.print(items[menu_selected].label);  // see row-grid path
     }
 
     // ── Scrollbar — only show if list exceeds viewport ──
@@ -4197,9 +4197,6 @@ void draw_locator_screen() {
     xSemaphoreGive(dataMutex);
 
     bool demo = !active;
-    const char* demo_name = "Pixel-6A-7F";
-    const int   demo_rssi = -67;
-    const float demo_dist = 43.0f;
 
     spr.fillSprite(BG_COLOR); draw_header_spr(1);
 
@@ -4252,10 +4249,12 @@ void draw_locator_screen() {
         float d = tgt - ease_arrow;
         while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
         while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.09f * d;
+        // Slower lock-on (was 0.09) — arrow visibly swings and settles
+        // toward the target rather than snapping into place.
+        ease_arrow += 0.06f * d;
     } else {
-        // Clockwise drift: 1 rev per 12s
-        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 12000.0f);
+        // Clockwise drift: 1 rev per 8s — gives a more visible "searching" feel.
+        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 8000.0f);
         if (ease_arrow > 2.0f*(float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
     }
     float ang = ease_arrow;
@@ -4349,7 +4348,7 @@ void draw_locator_screen() {
     // ── Status badge ──
     const char* status_base; uint16_t status_col; bool status_anim = false;
     if (north_mode) {
-        status_base = "North Mode";  status_col = GPS_COLOR;
+        status_base = "N Mode";  status_col = GPS_COLOR;
     } else if (!has_loc && !gps_valid) {
         status_base = "GPS";         status_col = GPS_COLOR;     status_anim = true;
     } else if (!active) {
@@ -4384,7 +4383,9 @@ void draw_locator_screen() {
     spr.setCursor(rpx, 46); kprint(spr, "TARGET");
     {
         char tname[18];
-        if (active) {
+        if (north_mode) {
+            safe_copy(tname, "North", sizeof(tname));
+        } else if (active) {
             bool nok = (target_name[0] != '\0'
                         && strcmp(target_name, "Hidden")  != 0
                         && strcmp(target_name, "Unknown") != 0);
@@ -4392,7 +4393,7 @@ void draw_locator_screen() {
                                    : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
             safe_copy(tname, src, sizeof(tname));
         } else {
-            safe_copy(tname, demo_name, sizeof(tname));
+            safe_copy(tname, "No Target", sizeof(tname));
         }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.5);
         spr.setCursor(rpx, 58); spr.print(tname);
@@ -4415,7 +4416,7 @@ void draw_locator_screen() {
         }
     }
     {
-        float sd = (active && has_est) ? dist : (demo ? demo_dist : -1.0f);
+        float sd = (active && has_est && !north_mode) ? dist : -1.0f;
         float sd_ft = sd * 3.28084f;
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(2);
         spr.setCursor(rpx, 92);
@@ -4444,7 +4445,7 @@ void draw_locator_screen() {
         spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
         spr.setCursor(sig_x, 80); kprint(spr, "SIGNAL");
 
-        int sr = (active && has_rssi) ? target_rssi : (demo ? demo_rssi : -999);
+        int sr = (active && has_rssi && !north_mode) ? target_rssi : -999;
         uint16_t sig_col;
         const char* sig_str;
         if      (sr == -999) { sig_str = "--";     sig_col = DIM_COLOR; }
@@ -5315,7 +5316,7 @@ void draw_current_screen() {
 void transition_screen(int new_screen, int dir) {
     if (stealth_mode) { current_screen = new_screen; return; }
     if (!is_muted) {
-        M5Cardputer.Speaker.tone(1500, 8);  // brief UI click
+        M5Cardputer.Speaker.tone(800, 6);   // soft warm tap, lower pitch than menu click
     }
     if (new_screen == 2) {
         history_scroll_offset = 0;
@@ -6400,13 +6401,13 @@ void loop() {
                 }
             }
             else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } }
-            else if (c == 'g') {
+            else if (c == 'n') {
                 if (current_screen == 1) {
                     // Locator screen: toggle Pointing North mode
                     north_mode = !north_mode;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
-                // On other screens, 'g' is currently a no-op.
+                // On other screens, 'n' is currently a no-op.
             }
             else if (c == 'l') {
                 // Instant locator stop from any screen. No-op when inactive.
