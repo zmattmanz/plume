@@ -728,7 +728,12 @@ static const char* mac_prefixes_tier2[] = {
     "3c:91:80", "80:30:49", "14:5a:fc", "9c:2f:9d", "e4:aa:ea",
     "c8:c9:a3", "70:c9:4e", "d0:39:57",
     "24:b2:b9", "00:f4:8d", "e0:0a:f6",
-    "08:3a:88", "d8:f3:bc", "cc:cc:cc"
+    "08:3a:88", "d8:f3:bc",
+    // Field-validated additions from the NitekryDPaul 31-prefix research list.
+    "b8:35:32", "c0:35:32", "f4:6a:dd", "f8:a2:d6",
+    "e8:d0:fc", "e0:4f:43", "b8:1e:a4", "70:08:94",
+    "3c:71:bf", "58:00:e3", "5c:93:a2", "64:6e:69",
+    "48:27:ea", "82:6b:f2"
 };
 static const int NUM_MAC_TIER2 = sizeof(mac_prefixes_tier2) / sizeof(mac_prefixes_tier2[0]);
 
@@ -859,19 +864,22 @@ static void methods_to_human(const char* methods, char* out, size_t out_len) {
     }
     struct Token { const char* code; const char* human; };
     static const Token tokens[] = {
-        {"raven_multi",  "3+ Raven UUIDs"},
-        {"raven_custom", "Raven custom UUID"},
-        {"raven_uuid",   "Raven UUID"},
-        {"mfg_0x09C8",   "Flock mfg ID"},
-        {"tn_serial",    "TN serial"},
-        {"ssid_fmt",     "Flock SSID format"},
-        {"wpa2_psk",     "WPA2-PSK"},
-        {"penguin_num",  "Penguin name"},
-        {"name",         "Known name"},
-        {"mac_t1",       "Known MAC"},
-        {"mac_t2",       "Similar MAC"},
-        {"ssid",         "SSID pattern"},
-        {"static_addr",  "Static addr"},
+        {"raven_multi",    "3+ Raven UUIDs"},
+        {"raven_custom",   "Raven custom UUID"},
+        {"raven_uuid",     "Raven UUID"},
+        {"mfg_0x09C8",     "Flock mfg ID"},
+        {"tn_serial",      "TN serial"},
+        {"ssid_fmt",       "Flock SSID format"},
+        {"wildcard_probe", "Wildcard probe (Flock sig)"},
+        {"wpa2_psk",       "WPA2-PSK"},
+        {"penguin_num",    "Penguin name"},
+        {"name",           "Known name"},
+        {"mac_t1",         "Known MAC"},
+        {"mac_t2",         "Similar MAC"},
+        {"ssid",           "SSID pattern"},
+        {"static_addr",    "Static addr"},
+        {"addr1_t1",       "Receiver MAC (known)"},
+        {"addr1_t2",       "Receiver MAC (similar)"},
     };
     static const int N_TOKENS = (int)(sizeof(tokens) / sizeof(tokens[0]));
 
@@ -2125,7 +2133,8 @@ typedef struct { wifi_ieee80211_mac_hdr_t hdr; uint8_t payload[0]; } wifi_ieee80
 #define WIFI_EVENT_QUEUE_SIZE 8
 
 struct WifiEvent {
-    uint8_t  mac[6];
+    uint8_t  mac[6];      // addr2 — transmitter
+    uint8_t  addr1[6];    // addr1 — receiver/destination (sleeping-device check)
     int8_t   rssi;
     uint8_t  channel;
     uint16_t seq_num;
@@ -2183,6 +2192,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     }
 
     memcpy(ev->mac, hdr->addr2, 6);
+    memcpy(ev->addr1, hdr->addr1, 6);
     ev->rssi             = (int8_t)ppkt->rx_ctrl.rssi;
     ev->channel          = (uint8_t)ppkt->rx_ctrl.channel;
     ev->seq_num          = (uint16_t)(hdr->sequence_ctrl >> 4);
@@ -2255,7 +2265,13 @@ void process_wifi_event_queue() {
 
         clean_device_name_char(local.ssid);
 
-        int  mac_score     = check_mac_prefix_tiered(local.mac);
+        // Skip locally-administered (randomized) MACs for OUI scoring — a
+        // randomized MAC can coincidentally match a Flock OUI prefix. SSID
+        // pattern matching still runs (it doesn't depend on OUI), so a real
+        // Flock device with a randomized MAC can still be detected via SSID.
+        // BLE handles this via addr_type; WiFi needs an explicit bit check.
+        bool is_random_mac = (local.mac[0] & 0x02) != 0;
+        int  mac_score     = is_random_mac ? 0 : check_mac_prefix_tiered(local.mac);
 
         // Push to live feed (every observed device, preview flock status)
         {
@@ -2286,6 +2302,16 @@ void process_wifi_event_queue() {
             if (mac_score == 2) { confidence += SCORE_WEAK; strlcat(methods, "mac_t2 ", sizeof(methods)); }
             if (ssid_generic)   { confidence += SCORE_WEAK; strlcat(methods, "ssid ", sizeof(methods)); }
         }
+
+        // ── Wildcard probe request from a known OUI — DeFlockJoplin signature ──
+        // Flock cameras hop channels and spam Probe Requests with empty SSID.
+        // OUI match + non-beacon + empty SSID is a tight definitive signal.
+        // Field-tested: 11/12 cameras caught with 2 false positives (Joplin).
+        if (!local.is_beacon && mac_score > 0 && strlen(local.ssid) == 0) {
+            confidence = SCORE_DEFINITIVE;
+            strlcat(methods, "wildcard_probe ", sizeof(methods));
+        }
+
         if (confidence > 0 && local.rssi > -50) confidence += SCORE_BONUS_RSSI;
         if (ssid_flock_fmt && local.is_wpa2_psk) {
             strlcat(methods, "wpa2_psk ", sizeof(methods));
@@ -2298,6 +2324,39 @@ void process_wifi_event_queue() {
             local.mac[3], local.mac[4], local.mac[5]);
         const char* name_str       = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
         const char* frame_type_str = local.is_beacon ? "Beacon" : "ProbeReq";
+
+        // ── addr1 (receiver) OUI check — catches sleeping Flock devices ──
+        // Flock cameras sleep most of their duty cycle but still appear as
+        // the destination of probe responses and data frames from nearby APs.
+        // Guards: skip broadcast/multicast addr1, skip randomized MACs.
+        // Research: @NitekryDPaul promiscuous-mode addr1 technique.
+        {
+            bool addr1_multicast = (local.addr1[0] & 0x01);
+            bool addr1_random    = (local.addr1[0] & 0x02);
+            bool addr1_broadcast = (local.addr1[0] == 0xFF && local.addr1[1] == 0xFF);
+
+            if (!addr1_multicast && !addr1_random && !addr1_broadcast) {
+                int addr1_mac_score = check_mac_prefix_tiered(local.addr1);
+                if (addr1_mac_score > 0 && confidence == 0) {
+                    // addr1 matched but addr2 didn't — sleeping-device hit.
+                    if (addr1_mac_score == 1) {
+                        confidence = SCORE_STRONG;
+                        strlcat(methods, "addr1_t1 ", sizeof(methods));
+                    } else {
+                        confidence += SCORE_WEAK;
+                        strlcat(methods, "addr1_t2 ", sizeof(methods));
+                    }
+
+                    // Override mac_str so logging/tracking keys off the actual
+                    // Flock device MAC (addr1) rather than the AP (addr2).
+                    snprintf(mac_str, sizeof(mac_str),
+                             "%02x:%02x:%02x:%02x:%02x:%02x",
+                             local.addr1[0], local.addr1[1], local.addr1[2],
+                             local.addr1[3], local.addr1[4], local.addr1[5]);
+                    feed_push_candidate(mac_str, "Sleeping", local.rssi, 0, true);
+                }
+            }
+        }
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
