@@ -171,17 +171,52 @@ static void safe_copy(char* dest, const char* src, size_t dest_size) {
     dest[dest_size - 1] = '\0';
 }
 
-// ── Easing utilities — shared by all overlays and animations ──
+// ── Unified UI animation vocabulary ──
+// One easing curve, three duration tiers, one slide distance.
+// Reach for these instead of inventing new constants.
+//
+// Tier guide:
+//   UI_ANIM_QUICK  — micro-feedback: digit rolls, key acks, color blips
+//   UI_ANIM_NORMAL — standard transitions: slides, fades, intros
+//   UI_ANIM_SLOW   — hero moments: gates, screen-level reveals
+//
+// All UI animations should call ui_ease() or ui_progress(); raw
+// `1.0f - (1.0f - t) * (1.0f - t)` should not appear elsewhere in the file.
 
-static inline float ease_out_quad(float t) {
+static const unsigned long UI_ANIM_QUICK  = 180;
+static const unsigned long UI_ANIM_NORMAL = 320;
+static const unsigned long UI_ANIM_SLOW   = 500;
+static const int           UI_SLIDE_PX    = 14;
+
+// ease_out_quad — the single curve we use for every UI animation.
+// Decelerating motion: fast start, soft landing. Reads as "natural" UI motion.
+static inline float ui_ease(float t) {
+    if (t < 0.0f) return 0.0f;
+    if (t > 1.0f) return 1.0f;
     return 1.0f - (1.0f - t) * (1.0f - t);
 }
 
-// Returns 0.0 at start_ms, eases to 1.0 at start_ms + duration_ms, stays 1.0 after.
+// Returns eased 0..1 progress. Pass start_ms=0 to mean "settled / not animating".
+static inline float ui_progress(unsigned long start_ms, unsigned long duration_ms) {
+    if (start_ms == 0) return 1.0f;
+    unsigned long now = millis();
+    if (now <= start_ms) return 0.0f;
+    unsigned long elapsed = now - start_ms;
+    if (elapsed >= duration_ms) return 1.0f;
+    return ui_ease((float)elapsed / (float)duration_ms);
+}
+
+// ── Legacy aliases — kept so existing call sites still compile ──
+// New code should use ui_ease() / ui_progress() directly. These can be
+// deleted once all call sites are migrated.
+static inline float ease_out_quad(float t) {
+    return ui_ease(t);
+}
 static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms) {
+    if (start_ms == 0) return 1.0f;
     unsigned long elapsed = millis() - start_ms;
     if (elapsed >= duration_ms) return 1.0f;
-    return ease_out_quad((float)elapsed / (float)duration_ms);
+    return ui_ease((float)elapsed / (float)duration_ms);
 }
 #define GPS_RX_PIN   15  
 #define GPS_TX_PIN   13   
@@ -5159,13 +5194,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 
     // ── Title: slide down + fade in over 350ms, settled at y=24 ──
     {
-        const unsigned long TITLE_DUR = 350;
-        const int           TITLE_FINAL_Y = 24;
-        const int           TITLE_SLIDE_PX = 10;
+        const int TITLE_FINAL_Y = 24;
+        const int TITLE_SLIDE_PX = 10;
 
-        if (intro_elapsed < TITLE_DUR) {
-            float t    = (float)intro_elapsed / (float)TITLE_DUR;
-            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+        if (intro_elapsed < UI_ANIM_NORMAL) {
+            float ease = ui_ease((float)intro_elapsed / (float)UI_ANIM_NORMAL);
             int   y    = TITLE_FINAL_Y - TITLE_SLIDE_PX + (int)(ease * (float)TITLE_SLIDE_PX);
             uint16_t col = lerp_col16(bg, blue, ease);
 
@@ -5195,13 +5228,14 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     // outline rightward to match the eased progress. The completed outline
     // stays drawn afterward.
     {
-        const unsigned long OUTLINE_DELAY = 220;
-        const unsigned long OUTLINE_DUR   = 350;
+        // Outline reveal: lead-in matches UI_ANIM_QUICK, reveal duration matches
+        // the title's UI_ANIM_NORMAL — outline finishes drawing as title settles.
+        const unsigned long OUTLINE_DELAY = UI_ANIM_QUICK;
 
         if (intro_elapsed >= OUTLINE_DELAY && boot_outline_drawn_to < bar_w) {
             unsigned long oe = intro_elapsed - OUTLINE_DELAY;
-            float t = (oe < OUTLINE_DUR) ? (float)oe / (float)OUTLINE_DUR : 1.0f;
-            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+            float t = (oe < UI_ANIM_NORMAL) ? (float)oe / (float)UI_ANIM_NORMAL : 1.0f;
+            float ease = ui_ease(t);
             int target = (int)(ease * (float)bar_w);
             if (target > bar_w) target = bar_w;
 
@@ -5217,11 +5251,9 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // Gate everything else (percentage, status text, bar fill) until +500ms.
-    // This is the staggered slot for the lower elements to come alive.
-    const unsigned long LOWER_GATE_MS = 500;
-    if (intro_elapsed < LOWER_GATE_MS) {
-        // Still in intro — title and outline are animating; defer the rest.
+    // Gate everything else (percentage, status text, bar fill) until the
+    // intro's UI_ANIM_SLOW slot opens — title + outline have settled by then.
+    if (intro_elapsed < UI_ANIM_SLOW) {
         return;
     }
 
@@ -5261,7 +5293,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             boot_prev_pct = pct;
         }
 
-        const unsigned long ROLL_MS = 180;  // was 250 — snappier per-digit roll
+        // Per-digit roll uses UI_ANIM_QUICK — micro-feedback tier.
+        const unsigned long ROLL_MS = UI_ANIM_QUICK;
 
         // Draw the % symbol whenever its position needs to change (which
         // happens on first appearance and when the digit count changes:
@@ -5291,9 +5324,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             unsigned long elapsed = now_t - boot_digit_anim_ms[di];
             if (elapsed > ROLL_MS) continue;
 
-            float t    = (float)elapsed / (float)ROLL_MS;
-            float ease = 1.0f - (1.0f - t) * (1.0f - t);
-            int y_off = (int)((1.0f - ease) * (float)num_h);
+            float ease = ui_ease((float)elapsed / (float)ROLL_MS);
+            int y_off  = (int)((1.0f - ease) * (float)num_h);
 
             int dx = start_x + di * char_w;
 
@@ -5310,13 +5342,26 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Update bar fill (incremental — extend forward only, no clear) ──
+    // ── Update bar fill — time-based ease toward target ──
+    // Each pct change kicks off a new UI_ANIM_NORMAL animation from the
+    // current fill width to the new target. Frame-rate independent.
     {
-        // 10px padding per side; fill_h = bar_h - 20 = 4
-        int target_fill = (pct * (bar_w - 20)) / 100;
-        float diff = (float)target_fill - boot_eased_fill;
-        boot_eased_fill += diff * 0.5f;  // was 0.3f — tightens settle time
-        if (fabsf(diff) < 0.5f) boot_eased_fill = (float)target_fill;
+        const int fill_max_w = bar_w - 20;
+        int target_fill = (pct * fill_max_w) / 100;
+
+        static int           fill_anim_from   = 0;
+        static int           fill_anim_to     = 0;
+        static unsigned long fill_anim_start  = 0;
+
+        if (target_fill != fill_anim_to) {
+            fill_anim_from  = (int)(boot_eased_fill + 0.5f);
+            fill_anim_to    = target_fill;
+            fill_anim_start = millis();
+        }
+
+        float ease = ui_progress(fill_anim_start, UI_ANIM_NORMAL);
+        boot_eased_fill = (float)fill_anim_from + (float)(fill_anim_to - fill_anim_from) * ease;
+
         int fill_w = (int)(boot_eased_fill + 0.5f);
         if (fill_w < 0) fill_w = 0;
 
@@ -5355,8 +5400,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     }
 
     if (boot_cur_status[0] != '\0') {
-        const unsigned long SLIDE_MS = 320;
-        const int           SLIDE_PX = 14;
+        // Status slide uses UI_ANIM_NORMAL + UI_SLIDE_PX — same vocabulary as
+        // the live activity feed.
+        const unsigned long SLIDE_MS = UI_ANIM_NORMAL;
+        const int           SLIDE_PX = UI_SLIDE_PX;
         unsigned long elapsed = millis() - boot_status_change_ms;
 
         // Build uppercase + center geometry for both strings.
@@ -5391,8 +5438,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         lcd.setTextDatum(TL_DATUM);
 
         if (elapsed < SLIDE_MS && prev_len > 0) {
-            float t    = (float)elapsed / (float)SLIDE_MS;
-            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+            float ease = ui_ease((float)elapsed / (float)SLIDE_MS);
 
             // New text: starts SLIDE_PX below status_y, lands at status_y.
             int new_y = status_y + SLIDE_PX - (int)(ease * (float)SLIDE_PX);
