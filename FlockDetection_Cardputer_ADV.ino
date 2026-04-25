@@ -3053,7 +3053,7 @@ void draw_help_overlay() {
         {"ESC",  "Home"},
         {"DEL",  "Back/Close"},
         {"`",    "Mute"},
-        {";/.",  "Volume"},
+        {"-/+",  "Volume"},
         {"s",    "Stealth"},
         {"\\",   "LED"},
         {"f",    "Feed view"},
@@ -3070,7 +3070,7 @@ void draw_help_overlay() {
         {"g", "N-mode"},
     };
     static const HelpKey detections_keys[] = {
-        {"-/+", "Navigate"},
+        {"^/v", "Navigate"},
         {"ENT", "Detail"},
         {"DEL", "Close"},
     };
@@ -3078,7 +3078,7 @@ void draw_help_overlay() {
         {"", "No keys"},
     };
     static const HelpKey devinfo_keys[] = {
-        {"-/+", "Scroll"},
+        {"^/v", "Scroll"},
     };
 
     switch (current_screen) {
@@ -3596,7 +3596,13 @@ void draw_scanner_screen() {
             uint16_t line_col = local_colors[i];
 
             if (is_strong) {
-                spr.drawLine(base_x, base_y, base_x, base_y - spike_len, line_col);
+                // Stop the stem line at the shape's bottom edge so it doesn't
+                // cut through the icon. Triangle bottom = tip_y+7, diamond
+                // bottom = tip_y+8 — use 8 to cover both.
+                int shape_bottom = base_y - spike_len + 8;
+                if (shape_bottom < base_y) {
+                    spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
+                }
                 // Shape encodes protocol — filled, larger for visibility
                 // against the busy sweep/particle background.
                 // BLE = diamond (◆), WiFi = triangle (▲)
@@ -3625,22 +3631,29 @@ void draw_scanner_screen() {
 
     spr.clearClipRect();
 
-    // ── Ambient packet counter — bottom of left panel ──
+    // ── Ambient packet counter — two-line label + value, centered under radar ──
     {
         uint32_t pkts = ambient_packet_count;
         char pkt_str[20];
         if (pkts >= 1000000) {
-            snprintf(pkt_str, sizeof(pkt_str), "%.1fM pkts", pkts / 1000000.0f);
+            snprintf(pkt_str, sizeof(pkt_str), "%.1fM", pkts / 1000000.0f);
         } else if (pkts >= 1000) {
-            snprintf(pkt_str, sizeof(pkt_str), "%.1fk pkts", pkts / 1000.0f);
+            snprintf(pkt_str, sizeof(pkt_str), "%.1fk", pkts / 1000.0f);
         } else {
-            snprintf(pkt_str, sizeof(pkt_str), "%lu pkts", pkts);
+            snprintf(pkt_str, sizeof(pkt_str), "%lu", pkts);
         }
 
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        // Line 1: green label
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setTextSize(1);
         spr.setTextDatum(TC_DATUM);
+        spr.drawString("PACKETS SCANNED", radar_cx, DISP_H - 18);
+
+        // Line 2: white number
+        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
+        spr.setTextSize(1);
         spr.drawString(pkt_str, radar_cx, DISP_H - 9);
+
         spr.setTextDatum(TL_DATUM);
     }
 
@@ -5440,11 +5453,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         if (fill_w < 0) fill_w = 0;
 
         // Horizontal inset matches the corner radius so the pill-shaped fill
-        // sits flush inside the rounded outline.
+        // sits flush inside the rounded outline. Vertical centering keeps the
+        // fill line balanced inside the 20px-tall outline.
         const int fill_x = bar_x + bar_h / 2;
-        const int fill_y = bar_y + 10;
-        int fill_h = bar_h - 20;       // 2px tall — thin accent line inside outline
-        if (fill_h < 2) fill_h = 2;    // clamp to a visible minimum
+        const int fill_h = 4;                                // 4px tall
+        const int fill_y = bar_y + (bar_h - fill_h) / 2;     // vertically centered
 
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
@@ -5460,30 +5473,22 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: 200ms fade-in via lerped color, no per-frame flicker ──
-    // Anti-flicker technique: the second arg of setTextColor is the bg color,
-    // so each drawString fills its own glyph cells in a single pass — no
-    // separate fillRect is needed during the fade. The only fillRect happens
-    // ONCE per status change to clear leftover chars from a longer previous
-    // string. Subsequent fade frames just overdraw glyphs at progressively
-    // brighter colors.
-    static char boot_cur_status[32]   = "";
-    static unsigned long boot_status_fade_start = 0;
+    // ── Status text: 200ms roll-up. Clipped region + per-frame redraw with
+    // bg as text background means each glyph self-clears, no flicker.
+    static char boot_cur_status[32] = "";
+    static unsigned long boot_status_anim_start = 0;
     static bool boot_status_settled_drawn = false;
-    static bool boot_status_needs_clear   = false;
 
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
-        boot_status_fade_start = millis();
+        boot_status_anim_start = millis();
         boot_status_settled_drawn = false;
-        boot_status_needs_clear   = true;
     }
 
     if (boot_cur_status[0] != '\0' && !boot_status_settled_drawn) {
-        // Build uppercase copy.
         char cur_buf[32];
-        int  cur_len = 0;
+        int cur_len = 0;
         for (const char* p = boot_cur_status; *p && cur_len < 31; p++) {
             cur_buf[cur_len++] = (char)toupper((unsigned char)*p);
         }
@@ -5492,28 +5497,26 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int cur_w = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
         int cur_x = (DISP_W - cur_w) / 2;
 
-        const unsigned long FADE_MS = 200;
-        unsigned long elapsed = millis() - boot_status_fade_start;
-        float alpha = (elapsed >= FADE_MS) ? 1.0f : (float)elapsed / (float)FADE_MS;
-        uint16_t col = lerp_col16(bg, white, alpha);
+        const unsigned long ROLL_MS = 200;
+        unsigned long elapsed = millis() - boot_status_anim_start;
+        float t = (elapsed >= ROLL_MS) ? 1.0f : (float)elapsed / (float)ROLL_MS;
+        float ease = ui_ease(t);
+        int y_offset = (int)((1.0f - ease) * 10.0f);  // slides up 10px
 
         lcd.startWrite();
-        // One-shot row clear on string change so leftover chars from a wider
-        // previous string don't poke out at the edges of the new text.
-        if (boot_status_needs_clear) {
-            lcd.fillRect(0, status_y, DISP_W, status_h, bg);
-            boot_status_needs_clear = false;
-        }
-        lcd.setTextColor(col, bg);  // bg as second arg = each glyph self-clears
+        lcd.setClipRect(0, status_y, DISP_W, status_h);
+        lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+        lcd.setTextColor(white, bg);
         lcd.setTextSize(1);
         lcd.setTextDatum(TL_DATUM);
         for (int i = 0; i < cur_len; i++) {
             char ch[2] = { cur_buf[i], '\0' };
-            lcd.drawString(ch, cur_x + i * 7, status_y);
+            lcd.drawString(ch, cur_x + i * 7, status_y + y_offset);
         }
+        lcd.clearClipRect();
         lcd.endWrite();
 
-        if (alpha >= 1.0f) boot_status_settled_drawn = true;
+        if (t >= 1.0f) boot_status_settled_drawn = true;
     }
 
     lcd.setTextDatum(TL_DATUM);
@@ -5534,8 +5537,10 @@ static void boot_animate(int pct, const char* status, int frames = 36) {
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
         float t = (float)i / (float)(frames - 1);
-        float curve = 1.0f - 0.4f * (1.0f - fabsf(2.0f * t - 1.0f));
-        int per_frame = (int)(16.0f + 8.0f * curve);   // ~16–24ms base
+        // Sine-wave speed variation: slow at start, fast in middle, slow at end —
+        // reads like a physical mechanism ramping up and back down.
+        float wave = sinf(t * (float)M_PI);                // 0 → 1 → 0
+        int per_frame = (int)(22.0f - 8.0f * wave);        // 22ms edges, 14ms middle
         per_frame += (delay_phase++ & 0x03);
         per_frame += random(0, 8);                     // 0–7ms jitter
         delay(per_frame);
@@ -5614,14 +5619,14 @@ void setup() {
             M5Cardputer.Display.setBrightness(b);
             // First call kicks off the staggered intro animation; subsequent
             // calls advance it. Status only set on first draw.
-            draw_boot_screen(0, (i == 0) ? "starting" : nullptr);
+            draw_boot_screen(0, (i == 0) ? "waking up" : nullptr);
             delay(FADE_STEP_MS);
         }
     }
 
-    boot_animate(7, "serial ok");
+    boot_animate(7, "opening serial");
 
-    boot_animate(10, "SD card");
+    boot_animate(10, "searching for SD");
 
     // Route a dedicated SPI3 instance to the Cardputer's SD pins. 15 MHz is
     // the FAT32 sweet spot — slow enough for marginal cards, fast enough for
@@ -5700,18 +5705,18 @@ void setup() {
         sd_available = false;
         Serial.println("[SD] Mount failed. Verify card is FAT32 and fully inserted.");
     }
-    boot_animate(35, sd_available ? "SD mounted" : "no SD card");
+    boot_animate(35, sd_available ? "mounting SD card" : "no SD found");
     // Seed hot-plug state so the first poll doesn't fire a spurious "mounted" toast
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
 
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
-    boot_animate(40, "GPS serial");
-    boot_animate(44 + random(0, 3), "display ready");
+    boot_animate(40, "connecting GPS");
+    boot_animate(44 + random(0, 3), "drawing interface");
 
     // Sprite was already created at the top of setup().
-    boot_animate(52, "display ready");
+    boot_animate(52, "preparing display");
 
     // Prime the EMA filter to eliminate startup ADC noise before taking the baseline
     for (int i = 0; i < 20; i++) {
@@ -5719,13 +5724,13 @@ void setup() {
         get_filtered_voltage();
         delay(2);
     }
-    boot_animate(58 + random(0, 3), "battery cal");
+    boot_animate(58 + random(0, 3), "calibrating battery");
 
     setCpuFrequencyMhz(240);
-    boot_animate(62 + random(0, 3), "CPU 240MHz");
+    boot_animate(62 + random(0, 3), "boosting CPU");
     ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
-    boot_animate(68, "BLE init");
+    boot_animate(68, "starting Bluetooth");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
 
@@ -5770,7 +5775,7 @@ void setup() {
         load_session_from_flash();
         load_detections_from_flash();
     }
-    boot_animate(78 + random(0, 3), "reticulating splines");
+    boot_animate(78 + random(0, 3), "loading session");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5781,7 +5786,7 @@ void setup() {
         strncpy(export_pass, EXPORT_WIFI_PASS, sizeof(export_pass) - 1);
         export_pass[sizeof(export_pass) - 1] = '\0';
     }
-    boot_animate(82 + random(0, 3), "credentials");
+    boot_animate(82 + random(0, 3), "reading credentials");
 
     lifetime_boots++;
     if (littlefs_available) {
@@ -5795,14 +5800,14 @@ void setup() {
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
-    boot_animate(88, "WiFi sniffer");
+    boot_animate(88, "starting sniffer");
 
     // NimBLE — complete before scanner screen appears
     NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
-    boot_animate(96, "BLE scanner");
+    boot_animate(96, "arming scanner");
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
@@ -5829,7 +5834,7 @@ void setup() {
         const unsigned long FEED_GATE_MAX_MS = 4500;
         while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
             if (ambient_packet_count >= 15) break;
-            draw_boot_screen(100, "scanning");
+            draw_boot_screen(100, "listening for signals");
             delay(30);
             M5Cardputer.update();
             process_wifi_event_queue();
@@ -5984,17 +5989,18 @@ void loop() {
         for (auto c : status.word) {
 
             // ── Menu input intercept — when menu is open, swallow nav keys ──
+            // ; is up-arrow, . is down-arrow on the M5Cardputer keyboard.
             if (show_menu) {
                 if (c == ';') {
                     int prev = menu_selected;
-                    menu_selected++;
-                    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
+                    menu_selected--;
+                    if (menu_selected < 0) menu_selected = 0;
                     if (menu_selected != prev) menu_click();
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '.') {
                     int prev = menu_selected;
-                    menu_selected--;
-                    if (menu_selected < 0) menu_selected = 0;
+                    menu_selected++;
+                    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
                     if (menu_selected != prev) menu_click();
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '\n' || c == '\r') {
@@ -6059,34 +6065,7 @@ void loop() {
                 draw_current_screen(); spr.pushSprite(0,0);
             }
             else if (c == ';') {
-                current_volume += 15; if (current_volume > 255) current_volume = 255;
-                if (is_muted && current_volume > 0) {
-                    is_muted = false;
-                }
-                M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
-                if (!show_vol_overlay) {
-                    vol_overlay_start = millis(); show_vol_overlay = true;
-                } else {
-                    unsigned long el = millis() - vol_overlay_start;
-                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
-                }
-                draw_current_screen(); spr.pushSprite(0, 0);
-            }
-            else if (c == '.') {
-                current_volume -= 15; if (current_volume < 0) current_volume = 0;
-                if (current_volume == 0 && !is_muted) {
-                    is_muted = true;
-                }
-                M5Cardputer.Speaker.setVolume(current_volume); beep(400, 50);
-                if (!show_vol_overlay) {
-                    vol_overlay_start = millis(); show_vol_overlay = true;
-                } else {
-                    unsigned long el = millis() - vol_overlay_start;
-                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
-                }
-                draw_current_screen(); spr.pushSprite(0, 0);
-            }
-            else if (c == '-') {
+                // Up arrow — context-dependent scroll
                 if (current_screen == 2) {
                     history_selected_idx--;
                     if (history_selected_idx < 0) history_selected_idx = 0;
@@ -6097,7 +6076,8 @@ void loop() {
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
             }
-            else if (c == '+' || c == '=') {
+            else if (c == '.') {
+                // Down arrow — context-dependent scroll
                 if (current_screen == 2) {
                     int hist_total = sd_available ? sd_hist_count : capture_history_count;
                     history_selected_idx++;
@@ -6111,6 +6091,32 @@ void loop() {
                     if (device_info_scroll > max_scroll) device_info_scroll = max_scroll;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
+            }
+            else if (c == '-') {
+                // Volume down
+                current_volume -= 15; if (current_volume < 0) current_volume = 0;
+                if (current_volume == 0 && !is_muted) { is_muted = true; }
+                M5Cardputer.Speaker.setVolume(current_volume); beep(400, 50);
+                if (!show_vol_overlay) {
+                    vol_overlay_start = millis(); show_vol_overlay = true;
+                } else {
+                    unsigned long el = millis() - vol_overlay_start;
+                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
+                }
+                draw_current_screen(); spr.pushSprite(0, 0);
+            }
+            else if (c == '+' || c == '=') {
+                // Volume up
+                current_volume += 15; if (current_volume > 255) current_volume = 255;
+                if (is_muted && current_volume > 0) { is_muted = false; }
+                M5Cardputer.Speaker.setVolume(current_volume); beep(800, 50);
+                if (!show_vol_overlay) {
+                    vol_overlay_start = millis(); show_vol_overlay = true;
+                } else {
+                    unsigned long el = millis() - vol_overlay_start;
+                    if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
+                }
+                draw_current_screen(); spr.pushSprite(0, 0);
             }
             else if (c == 'x') {
                 if (!stealth_mode) {
@@ -6256,6 +6262,71 @@ void loop() {
                     }
                 }
                 // ENTER on other screens is a no-op (menu handles navigation)
+            }
+        }
+
+        // ── Key-hold repeat for the ; / . arrow keys ──
+        // The M5Cardputer keyboard doesn't auto-repeat; we track hold state
+        // ourselves so a held arrow keeps scrolling at REPEAT_INTERVAL after
+        // a HOLD_DELAY initial wait.
+        {
+            static unsigned long arrow_hold_start = 0;
+            static unsigned long arrow_last_repeat = 0;
+            static char arrow_held_key = 0;
+            const unsigned long HOLD_DELAY      = 400;  // ms before repeat starts
+            const unsigned long REPEAT_INTERVAL = 80;   // ms between repeats
+
+            bool up_held = false, down_held = false;
+            for (auto c : status.word) {
+                if (c == ';') up_held = true;
+                if (c == '.') down_held = true;
+            }
+            char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
+
+            if (cur_arrow && cur_arrow == arrow_held_key) {
+                unsigned long hold_dur = millis() - arrow_hold_start;
+                if (hold_dur > HOLD_DELAY &&
+                    (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
+                    if (show_menu) {
+                        if (cur_arrow == ';') {
+                            menu_selected--;
+                            if (menu_selected < 0) menu_selected = 0;
+                        } else {
+                            menu_selected++;
+                            if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
+                        }
+                        draw_current_screen(); spr.pushSprite(0, 0);
+                    } else if (current_screen == 2) {
+                        if (cur_arrow == ';') {
+                            history_selected_idx--;
+                            if (history_selected_idx < 0) history_selected_idx = 0;
+                        } else {
+                            int ht = sd_available ? sd_hist_count : capture_history_count;
+                            history_selected_idx++;
+                            if (history_selected_idx >= ht) history_selected_idx = max(0, ht - 1);
+                        }
+                        draw_current_screen(); spr.pushSprite(0, 0);
+                    } else if (current_screen == 4) {
+                        int visible_h = DISP_H - 18;
+                        int ms = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
+                        if (ms < 0) ms = 0;
+                        if (cur_arrow == ';') {
+                            device_info_scroll -= 12;
+                            if (device_info_scroll < 0) device_info_scroll = 0;
+                        } else {
+                            device_info_scroll += 12;
+                            if (device_info_scroll > ms) device_info_scroll = ms;
+                        }
+                        draw_current_screen(); spr.pushSprite(0, 0);
+                    }
+                    arrow_last_repeat = millis();
+                }
+            } else if (cur_arrow) {
+                arrow_held_key = cur_arrow;
+                arrow_hold_start = millis();
+                arrow_last_repeat = millis();
+            } else {
+                arrow_held_key = 0;
             }
         }
 
