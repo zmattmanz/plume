@@ -5297,7 +5297,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         // a cascading "reel" effect like an odometer rolling forward.
         unsigned long now_t = millis();
         if (pct != boot_prev_pct) {
-            const unsigned long DIGIT_STAGGER_MS = 30;
+            const unsigned long DIGIT_STAGGER_MS = 120;
             for (int di = 0; di < n_chars - 1 && di < 8; di++) {
                 boot_digit_anim_ms[di] = now_t + di * DIGIT_STAGGER_MS;
             }
@@ -5383,8 +5383,9 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         if (fill_w < 0) fill_w = 0;
 
         const int fill_x = bar_x + 6;
-        const int fill_y = bar_y + 9;
-        const int fill_h = bar_h - 18;  // 4px tall — even thinner, the most refined
+        const int fill_y = bar_y + 10;
+        int fill_h = bar_h - 20;       // 2px tall — thin accent line inside outline
+        if (fill_h < 2) fill_h = 2;    // clamp to a visible minimum
 
         // Bar only grows during boot — never clear, just redraw from the origin so
         // the rounded ends stay crisp as new pixels are added to the right.
@@ -5400,109 +5401,45 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
     }
 
-    // ── Status text: feed-style slide-up with eased fade ──
-    // When the status changes, the new text slides UP into position from
-    // ~14px below while the old text slides UP and out, fading as it goes.
-    // Same vocabulary as the live feed (ease_out_quad over 320ms).
+    // ── Status text: instant swap, drawn exactly once per status change ──
+    // Slide animations on this LCD flickered no matter the rate limit, so
+    // we just clear the row and paint the final text once. boot_status_settled_drawn
+    // gates the draw so subsequent frames are a no-op (zero flicker).
     static char boot_cur_status[32]   = "";
-    static char boot_prev_status[32]  = "";
     static unsigned long boot_status_change_ms = 0;
-    static bool boot_status_settled_drawn = false;  // true once settled state has been painted
+    static bool boot_status_settled_drawn = false;
 
     if (status_text && strcmp(status_text, boot_cur_status) != 0) {
-        strncpy(boot_prev_status, boot_cur_status, sizeof(boot_prev_status) - 1);
-        boot_prev_status[sizeof(boot_prev_status) - 1] = '\0';
         strncpy(boot_cur_status, status_text, sizeof(boot_cur_status) - 1);
         boot_cur_status[sizeof(boot_cur_status) - 1] = '\0';
         boot_status_change_ms = millis();
         boot_status_settled_drawn = false;
     }
 
-    if (boot_cur_status[0] != '\0') {
-        // Status slide uses UI_ANIM_NORMAL + UI_SLIDE_PX — same vocabulary as
-        // the live activity feed.
-        const unsigned long SLIDE_MS = UI_ANIM_NORMAL;
-        const int           SLIDE_PX = UI_SLIDE_PX;
-        unsigned long elapsed = millis() - boot_status_change_ms;
-
-        // Build uppercase + center geometry for both strings.
-        auto build_upper = [](const char* src, char* dst, int dst_size) -> int {
-            int n = 0;
-            for (const char* p = src; *p && n < dst_size - 1; p++) {
-                dst[n++] = (char)toupper((unsigned char)*p);
-            }
-            dst[n] = '\0';
-            return n;
-        };
-
-        char  cur_buf[32];
-        int   cur_len = build_upper(boot_cur_status, cur_buf, sizeof(cur_buf));
-        int   cur_w   = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
-        int   cur_x   = (DISP_W - cur_w) / 2;
-
-        char  prev_buf[32];
-        int   prev_len = build_upper(boot_prev_status, prev_buf, sizeof(prev_buf));
-        int   prev_w   = (prev_len > 0) ? (prev_len * 7 - 1) : 0;
-        int   prev_x   = (DISP_W - prev_w) / 2;
-
-        // Allow a few extra pixels above status_y so the outgoing text can
-        // slide upward into a clipped area without being abruptly cut off.
-        const int region_y = status_y - SLIDE_PX;
-        const int region_h = status_h + SLIDE_PX;
-
-        bool animating = (elapsed < SLIDE_MS && prev_len > 0);
-        bool need_draw = animating || !boot_status_settled_drawn;
-
-        // Rate-limit the redraw while animating — back-to-back fillRect+drawString
-        // on the LCD at full draw speed produces visible flicker. ~60ms minimum
-        // gap (~16 fps) is slow enough for each frame's text to actually persist
-        // on screen, still smooth enough for the slide to read as motion.
-        static unsigned long last_status_redraw_ms = 0;
-        if (animating && need_draw) {
-            unsigned long since_last = millis() - last_status_redraw_ms;
-            if (since_last < 60) need_draw = false;
+    if (boot_cur_status[0] != '\0' && !boot_status_settled_drawn) {
+        // Build uppercase copy.
+        char cur_buf[32];
+        int  cur_len = 0;
+        for (const char* p = boot_cur_status; *p && cur_len < 31; p++) {
+            cur_buf[cur_len++] = (char)toupper((unsigned char)*p);
         }
-        if (need_draw) last_status_redraw_ms = millis();
+        cur_buf[cur_len] = '\0';
 
-        if (need_draw) {
-            lcd.startWrite();
-            lcd.setClipRect(0, region_y, DISP_W, region_h);
-            lcd.fillRect(0, region_y, DISP_W, region_h, bg);
-            lcd.setTextSize(1);
-            lcd.setTextDatum(TL_DATUM);
+        int cur_w = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
+        int cur_x = (DISP_W - cur_w) / 2;
 
-            if (animating) {
-                // Animating — redraw every frame.
-                float ease = ui_ease((float)elapsed / (float)SLIDE_MS);
-                int new_y = status_y + SLIDE_PX - (int)(ease * (float)SLIDE_PX);
-                int old_y = status_y - (int)(ease * (float)SLIDE_PX);
-
-                uint16_t old_col = lerp_col16(white, bg, ease);
-                lcd.setTextColor(old_col, bg);
-                for (int i = 0; i < prev_len; i++) {
-                    char ch[2] = { prev_buf[i], '\0' };
-                    lcd.drawString(ch, prev_x + i * 7, old_y);
-                }
-                uint16_t new_col = lerp_col16(bg, white, ease);
-                lcd.setTextColor(new_col, bg);
-                for (int i = 0; i < cur_len; i++) {
-                    char ch[2] = { cur_buf[i], '\0' };
-                    lcd.drawString(ch, cur_x + i * 7, new_y);
-                }
-            } else {
-                // Just settled — draw final state once, then never touch until next change.
-                lcd.setTextColor(white, bg);
-                for (int i = 0; i < cur_len; i++) {
-                    char ch[2] = { cur_buf[i], '\0' };
-                    lcd.drawString(ch, cur_x + i * 7, status_y);
-                }
-                boot_status_settled_drawn = true;
-            }
-
-            lcd.clearClipRect();
-            lcd.endWrite();
+        lcd.startWrite();
+        lcd.fillRect(0, status_y, DISP_W, status_h, bg);
+        lcd.setTextColor(white, bg);
+        lcd.setTextSize(1);
+        lcd.setTextDatum(TL_DATUM);
+        for (int i = 0; i < cur_len; i++) {
+            char ch[2] = { cur_buf[i], '\0' };
+            lcd.drawString(ch, cur_x + i * 7, status_y);
         }
-        // else: already settled and drawn — skip everything (no flicker).
+        lcd.endWrite();
+
+        boot_status_settled_drawn = true;
     }
 
     lcd.setTextDatum(TL_DATUM);
@@ -5511,17 +5448,22 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 // Animate the boot progress bar so the eased fill is visible.
 // Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
 static void boot_animate(int pct, const char* status, int frames = 36) {
-    // 36 frames per stage at ~16–24ms each ≈ ~720ms total stage time —
-    // ~50% more frames than before so the percentage counter increments
-    // smoothly and the bar fill easing curve has more samples to work with.
-    // Per-frame delay is also bumped up for a more deliberate boot pace.
+    // Randomized: frames vary by ±4 and per-frame delay gets a 0–7ms jitter
+    // so each boot stage takes a slightly different wall-clock time. The
+    // percentage counter ends up hitting different numbers at different
+    // moments — each boot reads as organic rather than mechanical.
+    frames += random(-4, 5);
+    if (frames < 12) frames = 12;
+    if (frames > 48) frames = 48;
+
     static uint8_t delay_phase = 0;
     for (int i = 0; i < frames; i++) {
         draw_boot_screen(pct, (i == 0) ? status : nullptr);
         float t = (float)i / (float)(frames - 1);
         float curve = 1.0f - 0.4f * (1.0f - fabsf(2.0f * t - 1.0f));
-        int per_frame = (int)(16.0f + 8.0f * curve);  // ~16–24ms per frame
+        int per_frame = (int)(20.0f + 10.0f * curve);  // ~20–30ms base
         per_frame += (delay_phase++ & 0x03);
+        per_frame += random(0, 8);                     // 0–7ms jitter
         delay(per_frame);
     }
 }
@@ -5692,7 +5634,7 @@ void setup() {
     delay(100); SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); delay(100);
     WiFi.mode(WIFI_STA); delay(50);
     boot_animate(40, "GPS serial");
-    boot_animate(44, "display ready");
+    boot_animate(44 + random(0, 3), "display ready");
 
     // Sprite was already created at the top of setup().
     boot_animate(52, "display ready");
@@ -5703,10 +5645,10 @@ void setup() {
         get_filtered_voltage();
         delay(2);
     }
-    boot_animate(58, "battery cal");
+    boot_animate(58 + random(0, 3), "battery cal");
 
     setCpuFrequencyMhz(240);
-    boot_animate(62, "CPU 240MHz");
+    boot_animate(62 + random(0, 3), "CPU 240MHz");
     ble_event_queue = xQueueCreate(15, sizeof(BleEventData*));
     xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
     boot_animate(68, "BLE init");
@@ -5754,7 +5696,7 @@ void setup() {
         load_session_from_flash();
         load_detections_from_flash();
     }
-    boot_animate(78, "reticulating splines");
+    boot_animate(78 + random(0, 3), "reticulating splines");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
     if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
@@ -5765,7 +5707,7 @@ void setup() {
         strncpy(export_pass, EXPORT_WIFI_PASS, sizeof(export_pass) - 1);
         export_pass[sizeof(export_pass) - 1] = '\0';
     }
-    boot_animate(82, "credentials");
+    boot_animate(82 + random(0, 3), "credentials");
 
     lifetime_boots++;
     if (littlefs_available) {
