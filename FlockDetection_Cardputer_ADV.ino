@@ -206,8 +206,15 @@ static const int           UI_SLIDE_PX    = 14;
 static const unsigned long UI_FADE_IN_MS  = 150;  // overlays/toasts appearing
 static const unsigned long UI_FADE_OUT_MS = 200;  // overlays/toasts disappearing
 
-// ease_out_quad — the single curve we use for every UI animation.
-// Decelerating motion: fast start, soft landing. Reads as "natural" UI motion.
+// Pulse period vocabulary — three tiers for sin-based oscillators.
+// Slow: calm/idle. Medium: attention/status. Fast: active/urgent.
+static const unsigned long UI_PULSE_BREATHE = 1200;
+static const unsigned long UI_PULSE_MEDIUM  = 600;
+static const unsigned long UI_PULSE_FAST    = 300;
+
+// ui_ease — the single curve we use for every UI animation
+// (ease_out_quad). Decelerating motion: fast start, soft landing.
+// Reads as "natural" UI motion.
 static inline float ui_ease(float t) {
     if (t < 0.0f) return 0.0f;
     if (t > 1.0f) return 1.0f;
@@ -277,19 +284,7 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
     out_buf[written] = '\0';
 }
 
-// ── Legacy aliases — kept so existing call sites still compile ──
-// New code should use ui_ease() / ui_progress() directly. These can be
-// deleted once all call sites are migrated.
-static inline float ease_out_quad(float t) {
-    return ui_ease(t);
-}
-static inline float ease_alpha(unsigned long start_ms, unsigned long duration_ms) {
-    if (start_ms == 0) return 1.0f;
-    unsigned long elapsed = millis() - start_ms;
-    if (elapsed >= duration_ms) return 1.0f;
-    return ui_ease((float)elapsed / (float)duration_ms);
-}
-#define GPS_RX_PIN   15  
+#define GPS_RX_PIN   15
 #define GPS_TX_PIN   13   
 #define GPS_BAUD     115200 
 
@@ -682,14 +677,14 @@ void LedTask(void* pv) {
         uint8_t r = 0, g = 0, b = 0;
         unsigned long now = millis();
         if (led_detect_active && now < led_detection_flash_until) {
-            float pulse = (sinf((float)now / 100.0f) + 1.0f) * 0.5f;
+            float pulse = anim_pulse(UI_PULSE_FAST);
             r = (uint8_t)((float)led_detect_r * pulse);
             g = (uint8_t)((float)led_detect_g * pulse);
             b = (uint8_t)((float)led_detect_b * pulse);
         } else {
             led_detect_active = false;
             if (led_breathing_on && !stealth_mode && brightness_level >= 2) {
-                float breath = (sinf((float)now / 600.0f) + 1.0f) * 0.5f;
+                float breath = anim_pulse(UI_PULSE_BREATHE);
                 float dim    = 0.15f + breath * 0.35f;
                 r = (uint8_t)((float)led_r * dim);
                 g = (uint8_t)((float)led_g * dim);
@@ -3142,7 +3137,7 @@ void draw_header_spr(int screen_num) {
 
             uint16_t fg = badges[i].color;
             if (badges[i].pulse) {
-                float pulse = (sinf((float)millis() / 600.0f) + 1.0f) * 0.5f;
+                float pulse = anim_pulse(UI_PULSE_MEDIUM);
                 fg = lerp_col16(badges[i].color, ACCENT_COLOR, pulse * 0.5f);
             }
             uint16_t bg = lerp_col16(BG_COLOR, fg, 0.18f);
@@ -3232,8 +3227,8 @@ void draw_header_spr(int screen_num) {
     } else if (should_draw(ease_cooldown) && cooldown_now) {
         int ix = icon_right - 8;
         float progress = (float)cooldown_elapsed / (float)BUZZER_COOLDOWN;
-        float pulse_rate = 400.0f + progress * 1200.0f;
-        float pulse = (sinf((float)millis() / pulse_rate) + 1.0f) * 0.5f;
+        unsigned long period = (unsigned long)(UI_PULSE_FAST + progress * 1500.0f);
+        float pulse = anim_pulse(period);
         uint8_t intensity = (uint8_t)(120 + pulse * 80);
         uint16_t c = lerp_col16(BG_COLOR, lgfx::color565(intensity, intensity, intensity), ease_cooldown);
         spr.drawCircle(ix + 4, icon_y + 5, 4, c);
@@ -3297,13 +3292,13 @@ void draw_toast_spr() {
     // Render from snapshot — no global toast_* access below this point.
     int y_pos = DISP_H - 34;
 
-    // Fade in over 150ms, hold, fade out over 200ms
+    // Fade in over UI_FADE_IN_MS, hold, fade out over UI_FADE_OUT_MS.
     float toast_alpha;
-    if (elapsed < 150) {
-        toast_alpha = ease_out_quad((float)elapsed / 150.0f);
-    } else if (elapsed > TOAST_DURATION_MS - 200) {
-        float fade_t = (float)(elapsed - (TOAST_DURATION_MS - 200)) / 200.0f;
-        toast_alpha = 1.0f - ease_out_quad(fade_t);
+    if (elapsed < UI_FADE_IN_MS) {
+        toast_alpha = ui_ease((float)elapsed / (float)UI_FADE_IN_MS);
+    } else if (elapsed > TOAST_DURATION_MS - UI_FADE_OUT_MS) {
+        float fade_t = (float)(elapsed - (TOAST_DURATION_MS - UI_FADE_OUT_MS)) / (float)UI_FADE_OUT_MS;
+        toast_alpha = 1.0f - ui_ease(fade_t);
     } else {
         toast_alpha = 1.0f;
     }
@@ -3337,11 +3332,11 @@ void draw_vol_overlay() {
     if (elapsed > SHOW_MS) { show_vol_overlay = false; return; }
 
     float alpha;
-    if (elapsed < 100) {
-        alpha = ease_out_quad((float)elapsed / 100.0f);
-    } else if (elapsed > SHOW_MS - 300) {
-        float t = (float)(elapsed - (SHOW_MS - 300)) / 300.0f;
-        alpha = 1.0f - ease_out_quad(t);
+    if (elapsed < UI_FADE_IN_MS) {
+        alpha = ui_ease((float)elapsed / (float)UI_FADE_IN_MS);
+    } else if (elapsed > SHOW_MS - UI_FADE_OUT_MS) {
+        float t = (float)(elapsed - (SHOW_MS - UI_FADE_OUT_MS)) / (float)UI_FADE_OUT_MS;
+        alpha = 1.0f - ui_ease(t);
     } else {
         alpha = 1.0f;
     }
@@ -3398,7 +3393,7 @@ void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
 }
 
 void draw_help_overlay() {
-    float alpha = ease_alpha(help_ease_start, 150);
+    float alpha = ui_progress(help_ease_start, UI_FADE_IN_MS);
     if (alpha < 0.02f) return;
 
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
@@ -3528,7 +3523,7 @@ static void menu_click() {
 
 void draw_menu_overlay() {
     unsigned long now_ms = millis();
-    float alpha = ease_alpha(menu_open_ms, 150);
+    float alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
     // Solid backdrop matching the rest of the app
@@ -3657,7 +3652,7 @@ void draw_menu_overlay() {
 }
 
 void draw_wifi_config_overlay() {
-    float alpha = ease_alpha(wifi_config_open_ms, 150);
+    float alpha = ui_progress(wifi_config_open_ms, UI_FADE_IN_MS);
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
     // Solid backdrop
@@ -4049,7 +4044,7 @@ void draw_scanner_screen() {
         }
     }
 
-    float breathe = sinf(frame_ms / 500.0f);
+    float breathe = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;  // remap to -1..1
     uint16_t modulated_col = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
     int dynamic_r   = (radar_r - 6) + (int)(4 * breathe);
     float cos_rot   = cosf(hud_rotation);
@@ -4741,7 +4736,7 @@ void draw_locator_screen() {
 
             uint16_t box_col;
             if (filled) {
-                float pulse_t = sinf((float)now_ms * 0.004f) * 0.5f + 0.5f;
+                float pulse_t = anim_pulse(UI_PULSE_MEDIUM);
                 uint16_t dark_accent = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.4f);
                 box_col = lerp_col16(dark_accent, ACCENT_COLOR, pulse_t);
             } else {
@@ -5634,7 +5629,7 @@ void draw_feed_expanded_overlay() {
         expand_prev_head = local_head;
     }
 
-    float expand_alpha = ease_alpha(feed_expand_ms, 200);
+    float expand_alpha = ui_progress(feed_expand_ms, UI_FADE_OUT_MS);
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, expand_alpha); };
 
     // Solid backdrop
