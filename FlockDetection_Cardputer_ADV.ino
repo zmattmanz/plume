@@ -1035,12 +1035,40 @@ void export_server_setup_routes() {
 
     auto serve_sd_file = [](const char* path, const char* mime) {
         if (!sd_available) { export_server->send(503, "text/plain", "SD unavailable"); return; }
+        // Serialize against PersistTask / flush_sd_buffer — the Arduino SD/FAT
+        // driver isn't reentrancy-safe and concurrent reads/writes through
+        // separate File handles can corrupt the FAT cluster table mid-pcap.
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            export_server->send(503, "text/plain", "SD busy");
+            return;
+        }
         File f = SD.open(path, FILE_READ);
-        if (!f) { export_server->send(404, "text/plain", "Not found"); return; }
+        if (!f) {
+            xSemaphoreGive(sdMutex);
+            export_server->send(404, "text/plain", "Not found");
+            return;
+        }
+        size_t total = f.size();
+        export_server->setContentLength(total);
         export_server->sendHeader("Content-Disposition",
                                   String("attachment; filename=\"") + (path + 1) + "\"");
-        export_server->streamFile(f, mime);
+        export_server->send(200, mime, "");
+
+        // Stream in 1 KB chunks, resetting the WDT and yielding to TCP/WiFi
+        // tasks between each. streamFile() would block the main loop for the
+        // entire transfer (10–30s on slow clients with multi-MB pcaps),
+        // tripping the 30-second WDT and stalling alarms / event drain.
+        WiFiClient client = export_server->client();
+        uint8_t buf[1024];
+        while (f.available() && client.connected()) {
+            int n = f.read(buf, sizeof(buf));
+            if (n <= 0) break;
+            client.write(buf, n);
+            esp_task_wdt_reset();
+            yield();
+        }
         f.close();
+        xSemaphoreGive(sdMutex);
     };
 
     export_server->on("/FlockLog.csv", HTTP_GET, [serve_sd_file]() {
@@ -1403,11 +1431,10 @@ static void sd_check_hotplug() {
     if (now - last_sd_check_ms < SD_CHECK_INTERVAL_MS) return;
     last_sd_check_ms = now;
 
-    // Timed take so the main loop's WDT can still reset if PersistTask is
-    // mid-write. If we can't grab the mutex within 5s, bail — the next
-    // 5-second poll will retry. Single exit point below ensures the give
-    // always pairs with this take.
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    // Short timed take — hot-plug is a 5-second poll and gladly retries.
+    // Blocking the main loop here for seconds at a time would freeze the
+    // UI and starve alarm processing while PersistTask is writing.
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         return;
     }
 
@@ -1825,10 +1852,10 @@ void flush_sd_buffer() {
         return;
     }
 
-    // Timed take — if PersistTask or hot-plug holds the SD mutex too long,
-    // drop this flush cycle. The same buffers will retry on the next
-    // FLUSH_INTERVAL_MS tick. Keeps the main loop's WDT alive.
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    // Short timed take — flush runs every 500ms and gladly retries on the
+    // next tick. Blocking for seconds here freezes the main loop and
+    // starves alarms / WiFi event processing.
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         return;
     }
 
@@ -5717,9 +5744,11 @@ void transition_screen(int new_screen, int dir) {
         history_scroll_offset = 0;
         history_selected_idx = 0;
         hist_detail_open = false;
-        // Timed take so a stuck PersistTask can't freeze the UI on screen
-        // change. Stale history is acceptable — next detection re-marks it dirty.
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        // Short timed take so a stuck PersistTask can't freeze the screen
+        // transition. If we miss this window, the screen renders with the
+        // previous snapshot — sd_hist_dirty stays set so the next loop
+        // iteration retries once the bus frees up.
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             load_sd_history();
             xSemaphoreGive(sdMutex);
             sd_hist_dirty = false;
