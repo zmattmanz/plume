@@ -941,17 +941,36 @@ const char* confidence_label(int score) {
     return "LOW";
 }
 
+// Prefer GPS UTC for PCAP timestamps so captures open in Wireshark with
+// real wall-clock time. Falls back to a synthetic monotonic epoch if no
+// GPS lock is available. Caller must NOT hold dataMutex (non-recursive).
+static void compute_pcap_ts(uint32_t* sec, uint32_t* usec) {
+    unsigned long ms = millis();
+    bool got_gps = false;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
+            uint32_t epoch = utc_to_epoch(
+                gps.date.year(), gps.date.month(), gps.date.day(),
+                gps.time.hour(), gps.time.minute(), gps.time.second());
+            if (epoch > 0) { *sec = epoch; got_gps = true; }
+        }
+        xSemaphoreGive(dataMutex);
+    }
+    if (!got_gps) {
+        *sec = 1700000000UL + (uint32_t)(ms / 1000UL);
+    }
+    *usec = (uint32_t)((ms % 1000UL) * 1000UL);
+}
+
 void write_threat_pcap(const uint8_t* payload, uint32_t length) {
     if (!sd_available) return;
     uint32_t capture_len = (length > 256) ? 256 : length;
+    uint32_t ts_sec = 0, ts_usec = 0;
+    compute_pcap_ts(&ts_sec, &ts_usec);
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (pcap_write_count < MAX_PCAP_BUFFER) {
-        unsigned long now_ms = millis();
-        const uint32_t PCAP_EPOCH_BASE = 1700000000UL;
-        uint32_t elapsed_sec  = (uint32_t)(now_ms / 1000UL);
-        uint32_t elapsed_usec = (uint32_t)((now_ms % 1000UL) * 1000UL);
-        pcap_write_buffer[pcap_write_count].ts_sec  = PCAP_EPOCH_BASE + elapsed_sec;
-        pcap_write_buffer[pcap_write_count].ts_usec = elapsed_usec;
+        pcap_write_buffer[pcap_write_count].ts_sec  = ts_sec;
+        pcap_write_buffer[pcap_write_count].ts_usec = ts_usec;
         pcap_write_buffer[pcap_write_count].incl_len = capture_len;
         pcap_write_buffer[pcap_write_count].orig_len = length;
         memcpy(pcap_write_buffer[pcap_write_count].payload, payload, capture_len);
@@ -963,14 +982,12 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
 void write_ble_pcap(const uint8_t* payload, uint32_t length) {
     if (!sd_available) return;
     uint32_t capture_len = (length > 256) ? 256 : length;
+    uint32_t ts_sec = 0, ts_usec = 0;
+    compute_pcap_ts(&ts_sec, &ts_usec);
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     if (ble_pcap_write_count < MAX_PCAP_BUFFER) {
-        unsigned long now_ms = millis();
-        const uint32_t PCAP_EPOCH_BASE = 1700000000UL;
-        uint32_t elapsed_sec  = (uint32_t)(now_ms / 1000UL);
-        uint32_t elapsed_usec = (uint32_t)((now_ms % 1000UL) * 1000UL);
-        ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = PCAP_EPOCH_BASE + elapsed_sec;
-        ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = elapsed_usec;
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = ts_sec;
+        ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = ts_usec;
         ble_pcap_write_buffer[ble_pcap_write_count].incl_len = capture_len;
         ble_pcap_write_buffer[ble_pcap_write_count].orig_len = length;
         memcpy(ble_pcap_write_buffer[ble_pcap_write_count].payload, payload, capture_len);
@@ -1469,15 +1486,16 @@ static void sd_check_hotplug() {
             Serial.println("[SD] Hot-plug mount succeeded");
         }
     } else {
-        // Card was present — probe a known file as a cheap presence check
-        File probe = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_READ);
-        if (!probe && sd_was_available) {
+        // Probe at the controller level — independent of any file existing.
+        // The previous file-probe falsely reported "removed" within the first
+        // 60s of boot when /FLOCK_FINDER/stats/lifetime.txt had not yet been
+        // written by the persist task.
+        if (SD.cardType() == CARD_NONE && sd_was_available) {
             sd_available = false;
             SD.end();
             set_toast_direct("SD CARD REMOVED", CAUTION_COLOR);
             Serial.println("[SD] Card removal detected");
         }
-        if (probe) probe.close();
     }
 
     sd_was_available = sd_available;
@@ -1953,6 +1971,18 @@ void add_to_capture_history(const char* type, const char* mac, const char* name,
     capture_history[0].confidence = confidence;
     format_time_buf((millis() - session_start_time) / 1000,
                     capture_history[0].time, sizeof(capture_history[0].time));
+
+    // Caller (log_detection) already holds dataMutex — read GPS directly.
+    // Without this, the new entry inherits stale lat/lng from the shifted
+    // entry below it, then save_detections_to_flash persists wrong coords.
+    if (gps.location.isValid() && gps.location.age() < 2000) {
+        capture_history[0].lat = gps.location.lat();
+        capture_history[0].lng = gps.location.lng();
+    } else {
+        capture_history[0].lat = 0.0;
+        capture_history[0].lng = 0.0;
+    }
+
     if (capture_history_count < CAPTURE_HISTORY_SIZE) capture_history_count++;
 }
 
