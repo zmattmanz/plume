@@ -107,10 +107,10 @@ static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 static float ease_muted = 0.0f;
 
 // RGB LED state — color cycles with C key, on/off with L when locator idle
-static uint8_t led_r = 50, led_g = 255, led_b = 100; // default green (matches ACCENT_COLOR)
+static uint8_t led_r = 124, led_g = 228, led_b = 210; // default mint (matches ACCENT_COLOR)
 static bool    led_breathing_on = true;
 static const uint8_t LED_COLORS[][3] = {
-    { 50, 255, 100},  // green (matches ACCENT_COLOR — default)
+    {124, 228, 210},  // mint (matches ACCENT_COLOR — default)
     { 80, 200, 255},  // cyan
     {  0, 200,   0},  // green
     {  0, 160, 200},  // teal
@@ -128,33 +128,35 @@ static bool     led_detect_active = false;
 
 void apply_color_palette() {
     if (night_mode) {
-        BG_COLOR      = lgfx::color565(  8,   0,   0);
-        CARD_COLOR    = lgfx::color565( 25,   0,   0);
-        CARD_BORDER   = lgfx::color565( 60,   5,   5);
-        HEADER_COLOR  = lgfx::color565(255,  60,  60);
-        TEXT_COLOR    = lgfx::color565(220, 180, 180);
-        DIM_COLOR     = lgfx::color565(140,  30,  30);
-        ACCENT_COLOR  = lgfx::color565(255, 100, 100);  // bright red — primary
-
-        // Three-tier night palette: bright, warning, dim.
-        // Categories that were distinct in day mode (Raven, BLE, GPS) collapse
-        // toward ACCENT in night mode — geometry/position carries the meaning.
-        CAUTION_COLOR = lgfx::color565(255, 140,  20);  // amber — warnings only
-        TEAL_COLOR    = lgfx::color565(255, 100, 100);  // = ACCENT (Raven)
-        PURPLE_COLOR  = lgfx::color565(200,  60,  80);  // dim red-pink (BLE)
-        GPS_COLOR     = lgfx::color565(255, 100, 100);  // = ACCENT (GPS)
+        // Night condensed: red-only chrome, amber stays distinct.
+        // One-token swap from day: mint → red. Everything else follows.
+        BG_COLOR      = lgfx::color565( 10,   0,   0);   // #0A0000
+        CARD_COLOR    = lgfx::color565( 58,  10,  10);   // #3A0A0A
+        CARD_BORDER   = lgfx::color565( 90,  20,  20);   // #5A1414
+        HEADER_COLOR  = lgfx::color565(255,  90,  90);   // #FF5A5A
+        TEXT_COLOR    = lgfx::color565(255, 208, 208);   // #FFD0D0
+        DIM_COLOR     = lgfx::color565(122,  48,  48);   // #7A3030
+        ACCENT_COLOR  = lgfx::color565(255,  90,  90);   // = HEADER (unified)
+        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber (same both modes)
+        TEAL_COLOR    = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
+        PURPLE_COLOR  = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
+        GPS_COLOR     = lgfx::color565(255,  90,  90);   // = HEADER (collapsed)
     } else {
-        BG_COLOR      = lgfx::color565( 10,  20,  48);
-        CARD_COLOR    = lgfx::color565( 18,  36,  80);
-        CARD_BORDER   = lgfx::color565( 24,  46, 100);
-        HEADER_COLOR  = lgfx::color565(  0, 215, 235);
-        TEXT_COLOR    = lgfx::color565(220, 232, 255);
-        DIM_COLOR     = lgfx::color565(100, 140, 180);
-        ACCENT_COLOR  = lgfx::color565( 50, 255, 100);
-        TEAL_COLOR    = lgfx::color565(  0, 215, 160);
-        PURPLE_COLOR  = lgfx::color565(210, 110, 255);
-        CAUTION_COLOR = lgfx::color565(255, 224,   0);
-        GPS_COLOR     = lgfx::color565( 80, 200, 255);
+        // Condensed palette: 4 hues + chrome stack.
+        // Mint-cyan = chrome AND confirmation. Amber = only contrast hue.
+        // WiFi/BLE/Raven feed rows lose categorical color — protocol is
+        // carried by the W/B/R symbol prefix and the flock-confirmed *.
+        BG_COLOR      = lgfx::color565(  5,  10,  20);   // #050A14
+        CARD_COLOR    = lgfx::color565( 29,  50,  88);   // #1D3258
+        CARD_BORDER   = lgfx::color565( 46,  70, 112);   // #2E4670
+        HEADER_COLOR  = lgfx::color565(124, 228, 210);   // #7CE4D2 mint
+        TEXT_COLOR    = lgfx::color565(232, 239, 255);   // #E8EFFF
+        DIM_COLOR     = lgfx::color565( 90, 107, 128);   // #5A6B80
+        ACCENT_COLOR  = lgfx::color565(124, 228, 210);   // = HEADER (unified)
+        TEAL_COLOR    = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
+        PURPLE_COLOR  = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
+        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber
+        GPS_COLOR     = lgfx::color565(124, 228, 210);   // = HEADER (collapsed)
     }
 }
 
@@ -2119,11 +2121,12 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     if (is_new) {
         add_seen_mac(mac);
         if (strcmp(proto, "WIFI") == 0) {
-            session_wifi++; lifetime_wifi++; session_flock_wifi++; blip_col = CAUTION_COLOR;
+            session_wifi++; lifetime_wifi++; session_flock_wifi++;
+            blip_col = ACCENT_COLOR;   // condensed: all detections use accent
         } else {
-            session_ble++; lifetime_ble++; blip_col = PURPLE_COLOR;
+            session_ble++; lifetime_ble++; blip_col = ACCENT_COLOR;
         }
-        if (strstr(type, "RAVEN") != NULL) { session_raven++; blip_col = TEAL_COLOR; }
+        if (strstr(type, "RAVEN") != NULL) { session_raven++; blip_col = ACCENT_COLOR; }
         else if (strcmp(proto, "BLE") == 0) { session_flock_ble++; }
         lifetime_flock_total++;
         add_to_capture_history(type, mac, name, rssi, confidence);
@@ -4025,9 +4028,10 @@ void draw_scanner_screen() {
             int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
 
             // Color based on intensity — cyan-green family for day, red-orange for night
+            // Day: mint-cyan tinted particles. Night: warmer red tint.
             uint16_t p_col = night_mode
-                ? lgfx::color565(total_intensity, total_intensity / 5, 0)
-                : lgfx::color565(0, total_intensity * 2 / 3, total_intensity);
+                ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
+                : lgfx::color565(total_intensity / 3, (total_intensity * 7) / 8, (total_intensity * 5) / 6);
 
             // Draw small upward triangle (matches detection triangle vocabulary but smaller)
             // Size 3: base 3px, height 3px
@@ -5826,10 +5830,10 @@ static unsigned long boot_digit_anim_ms[8] = {0};
 void draw_boot_screen(int pct, const char* status_text = nullptr) {
     auto& lcd = M5Cardputer.Display;
 
-    uint16_t bg     = lgfx::color565( 10,  20,  48);
-    uint16_t blue   = lgfx::color565(  0, 215, 235);
-    uint16_t white  = lgfx::color565(255, 255, 255);
-    uint16_t dim    = lgfx::color565(140, 170, 200);
+    uint16_t bg     = lgfx::color565(  5,  10,  20);   // matches BG_COLOR (day)
+    uint16_t blue   = lgfx::color565(124, 228, 210);   // matches HEADER_COLOR (mint)
+    uint16_t white  = lgfx::color565(232, 239, 255);   // matches TEXT_COLOR
+    uint16_t dim    = lgfx::color565( 90, 107, 128);   // matches DIM_COLOR
 
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -5968,22 +5972,23 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int total_w = n_chars * char_w;
         int start_x = (DISP_W - total_w) / 2;
 
-        // On every pct change, animate ALL visible digits with a left-to-right
-        // stagger — each digit starts 30ms after the one to its left, creating
-        // a cascading "reel" effect like an odometer rolling forward.
+        // On every pct change, kick off all digit rolls simultaneously.
+        // The previous left-to-right stagger looked broken at the new
+        // 100ms roll duration — too short to read as a cascade.
         unsigned long now_t = millis();
         if (pct != boot_prev_pct) {
-            const unsigned long DIGIT_STAGGER_MS = 30;
             for (int di = 0; di < n_chars - 1 && di < 8; di++) {
-                boot_digit_anim_ms[di] = now_t + di * DIGIT_STAGGER_MS;
+                boot_digit_anim_ms[di] = now_t;
             }
             strncpy(boot_prev_digits, pct_str, sizeof(boot_prev_digits) - 1);
             boot_prev_digits[sizeof(boot_prev_digits) - 1] = '\0';
             boot_prev_pct = pct;
         }
 
-        // Per-digit roll uses UI_ANIM_QUICK — micro-feedback tier.
-        const unsigned long ROLL_MS = UI_ANIM_QUICK;
+        // Fast roll — must complete well within the shortest boot stage
+        // (BOOT_RUSH approach_max_ms = 120) so digits are never caught
+        // mid-animation by a phase transition.
+        const unsigned long ROLL_MS = 100;
 
         // Draw the % symbol whenever its position needs to change (which
         // happens on first appearance and when the digit count changes:
@@ -6006,17 +6011,23 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             pct_symbol_x = new_pct_x;
         }
 
-        // Animate each digit independently. Skip if not yet started (staggered
-        // start time is in the future) or already finished (past ROLL_MS).
+        // Always render every digit every frame — settled or animating.
+        // The previous skip-if-settled path left a digit mid-roll on the
+        // LCD if a personality reset the animation before the roll
+        // completed; without a redraw the digit would freeze in place
+        // (this is what produced the "hung digit" boot bug).
         for (int di = 0; di < n_chars - 1 && di < 8; di++) {
-            if (boot_digit_anim_ms[di] == 0) continue;
-            // Future start time — staggered digit hasn't begun rolling yet.
-            if ((long)(now_t - boot_digit_anim_ms[di]) < 0) continue;
-            unsigned long elapsed = now_t - boot_digit_anim_ms[di];
-            if (elapsed > ROLL_MS) continue;
-
             int dx = start_x + di * char_w;
-            int draw_y = anim_slide_in(num_y, num_h, boot_digit_anim_ms[di], ROLL_MS);
+            int draw_y = num_y;  // default: settled position
+
+            if (boot_digit_anim_ms[di] != 0 &&
+                (long)(now_t - boot_digit_anim_ms[di]) >= 0) {
+                unsigned long elapsed = now_t - boot_digit_anim_ms[di];
+                if (elapsed < ROLL_MS) {
+                    draw_y = anim_slide_in(num_y, num_h, boot_digit_anim_ms[di], ROLL_MS);
+                }
+                // else: animation complete — draw_y stays at num_y
+            }
 
             lcd.startWrite();
             lcd.setClipRect(dx, num_y, char_w, num_h);
@@ -6050,9 +6061,12 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             fill_anim_start = millis();
         }
 
-        // Bar fill uses UI_ANIM_NORMAL for a smoother eased expansion across
-        // the boot stage's frames.
-        float ease = ui_progress(fill_anim_start, UI_ANIM_NORMAL);
+        // Boot bar fill uses a shorter duration than UI_ANIM_NORMAL so the
+        // bar arrives authoritatively rather than creeping. Must be shorter
+        // than BOOT_RUSH approach_max_ms (120) so even the fastest stage
+        // can fully resolve to its target.
+        static const unsigned long BOOT_BAR_FILL_MS = 160;
+        float ease = ui_progress(fill_anim_start, BOOT_BAR_FILL_MS);
         boot_eased_fill = (float)fill_anim_from + (float)(fill_anim_to - fill_anim_from) * ease;
 
         int fill_w = (int)(boot_eased_fill + 0.5f);
@@ -6107,7 +6121,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int cur_w = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
         int cur_x = (DISP_W - cur_w) / 2;
 
-        const unsigned long ROLL_MS = 200;
+        const unsigned long ROLL_MS = 120;
         const int SLIDE_PX = 10;  // slides up 10px
         int draw_y = anim_slide_in(status_y, SLIDE_PX, boot_status_anim_start, ROLL_MS);
         int y_offset = draw_y - status_y;
@@ -6135,38 +6149,93 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     lcd.setTextDatum(TL_DATUM);
 }
 
-// Animate the boot progress bar so the eased fill is visible.
-// Per-frame delay bumped from 18ms to 25ms for a more deliberate boot pace.
-static void boot_animate(int pct, const char* status, int frames = 30) {
-    // Randomized: frames vary by ±4 and per-frame delay gets a 0–7ms jitter
-    // so each boot stage takes a slightly different wall-clock time. The
-    // percentage counter ends up hitting different numbers at different
-    // moments — each boot reads as organic rather than mechanical.
-    frames += random(-8, 10);
-    if (frames < 8) frames = 8;
-    if (frames > 55) frames = 55;
+// Boot stage personalities — selected randomly per call to give each
+// boot slightly different pacing. Smoothness within a stage stays at
+// ~60fps; only the dwell-after-target and the bar's approach curve vary.
+enum BootPersonality {
+    BOOT_NORMAL,   // smooth advance, brief settle
+    BOOT_LURCH,    // overshoot target slightly, settle back
+    BOOT_RUSH,     // fast advance, no settle dwell
+    BOOT_STALL,    // pause near target, then snap home
+};
 
-    static uint8_t delay_phase = 0;
-    for (int i = 0; i < frames; i++) {
-        draw_boot_screen(pct, (i == 0) ? status : nullptr);
-        float t = (float)i / (float)(frames - 1);
-        // Sine-wave speed variation: slow at start, fast in middle, slow at end —
-        // reads like a physical mechanism ramping up and back down.
-        float wave = sinf(t * (float)M_PI);                // 0 → 1 → 0
-        int per_frame = (int)(18.0f - 6.0f * wave);        // 18ms edges, 12ms middle
-        per_frame += (delay_phase++ & 0x03);
-        per_frame += random(0, 8);                     // 0–7ms jitter
+static BootPersonality pick_boot_personality() {
+    int roll = random(0, 100);
+    if (roll < 65) return BOOT_NORMAL;
+    if (roll < 85) return BOOT_LURCH;
+    if (roll < 95) return BOOT_RUSH;
+    return BOOT_STALL;
+}
 
-        // Random lurches: ~15% chance of a stall (heavy load feel),
-        // ~10% chance of a burst (catching up after stall)
-        int roll = random(0, 100);
-        if (roll < 15) {
-            per_frame += random(40, 120);  // stall: 40-120ms pause
-        } else if (roll < 25) {
-            per_frame = random(2, 5);      // burst: nearly instant frame
+// Drive the boot screen until the bar fill reaches the target percentage,
+// then hold for a personality-dependent dwell. Frames render at ~60fps
+// (16ms each) with no per-frame jitter — smoothness is deliberate.
+//
+// draw_boot_screen eases the bar fill internally (UI_ANIM_NORMAL re-target
+// whenever target_fill changes), so personality variations modify the
+// *target* the renderer sees rather than the per-frame motion. LURCH
+// retargets to an overshoot pct, lets the renderer ease there, then
+// retargets to the real value — the eye sees a smooth bounce.
+//
+// The third parameter is retained as `int = 0` so existing call sites that
+// passed a frame count keep compiling; the value is ignored.
+static void boot_animate(int pct, const char* status, int /*unused*/ = 0) {
+    BootPersonality p = pick_boot_personality();
+
+    int   final_pct        = pct;
+    int   intermediate_pct = pct;
+    unsigned long approach_max_ms;
+    unsigned long settle_ms;
+
+    switch (p) {
+        case BOOT_RUSH:
+            approach_max_ms = 120;
+            settle_ms       = 0;
+            break;
+        case BOOT_LURCH:
+            intermediate_pct = pct + random(3, 6);
+            if (intermediate_pct > 100) intermediate_pct = 100;
+            approach_max_ms = 200;
+            settle_ms       = 100;
+            break;
+        case BOOT_STALL:
+            intermediate_pct = pct;
+            approach_max_ms = 400;
+            settle_ms       = 0;
+            break;
+        case BOOT_NORMAL:
+        default:
+            approach_max_ms = 180;
+            settle_ms       = 60;
+            break;
+    }
+
+    // Phase 1: drive frames at ~60fps until the approach window expires.
+    // The renderer eases the bar toward intermediate_pct internally.
+    unsigned long phase_start = millis();
+    bool first_frame = true;
+    while (millis() - phase_start < approach_max_ms) {
+        draw_boot_screen(intermediate_pct, first_frame ? status : nullptr);
+        first_frame = false;
+        delay(16);
+    }
+
+    // Phase 2 (LURCH only): settle from overshoot back to the real target.
+    if (p == BOOT_LURCH && intermediate_pct != final_pct) {
+        unsigned long settle_start = millis();
+        while (millis() - settle_start < 120) {
+            draw_boot_screen(final_pct, nullptr);
+            delay(16);
         }
+    }
 
-        delay(per_frame);
+    // Phase 3: brief dwell so the eye registers the new value.
+    if (settle_ms > 0) {
+        unsigned long settle_start = millis();
+        while (millis() - settle_start < settle_ms) {
+            draw_boot_screen(final_pct, nullptr);
+            delay(16);
+        }
     }
 }
 
@@ -6484,7 +6553,7 @@ void setup() {
     // self-subscribes via esp_task_wdt_add(NULL) inside its loop.
 
     boot_animate(100, "ready");
-    delay(900);
+    delay(400);
 
     // Gate: wait for the WiFi sniffer to confirm radios are up (~15 packets) or
     // 4 seconds, whichever comes first. Pump event queues during the wait so the
