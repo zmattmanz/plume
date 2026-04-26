@@ -2558,7 +2558,8 @@ static void ble_worker_task(void* pvParameters) {
     BleEventData* ev;
     for (;;) {
         if (!wdt_subscribed) {
-            if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+            esp_err_t err = esp_task_wdt_add(NULL);
+            if (err == ESP_OK || err == ESP_ERR_INVALID_ARG) wdt_subscribed = true;
         }
         if (wdt_subscribed) esp_task_wdt_reset();
         // 1s timeout so the WDT reset above can fire even when the queue is idle.
@@ -2812,7 +2813,8 @@ void ScannerLoopTask(void* pvParameters) {
     unsigned long scan_start_ms = 0;
     for (;;) {
         if (!wdt_subscribed) {
-            if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+            esp_err_t err = esp_task_wdt_add(NULL);
+            if (err == ESP_OK || err == ESP_ERR_INVALID_ARG) wdt_subscribed = true;
         }
         if (wdt_subscribed) esp_task_wdt_reset();
         unsigned long now = millis();
@@ -2872,7 +2874,8 @@ void GPSLoopTask(void* pvParameters) {
     bool wdt_subscribed = false;
     for (;;) {
         if (!wdt_subscribed) {
-            if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+            esp_err_t err = esp_task_wdt_add(NULL);
+            if (err == ESP_OK || err == ESP_ERR_INVALID_ARG) wdt_subscribed = true;
         }
         if (wdt_subscribed) esp_task_wdt_reset();
         int avail = SerialGPS.available();
@@ -6458,7 +6461,8 @@ void setup() {
 void loop() {
     static bool wdt_subscribed = false;
     if (!wdt_subscribed) {
-        if (esp_task_wdt_add(NULL) == ESP_OK) wdt_subscribed = true;
+        esp_err_t err = esp_task_wdt_add(NULL);
+        if (err == ESP_OK || err == ESP_ERR_INVALID_ARG) wdt_subscribed = true;
     }
     if (wdt_subscribed) esp_task_wdt_reset();
     M5Cardputer.update(); yield();
