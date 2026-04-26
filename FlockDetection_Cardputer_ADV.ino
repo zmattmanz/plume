@@ -201,6 +201,11 @@ static const unsigned long UI_ANIM_NORMAL = 320;
 static const unsigned long UI_ANIM_SLOW   = 500;
 static const int           UI_SLIDE_PX    = 14;
 
+// Overlay/toast fade tiers — names alias the purpose so call sites
+// can self-document without inventing new durations.
+static const unsigned long UI_FADE_IN_MS  = 150;  // overlays/toasts appearing
+static const unsigned long UI_FADE_OUT_MS = 200;  // overlays/toasts disappearing
+
 // ease_out_quad — the single curve we use for every UI animation.
 // Decelerating motion: fast start, soft landing. Reads as "natural" UI motion.
 static inline float ui_ease(float t) {
@@ -217,6 +222,59 @@ static inline float ui_progress(unsigned long start_ms, unsigned long duration_m
     unsigned long elapsed = now - start_ms;
     if (elapsed >= duration_ms) return 1.0f;
     return ui_ease((float)elapsed / (float)duration_ms);
+}
+
+// ── Animation primitives ───────────────────────────────────────────
+// Built on ui_ease/ui_progress. New animation code should reach for
+// these instead of hand-rolling the math at every site.
+
+// Returns the current y for an element animating from
+// (target_y + slide_distance) to target_y over duration_ms with the
+// standard UI ease curve. Pass start_ms=0 for "settled" — returns
+// target_y immediately. Once duration elapses, returns target_y exactly.
+// Positive slide_distance means the element starts BELOW target; pass
+// a negative distance to slide in from above.
+static inline int anim_slide_in(int target_y, int slide_distance,
+                                unsigned long start_ms, unsigned long duration_ms) {
+    if (start_ms == 0) return target_y;
+    float t = ui_progress(start_ms, duration_ms);
+    if (t >= 1.0f) return target_y;
+    return target_y + (int)((1.0f - t) * (float)slide_distance);
+}
+
+// Returns a value in [0.0, 1.0] oscillating sinusoidally with the given
+// period. 0.5 is the resting midpoint. phase offsets the cycle (0.25
+// starts at the peak, 0.75 at the trough). period_ms == 0 returns 0.5.
+static inline float anim_pulse(unsigned long period_ms, float phase = 0.0f) {
+    if (period_ms == 0) return 0.5f;
+    float t = (float)(millis() % period_ms) / (float)period_ms + phase;
+    return 0.5f + 0.5f * sinf(t * 2.0f * (float)M_PI);
+}
+
+// Frame-rate-independent exponential smoothing. time_constant_ms is
+// the time to cover ~63% of the remaining gap; behavior is identical
+// at any FPS. Common tiers: 80–120ms snappy, 200–400ms natural,
+// 800ms+ slow drift.
+static inline float anim_filter(float state, float target,
+                                float time_constant_ms, float dt_ms) {
+    if (time_constant_ms <= 0.0f) return target;
+    float alpha = 1.0f - expf(-dt_ms / time_constant_ms);
+    return state + alpha * (target - state);
+}
+
+// Writes 0..max_dots ASCII dots into out_buf, cycling at period_ms per
+// dot. Buffer must be at least max_dots + 1 bytes. period_ms default
+// 500 matches the existing "scanning..." pattern.
+static inline void anim_ellipsis(char* out_buf, size_t out_len,
+                                 unsigned long period_ms = 500,
+                                 int max_dots = 3) {
+    if (out_len == 0) return;
+    int n = (int)(millis() / period_ms) % (max_dots + 1);
+    int written = 0;
+    for (int i = 0; i < n && written + 1 < (int)out_len; i++) {
+        out_buf[written++] = '.';
+    }
+    out_buf[written] = '\0';
 }
 
 // ── Legacy aliases — kept so existing call sites still compile ──
@@ -1738,8 +1796,8 @@ void rssi_track_expire() {
 // ============================================================================
 #define radar_cx 58
 #define radar_cy 46
-#define radar_r  38
-#define inner_r  16
+#define radar_r  34
+#define inner_r  14
 
 #define NUM_RADIAL_BANDS 36
 float radial_spikes[NUM_RADIAL_BANDS] = {0};
@@ -3835,7 +3893,7 @@ void draw_scanner_screen() {
     float TILT = 0.55f;
     int rcx = radar_cx;
     int rcy = radar_cy;
-    int THICKNESS = 8;
+    int THICKNESS = 7;
 
     // Shadow below cylinder
     spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
@@ -4249,21 +4307,13 @@ void draw_scanner_screen() {
             spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
             spr.setTextSize(1);
 
-            if (pkt_anim_start > 0 && (frame_ms - pkt_anim_start) < PKT_ROLL_MS) {
-                float t = (float)(frame_ms - pkt_anim_start) / (float)PKT_ROLL_MS;
-                float ease = ui_ease(t);
-                int y_offset = (int)((1.0f - ease) * (float)num_h);
-                spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
-                spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
-                spr.setTextDatum(TL_DATUM);
-                spr.setCursor(num_x, num_y + y_offset);
-                spr.print(pkt_str);
-                spr.clearClipRect();
-            } else {
-                spr.setTextDatum(TL_DATUM);
-                spr.setCursor(num_x, num_y);
-                spr.print(pkt_str);
-            }
+            spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
+            spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
+            spr.setTextDatum(TL_DATUM);
+            int draw_y = anim_slide_in(num_y, num_h, pkt_anim_start, PKT_ROLL_MS);
+            spr.setCursor(num_x, draw_y);
+            spr.print(pkt_str);
+            spr.clearClipRect();
         }
 
         spr.setTextDatum(TL_DATUM);
@@ -4277,7 +4327,7 @@ void draw_scanner_screen() {
         long sb_local = sb;
 
         const int stats_label_y = 62;       // top of size-1 labels
-        const int stats_num_y   = 74;       // top of size-3 numbers
+        const int stats_num_y   = 78;       // top of size-3 numbers
         const int sd_left       = right_text_x + 2;
         const int col1_x        = sd_left + 2;
         const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
@@ -4310,23 +4360,14 @@ void draw_scanner_screen() {
 
         // WIFI number with roll animation
         {
-            unsigned long sw_elapsed = frame_ms - sw_anim_start;
-            int num_clip_y = stats_num_y;
-            int num_h = 24;  // textSize(3) height
-            spr.setClipRect(col1_x + 20, num_clip_y, 40, num_h);
+            const int num_h = 24;  // textSize(3) height
+            spr.setClipRect(col1_x + 20, stats_num_y, 40, num_h);
+            spr.fillRect(col1_x + 20, stats_num_y, 40, num_h, BG_COLOR);
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
             spr.setTextSize(3);
-            if (sw_anim_start > 0 && sw_elapsed < ROLL_DURATION) {
-                float t = (float)sw_elapsed / (float)ROLL_DURATION;
-                float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                int offset = (int)((1.0f - ease) * (float)num_h);
-                spr.fillRect(col1_x + 20, num_clip_y, 40, num_h, BG_COLOR);
-                spr.setCursor(col1_x + 20, stats_num_y + offset);
-                spr.print(wifi_num);
-            } else {
-                spr.setCursor(col1_x + 20, stats_num_y);
-                spr.print(wifi_num);
-            }
+            int draw_y = anim_slide_in(stats_num_y, num_h, sw_anim_start, ROLL_DURATION);
+            spr.setCursor(col1_x + 20, draw_y);
+            spr.print(wifi_num);
             spr.clearClipRect();
         }
 
@@ -4347,23 +4388,14 @@ void draw_scanner_screen() {
 
         // BLE number with roll animation
         {
-            unsigned long sb_elapsed = frame_ms - sb_anim_start;
-            int num_clip_y = stats_num_y;
-            int num_h = 24;
-            spr.setClipRect(col2_x + 20, num_clip_y, 40, num_h);
+            const int num_h = 24;
+            spr.setClipRect(col2_x + 20, stats_num_y, 40, num_h);
+            spr.fillRect(col2_x + 20, stats_num_y, 40, num_h, BG_COLOR);
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
             spr.setTextSize(3);
-            if (sb_anim_start > 0 && sb_elapsed < ROLL_DURATION) {
-                float t = (float)sb_elapsed / (float)ROLL_DURATION;
-                float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                int offset = (int)((1.0f - ease) * (float)num_h);
-                spr.fillRect(col2_x + 20, num_clip_y, 40, num_h, BG_COLOR);
-                spr.setCursor(col2_x + 20, stats_num_y + offset);
-                spr.print(ble_num);
-            } else {
-                spr.setCursor(col2_x + 20, stats_num_y);
-                spr.print(ble_num);
-            }
+            int draw_y = anim_slide_in(stats_num_y, num_h, sb_anim_start, ROLL_DURATION);
+            spr.setCursor(col2_x + 20, draw_y);
+            spr.print(ble_num);
             spr.clearClipRect();
         }
     }
@@ -4429,7 +4461,7 @@ void draw_scanner_screen() {
         // Feed section label
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setTextSize(1);
-        spr.setCursor(feed_col_left, feed_top_y - 10);
+        spr.setCursor(feed_col_left, feed_top_y - 12);
         kprint(spr, "LIVE FEED");
 
         // Always render feed — overlay covers it during startup warm-up
@@ -4446,15 +4478,9 @@ void draw_scanner_screen() {
 
                 int row_y;
                 if (i == 0 && display_shift_ms != 0) {
-                    unsigned long elapsed = local_now - display_shift_ms;
-                    if (elapsed < 300) {
-                        float t = (float)elapsed / 300.0f;
-                        float ease = 1.0f - (1.0f - t) * (1.0f - t);
-                        int slide_offset = (int)((1.0f - ease) * (float)feed_row_h);
-                        row_y = feed_top_y - slide_offset;
-                    } else {
-                        row_y = feed_top_y;
-                    }
+                    // New entry slides DOWN into target from above (existing
+                    // rows shift down to make room) — negative slide distance.
+                    row_y = anim_slide_in(feed_top_y, -feed_row_h, display_shift_ms, 300);
                 } else {
                     row_y = feed_top_y + i * feed_row_h;
                 }
@@ -4537,10 +4563,10 @@ void draw_scanner_screen() {
             spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.setTextSize(1.2);
             int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
-            int nd = (int)(local_now / 500) % 4;
+            char dots[4];
+            anim_ellipsis(dots, sizeof(dots));
             char load_str[20];
-            snprintf(load_str, sizeof(load_str), "scanning%s",
-                     nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
+            snprintf(load_str, sizeof(load_str), "scanning%s", dots);
             spr.setCursor(feed_col_left + 8, load_y);
             spr.print(load_str);
         }
@@ -4747,9 +4773,9 @@ void draw_locator_screen() {
     }
     char status_str[26];
     if (status_anim) {
-        int nd = (int)(now_ms / 500) % 4;
-        snprintf(status_str, sizeof(status_str), "%s%s", status_base,
-                 nd == 0 ? "" : nd == 1 ? "." : nd == 2 ? ".." : "...");
+        char dots[4];
+        anim_ellipsis(dots, sizeof(dots));
+        snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
     } else {
         safe_copy(status_str, status_base, sizeof(status_str));
     }
@@ -5352,9 +5378,9 @@ void draw_gps_screen() {
         else                        { status_base = "GPS";           status_col = GPS_COLOR; status_anim = true; }
         char status_str[22];
         if (status_anim) {
-            int nd = (int)(frame_ms / 500) % 4;
-            snprintf(status_str, sizeof(status_str), "%s%s", status_base,
-                     nd==0?"":nd==1?".":nd==2?"..":"...");
+            char dots[4];
+            anim_ellipsis(dots, sizeof(dots));
+            snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
         } else {
             strncpy(status_str, status_base, sizeof(status_str)-1);
             status_str[sizeof(status_str)-1] = '\0';
@@ -5667,15 +5693,7 @@ void draw_feed_expanded_overlay() {
             FeedEntry& e = local_feed[idx];
             int row_y;
             if (rendered == 0 && expand_shift_ms > 0) {
-                unsigned long slide_elapsed = local_now - expand_shift_ms;
-                if (slide_elapsed < 300UL) {
-                    float st = (float)slide_elapsed / 300.0f;
-                    float ease = 1.0f - (1.0f - st) * (1.0f - st);
-                    int slide_offset = (int)((1.0f - ease) * (float)row_h);
-                    row_y = row_top_adj - slide_offset;
-                } else {
-                    row_y = row_top_adj;
-                }
+                row_y = anim_slide_in(row_top_adj, -row_h, expand_shift_ms, 300);
             } else {
                 row_y = row_top_adj + rendered * row_h;
             }
@@ -5871,8 +5889,11 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         const int TITLE_SLIDE_PX = 10;
 
         if (intro_elapsed < UI_ANIM_NORMAL) {
-            float ease = ui_ease((float)intro_elapsed / (float)UI_ANIM_NORMAL);
-            int   y    = TITLE_FINAL_Y - TITLE_SLIDE_PX + (int)(ease * (float)TITLE_SLIDE_PX);
+            // Title slides DOWN from above its resting position. Same elapsed
+            // window drives the color fade; both read from the same start.
+            unsigned long start = millis() - intro_elapsed;
+            int y = anim_slide_in(TITLE_FINAL_Y, -TITLE_SLIDE_PX, start, UI_ANIM_NORMAL);
+            float ease = ui_progress(start, UI_ANIM_NORMAL);
             uint16_t col = lerp_col16(bg, blue, ease);
 
             lcd.startWrite();
@@ -5999,10 +6020,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             unsigned long elapsed = now_t - boot_digit_anim_ms[di];
             if (elapsed > ROLL_MS) continue;
 
-            float ease = ui_ease((float)elapsed / (float)ROLL_MS);
-            int y_off  = (int)((1.0f - ease) * (float)num_h);
-
             int dx = start_x + di * char_w;
+            int draw_y = anim_slide_in(num_y, num_h, boot_digit_anim_ms[di], ROLL_MS);
 
             lcd.startWrite();
             lcd.setClipRect(dx, num_y, char_w, num_h);
@@ -6011,7 +6030,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             lcd.setTextSize(2);
             lcd.setTextDatum(TL_DATUM);
             char ch[2] = { pct_str[di], '\0' };
-            lcd.drawString(ch, dx, num_y + y_off);
+            lcd.drawString(ch, dx, draw_y);
             lcd.clearClipRect();
             lcd.endWrite();
         }
@@ -6094,10 +6113,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         int cur_x = (DISP_W - cur_w) / 2;
 
         const unsigned long ROLL_MS = 200;
-        unsigned long elapsed = millis() - boot_status_anim_start;
-        float t = (elapsed >= ROLL_MS) ? 1.0f : (float)elapsed / (float)ROLL_MS;
-        float ease = ui_ease(t);
-        int y_offset = (int)((1.0f - ease) * 10.0f);  // slides up 10px
+        const int SLIDE_PX = 10;  // slides up 10px
+        int draw_y = anim_slide_in(status_y, SLIDE_PX, boot_status_anim_start, ROLL_MS);
+        int y_offset = draw_y - status_y;
+        float t = ui_progress(boot_status_anim_start, ROLL_MS);
 
         lcd.startWrite();
         lcd.setClipRect(0, status_y, DISP_W, status_h);
