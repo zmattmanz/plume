@@ -1894,22 +1894,33 @@ void flush_sd_buffer() {
 // Does NOT touch the queue — it only sets the currently-displayed toast.
 static void set_toast_direct(const char* text, uint16_t accent) {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    // If a queued toast is already active, replace the head entry so the
-    // expiry handler in draw_toast_spr doesn't pop a phantom slot.
     if (toast_active && toast_queue_count > 0) {
+        // Replace the head entry so the expiry handler in draw_toast_spr
+        // doesn't pop a phantom slot.
         strncpy(toast_queue[toast_queue_head].text, text,
                 sizeof(toast_queue[toast_queue_head].text) - 1);
         toast_queue[toast_queue_head].text[sizeof(toast_queue[toast_queue_head].text) - 1] = '\0';
         toast_queue[toast_queue_head].accent    = accent;
         toast_queue[toast_queue_head].is_action = true;
-    } else if (toast_queue_count == 0) {
-        // No queue activity — push one so expiry accounting matches.
-        toast_queue_head = 0;
-        strncpy(toast_queue[0].text, text, sizeof(toast_queue[0].text) - 1);
-        toast_queue[0].text[sizeof(toast_queue[0].text) - 1] = '\0';
-        toast_queue[0].accent    = accent;
-        toast_queue[0].is_action = true;
-        toast_queue_count = 1;
+    } else {
+        // No active toast — push as a new queue entry so expiry accounting
+        // matches. Covers both the toast_queue_count == 0 case and the
+        // !toast_active && toast_queue_count > 0 case (the latter would
+        // otherwise be silently lost: expiry would advance past a queued
+        // toast that was never displayed).
+        if (toast_queue_count >= TOAST_QUEUE_SIZE) {
+            toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
+            toast_queue_count--;
+        }
+        int slot = (toast_queue_head + toast_queue_count) % TOAST_QUEUE_SIZE;
+        strncpy(toast_queue[slot].text, text, sizeof(toast_queue[slot].text) - 1);
+        toast_queue[slot].text[sizeof(toast_queue[slot].text) - 1] = '\0';
+        toast_queue[slot].accent    = accent;
+        toast_queue[slot].is_action = true;
+        toast_queue_count++;
+        // Advance head to the just-pushed entry so the legacy mirror and
+        // expiry pop refer to the same slot we're about to display.
+        toast_queue_head = slot;
     }
     strncpy(toast_text, text, sizeof(toast_text) - 1);
     toast_text[sizeof(toast_text) - 1] = '\0';
@@ -2382,7 +2393,10 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
 }
 
 void process_wifi_event_queue() {
-    while (wifi_event_queue[wifi_eq_read_idx].ready) {
+    // Cap drained events per call so a packet burst (e.g. crowded
+    // conference center) cannot starve the rest of loop().
+    int budget = 4;
+    while (budget-- > 0 && wifi_event_queue[wifi_eq_read_idx].ready) {
         WifiEvent* ev = &wifi_event_queue[wifi_eq_read_idx];
         __sync_synchronize();   // acquire: pair with producer's release below
 
@@ -4327,7 +4341,11 @@ void draw_scanner_screen() {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             display_count = feed_count;
             display_head = feed_head;
-            for (int i = 0; i < display_count; i++) display_feed[i] = feed_entries[i];
+            // feed_entries is a ring keyed by feed_head; entries past
+            // display_count still hold valid live data the renderer
+            // will reach via its (head - i) modular index. Copy the
+            // whole array so the snapshot matches the renderer's view.
+            for (int i = 0; i < FEED_SIZE; i++) display_feed[i] = feed_entries[i];
             xSemaphoreGive(dataMutex);
             display_last_refresh = local_now;
             if (display_count > 0) {
@@ -5509,7 +5527,9 @@ void draw_feed_expanded_overlay() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     local_count = feed_count;
     local_head = feed_head;
-    for (int i = 0; i < local_count; i++) local_feed[i] = feed_entries[i];
+    // feed_entries is a ring keyed by feed_head; copy the whole array
+    // so the renderer's modular index reaches the actual newest entry.
+    for (int i = 0; i < FEED_SIZE; i++) local_feed[i] = feed_entries[i];
     local_now = millis();
     xSemaphoreGive(dataMutex);
 
@@ -6578,7 +6598,14 @@ void loop() {
             draw_current_screen(); spr.pushSprite(0,0);
         }
 
+        // Tracks whether ENTER was already handled by the status.word loop
+        // so the status.enter fallback below doesn't re-fire the same action
+        // on firmwares that report ENTER in both places.
+        bool enter_consumed = false;
+
         for (auto c : status.word) {
+
+            if (c == '\n' || c == '\r') enter_consumed = true;
 
             // ── WiFi Config input intercept ──
             // When the wifi config overlay is open, all keys are routed here.
@@ -7016,8 +7043,10 @@ void loop() {
         }
 
         // Fallback ENTER check — some Cardputer ADV firmware doesn't put
-        // ENTER in status.word. Check status.enter directly.
-        if (status.enter && !stealth_mode) {
+        // ENTER in status.word. Check status.enter directly only when the
+        // loop above didn't already act on it (firmwares that report ENTER
+        // in both places would otherwise toggle every action twice).
+        if (status.enter && !enter_consumed && !stealth_mode) {
             if (show_menu) {
                 menu_click();
                 handle_menu_select();
