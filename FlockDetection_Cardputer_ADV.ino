@@ -1311,15 +1311,20 @@ static void PersistTask(void* pv) {
     vTaskDelete(NULL);
 }
 
-static void schedule_persist() {
-    if (persist_in_flight) return;  // already running, skip this cycle
+// Returns true if a persist is now in flight (either we just spawned one
+// or one was already running). Returns false if the spawn failed (e.g.
+// heap exhaustion) — caller should retry on the next loop iteration so
+// a low-heap window doesn't lose a full PERSIST_INTERVAL of data.
+static bool schedule_persist() {
+    if (persist_in_flight) return true;
     persist_in_flight = true;
     BaseType_t ok = xTaskCreatePinnedToCore(
         PersistTask, "PersistTask", 4096, NULL, 1, NULL, 1);
     if (ok != pdPASS) {
-        // Couldn't spawn — clear the flag so next minute can retry.
         persist_in_flight = false;
+        return false;
     }
+    return true;
 }
 
 static void save_session_to_flash() {
@@ -2079,7 +2084,26 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         }
         led_detection_flash_until = millis() + 15000;
         led_detect_active = true;
-        sd_hist_dirty = true;
+
+        // Append to sd_hist in-memory so the Detections screen doesn't
+        // need to re-scan the SD log file. We already hold dataMutex.
+        // Without this, every new MAC would trigger a full FlockLog.csv
+        // re-read in loop() — which is megabytes after a day of use.
+        int new_count = (sd_hist_count < SD_HIST_SIZE) ? sd_hist_count + 1 : SD_HIST_SIZE;
+        for (int i = new_count - 1; i > 0; i--) sd_hist[i] = sd_hist[i - 1];
+        safe_copy(sd_hist[0].type,   type,             sizeof(sd_hist[0].type));
+        safe_copy(sd_hist[0].mac,    mac,              sizeof(sd_hist[0].mac));
+        safe_copy(sd_hist[0].name,   name,             sizeof(sd_hist[0].name));
+        safe_copy(sd_hist[0].method, detection_method, sizeof(sd_hist[0].method));
+        sd_hist[0].rssi       = rssi;
+        sd_hist[0].confidence = confidence;
+        format_time_buf((millis() - session_start_time) / 1000,
+                        sd_hist[0].timestamp, sizeof(sd_hist[0].timestamp));
+        if (sd_hist_count < SD_HIST_SIZE) sd_hist_count++;
+
+        // Leave sd_hist_dirty alone — the loop's was_dirty path becomes a
+        // safety net rather than a normal-flow trigger. (Boot, screen
+        // entry, and hot-plug remount still call load_sd_history directly.)
     }
 
     safe_copy(last_cap_type,       type,             sizeof(last_cap_type));
@@ -2336,8 +2360,11 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     bool is_probe_req = (frame_subtype == 4);
     if (!is_beacon && !is_probe_req) return;
 
+    // Check the slot we're about to write rather than the next one — the
+    // previous "next.ready" gate wasted a slot and capped capacity at 7
+    // when the consumer was even one step behind.
+    if (wifi_event_queue[wifi_eq_write_idx].ready) return;
     uint8_t next = (wifi_eq_write_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
-    if (wifi_event_queue[next].ready) return;
 
     WifiEvent* ev = &wifi_event_queue[wifi_eq_write_idx];
 
@@ -2798,11 +2825,13 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         memset(ev, 0, sizeof(BleEventData));
 
         NimBLEAddress addr = advertisedDevice->getAddress();
-        unsigned int mac_tmp[6] = {0};
-        sscanf(addr.toString().c_str(), "%02x:%02x:%02x:%02x:%02x:%02x",
-            &mac_tmp[0], &mac_tmp[1], &mac_tmp[2],
-            &mac_tmp[3], &mac_tmp[4], &mac_tmp[5]);
-        for (int i = 0; i < 6; i++) ev->mac[i] = (uint8_t)mac_tmp[i];
+        // NimBLE stores addresses little-endian; we display big-endian.
+        // Pulling the raw bytes avoids a heap-allocated std::string and a
+        // sscanf round-trip on every advertisement (50–200/sec under
+        // typical urban traffic — the steady alloc churn was the most
+        // consistent heap-fragmentation source in the code).
+        const uint8_t* native = addr.getNative();
+        for (int i = 0; i < 6; i++) ev->mac[i] = native[5 - i];
         ev->addr_type = addr.getType();
 
         ev->rssi          = (int8_t)advertisedDevice->getRSSI();
@@ -3781,9 +3810,11 @@ void handle_menu_select() {
             lifetime_flash_writes = 0;
             session_start_time = millis();
             xSemaphoreGive(dataMutex);
-            if (!persist_in_flight) {  // skip if PersistTask is already writing
-                save_session_to_flash();
-            }
+            // Hand the write off to PersistTask on Core 1 so the main
+            // loop doesn't freeze for the LittleFS + SD round-trip
+            // (~200-800ms, longer on a slow card). schedule_persist
+            // already no-ops if a write is in flight.
+            schedule_persist();
             set_toast_direct("STATS CLEARED", CAUTION_COLOR);
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
@@ -7135,8 +7166,12 @@ void loop() {
 
     if (millis() - last_time_save >= 1000) { xSemaphoreTake(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGive(dataMutex); last_time_save = millis(); }
     if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) {
-        last_persist_save = millis();  // gate retry timing on schedule, not completion
-        schedule_persist();
+        // Only advance the gate when the spawn actually took. If heap was
+        // too low to allocate the task stack, retry on the next loop tick
+        // (~10ms) instead of waiting another full PERSIST_INTERVAL.
+        if (schedule_persist()) {
+            last_persist_save = millis();
+        }
     }
     rssi_track_expire();
 
