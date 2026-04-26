@@ -393,12 +393,18 @@ static uint32_t hash_mac(const char* mac) {
 }
 
 static const int SEEN_MAC_TABLE_SIZE = MAX_SEEN_MACS * 2;
+// Bound the linear-probe walk. Once eviction starts overwriting slots
+// out-of-band, an unbounded probe degrades into a full-table linear
+// scan and the linear-probe invariant is violated anyway. Capping at 8
+// keeps lookup cost O(1); occasional false negatives just trigger a
+// re-toast within the 5-minute redetect window — acceptable.
+static const int SEEN_MAC_PROBE_LIMIT = 8;
 
 bool is_mac_recently_seen(const char* mac) {
     const char* key = mac;
     uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
     unsigned long now = millis();
-    for (int probe = 0; probe < SEEN_MAC_TABLE_SIZE; probe++) {
+    for (int probe = 0; probe < SEEN_MAC_PROBE_LIMIT; probe++) {
         int slot = (idx + probe) % SEEN_MAC_TABLE_SIZE;
         if (!seen_mac_table[slot].occupied) return false;
         if (strncmp(seen_mac_table[slot].mac, key, 17) == 0) {
@@ -413,7 +419,7 @@ bool is_mac_recently_seen(const char* mac) {
 void add_seen_mac(const char* mac) {
     const char* key = mac;
     uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
-    for (int probe = 0; probe < SEEN_MAC_TABLE_SIZE; probe++) {
+    for (int probe = 0; probe < SEEN_MAC_PROBE_LIMIT; probe++) {
         int slot = (idx + probe) % SEEN_MAC_TABLE_SIZE;
         if (!seen_mac_table[slot].occupied ||
             strncmp(seen_mac_table[slot].mac, key, 17) == 0) {
@@ -4511,6 +4517,10 @@ void draw_locator_screen() {
 
     int grid_o = (int)fmodf(cumulative_grid_offset, (float)GRID_STEP);
     if (grid_o < 0) grid_o += GRID_STEP;
+    // Wrap the accumulator after sampling so it cannot grow without
+    // bound — at multi-hour timescales the float loses sub-pixel
+    // precision and the grid stutters or jumps.
+    cumulative_grid_offset = fmodf(cumulative_grid_offset, (float)GRID_STEP);
 
     for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
         spr.drawLine(gx, 18, gx, DISP_H - 1, CARD_BORDER);
@@ -7072,6 +7082,10 @@ void loop() {
     // corruption that can build up during multi-hour continuous scanning.
     if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
         last_ble_restart_ms = millis();
+        // Suspend ScannerLoopTask first — without this, the Core 0 task can
+        // be inside pBLEScan->start()/isScanning() while we deinit the stack
+        // and free the underlying object, dereferencing a dangling pointer.
+        if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
         if (pBLEScan) {
             pBLEScan->stop();
             pBLEScan->clearResults();
@@ -7087,6 +7101,7 @@ void loop() {
         pBLEScan->setWindow(97);
         pBLEScan->setMaxResults(0);  // see setup() — callback handles everything
         last_ble_scan = millis();
+        if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
         Serial.println("[BLE] Periodic stack restart completed");
     }
 
