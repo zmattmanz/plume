@@ -5235,6 +5235,9 @@ void draw_gps_screen() {
     int sats;
     double d_lat, d_lng;
     float f_spd;
+    float f_hdop;
+    bool hdop_valid, time_valid;
+    int gps_hour, gps_min, gps_sec;
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     has_loc     = gps.location.isValid();
@@ -5244,6 +5247,12 @@ void draw_gps_screen() {
     d_lng       = gps.location.lng();
     speed_valid = gps.speed.isValid();
     f_spd       = gps.speed.mph();
+    hdop_valid  = gps.hdop.isValid();
+    f_hdop      = hdop_valid ? gps.hdop.hdop() : 0.0f;
+    time_valid  = gps.time.isValid();
+    gps_hour    = time_valid ? gps.time.hour()   : 0;
+    gps_min     = time_valid ? gps.time.minute() : 0;
+    gps_sec     = time_valid ? gps.time.second() : 0;
     xSemaphoreGive(dataMutex);
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
@@ -5324,9 +5333,9 @@ void draw_gps_screen() {
 
     // Globe rim
     uint16_t rim_col = stale ? CAUTION_COLOR
-                     : (has_loc ? GPS_COLOR : lgfx::color565(48, 108, 220));
+                     : (has_loc ? GPS_COLOR : DIM_COLOR);
     spr.drawCircle(gx, gy, gr,     rim_col);
-    spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
+    spr.drawCircle(gx, gy, gr + 1, CARD_BORDER);
 
     // ── Multi-plane orbital satellite animation ──────────────────────────────
     // Skipped entirely when no GPS lock — the spinning globe alone reads as
@@ -5381,7 +5390,7 @@ void draw_gps_screen() {
                 float tz0 = orb_proj_p(a0, &px0, &py0);
                 float tz1 = orb_proj_p(a1, &px1, &py1);
                 if ((tz0 + tz1) * 0.5f > 0.0f)
-                    spr.drawLine(px0, py0, px1, py1, lgfx::color565(18, 40, 72));
+                    spr.drawLine(px0, py0, px1, py1, CARD_BORDER);
             }
 
             // Draw satellite dots with motion trails
@@ -5429,21 +5438,12 @@ void draw_gps_screen() {
         }
     }
 
-    // SAT count — single line below the full orbit extent, number in white
-    {
-        int sat_y = gy + (gr + 14) + 9;  // below orbit (orb_r = gr+14)
-        int sat_x = gx - 24;
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-        spr.setCursor(sat_x, sat_y); kprint(spr, "SATS ");
-        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-        spr.setCursor(sat_x + 35, sat_y); spr.print(sats);
-    }
-
-    // ── Right panel: STATUS badge + LAT / LON / SPEED ───────────────────────
-    const int RX = 122, RW = 114;
+    // ── Right panel: STATUS badge + key-value readouts ──────────────────────
+    const int RX = 122;
+    const int RW = DISP_W - RX - 4;  // right margin 4px
     int ry = 25;
 
-    // STATUS badge (top-right, matches scanner/locator badge style)
+    // STATUS badge
     {
         const char* status_base;
         uint16_t    status_col;
@@ -5457,43 +5457,83 @@ void draw_gps_screen() {
             anim_ellipsis(dots, sizeof(dots));
             snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
         } else {
-            strncpy(status_str, status_base, sizeof(status_str)-1);
-            status_str[sizeof(status_str)-1] = '\0';
+            strncpy(status_str, status_base, sizeof(status_str) - 1);
+            status_str[sizeof(status_str) - 1] = '\0';
         }
-        int bw = (int)strlen(status_base) * 7 + (status_anim ? 3*7 : 0) + 12;
+        int bw = (int)strlen(status_base) * 7 + (status_anim ? 3 * 7 : 0) + 12;
         if (bw > RW) bw = RW;
         uint16_t sfill = lerp_col16(BG_COLOR, status_col, 0.22f);
         spr.fillRoundRect(RX, ry, bw, 16, 5, sfill);
         spr.drawRoundRect(RX, ry, bw, 16, 5, status_col);
         spr.setTextColor(status_col, sfill); spr.setTextSize(TS_MICRO);
-        spr.setClipRect(RX+1, ry+1, bw-2, 14);
-        spr.setCursor(RX+6, ry+4); kprint(spr, status_str);
+        spr.setClipRect(RX + 1, ry + 1, bw - 2, 14);
+        spr.setCursor(RX + 6, ry + 4); kprint(spr, status_str);
         spr.clearClipRect();
     }
 
-    // LAT
+    // Key-value readout rows — label left, value right-justified
     ry += 22;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-    spr.setCursor(RX, ry); kprint(spr, "LAT");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-    char lat_buf[14]; snprintf(lat_buf, sizeof(lat_buf), "%.5f", has_loc ? d_lat : 0.0);
-    spr.setCursor(RX, ry + 11); spr.print(lat_buf);
+    const int KV_RIGHT = DISP_W - 6;  // right edge for value text
 
-    // LON
-    ry += 28;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-    spr.setCursor(RX, ry); kprint(spr, "LON");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-    char lon_buf[14]; snprintf(lon_buf, sizeof(lon_buf), "%.5f", has_loc ? d_lng : 0.0);
-    spr.setCursor(RX, ry + 11); spr.print(lon_buf);
+    auto kv_row = [&](const char* label, const char* value, uint16_t val_col = TEXT_COLOR) {
+        // Label (accent, left-aligned)
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(RX, ry);
+        kprint(spr, label);
 
-    // SPEED
-    ry += 28;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-    spr.setCursor(RX, ry); kprint(spr, "SPEED");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-    char spd_buf[12]; snprintf(spd_buf, sizeof(spd_buf), "%.1f mph", speed_valid ? f_spd : 0.0f);
-    spr.setCursor(RX, ry + 11); spr.print(spd_buf);
+        // Value (right-aligned)
+        int val_w = (int)strlen(value) * 7;
+        spr.setTextColor(val_col, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(KV_RIGHT - val_w, ry);
+        spr.print(value);
+
+        ry += 14;  // row height: 10px text + 4px gap
+    };
+
+    // LAT
+    {
+        char lat_buf[14];
+        snprintf(lat_buf, sizeof(lat_buf), "%.4f", has_loc ? d_lat : 0.0);
+        kv_row("LAT", lat_buf);
+    }
+
+    // LNG
+    {
+        char lng_buf[14];
+        snprintf(lng_buf, sizeof(lng_buf), "%.4f", has_loc ? d_lng : 0.0);
+        kv_row("LNG", lng_buf);
+    }
+
+    // SAT — X/12 format
+    {
+        char sat_buf[8];
+        snprintf(sat_buf, sizeof(sat_buf), "%d/12", sats);
+        kv_row("SAT", sat_buf);
+    }
+
+    // HDOP — horizontal dilution of precision
+    {
+        char hdop_buf[8];
+        snprintf(hdop_buf, sizeof(hdop_buf), "%.1f", f_hdop);
+        uint16_t hdop_col = (hdop_valid && f_hdop <= 2.0f) ? TEXT_COLOR
+                          : (hdop_valid && f_hdop <= 5.0f) ? CAUTION_COLOR
+                          : DIM_COLOR;
+        kv_row("HDOP", hdop_buf, hdop_col);
+    }
+
+    // TIME — UTC from GPS
+    {
+        char time_buf[12];
+        if (time_valid) {
+            snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d",
+                     gps_hour, gps_min, gps_sec);
+        } else {
+            strncpy(time_buf, "--:--:--", sizeof(time_buf));
+        }
+        kv_row("TIME", time_buf, DIM_COLOR);
+    }
 }
 
 void draw_device_info_screen() {
