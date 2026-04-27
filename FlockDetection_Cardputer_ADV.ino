@@ -29,6 +29,16 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// Boot stage personalities — must be defined before any function that returns
+// it, including Arduino's auto-generated forward declarations near the top of
+// the translation unit.
+enum BootPersonality {
+    BOOT_NORMAL,   // smooth advance, brief settle
+    BOOT_LURCH,    // overshoot target slightly, settle back
+    BOOT_RUSH,     // fast advance, no settle dwell
+    BOOT_STALL,    // pause near target, then snap home
+};
+
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -6152,13 +6162,8 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
 // Boot stage personalities — selected randomly per call to give each
 // boot slightly different pacing. Smoothness within a stage stays at
 // ~60fps; only the dwell-after-target and the bar's approach curve vary.
-enum BootPersonality {
-    BOOT_NORMAL,   // smooth advance, brief settle
-    BOOT_LURCH,    // overshoot target slightly, settle back
-    BOOT_RUSH,     // fast advance, no settle dwell
-    BOOT_STALL,    // pause near target, then snap home
-};
-
+// (enum BootPersonality is defined near the top of the file so Arduino's
+// auto-generated forward declarations can see it.)
 static BootPersonality pick_boot_personality() {
     int roll = random(0, 100);
     if (roll < 65) return BOOT_NORMAL;
