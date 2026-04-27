@@ -227,6 +227,34 @@ static const unsigned long UI_PULSE_BREATHE = 1200;
 static const unsigned long UI_PULSE_MEDIUM  = 600;
 static const unsigned long UI_PULSE_FAST    = 300;
 
+// ── Type scale — named tiers replacing magic textSize values ──
+// Maps the design system's 5-tier scale to hardware setTextSize() values.
+//
+// Tier guide:
+//   TS_MICRO  — footnotes, RSSI dBm, footer hints, scrollbar labels
+//   TS_BODY   — primary UI: labels, feed rows, status badges, kprint text
+//   TS_STRONG — hero inline values: target name, stat card numbers
+//   TS_H2     — menu items, overlay titles, locator distance
+//   TS_H1     — big numerals: scanner counters, ambient mode count
+static const float TS_MICRO  = 1.0f;
+static const float TS_BODY   = 1.2f;
+static const float TS_STRONG = 1.5f;
+static const float TS_H2     = 2.0f;
+static const float TS_H1     = 3.0f;
+
+// ── Spacing — 4-step scale ──
+//   UI_PAD_XS — hairline gaps, pill vertical inset
+//   UI_PAD_SM — card inner padding, icon-to-text gap
+//   UI_PAD_MD — card-to-card gap, section breaks
+//   UI_PAD_LG — header strip height, menu row pitch
+static const int UI_PAD_XS  = 2;
+static const int UI_PAD_SM  = 6;
+static const int UI_PAD_MD  = 12;
+static const int UI_PAD_LG  = 18;
+
+// Content area starts at this Y on every screen. Header = 0..CONTENT_Y-1.
+static const int CONTENT_Y  = 20;
+
 // ui_ease — the single curve we use for every UI animation
 // (ease_out_quad). Decelerating motion: fast start, soft landing.
 // Reads as "natural" UI motion.
@@ -3177,7 +3205,7 @@ void draw_header_spr(int screen_num) {
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
     spr.fillRect(0, 0, DISP_W, 20, BG_COLOR);
-    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1.2);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
 
     // ── Status pill row ─────────────────────────────────────────────────────
@@ -3333,7 +3361,7 @@ void draw_toast_spr() {
     // Sentinel: [i] or [!]
     int text_y = y_pos + (t_h - 8) / 2;  // vertically center 8px text
     spr.setTextColor(ta(accent), ta(CARD_COLOR));
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(t_x + 7, text_y);
     spr.print(is_action_snap ? "[i]" : "[!]");
 
@@ -3385,7 +3413,7 @@ void draw_vol_overlay() {
         snprintf(vol_str, sizeof(vol_str), "VOL %d%%", vol_pct);
     }
     spr.setTextColor(va(is_muted ? DIM_COLOR : HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setTextDatum(TC_DATUM);
     spr.drawString(vol_str, DISP_W / 2, bar_y - 14);
     spr.setTextDatum(TL_DATUM);
@@ -3421,7 +3449,7 @@ static void drawPill(int x, int y, const char* text, uint16_t accent_col,
     spr.fillRoundRect(x, y, tw, th, 3, bg);
     spr.drawRoundRect(x, y, tw, th, 3, border);
     spr.setTextColor(fg, bg);
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(x + 3, y + 2);
     spr.print(text);
 }
@@ -3447,48 +3475,43 @@ void draw_help_overlay() {
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
     // Subtitle in header area (overwrite screen name)
-    spr.fillRect(0, 0, 80, 18, BG_COLOR);
+    spr.fillRect(0, 0, 90, CONTENT_Y, BG_COLOR);
     spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(4, 5);
-    kprint(spr, "KEYS");
+    kprint(spr, "HELP");
 
     struct HelpKey { const char* key; const char* desc; };
     const HelpKey* keys;
     int key_count;
 
     static const HelpKey global_keys[] = {
-        {"m",    "Menu"},
-        {"</>",  "Prev/Next"},
-        {"ESC",  "Home"},
-        {"DEL",  "Back/Close"},
-        {"`",    "Mute"},
-        {"-/+",  "Volume"},
-        {"s",    "Stealth"},
-        {"\\",   "LED"},
-        {"f",    "Feed view"},
-        {"TAB",  "This help"},
+        {"-/+",  "volume"},
+        {"`",    "mute"},
+        {"DEL",  "back"},
+        {"ESC",  "home"},
+        {"f",    "feed"},
     };
 
     static const HelpKey scanner_keys[] = {
-        {"x", "Simulate"},
-        {"t", "Locate"},
+        {"x",   "simulate"},
+        {"t",   "locate"},
+        {"m",   "menu"},
     };
     static const HelpKey locator_keys[] = {
-        {"l", "Start/stop"},
-        {"t", "Cycle target"},
-        {"n", "N-mode"},
+        {"l",   "start/stop"},
+        {"t",   "target"},
+        {"n",   "north"},
     };
     static const HelpKey detections_keys[] = {
-        {"^/v", "Navigate"},
-        {"ENT", "Detail"},
-        {"DEL", "Close"},
+        {";/.", "navigate"},
+        {"ENT", "detail"},
     };
     static const HelpKey gps_keys[] = {
-        {"", "No keys"},
+        {"",    "no keys"},
     };
     static const HelpKey devinfo_keys[] = {
-        {"^/v", "Scroll"},
+        {";/.", "scroll"},
     };
 
     switch (current_screen) {
@@ -3501,16 +3524,16 @@ void draw_help_overlay() {
     }
 
     const int ROW_H = 10;
-    const int col_left_x  = 6;
+    const int col_left_x  = UI_PAD_SM;
     const int col_right_x = DISP_W / 2 + 4;
     int row_y;
 
     // ── Left column: screen-specific keys ──
     row_y = 24;
     spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(col_left_x, row_y);
-    kprint(spr, "SCREEN");
+    kprint(spr, "THIS SCREEN");
     row_y += ROW_H + 2;
 
     for (int i = 0; i < key_count && row_y < DISP_H - 12; i++) {
@@ -3526,7 +3549,7 @@ void draw_help_overlay() {
     // ── Right column: global keys ──
     row_y = 24;
     spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(col_right_x, row_y);
     kprint(spr, "GLOBAL");
     row_y += ROW_H + 2;
@@ -3544,9 +3567,12 @@ void draw_help_overlay() {
 
     // Footer
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(6, DISP_H - 10);
-    spr.print("TAB or DEL to close");
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
+    spr.print("TAB to close");
+    // Version tag, right-aligned
+    spr.setCursor(DISP_W - 30, DISP_H - 10);
+    spr.print("v9.6");
 }
 
 // Draw a dithered darkening overlay — fast checkerboard pattern that
@@ -3575,9 +3601,9 @@ void draw_menu_overlay() {
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
     // Overwrite the screen name area with "MENU"
-    spr.fillRect(0, 0, 80, 18, BG_COLOR);
+    spr.fillRect(0, 0, 90, CONTENT_Y, BG_COLOR);
     spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);  // matches draw_header_spr style
+    spr.setTextSize(TS_BODY);  // matches draw_header_spr style
     spr.setCursor(4, 5);
     kprint(spr, "MENU");
 
@@ -3613,9 +3639,9 @@ void draw_menu_overlay() {
     if (menu_selected < 0) menu_selected = 0;
     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
 
-    const int row_h    = 18;  // textSize 2 = 16px tall + 2px breathing room
-    const int row_gap  = 4;
-    const int start_y  = 20;
+    const int row_h    = 14;  // textSize 1.5 = 12px tall + 2px breathing room
+    const int row_gap  = 6;   // more vertical breathing between items
+    const int start_y  = CONTENT_Y + 2;
 
     // Scrollable viewport — compute how many items fit between start_y and bottom
     // (footer was removed; the row space extends to the bottom of the screen).
@@ -3634,14 +3660,20 @@ void draw_menu_overlay() {
     if (max_scroll < 0) max_scroll = 0;
     if (menu_scroll_offset > max_scroll) menu_scroll_offset = max_scroll;
 
-    // Eased highlight — target is the screen position of the selected item
+    // Eased highlight — smoothly interpolates toward the selected item's
+    // screen position. Frame-rate-independent so the motion feels identical
+    // at 15fps and 60fps. 80ms time constant for a snappy slide.
     int sel_vi = menu_selected - menu_scroll_offset;
     float target_y = (float)(start_y + sel_vi * (row_h + row_gap));
     if (!menu_highlight_init) {
         menu_highlight_ease_y = target_y;
         menu_highlight_init = true;
     } else {
-        menu_highlight_ease_y = target_y;
+        static unsigned long menu_last_frame_ms = 0;
+        float frame_dt = (menu_last_frame_ms == 0) ? 16.0f : (float)(now_ms - menu_last_frame_ms);
+        if (frame_dt > 100.0f) frame_dt = 16.0f;
+        menu_last_frame_ms = now_ms;
+        menu_highlight_ease_y = anim_filter(menu_highlight_ease_y, target_y, 80.0f, frame_dt);
     }
     int ease_y = (int)(menu_highlight_ease_y + 0.5f);
 
@@ -3654,9 +3686,9 @@ void draw_menu_overlay() {
 
         int text_x = 16;  // padded to clear the selection-indicator dash area
         spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-        spr.setTextSize(2);
-        spr.setCursor(text_x, y + 1);  // center 16px text in 18px row
-        spr.print(items[i].label);  // no kerning at size 2 — keeps glyphs crisp
+        spr.setTextSize(TS_STRONG);
+        spr.setCursor(text_x, y + 1);
+        spr.print(items[i].label);
     }
 
     // ── Eased highlight bar ──
@@ -3671,7 +3703,7 @@ void draw_menu_overlay() {
         // Redraw selected item text on highlight.
         int text_x = 16;
         spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-        spr.setTextSize(2);
+        spr.setTextSize(TS_STRONG);
         spr.setCursor(text_x, ease_y + 1);
         spr.print(items[menu_selected].label);  // see row-grid path
     }
@@ -3704,14 +3736,14 @@ void draw_wifi_config_overlay() {
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
     // Overwrite header with "WIFI CONFIG"
-    spr.fillRect(0, 0, 100, 18, BG_COLOR);
+    spr.fillRect(0, 0, 90, CONTENT_Y, BG_COLOR);
     spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(4, 5);
     kprint(spr, "WIFI CONFIG");
 
     // Card background
-    int cx = 4, cy = 22, cw = DISP_W - 8, ch = DISP_H - 26;
+    int cx = 4, cy = CONTENT_Y + UI_PAD_XS, cw = DISP_W - 8, ch = DISP_H - CONTENT_Y - UI_PAD_SM;
     spr.fillRoundRect(cx, cy, cw, ch, 4, ea(CARD_COLOR));
     spr.drawRoundRect(cx, cy, cw, ch, 4, ea(CARD_BORDER));
 
@@ -3724,7 +3756,7 @@ void draw_wifi_config_overlay() {
     bool ssid_editing = ssid_selected && wifi_config_editing;
 
     spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, field_y);
     kprint(spr, "SSID");
 
@@ -3740,7 +3772,7 @@ void draw_wifi_config_overlay() {
     bool ssid_empty = (strlen(ssid_display) == 0);
 
     spr.setTextColor(ssid_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 9, input_y + 4);
 
     if (ssid_empty && !ssid_editing) {
@@ -3762,9 +3794,9 @@ void draw_wifi_config_overlay() {
     bool pass_editing = pass_selected && wifi_config_editing;
 
     spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, field_y);
-    kprint(spr, "PASSWORD");
+    kprint(spr, "PASS");
 
     input_y = field_y + 12;
     field_bg = pass_selected ? ea(lerp_col16(CARD_COLOR, HEADER_COLOR, 0.08f)) : ea(CARD_COLOR);
@@ -3778,7 +3810,7 @@ void draw_wifi_config_overlay() {
     bool pass_empty = (strlen(pass_src) == 0);
 
     spr.setTextColor(pass_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 9, input_y + 4);
 
     if (pass_empty && !pass_editing) {
@@ -3813,7 +3845,7 @@ void draw_wifi_config_overlay() {
     spr.fillRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_bg);
     spr.drawRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_border);
     spr.setTextColor(save_sel ? ea(ACCENT_COLOR) : ea(TEXT_COLOR), save_bg);
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(btn_x1 + 18, btn_y + 4);
     spr.print("SAVE");
 
@@ -3823,18 +3855,18 @@ void draw_wifi_config_overlay() {
     spr.fillRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_bg);
     spr.drawRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_border);
     spr.setTextColor(clear_sel ? ea(CAUTION_COLOR) : ea(TEXT_COLOR), clear_bg);
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(btn_x2 + 14, btn_y + 4);
     spr.print("CLEAR");
 
     // Footer hint
     spr.setTextColor(ea(DIM_COLOR), ea(CARD_COLOR));
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, cy + ch - 11);
     if (wifi_config_editing) {
-        spr.print("type to edit  ENTER done  DEL bksp");
+        spr.print("type to edit  ENT done  DEL bksp");
     } else {
-        spr.print("ENTER edit/select  DEL close");
+        spr.print("ENT edit  ;/. field  DEL close");
     }
 }
 
@@ -4228,7 +4260,7 @@ void draw_scanner_screen() {
     uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
 
     int badge_x = right_text_x + 2;
-    int badge_y = 22;
+    int badge_y = CONTENT_Y + UI_PAD_XS;
     int badge_h = 18;
     int total_w = wf_seg_w + ble_seg_w;
     uint16_t outer_border = lerp_col16(wf_col, ble_badge_col, 0.5f);
@@ -4281,7 +4313,7 @@ void draw_scanner_screen() {
     }
 
     // WiFi text — centered in WiFi segment
-    spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1.2);
+    spr.setTextColor(wf_col, wf_fill); spr.setTextSize(TS_BODY);
     {
         int wf_base_w = (int)strlen(wf_label) * 7;
         int wf_lock_w = wf_locked ? 14 : 0;
@@ -4332,7 +4364,7 @@ void draw_scanner_screen() {
 
         // Line 1: green label, kerned
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(1);
+        spr.setTextSize(TS_MICRO);
         {
             const char* label = "PACKETS SCANNED";
             int label_x = right_text_x + 2;
@@ -4348,7 +4380,7 @@ void draw_scanner_screen() {
             int num_h = 8;  // textSize 1 height
 
             spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-            spr.setTextSize(1);
+            spr.setTextSize(TS_MICRO);
 
             spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
             spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
@@ -4388,7 +4420,7 @@ void draw_scanner_screen() {
         if (sb_local != prev_sb) { sb_anim_start = frame_ms; prev_sb = sb_local; }
 
         // ── WIFI label ──
-        spr.setTextSize(1.2);
+        spr.setTextSize(TS_BODY);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setCursor(col1_x, stats_label_y);
         kprint(spr, "WIFI");
@@ -4407,7 +4439,7 @@ void draw_scanner_screen() {
             spr.setClipRect(col1_x + 20, stats_num_y, 40, num_h);
             spr.fillRect(col1_x + 20, stats_num_y, 40, num_h, BG_COLOR);
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(3);
+            spr.setTextSize(TS_H1);
             int draw_y = anim_slide_in(stats_num_y, num_h, sw_anim_start, ROLL_DURATION);
             spr.setCursor(col1_x + 20, draw_y);
             spr.print(wifi_num);
@@ -4415,7 +4447,7 @@ void draw_scanner_screen() {
         }
 
         // ── BLE label ──
-        spr.setTextSize(1.2);
+        spr.setTextSize(TS_BODY);
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
         spr.setCursor(col2_x, stats_label_y);
         kprint(spr, "BLE");
@@ -4435,7 +4467,7 @@ void draw_scanner_screen() {
             spr.setClipRect(col2_x + 20, stats_num_y, 40, num_h);
             spr.fillRect(col2_x + 20, stats_num_y, 40, num_h, BG_COLOR);
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(3);
+            spr.setTextSize(TS_H1);
             int draw_y = anim_slide_in(stats_num_y, num_h, sb_anim_start, ROLL_DURATION);
             spr.setCursor(col2_x + 20, draw_y);
             spr.print(ble_num);
@@ -4503,7 +4535,7 @@ void draw_scanner_screen() {
 
         // Feed section label
         spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(1);
+        spr.setTextSize(TS_MICRO);
         spr.setCursor(feed_col_left, feed_top_y - 12);
         kprint(spr, "LIVE FEED");
 
@@ -4546,7 +4578,7 @@ void draw_scanner_screen() {
 
                 uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, total_alpha);
 
-                spr.setTextSize(1.2);
+                spr.setTextSize(TS_BODY);
 
                 // Prefix is a small colored symbol (filled triangle/diamond)
                 // instead of a bracketed letter — more visually distinctive,
@@ -4571,7 +4603,7 @@ void draw_scanner_screen() {
                 // Flock indicator: small asterisk after the symbol
                 if (e.is_flock) {
                     spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, total_alpha), BG_COLOR);
-                    spr.setTextSize(1.2);
+                    spr.setTextSize(TS_BODY);
                     spr.setCursor(sym_x + 7, row_y);
                     spr.print("*");
                 }
@@ -4587,7 +4619,7 @@ void draw_scanner_screen() {
                 char name_disp[20];
                 strncpy(name_disp, e.name, name_max_chars);
                 name_disp[name_max_chars] = '\0';
-                spr.setTextSize(1.2);
+                spr.setTextSize(TS_BODY);
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
@@ -4604,7 +4636,7 @@ void draw_scanner_screen() {
                          feed_col_right - feed_col_left,
                          max_visible * feed_row_h, BG_COLOR);
             spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(1.2);
+            spr.setTextSize(TS_BODY);
             int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
             char dots[4];
             anim_ellipsis(dots, sizeof(dots));
@@ -4830,14 +4862,14 @@ void draw_locator_screen() {
         uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
         spr.fillRoundRect(rpx, 23, box_w, 16, 5, status_fill);
         spr.drawRoundRect(rpx, 23, box_w, 16, 5, status_col);
-        spr.setTextColor(status_col, status_fill); spr.setTextSize(1.2);
+        spr.setTextColor(status_col, status_fill); spr.setTextSize(TS_BODY);
         spr.setClipRect(rpx + 1, 24, box_w - 2, 14);
         spr.setCursor(rpx + 6, 27); kprint(spr, status_str);
         spr.clearClipRect();
     }
 
     // ── TARGET (prominent — larger value text) ──
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
     spr.setCursor(rpx, 46); kprint(spr, "TARGET");
     {
         char tname[18];
@@ -4853,12 +4885,12 @@ void draw_locator_screen() {
         } else {
             safe_copy(tname, "No Target", sizeof(tname));
         }
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.5);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_STRONG);
         spr.setCursor(rpx, 58); spr.print(tname);
     }
 
     // ── DISTANCE + SIGNAL on same line ──
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
     spr.setCursor(rpx, 80); kprint(spr, "DIST");
 
     {
@@ -4876,11 +4908,11 @@ void draw_locator_screen() {
     {
         float sd = (active && has_est && !north_mode) ? dist : -1.0f;
         float sd_ft = sd * 3.28084f;
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(2);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_H2);
         spr.setCursor(rpx, 92);
         if (sd < 0) {
             spr.print("--");
-            spr.setTextSize(1.2);
+            spr.setTextSize(TS_BODY);
             spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.print("ft");
         } else {
@@ -4888,13 +4920,13 @@ void draw_locator_screen() {
             if (sd < 300) {
                 snprintf(db, sizeof(db), "%.0f", sd_ft);
                 spr.print(db);
-                spr.setTextSize(1.2);
+                spr.setTextSize(TS_BODY);
                 spr.setTextColor(DIM_COLOR, BG_COLOR);
                 spr.print("ft");
             } else {
                 snprintf(db, sizeof(db), "%.1f", sd / 1000.0f);
                 spr.print(db);
-                spr.setTextSize(1.2);
+                spr.setTextSize(TS_BODY);
                 spr.setTextColor(DIM_COLOR, BG_COLOR);
                 spr.print("km");
             }
@@ -4903,7 +4935,7 @@ void draw_locator_screen() {
 
     {
         int sig_x = rpx + 80;
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
         spr.setCursor(sig_x, 80); kprint(spr, "SIGNAL");
 
         int sr = (active && has_rssi && !north_mode) ? target_rssi : -999;
@@ -4914,7 +4946,7 @@ void draw_locator_screen() {
         else if (sr > -80)   { sig_str = "MED";    sig_col = CAUTION_COLOR; }
         else                 { sig_str = "WEAK";   sig_col = DIM_COLOR; }
 
-        spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(1.2);
+        spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(TS_BODY);
         spr.setCursor(sig_x, 92); spr.print(sig_str);
     }
 }
@@ -4957,10 +4989,10 @@ void draw_capture_history_screen() {
 
     if (total == 0) {
         for (int i = 0; i < 4; i++) {
-            int y = 19 + i * 28;
+            int y = CONTENT_Y + i * 28;
             spr.fillRect(0, y, 3, 27, CARD_BORDER);
             spr.fillRect(3, y, DISP_W - 3, 27, (i % 2 == 0) ? CARD_COLOR : BG_COLOR);
-            spr.setTextColor(CARD_BORDER, (i % 2 == 0) ? CARD_COLOR : BG_COLOR); spr.setTextSize(1);
+            spr.setTextColor(CARD_BORDER, (i % 2 == 0) ? CARD_COLOR : BG_COLOR); spr.setTextSize(TS_MICRO);
             spr.setCursor(10, y + 9); spr.print(use_sd ? "-- No SD log --" : "-- Listening...");
         }
         return;
@@ -4976,7 +5008,7 @@ void draw_capture_history_screen() {
 
     int rows_shown = 0;
     for (int i = history_scroll_offset; i < total && rows_shown < 4; i++, rows_shown++) {
-        int y = 19 + rows_shown * 28;
+        int y = CONTENT_Y + rows_shown * 28;
         bool selected = (i == history_selected_idx);
 
         // Pull fields from whichever source
@@ -5030,7 +5062,7 @@ void draw_capture_history_screen() {
         int content_x = selected ? 14 : 10;
 
         // Protocol label in proto_col
-        spr.setTextColor(proto_col, row_bg); spr.setTextSize(1);
+        spr.setTextColor(proto_col, row_bg); spr.setTextSize(TS_BODY);
         spr.setCursor(content_x, y + 4); spr.print(proto_lbl);
 
         // Name (or last MAC octets)
@@ -5041,7 +5073,7 @@ void draw_capture_history_screen() {
         if (name_ok) { strncpy(nom, e_name, 12); nom[12] = '\0'; }
         else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 12); nom[12] = '\0'; }
 
-        spr.setTextColor(TEXT_COLOR, row_bg); spr.setTextSize(1);
+        spr.setTextColor(TEXT_COLOR, row_bg); spr.setTextSize(TS_MICRO);
         spr.setCursor(content_x + 28, y + 4); spr.print(nom);
 
         // Right-aligned timestamp
@@ -5067,7 +5099,7 @@ void draw_capture_history_screen() {
     }
 
     {
-        const int list_y = 19;
+        const int list_y = CONTENT_Y;
         const int list_h = 4 * 28;
         if (total > 4) {
             if (history_scroll_offset > 0)
@@ -5079,7 +5111,7 @@ void draw_capture_history_screen() {
 
     // Scroll indicator
     if (total > 4) {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
+        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
         spr.setCursor(DISP_W - 56, DISP_H - 8);
         char scr_buf[16]; snprintf(scr_buf, sizeof(scr_buf), "%d/%d -/+", history_selected_idx + 1, total);
         spr.print(scr_buf);
@@ -5116,7 +5148,7 @@ void draw_capture_history_screen() {
         // Override header with detection type (and name when meaningful).
         spr.fillRect(0, 0, 120, 18, BG_COLOR);
         spr.setTextColor(proto_col, BG_COLOR);
-        spr.setTextSize(1.2);
+        spr.setTextSize(TS_BODY);
         spr.setCursor(4, 5);
         bool dn_ok = (d_name[0] != '\0'
                       && strcmp(d_name, "Hidden")  != 0
@@ -5137,7 +5169,7 @@ void draw_capture_history_screen() {
 
         auto detail_row = [&](const char* lbl, const char* val, uint16_t val_col = TEXT_COLOR) {
             spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-            spr.setTextSize(1.2);
+            spr.setTextSize(TS_BODY);
             spr.setCursor(label_x, fy);
             kprint(spr, lbl);
             spr.setTextColor(val_col, BG_COLOR);
@@ -5171,11 +5203,11 @@ void draw_capture_history_screen() {
             char human[48];
             methods_to_human(d_method, human, sizeof(human));
             spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-            spr.setTextSize(1.2);
+            spr.setTextSize(TS_BODY);
             spr.setCursor(label_x, fy);
             kprint(spr, "MATCH");
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(1);
+            spr.setTextSize(TS_MICRO);
             spr.setCursor(value_x, fy);
             spr.print(human);
             fy += row_gap;
@@ -5188,7 +5220,7 @@ void draw_capture_history_screen() {
 
         // Footer hint
         spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(1);
+        spr.setTextSize(TS_MICRO);
         spr.setCursor(8, DISP_H - 10);
         spr.print("DEL or ENTER to close");
     }
@@ -5401,7 +5433,7 @@ void draw_gps_screen() {
     {
         int sat_y = gy + (gr + 14) + 9;  // below orbit (orb_r = gr+14)
         int sat_x = gx - 24;
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
         spr.setCursor(sat_x, sat_y); kprint(spr, "SATS ");
         spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
         spr.setCursor(sat_x + 35, sat_y); spr.print(sats);
@@ -5433,7 +5465,7 @@ void draw_gps_screen() {
         uint16_t sfill = lerp_col16(BG_COLOR, status_col, 0.22f);
         spr.fillRoundRect(RX, ry, bw, 16, 5, sfill);
         spr.drawRoundRect(RX, ry, bw, 16, 5, status_col);
-        spr.setTextColor(status_col, sfill); spr.setTextSize(1);
+        spr.setTextColor(status_col, sfill); spr.setTextSize(TS_MICRO);
         spr.setClipRect(RX+1, ry+1, bw-2, 14);
         spr.setCursor(RX+6, ry+4); kprint(spr, status_str);
         spr.clearClipRect();
@@ -5441,25 +5473,25 @@ void draw_gps_screen() {
 
     // LAT
     ry += 22;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
     spr.setCursor(RX, ry); kprint(spr, "LAT");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
     char lat_buf[14]; snprintf(lat_buf, sizeof(lat_buf), "%.5f", has_loc ? d_lat : 0.0);
     spr.setCursor(RX, ry + 11); spr.print(lat_buf);
 
     // LON
     ry += 28;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
     spr.setCursor(RX, ry); kprint(spr, "LON");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
     char lon_buf[14]; snprintf(lon_buf, sizeof(lon_buf), "%.5f", has_loc ? d_lng : 0.0);
     spr.setCursor(RX, ry + 11); spr.print(lon_buf);
 
     // SPEED
     ry += 28;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
     spr.setCursor(RX, ry); kprint(spr, "SPEED");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
+    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
     char spd_buf[12]; snprintf(spd_buf, sizeof(spd_buf), "%.1f mph", speed_valid ? f_spd : 0.0f);
     spr.setCursor(RX, ry + 11); spr.print(spd_buf);
 }
@@ -5478,11 +5510,11 @@ void draw_device_info_screen() {
     spr.fillSprite(BG_COLOR);
     draw_header_spr(4);
 
-    const int content_top_y = 18;
+    const int content_top_y = CONTENT_Y;
     const int content_bottom_y = DISP_H - 1;
     spr.setClipRect(0, content_top_y, DISP_W - 6, content_bottom_y - content_top_y);
 
-    int yoff = 19 - device_info_scroll;
+    int yoff = CONTENT_Y - device_info_scroll;
 
     const int COL_L   = 4;
     const int COL_R   = 124;
@@ -5492,22 +5524,22 @@ void draw_device_info_screen() {
 
     // Helper: stat card with kerned ACCENT label + value below.
     auto stat_card = [&](int x, int y, const char* label, const char* value,
-                         uint16_t val_col = TEXT_COLOR, float val_size = 2.0f) {
+                         uint16_t val_col = TEXT_COLOR, float val_size = TS_H2) {
         drawCard(x, y, CARD_W, CARD_H);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(x + 4, y + 4);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(x + UI_PAD_SM, y + 4);
         kprint(spr, label);
         spr.setTextColor(val_col, CARD_COLOR);
         spr.setTextSize(val_size);
-        spr.setCursor(x + 4, y + 18);
+        spr.setCursor(x + UI_PAD_SM, y + UI_PAD_LG);
         spr.print(value);
     };
 
     // Row 0: Version (full width, shorter)
     drawCard(COL_L, yoff, DISP_W - 8, 20);
     spr.setTextColor(HEADER_COLOR, CARD_COLOR);
-    spr.setTextSize(1);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(10, yoff + 5);
     spr.print(VERSION_STRING);
 
@@ -5523,7 +5555,7 @@ void draw_device_info_screen() {
     {
         char time_str[9];
         format_time_buf(lifetime_seconds, time_str, sizeof(time_str));
-        stat_card(COL_R, row_y, "LIFETIME", time_str, TEXT_COLOR, 1.5f);
+        stat_card(COL_R, row_y, "LIFETIME", time_str, TEXT_COLOR, TS_STRONG);
     }
 
     // Row 2: SESSION / ALL-TIME
@@ -5531,7 +5563,7 @@ void draw_device_info_screen() {
     {
         char sess_str[9];
         format_time_buf((frame_ms - session_start_time) / 1000, sess_str, sizeof(sess_str));
-        stat_card(COL_L, row_y, "SESSION", sess_str, TEXT_COLOR, 1.5f);
+        stat_card(COL_L, row_y, "SESSION", sess_str, TEXT_COLOR, TS_STRONG);
     }
     {
         char total_str[12];
@@ -5568,11 +5600,11 @@ void draw_device_info_screen() {
 
         drawCard(COL_R, row_y, CARD_W, CARD_H);
         spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
-        spr.setTextSize(1);
+        spr.setTextSize(TS_MICRO);
         spr.setCursor(COL_R + 4, row_y + 4);
         kprint(spr, "FLASH");
         spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-        spr.setTextSize(1.5);
+        spr.setTextSize(TS_STRONG);
         spr.setCursor(COL_R + 4, row_y + 16);
         spr.print(fw_str);
 
@@ -5584,7 +5616,7 @@ void draw_device_info_screen() {
         char pct_str[6];
         snprintf(pct_str, sizeof(pct_str), "%d%%", wear_pct);
         spr.setTextColor(wear_col, CARD_COLOR);
-        spr.setTextSize(1);
+        spr.setTextSize(TS_MICRO);
         spr.setCursor(bar_x, bar_y2 + bar_h2 + 2);
         spr.print(pct_str);
     }
@@ -5602,7 +5634,7 @@ void draw_device_info_screen() {
         stat_card(COL_L, row_y, "VOLTAGE", volt_str, v_col);
 
         const char* pwr_label = (bat_mv_snap >= 4200) ? "USB" : "BATTERY";
-        stat_card(COL_R, row_y, "POWER", pwr_label, TEXT_COLOR, 1.5f);
+        stat_card(COL_R, row_y, "POWER", pwr_label, TEXT_COLOR, TS_STRONG);
     }
 
     // Row 6: SD STATUS (left only — second column reserved for future use)
@@ -5613,7 +5645,7 @@ void draw_device_info_screen() {
                  sd_available ? "MOUNTED" : "NO CARD",
                  littlefs_available ? "FS OK" : "FS ERR");
         uint16_t sd_col = sd_available ? ACCENT_COLOR : DIM_COLOR;
-        stat_card(COL_L, row_y, "SD CARD", sd_str, sd_col, 1.0f);
+        stat_card(COL_L, row_y, "SD CARD", sd_str, sd_col, TS_MICRO);
     }
 
     spr.clearClipRect();
@@ -5685,7 +5717,7 @@ void draw_feed_expanded_overlay() {
 
     // Subtitle appended to header bar ("SCANNER / LIVE FEED")
     spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), ea(BG_COLOR));
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(56, 5);
     kprint(spr, "/ LIVE FEED");
 
@@ -5695,7 +5727,7 @@ void draw_feed_expanded_overlay() {
     // Empty state
     if (local_count == 0) {
         spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-        spr.setTextSize(1.2);
+        spr.setTextSize(TS_BODY);
         const char* msg = "no activity yet";
         int mw = (int)strlen(msg) * 7;
         spr.setCursor((DISP_W - mw) / 2, DISP_H / 2 - 4);
@@ -5714,7 +5746,7 @@ void draw_feed_expanded_overlay() {
 
         // Column headers (faded in)
         const int hdr_y = 23;
-        spr.setTextSize(1.2);
+        spr.setTextSize(TS_BODY);
         spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
         spr.setCursor(col_sym, hdr_y); kprint(spr, "DEVICE");
         spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
@@ -5763,7 +5795,7 @@ void draw_feed_expanded_overlay() {
             }
             if (e.is_flock) {
                 spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-                spr.setTextSize(1.2);
+                spr.setTextSize(TS_BODY);
                 spr.setCursor(sym_x + 10, row_y + 3);
                 spr.print("*");
             }
@@ -5779,7 +5811,7 @@ void draw_feed_expanded_overlay() {
             strncpy(name_disp, e.name, name_max_chars);
             name_disp[name_max_chars] = '\0';
             spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setTextSize(1.2);
+            spr.setTextSize(TS_BODY);
             spr.setCursor(name_start_x, row_y + 3);
             spr.print(name_disp);
 
@@ -7290,9 +7322,14 @@ void loop() {
             const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
 
             bool up_held = false, down_held = false;
-            for (auto c : status.word) {
-                if (c == ';') up_held = true;
-                if (c == '.') down_held = true;
+            // Skip hold-repeat when the menu is open — the menu's own
+            // input handler in the word loop already processed ;/. and
+            // the hold-repeat would double-fire the navigation.
+            if (!show_menu && !wifi_config_open) {
+                for (auto c : status.word) {
+                    if (c == ';') up_held = true;
+                    if (c == '.') down_held = true;
+                }
             }
             char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
 
@@ -7590,9 +7627,9 @@ void loop() {
             snprintf(det_buf, sizeof(det_buf), "%ld", det_total);
             spr.setTextDatum(MC_DATUM);
             spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(3);
+            spr.setTextSize(TS_H1);
             spr.drawString(det_buf, (int)amb_x, (int)amb_y - 6);
-            spr.setTextSize(1);
+            spr.setTextSize(TS_MICRO);
             spr.drawString("DETECTIONS", (int)amb_x, (int)amb_y + 16);
             spr.setTextDatum(TL_DATUM);
             spr.pushSprite(0, 0);
@@ -7605,7 +7642,7 @@ void loop() {
             spr.fillSprite(BG_COLOR);
             uint16_t s_col = lerp_col16(BG_COLOR, lgfx::color565(180, 30, 30), 0.6f);
             spr.setTextColor(s_col, BG_COLOR);
-            spr.setTextSize(1);
+            spr.setTextSize(TS_MICRO);
             spr.setCursor(DISP_W - 8, DISP_H - 9);
             spr.print("S");
             spr.pushSprite(0, 0);
