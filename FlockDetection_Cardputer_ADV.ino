@@ -5380,36 +5380,25 @@ void draw_gps_screen() {
                 return tz2;
             };
 
-            // Draw dashed orbit ring for this plane
-            const int N_RING = 48;
-            for (int ri = 0; ri < N_RING; ri++) {
-                if (ri % 2 != 0) continue;
-                float a0 = (float)ri       / N_RING * 2.0f * (float)M_PI;
-                float a1 = (float)(ri + 1) / N_RING * 2.0f * (float)M_PI;
-                int px0, py0, px1, py1;
-                float tz0 = orb_proj_p(a0, &px0, &py0);
-                float tz1 = orb_proj_p(a1, &px1, &py1);
-                if ((tz0 + tz1) * 0.5f > 0.0f)
-                    spr.drawLine(px0, py0, px1, py1, CARD_BORDER);
-            }
-
-            // Draw satellite dots with motion trails
+            // Draw satellites as directional triangles pointing outward
+            // from the globe center. Acquired = filled, unacquired = outline.
+            // Motion trails use single-pixel dots fading behind each triangle.
             float orbit_t = (float)frame_ms * pl.speed + pl.phase_off;
             for (int si = 0; si < pl.n_sats; si++) {
                 float base_ang = orbit_t + (float)si / (float)pl.n_sats * 2.0f * (float)M_PI;
-                // Motion trail: 4 ghost dots fading behind
-                for (int tr = 3; tr >= 0; tr--) {
-                    float trail_ang = base_ang - (float)(tr + 1) * 0.12f;
+
+                // Motion trail: 3 fading dots behind each satellite
+                for (int tr = 2; tr >= 0; tr--) {
+                    float trail_ang = base_ang - (float)(tr + 1) * 0.10f;
                     int tpx, tpy;
                     float ttz = orb_proj_p(trail_ang, &tpx, &tpy);
                     if (ttz > -0.3f) {
-                        // Smooth fade: full at z>=0.3, transitions to 0 across [-0.3, 0.3].
                         float depth_fade = (ttz > 0.3f) ? 1.0f : (ttz + 0.3f) / 0.6f;
                         if (depth_fade < 0.0f) depth_fade = 0.0f;
                         if (depth_fade > 1.0f) depth_fade = 1.0f;
-                        float fade = 1.0f - (float)(tr + 1) / 5.0f;
+                        float fade = 1.0f - (float)(tr + 1) / 4.0f;
                         fade *= depth_fade;
-                        if (fade > 0.03f) {
+                        if (fade > 0.05f) {
                             bool acquired = (si < sats);
                             uint16_t trail_col = acquired
                                 ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.5f)
@@ -5418,20 +5407,48 @@ void draw_gps_screen() {
                         }
                     }
                 }
-                // Main satellite dot — fades near the horizon for 3D depth.
+
+                // Main satellite — triangle pointing outward from globe center
                 int dpx, dpy;
                 float tz2 = orb_proj_p(base_ang, &dpx, &dpy);
                 if (tz2 > -0.3f) {
                     float depth_fade = (tz2 > 0.3f) ? 1.0f : (tz2 + 0.3f) / 0.6f;
                     if (depth_fade < 0.0f) depth_fade = 0.0f;
                     if (depth_fade > 1.0f) depth_fade = 1.0f;
+                    if (depth_fade < 0.05f) continue;
+
                     bool acquired = (si < sats);
-                    uint16_t base_col = acquired
-                        ? lgfx::color565(255, 255, 255)
-                        : lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
-                    uint16_t sat_col = lerp_col16(BG_COLOR, base_col, depth_fade);
-                    if (depth_fade > 0.05f) {
-                        spr.fillCircle(dpx, dpy, acquired ? 2 : 1, sat_col);
+                    uint16_t sat_col = acquired
+                        ? lerp_col16(BG_COLOR, GPS_COLOR, depth_fade)
+                        : lerp_col16(BG_COLOR, DIM_COLOR, depth_fade * 0.5f);
+
+                    // Triangle pointing radially outward from globe center.
+                    // Compute the outward unit vector from globe center to
+                    // satellite position, then build a 5px triangle along it.
+                    float dx = (float)(dpx - gx);
+                    float dy = (float)(dpy - gy);
+                    float dist = sqrtf(dx * dx + dy * dy);
+                    if (dist < 1.0f) dist = 1.0f;
+                    float nx = dx / dist;  // outward unit vector
+                    float ny = dy / dist;
+                    // Perpendicular for triangle base
+                    float perpx = -ny;
+                    float perpy =  nx;
+
+                    // Tip 3px outward, base 1px inward + 2px to each side
+                    int tip_x  = dpx + (int)(nx * 3.0f);
+                    int tip_y  = dpy + (int)(ny * 3.0f);
+                    int base1x = dpx - (int)(nx * 1.0f) + (int)(perpx * 2.0f);
+                    int base1y = dpy - (int)(ny * 1.0f) + (int)(perpy * 2.0f);
+                    int base2x = dpx - (int)(nx * 1.0f) - (int)(perpx * 2.0f);
+                    int base2y = dpy - (int)(ny * 1.0f) - (int)(perpy * 2.0f);
+
+                    if (acquired) {
+                        spr.fillTriangle(tip_x, tip_y, base1x, base1y,
+                                         base2x, base2y, sat_col);
+                    } else {
+                        spr.drawTriangle(tip_x, tip_y, base1x, base1y,
+                                         base2x, base2y, sat_col);
                     }
                 }
             }
@@ -5472,7 +5489,7 @@ void draw_gps_screen() {
     }
 
     // Key-value readout rows — label left, value right-justified
-    ry += 22;
+    ry += 22 + UI_PAD_SM;  // 6px standard gap between badge and data
     const int KV_RIGHT = DISP_W - 6;  // right edge for value text
 
     auto kv_row = [&](const char* label, const char* value, uint16_t val_col = TEXT_COLOR) {
