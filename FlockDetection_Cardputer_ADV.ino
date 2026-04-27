@@ -22,6 +22,7 @@
 #include <LittleFS.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
+#include <Wire.h>
 #include <math.h>
 #include "ui_beep.h"  // PCM sound for screen transitions
 
@@ -67,6 +68,8 @@ void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
 static void set_toast_direct(const char* text, uint16_t accent);
 static void apply_ble_scan_params();
+struct WifiEvent;
+static void parse_wifi_event(struct WifiEvent* ev);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -6387,11 +6390,6 @@ void setup() {
 
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
-
-    // Confirm I2C pin assignments at boot — i2c_bus_recover() hardcodes
-    // SDA=2/SCL=1 (M5Cardputer ADV defaults). If this prints different
-    // values, update the constants in i2c_bus_recover().
-    Serial.printf("[I2C] SDA=%d SCL=%d\n", Wire.getSDA(), Wire.getSCL());
 
     // PSRAM availability + heap snapshot. Total PSRAM = 0 means PSRAM
     // isn't enabled in the board config; setPsram(true) will silently fall
