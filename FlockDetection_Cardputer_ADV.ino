@@ -46,6 +46,8 @@ void draw_header_spr(int screen_num);
 void draw_toast_spr();
 void draw_vol_overlay();
 void drawCard(int x, int y, int w, int h);
+static void drawPill(int x, int y, const char* text, uint16_t accent_col,
+                     float bg_accent_pct = 0.18f, bool filled = false);
 void draw_current_screen();
 void transition_screen(int new_screen, int dir);
 void play_escalated_alarm(int confidence, int source);
@@ -115,13 +117,11 @@ static int   menu_scroll_offset = 0;        // index of first visible item
 static bool low_power_mode = false;
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
-static float ease_muted = 0.0f;
-
 // RGB LED state — color cycles with C key, on/off with L when locator idle
-static uint8_t led_r = 124, led_g = 228, led_b = 210; // default mint (matches ACCENT_COLOR)
+static uint8_t led_r = 110, led_g = 200, led_b = 255; // default ice blue (matches ACCENT_COLOR)
 static bool    led_breathing_on = true;
 static const uint8_t LED_COLORS[][3] = {
-    {124, 228, 210},  // mint (matches ACCENT_COLOR — default)
+    {110, 200, 255},  // ice blue (matches ACCENT_COLOR — default)
     { 80, 200, 255},  // cyan
     {  0, 200,   0},  // green
     {  0, 160, 200},  // teal
@@ -139,35 +139,34 @@ static bool     led_detect_active = false;
 
 void apply_color_palette() {
     if (night_mode) {
-        // Night condensed: red-only chrome, amber stays distinct.
-        // One-token swap from day: mint → red. Everything else follows.
+        // Night: red chrome, lifted dim for readability, amber caution.
         BG_COLOR      = lgfx::color565( 10,   0,   0);   // #0A0000
         CARD_COLOR    = lgfx::color565( 58,  10,  10);   // #3A0A0A
         CARD_BORDER   = lgfx::color565( 90,  20,  20);   // #5A1414
         HEADER_COLOR  = lgfx::color565(255,  90,  90);   // #FF5A5A
         TEXT_COLOR    = lgfx::color565(255, 208, 208);   // #FFD0D0
-        DIM_COLOR     = lgfx::color565(122,  48,  48);   // #7A3030
+        DIM_COLOR     = lgfx::color565(180,  90,  90);   // #B45A5A lifted red-dim
         ACCENT_COLOR  = lgfx::color565(255,  90,  90);   // = HEADER (unified)
-        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber (same both modes)
+        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber
         TEAL_COLOR    = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
         PURPLE_COLOR  = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
         GPS_COLOR     = lgfx::color565(255,  90,  90);   // = HEADER (collapsed)
     } else {
-        // Condensed palette: 4 hues + chrome stack.
-        // Mint-cyan = chrome AND confirmation. Amber = only contrast hue.
-        // WiFi/BLE/Raven feed rows lose categorical color — protocol is
-        // carried by the W/B/R symbol prefix and the flock-confirmed *.
+        // Palette #3: ice blue + coral + bright steel.
+        // Softer, wider header hue reads as calm-professional.
+        // Coral caution is warmer and more urgent than amber.
+        // Dim lifted to #95A5B8 for card-background readability.
         BG_COLOR      = lgfx::color565(  5,  10,  20);   // #050A14
         CARD_COLOR    = lgfx::color565( 29,  50,  88);   // #1D3258
         CARD_BORDER   = lgfx::color565( 46,  70, 112);   // #2E4670
-        HEADER_COLOR  = lgfx::color565(124, 228, 210);   // #7CE4D2 mint
+        HEADER_COLOR  = lgfx::color565(110, 200, 255);   // #6EC8FF ice blue
         TEXT_COLOR    = lgfx::color565(232, 239, 255);   // #E8EFFF
-        DIM_COLOR     = lgfx::color565( 90, 107, 128);   // #5A6B80
-        ACCENT_COLOR  = lgfx::color565(124, 228, 210);   // = HEADER (unified)
+        DIM_COLOR     = lgfx::color565(149, 165, 184);   // #95A5B8 bright steel
+        ACCENT_COLOR  = lgfx::color565(110, 200, 255);   // = HEADER (unified)
         TEAL_COLOR    = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
         PURPLE_COLOR  = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
-        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber
-        GPS_COLOR     = lgfx::color565(124, 228, 210);   // = HEADER (collapsed)
+        CAUTION_COLOR = lgfx::color565(255, 123,  92);   // #FF7B5C coral
+        GPS_COLOR     = lgfx::color565(110, 200, 255);   // = HEADER (collapsed)
     }
 }
 
@@ -3178,156 +3177,74 @@ void draw_header_spr(int screen_num) {
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1.2);
     spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
 
-    // ── Status icon row ──────────────────────────────────────────────────────
-    const uint16_t ICON_COL = lgfx::color565(255, 255, 255);
+    // ── Status pill row ─────────────────────────────────────────────────────
+    // Right-aligned pills: mode badges, counts, status indicators.
+    // Each pill renders right-to-left, tracking icon_right as the cursor.
 
     bool gps_lock_now;
-    bool cooldown_now;
-    unsigned long cooldown_elapsed = 0;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
-    cooldown_elapsed = millis() - last_buzzer_time;
-    cooldown_now = (last_buzzer_time > 0) && (cooldown_elapsed < BUZZER_COOLDOWN);
+    long pill_det  = lifetime_flock_total;
     xSemaphoreGive(dataMutex);
     bool muted_now = is_muted;
 
-    ease_muted += ((muted_now ? 1.0f : 0.0f) - ease_muted) * 0.12f;
-
-    static float ease_cooldown = 0.0f;
-    ease_cooldown += ((cooldown_now ? 1.0f : 0.0f) - ease_cooldown) * 0.08f;
-
-    static float ease_gps_missing = 0.0f;
-    ease_gps_missing += ((!gps_lock_now ? 1.0f : 0.0f) - ease_gps_missing) * 0.08f;
-
-    int icon_right = DISP_W - 6;
+    int icon_right = DISP_W - 4;
     int icon_y = 4;
 
-    auto lerp_icon = [&](float t) -> uint16_t {
-        return lerp_col16(BG_COLOR, ICON_COL, t);
-    };
-    auto should_draw = [](float t) -> bool { return t > 0.05f; };
-
-    // Unified mode indicators — N / S / L text pills
+    // Mode badges: N / S / L / P — same as before but using drawPill
     {
         struct ModeBadge {
             bool active;
             const char* letter;
             uint16_t color;
-            bool pulse;
         };
         ModeBadge badges[4] = {
-            { night_mode,      "N", HEADER_COLOR, false },
-            { stealth_mode,    "S", DIM_COLOR,    false },
-            { locator_active,  "L", HEADER_COLOR, true  },
-            { low_power_mode,  "P", ACCENT_COLOR, false },
+            { night_mode,      "N", HEADER_COLOR },
+            { stealth_mode,    "S", DIM_COLOR },
+            { locator_active,  "L", CAUTION_COLOR },
+            { low_power_mode,  "P", ACCENT_COLOR },
         };
-
         for (int i = 0; i < 4; i++) {
             if (!badges[i].active) continue;
-
-            uint16_t fg = badges[i].color;
-            if (badges[i].pulse) {
-                float pulse = anim_pulse(UI_PULSE_MEDIUM);
-                fg = lerp_col16(badges[i].color, ACCENT_COLOR, pulse * 0.5f);
-            }
-            uint16_t bg = lerp_col16(BG_COLOR, fg, 0.18f);
-
-            int pill_x = icon_right - 12;
-            spr.fillRoundRect(pill_x, icon_y, 11, 11, 2, bg);
-            spr.setTextColor(fg, bg);
-            spr.setTextSize(1.2);
-            spr.setCursor(pill_x + 3, icon_y + 2);
-            spr.print(badges[i].letter);
-            icon_right = pill_x - 3;
+            int pw = (int)strlen(badges[i].letter) * 7 + 6;
+            drawPill(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
+            icon_right -= pw + 2;
         }
     }
 
-    // WiFi connected indicator — small 10px arcs + dot, green when active
+    // Export mode indicator
     if (export_mode_active) {
-        int ix = icon_right - 12;
-        uint16_t wc = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.9f);
-        spr.drawPixel(ix + 5, icon_y + 9, wc);
-        spr.drawPixel(ix + 5, icon_y + 8, wc);
-        spr.drawLine(ix + 3, icon_y + 6, ix + 5, icon_y + 4, wc);
-        spr.drawLine(ix + 5, icon_y + 4, ix + 7, icon_y + 6, wc);
-        spr.drawLine(ix + 1, icon_y + 5, ix + 5, icon_y + 1, wc);
-        spr.drawLine(ix + 5, icon_y + 1, ix + 9, icon_y + 5, wc);
-        icon_right -= 16;
+        drawPill(icon_right - 27, icon_y, "EXP", CAUTION_COLOR, 0.0f, true);
+        icon_right -= 29;
     }
 
-    // Muted icon — larger 10×10 speaker with slash
-    if (should_draw(ease_muted)) {
-        int ix = icon_right - 12;
-        uint16_t c = lerp_icon(ease_muted);
-        // Speaker body (rectangle + triangle cone)
-        spr.fillRect(ix + 1, icon_y + 4, 3, 4, c);
-        spr.fillTriangle(ix + 4, icon_y + 2, ix + 8, icon_y, ix + 8, icon_y + 10, c);
-        // Slash through it
-        spr.drawLine(ix, icon_y, ix + 10, icon_y + 10, c);
-        spr.drawLine(ix + 1, icon_y, ix + 10, icon_y + 9, c);
-        icon_right -= 16;
+    // Muted indicator
+    if (muted_now) {
+        drawPill(icon_right - 13, icon_y, "M", DIM_COLOR);
+        icon_right -= 15;
     }
 
-    // SD missing indicator (always occupies the slot; does not consume ease)
+    // SD missing
     if (system_fully_booted && !sd_available) {
-        int ix = icon_right - 8;
-        uint16_t c = lgfx::color565(180, 40, 40);
-        spr.drawRect(ix + 1, icon_y + 1, 8, 9, c);
-        spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
-        icon_right -= 14;
+        uint16_t sd_warn = lgfx::color565(180, 40, 40);
+        drawPill(icon_right - 20, icon_y, "SD", sd_warn);
+        icon_right -= 22;
     }
 
-    // GPS-missing amber pin (ease_gps_missing fades in when lock is lost)
-    if (should_draw(ease_gps_missing)) {
-        int ix = icon_right - 8;
-        uint16_t c = lerp_col16(BG_COLOR, CAUTION_COLOR, ease_gps_missing);
-        spr.fillCircle(ix + 4, icon_y + 3, 3, c);
-        spr.fillTriangle(ix + 2, icon_y + 5, ix + 6, icon_y + 5, ix + 4, icon_y + 9, c);
-        spr.fillCircle(ix + 4, icon_y + 3, 1, BG_COLOR);
-        icon_right -= 16;
+    // GPS missing
+    if (!gps_lock_now) {
+        drawPill(icon_right - 27, icon_y, "GPS", CAUTION_COLOR);
+        icon_right -= 29;
     }
 
-    // Detection counter pill
+    // Detection count pill — filled accent, inverted text
     {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        uint32_t det_total = lifetime_flock_total;
-        xSemaphoreGive(dataMutex);
-
         char det_str[8];
-        snprintf(det_str, sizeof(det_str), "%lu", det_total);
-        int det_w = (int)strlen(det_str) * 8 + 6;
-        uint16_t pill_bg = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.18f);
-        spr.fillRoundRect(icon_right - det_w, icon_y, det_w, 11, 3, pill_bg);
-        spr.setTextColor(lgfx::color565(255, 255, 255), pill_bg);
-        spr.setTextSize(1.2);
-        spr.setCursor(icon_right - det_w + 3, icon_y + 2);
-        spr.print(det_str);
-        icon_right -= det_w + 2;
+        snprintf(det_str, sizeof(det_str), "D%lu", (unsigned long)pill_det);
+        int dw = (int)strlen(det_str) * 7 + 6;
+        drawPill(icon_right - dw, icon_y, det_str, ACCENT_COLOR, 0.0f, true);
+        icon_right -= dw + 2;
     }
-
-    // Alert slot: EXP takes priority over cooldown
-    if (export_mode_active) {
-        uint16_t c = lgfx::color565(255, 140, 0);
-        spr.fillRoundRect(icon_right - 22, icon_y, 22, 11, 3, c);
-        spr.setTextColor(lgfx::color565(0, 0, 0), c);
-        spr.setTextSize(1.2);
-        spr.setCursor(icon_right - 19, icon_y + 2);
-        spr.print("EXP");
-        icon_right -= 26;
-    } else if (should_draw(ease_cooldown) && cooldown_now) {
-        int ix = icon_right - 8;
-        float progress = (float)cooldown_elapsed / (float)BUZZER_COOLDOWN;
-        unsigned long period = (unsigned long)(UI_PULSE_FAST + progress * 1500.0f);
-        float pulse = anim_pulse(period);
-        uint8_t intensity = (uint8_t)(120 + pulse * 80);
-        uint16_t c = lerp_col16(BG_COLOR, lgfx::color565(intensity, intensity, intensity), ease_cooldown);
-        spr.drawCircle(ix + 4, icon_y + 5, 4, c);
-        spr.drawCircle(ix + 4, icon_y + 5, 5, lerp_col16(BG_COLOR, c, 0.4f));
-        spr.drawLine(ix + 1, icon_y + 2, ix + 7, icon_y + 8, c);
-        icon_right -= 14;
-    }
-
-
 }
 
 void draw_toast_spr() {
@@ -3397,20 +3314,37 @@ void draw_toast_spr() {
     auto ta = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, toast_alpha); };
 
     uint16_t accent = accent_snap ? accent_snap : CAUTION_COLOR;
-    int t_w = 210; int t_x = (DISP_W - t_w) / 2;
 
-    spr.fillRect(t_x, y_pos, t_w, 26, ta(CARD_COLOR));
-    spr.drawRect(t_x, y_pos, t_w, 26, ta(CARD_BORDER));
+    // Full-width toast with 4px side margins, 3px left accent bar
+    int t_x = 4;
+    int t_w = DISP_W - 8;
+    int t_h = 22;
 
-    spr.setTextColor(ta(accent), ta(CARD_COLOR)); spr.setTextSize(1);
-    spr.setCursor(t_x + 6, y_pos + 9); spr.print(is_action_snap ? "[i]" : "[!]");
+    // Card background and border
+    spr.fillRect(t_x, y_pos, t_w, t_h, ta(CARD_COLOR));
+    spr.drawRect(t_x, y_pos, t_w, t_h, ta(CARD_BORDER));
+
+    // Left accent bar — 3px wide, inset by 1px from card edge
+    spr.fillRect(t_x, y_pos, 3, t_h, ta(accent));
+
+    // Sentinel: [i] or [!]
+    int text_y = y_pos + (t_h - 8) / 2;  // vertically center 8px text
+    spr.setTextColor(ta(accent), ta(CARD_COLOR));
+    spr.setTextSize(1.2);
+    spr.setCursor(t_x + 7, text_y);
+    spr.print(is_action_snap ? "[i]" : "[!]");
+
+    // Toast text
     spr.setTextColor(ta(TEXT_COLOR), ta(CARD_COLOR));
-    spr.setCursor(t_x + 26, y_pos + 9); spr.print(text_snap);
+    spr.setCursor(t_x + 30, text_y);
+    spr.print(text_snap);
+
+    // Queue count
     if (queue_count_snap > 1) {
         char qnum[6];
         snprintf(qnum, sizeof(qnum), "+%d", queue_count_snap - 1);
         spr.setTextColor(ta(DIM_COLOR), ta(CARD_COLOR));
-        spr.setCursor(t_x + t_w - 22, y_pos + 9);
+        spr.setCursor(t_x + t_w - 24, text_y);
         spr.print(qnum);
     }
 }
@@ -3469,6 +3403,24 @@ void draw_vol_overlay() {
 
 void drawCard(int x, int y, int w, int h) {
     spr.fillRect(x, y, w, h, CARD_COLOR); spr.drawRect(x, y, w, h, CARD_BORDER);
+}
+
+// Draw a header-bar status pill: rounded rect with text inside.
+// bg_accent_pct: how much of accent_col to mix into BG (0.0–1.0).
+// filled: if true, the pill is solid accent_col with BG-colored text.
+static void drawPill(int x, int y, const char* text, uint16_t accent_col,
+                     float bg_accent_pct, bool filled) {
+    int tw = (int)strlen(text) * 7 + 6;  // 7px per char + 6px padding
+    int th = 11;
+    uint16_t bg = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, bg_accent_pct);
+    uint16_t fg = filled ? BG_COLOR : TEXT_COLOR;
+    uint16_t border = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, 0.4f);
+    spr.fillRoundRect(x, y, tw, th, 3, bg);
+    spr.drawRoundRect(x, y, tw, th, 3, border);
+    spr.setTextColor(fg, bg);
+    spr.setTextSize(1);
+    spr.setCursor(x + 3, y + 2);
+    spr.print(text);
 }
 
 void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
@@ -4117,11 +4069,10 @@ void draw_scanner_screen() {
             int px = rcx + (int)(noise_r[i] * cosf(noise_a[i]));
             int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
 
-            // Color based on intensity — cyan-green family for day, red-orange for night
-            // Day: mint-cyan tinted particles. Night: warmer red tint.
+            // Day: ice-blue tinted particles. Night: red tinted.
             uint16_t p_col = night_mode
                 ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
-                : lgfx::color565(total_intensity / 3, (total_intensity * 7) / 8, (total_intensity * 5) / 6);
+                : lgfx::color565(total_intensity / 3, (total_intensity * 3) / 4, total_intensity);
 
             // Draw small upward triangle (matches detection triangle vocabulary but smaller)
             // Size 3: base 3px, height 3px
@@ -5922,9 +5873,9 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     auto& lcd = M5Cardputer.Display;
 
     uint16_t bg     = lgfx::color565(  5,  10,  20);   // matches BG_COLOR (day)
-    uint16_t blue   = lgfx::color565(124, 228, 210);   // matches HEADER_COLOR (mint)
+    uint16_t blue   = lgfx::color565(110, 200, 255);   // matches HEADER_COLOR (ice blue)
     uint16_t white  = lgfx::color565(232, 239, 255);   // matches TEXT_COLOR
-    uint16_t dim    = lgfx::color565( 90, 107, 128);   // matches DIM_COLOR
+    uint16_t dim    = lgfx::color565(149, 165, 184);   // matches DIM_COLOR (bright steel)
 
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
