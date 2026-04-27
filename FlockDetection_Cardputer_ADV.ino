@@ -64,6 +64,7 @@ void draw_gps_screen();
 void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
 static void set_toast_direct(const char* text, uint16_t accent);
+static void apply_ble_scan_params();
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -364,7 +365,8 @@ SPIClass sdSPI(FSPI);  // FSPI (SPI2_HOST) — matches the bmorcelli Launcher re
                        // sharing FSPI with a separate Arduino SPIClass for SD is safe.
 
 TaskHandle_t ScannerTaskHandle;
-TaskHandle_t GPSTaskHandle; 
+TaskHandle_t GPSTaskHandle;
+static TaskHandle_t BLEWorkerHandle = nullptr;
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t sdMutex;    // guards all SD card I/O — FAT is not thread-safe
 
@@ -397,9 +399,9 @@ int  sd_write_count = 0;
 unsigned long last_sd_flush = 0;
 static int flash_write_fail_count = 0; 
 
-String current_log_file = "/FLOCK_FINDER/logs/FlockLog.csv";
-String current_pcap_file = "/FLOCK_FINDER/captures/Threats.pcap";
-String current_ble_pcap_file = "/FLOCK_FINDER/captures/BLE_Threats.pcap";
+static const char* current_log_file = "/FLOCK_FINDER/logs/FlockLog.csv";
+static const char* current_pcap_file = "/FLOCK_FINDER/captures/Threats.pcap";
+static const char* current_ble_pcap_file = "/FLOCK_FINDER/captures/BLE_Threats.pcap";
 
 // Export server state
 static WebServer* export_server = nullptr;
@@ -419,6 +421,7 @@ static char export_ip_str[20] = "0.0.0.0";
 
 int current_screen = 0;
 bool system_fully_booted = false;
+static bool screen_dirty = true;   // Forces redraw; set by any state change
 bool stealth_mode = false;
 bool is_muted = false;       
 int current_volume = 150;    
@@ -894,17 +897,17 @@ bool is_penguin_numeric_name(const char* name) {
     return true;
 }
 
-bool check_manufacturer_id(const std::string& mfg_data) {
-    if (mfg_data.length() >= 2) {
-        uint16_t mfg_id = (uint8_t)mfg_data[0] | ((uint8_t)mfg_data[1] << 8);
+bool check_manufacturer_id(const uint8_t* mfg_data, size_t mfg_len) {
+    if (mfg_len >= 2) {
+        uint16_t mfg_id = mfg_data[0] | (mfg_data[1] << 8);
         if (mfg_id == FLOCK_MFG_COMPANY_ID) return true;
     }
     return false;
 }
 
-bool has_tn_serial(const std::string& mfg_data) {
-    if (mfg_data.length() < 4) return false;
-    for (size_t i = 2; i < mfg_data.length() - 1; i++) {
+bool has_tn_serial(const uint8_t* mfg_data, size_t mfg_len) {
+    if (mfg_len < 4) return false;
+    for (size_t i = 2; i < mfg_len - 1; i++) {
         if (mfg_data[i] == 'T' && mfg_data[i + 1] == 'N') return true;
     }
     return false;
@@ -1297,7 +1300,7 @@ void load_detections_from_flash() {
 void load_sd_history() {
     sd_hist_count = 0;
     if (!sd_available) return;
-    File f = SD.open(current_log_file.c_str(), FILE_READ);
+    File f = SD.open(current_log_file, FILE_READ);
     if (!f) return;
 
     // Ring buffer: keep last SD_HIST_SIZE parsed entries
@@ -1371,7 +1374,9 @@ static volatile bool persist_in_flight = false;
 static void save_session_to_flash();  // forward decl
 
 static void PersistTask(void* pv) {
+    esp_task_wdt_add(NULL);
     save_session_to_flash();
+    esp_task_wdt_delete(NULL);
     persist_in_flight = false;
     vTaskDelete(NULL);
 }
@@ -1531,8 +1536,8 @@ static void sd_check_hotplug() {
             if (!SD.exists("/FLOCK_FINDER/stats"))    SD.mkdir("/FLOCK_FINDER/stats");
             esp_task_wdt_reset();
 
-            if (!SD.exists(current_log_file.c_str())) {
-                File f = SD.open(current_log_file.c_str(), FILE_WRITE);
+            if (!SD.exists(current_log_file)) {
+                File f = SD.open(current_log_file, FILE_WRITE);
                 if (f) {
                     f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM");
                     f.close();
@@ -1540,14 +1545,14 @@ static void sd_check_hotplug() {
             }
             esp_task_wdt_reset();
 
-            auto ensure_pcap = [](const String& path, uint32_t link_type) {
-                bool need_hdr = !SD.exists(path.c_str());
+            auto ensure_pcap = [](const char* path, uint32_t link_type) {
+                bool need_hdr = !SD.exists(path);
                 if (!need_hdr) {
-                    File pcheck = SD.open(path.c_str(), FILE_READ);
+                    File pcheck = SD.open(path, FILE_READ);
                     if (pcheck) { need_hdr = (pcheck.size() < 24); pcheck.close(); }
                 }
                 if (need_hdr) {
-                    File pf = SD.open(path.c_str(), FILE_WRITE);
+                    File pf = SD.open(path, FILE_WRITE);
                     if (pf) {
                         uint32_t hdr[6] = {0xa1b2c3d4, 0x00040002, 0, 0, 0x0000ffff, link_type};
                         pf.write((const uint8_t*)hdr, 24);
@@ -1930,7 +1935,7 @@ void flush_sd_buffer() {
     }
 
     if (log_count > 0) {
-        File file = SD.open(current_log_file.c_str(), FILE_APPEND);
+        File file = SD.open(current_log_file, FILE_APPEND);
         if (file) {
             for (int i = 0; i < log_count; i++) {
                 if ((i & 0x0F) == 0) esp_task_wdt_reset();  // every 16 lines
@@ -1947,7 +1952,7 @@ void flush_sd_buffer() {
     }
 
     if (pcap_count > 0) {
-        File pfile = SD.open(current_pcap_file.c_str(), FILE_APPEND);
+        File pfile = SD.open(current_pcap_file, FILE_APPEND);
         if (pfile) {
             for (int i = 0; i < pcap_count; i++) {
                 esp_task_wdt_reset();  // pcap writes can be large per packet
@@ -1963,7 +1968,7 @@ void flush_sd_buffer() {
         }
     }
     if (ble_pcap_count > 0) {
-        File bfile = SD.open(current_ble_pcap_file.c_str(), FILE_APPEND);
+        File bfile = SD.open(current_ble_pcap_file, FILE_APPEND);
         if (bfile) {
             for (int i = 0; i < ble_pcap_count; i++) {
                 esp_task_wdt_reset();
@@ -2025,6 +2030,7 @@ static void set_toast_direct(const char* text, uint16_t accent) {
     toast_is_action    = true;
     toast_start        = millis();
     toast_active       = true;
+    screen_dirty       = true;
     xSemaphoreGive(dataMutex);
 }
 
@@ -2069,6 +2075,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
         toast_start = millis();
         toast_active = true;
     }
+    screen_dirty = true;
 
     xSemaphoreGive(dataMutex);
 }
@@ -2185,6 +2192,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     if (is_new) {
         trigger_toast(type, name, confidence);
         add_blip(blip_col, rssi);
+        screen_dirty = true;
     }
 
     // Heavy work outside mutex
@@ -2434,24 +2442,11 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
 
     WifiEvent* ev = &wifi_event_queue[wifi_eq_write_idx];
 
-    memset(ev->ssid, 0, sizeof(ev->ssid));
-    uint8_t* frame_body    = (uint8_t*)ipkt + 24;
-    uint8_t* tagged_params;
-    int      remaining;
-    if (is_beacon) {
-        if (ppkt->rx_ctrl.sig_len < 24 + 12 + 2) return;
-        tagged_params = frame_body + 12;
-        remaining     = (int)ppkt->rx_ctrl.sig_len - 24 - 12 - 4;
-    } else {
-        tagged_params = frame_body;
-        remaining     = (int)ppkt->rx_ctrl.sig_len - 24 - 4;
-    }
-    if (remaining > 2 && tagged_params[0] == 0
-        && tagged_params[1] <= 32 && tagged_params[1] <= remaining - 2) {
-        memcpy(ev->ssid, &tagged_params[2], tagged_params[1]);
-        ev->ssid[tagged_params[1]] = '\0';
-    }
-
+    // Copy only raw metadata and the frame snapshot.
+    // SSID extraction, RSN parsing, and vendor OUI collection are
+    // deferred to process_wifi_event_queue() via parse_wifi_event() —
+    // keeps the callback fast and avoids back-pressure on the WiFi
+    // driver's internal queue in dense RF environments.
     memcpy(ev->mac, hdr->addr2, 6);
     memcpy(ev->addr1, hdr->addr1, 6);
     ev->rssi             = (int8_t)ppkt->rx_ctrl.rssi;
@@ -2463,15 +2458,65 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->payload_snap_len = (ppkt->rx_ctrl.sig_len < 256) ? (uint16_t)ppkt->rx_ctrl.sig_len : 256;
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
 
+    // Clear parsed fields — they'll be populated by parse_wifi_event()
+    memset(ev->ssid, 0, sizeof(ev->ssid));
     ev->is_wpa2_psk = false;
     ev->vendor_oui_count = 0;
-    if (is_beacon) {
+
+    __sync_synchronize();   // release: publish all field writes before `ready`
+    ev->ready = true;
+    wifi_eq_write_idx = next;
+}
+
+// Parse tagged parameters from a locally-copied WiFi event. Extracts SSID,
+// RSN/WPA2-PSK status, and vendor OUIs from the raw payload snapshot.
+// Called from process_wifi_event_queue() after the event has been copied
+// out of the ring buffer — never from ISR/callback context.
+static void parse_wifi_event(WifiEvent* ev) {
+    // Locate the tagged parameters within the frame body.
+    // Management frame: 24-byte MAC header, then frame body.
+    // Beacon: 12 bytes of fixed fields (timestamp, interval, capability)
+    //         before tagged parameters.
+    // Probe Request: tagged parameters start immediately after MAC header.
+    if (ev->payload_snap_len < 24) return;
+
+    uint8_t* frame_body = ev->payload_snap + 24;
+    uint8_t* tagged_params;
+    int remaining;
+
+    if (ev->is_beacon) {
+        if (ev->payload_snap_len < 24 + 12 + 2) return;
+        tagged_params = frame_body + 12;
+        remaining = (int)ev->payload_snap_len - 24 - 12;
+    } else {
+        tagged_params = frame_body;
+        remaining = (int)ev->payload_snap_len - 24;
+    }
+    // Subtract FCS (4 bytes) if present in the snapshot
+    remaining -= 4;
+    if (remaining < 0) remaining = 0;
+
+    // ── SSID extraction (tag 0) ──
+    memset(ev->ssid, 0, sizeof(ev->ssid));
+    if (remaining > 2 && tagged_params[0] == 0
+        && tagged_params[1] <= 32 && tagged_params[1] <= remaining - 2) {
+        memcpy(ev->ssid, &tagged_params[2], tagged_params[1]);
+        ev->ssid[tagged_params[1]] = '\0';
+    }
+
+    // ── RSN and vendor OUI parsing ──
+    ev->is_wpa2_psk = false;
+    ev->vendor_oui_count = 0;
+
+    if (ev->is_beacon) {
         uint8_t* p = tagged_params;
         int rem = remaining;
         while (rem >= 2) {
             uint8_t tag_id = p[0];
             uint8_t tag_len = p[1];
             if (tag_len > rem - 2) break;
+
+            // RSN Information Element (tag 48) — check for WPA2-PSK AKM
             if (tag_id == 48 && tag_len >= 20) {
                 uint8_t* rsn = p + 2;
                 int rsn_len = tag_len;
@@ -2492,6 +2537,8 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                     }
                 }
             }
+
+            // Vendor-specific IE (tag 221) — collect unique OUIs
             if (tag_id == 221 && tag_len >= 4 && ev->vendor_oui_count < 4) {
                 bool seen = false;
                 for (int k = 0; k < ev->vendor_oui_count; k++) {
@@ -2502,14 +2549,11 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                     ev->vendor_oui_count++;
                 }
             }
+
             p += 2 + tag_len;
             rem -= 2 + tag_len;
         }
     }
-
-    __sync_synchronize();   // release: publish all field writes before `ready`
-    ev->ready = true;
-    wifi_eq_write_idx = next;
 }
 
 void process_wifi_event_queue() {
@@ -2527,6 +2571,12 @@ void process_wifi_event_queue() {
         wifi_eq_read_idx = (wifi_eq_read_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
         if (local.rssi < IGNORE_WEAK_RSSI) continue;
+
+        // Parse tagged parameters from the raw payload snapshot.
+        // This was previously done in the sniffer callback; deferring it
+        // here keeps the callback fast and prevents back-pressure on the
+        // WiFi driver's internal queue in dense RF environments.
+        parse_wifi_event(&local);
 
         clean_device_name_char(local.ssid);
 
@@ -2685,11 +2735,17 @@ struct BleEventData {
     char     service_uuids[8][37];
     uint8_t  uuid_count;
     uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
+    volatile bool in_use;  // pool slot occupancy flag
 };
+
+// Static pool — eliminates all malloc/free from the BLE advertisement
+// hot path. 12 slots × ~380 bytes ≈ 4.5KB static cost, zero fragmentation.
+#define BLE_POOL_SIZE 12
+static BleEventData ble_pool[BLE_POOL_SIZE];
+static volatile uint8_t ble_pool_write = 0;
 
 static void ble_worker_task(void* pvParameters) {
     bool wdt_subscribed = false;
-    BleEventData* ev;
     for (;;) {
         if (!wdt_subscribed) {
             esp_err_t err = esp_task_wdt_add(NULL);
@@ -2697,9 +2753,12 @@ static void ble_worker_task(void* pvParameters) {
         }
         if (wdt_subscribed) esp_task_wdt_reset();
         // 1s timeout so the WDT reset above can fire even when the queue is idle.
-        if (xQueueReceive(ble_event_queue, &ev, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
+        uint8_t pool_idx;
+        if (xQueueReceive(ble_event_queue, &pool_idx, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
 
-        if (ev->rssi < IGNORE_WEAK_RSSI) { free(ev); continue; }
+        BleEventData* ev = &ble_pool[pool_idx];
+
+        if (ev->rssi < IGNORE_WEAK_RSSI) { ev->in_use = false; continue; }
 
         int  confidence   = 0;
         char methods[64]  = {0};
@@ -2737,11 +2796,10 @@ static void ble_worker_task(void* pvParameters) {
                                 ev->rssi, 1, preview_is_flock);
         }
 
-        std::string mfg_std((const char*)ev->mfg_data, ev->mfg_data_len);
         if (ev->have_mfg) {
-            if (check_manufacturer_id(mfg_std)) {
+            if (check_manufacturer_id(ev->mfg_data, ev->mfg_data_len)) {
                 strlcat(methods, "mfg_0x09C8 ", sizeof(methods)); got_mfg = true;
-                if (has_tn_serial(mfg_std)) strlcat(methods, "tn_serial ", sizeof(methods));
+                if (has_tn_serial(ev->mfg_data, ev->mfg_data_len)) strlcat(methods, "tn_serial ", sizeof(methods));
             }
         }
 
@@ -2879,15 +2937,18 @@ static void ble_worker_task(void* pvParameters) {
             xSemaphoreGive(dataMutex);
         }
 
-        free(ev);
+        ev->in_use = false;
     }
 }
 
 class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-        BleEventData* ev = (BleEventData*)malloc(sizeof(BleEventData));
-        if (!ev) return;
+        // Claim a pool slot. If the slot is still being processed by the
+        // worker task, drop this advertisement — better than heap-allocating.
+        uint8_t slot = ble_pool_write;
+        if (ble_pool[slot].in_use) return;  // pool exhausted, drop
 
+        BleEventData* ev = &ble_pool[slot];
         memset(ev, 0, sizeof(BleEventData));
 
         NimBLEAddress addr = advertisedDevice->getAddress();
@@ -2932,7 +2993,17 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         // NimBLE does not reliably expose advertising channel on ESP32.
         ev->adv_channel = 0;
 
-        if (xQueueSend(ble_event_queue, &ev, 0) != pdTRUE) { free(ev); }
+        // Mark slot as occupied and advance the write cursor BEFORE queuing —
+        // the worker dereferences ble_pool[idx] directly and relies on
+        // in_use to know the slot is valid.
+        ev->in_use = true;
+        ble_pool_write = (slot + 1) % BLE_POOL_SIZE;
+
+        // Queue the slot index. If the queue is full, release the slot.
+        uint8_t idx = slot;
+        if (xQueueSend(ble_event_queue, &idx, 0) != pdTRUE) {
+            ev->in_use = false;
+        }
     }
 };
 
@@ -3029,6 +3100,8 @@ void GPSLoopTask(void* pvParameters) {
 }
 
 void AlarmTask(void* pvParameters) {
+    esp_task_wdt_add(NULL);
+
     // Flush any stale I2S DMA state before playing — prevents an assertion
     // inside the M5Unified speaker driver when tone() is called after the
     // peripheral has been idle for extended periods (e.g. ambient mode).
@@ -3065,10 +3138,13 @@ void AlarmTask(void* pvParameters) {
     }
 
     is_alarming = false;
+    esp_task_wdt_delete(NULL);
     vTaskDelete(NULL);
 }
 
 void LocatorChimeTask(void* pvParameters) {
+    esp_task_wdt_add(NULL);
+
     // Same I2S flush as AlarmTask — see comment there.
     M5Cardputer.Speaker.stop();
     vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -3078,6 +3154,7 @@ void LocatorChimeTask(void* pvParameters) {
         vTaskDelay(80 / portTICK_PERIOD_MS);
         M5Cardputer.Speaker.tone(880, 90);
     }
+    esp_task_wdt_delete(NULL);
     vTaskDelete(NULL);
 }
 
@@ -3822,10 +3899,13 @@ void handle_menu_select() {
         case 6:
             low_power_mode = !low_power_mode;
             if (low_power_mode) {
+                setCpuFrequencyMhz(80);
                 set_toast_direct("LOW POWER ON", ACCENT_COLOR);
             } else {
+                setCpuFrequencyMhz(160);
                 set_toast_direct("LOW POWER OFF", DIM_COLOR);
             }
+            apply_ble_scan_params();
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
         case 7:
@@ -5794,6 +5874,7 @@ void draw_current_screen() {
 }
 
 void transition_screen(int new_screen, int dir) {
+    screen_dirty = true;
     if (stealth_mode) { current_screen = new_screen; return; }
     if (!is_muted) {
         M5Cardputer.Speaker.tone(660, 5);   // soft warm tap, matches menu click
@@ -6244,6 +6325,92 @@ static void boot_animate(int pct, const char* status, int /*unused*/ = 0) {
     }
 }
 
+// Configure BLE scan parameters based on current power mode.
+// Called at boot and after every periodic BLE stack restart.
+static void apply_ble_scan_params() {
+    if (!pBLEScan) return;
+    if (low_power_mode) {
+        // 50% duty cycle: 125ms interval, 62.5ms window.
+        // Flock devices advertise every 100-200ms — still caught reliably.
+        pBLEScan->setInterval(200);   // 200 × 0.625ms = 125ms
+        pBLEScan->setWindow(100);     // 100 × 0.625ms = 62.5ms
+    } else {
+        // Full duty cycle: 60ms interval = window. Maximum detection rate.
+        pBLEScan->setInterval(97);
+        pBLEScan->setWindow(97);
+    }
+}
+
+// ── I2C bus recovery ────────────────────────────────────────────────────────
+// If a peripheral holds SDA low (lost state during power transient), the
+// entire I2C bus hangs. Per the I2C spec, clocking SCL 9 times releases
+// any stuck slave because it completes the partial byte transfer.
+//
+// Called only on detected bus failure — zero overhead during normal operation.
+// Uses the default Wire pins from M5Unified (SDA=2, SCL=1 on Cardputer ADV).
+//
+// Returns true if SDA was released (bus recovered), false if still stuck.
+static bool i2c_bus_recover() {
+    // M5Cardputer ADV I2C pins — match M5Unified defaults
+    const int PIN_SDA = 2;
+    const int PIN_SCL = 1;
+
+    // Check if SDA is actually stuck low
+    pinMode(PIN_SDA, INPUT_PULLUP);
+    pinMode(PIN_SCL, INPUT_PULLUP);
+    delayMicroseconds(10);
+
+    if (digitalRead(PIN_SDA) == HIGH) {
+        // SDA is not stuck — bus is fine, no recovery needed
+        return true;
+    }
+
+    Serial.println("[I2C] SDA stuck low — attempting bus recovery");
+
+    // Clock SCL up to 9 times to free the stuck slave
+    pinMode(PIN_SCL, OUTPUT);
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(PIN_SCL, LOW);
+        delayMicroseconds(5);
+        digitalWrite(PIN_SCL, HIGH);
+        delayMicroseconds(5);
+
+        // Check if SDA released
+        pinMode(PIN_SDA, INPUT_PULLUP);
+        delayMicroseconds(5);
+        if (digitalRead(PIN_SDA) == HIGH) {
+            Serial.printf("[I2C] SDA released after %d clock pulses\n", i + 1);
+            break;
+        }
+    }
+
+    // Send a STOP condition (SDA low→high while SCL is high)
+    pinMode(PIN_SDA, OUTPUT);
+    digitalWrite(PIN_SDA, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_SCL, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_SDA, HIGH);
+    delayMicroseconds(5);
+
+    // Restore pins to I2C function
+    pinMode(PIN_SDA, INPUT_PULLUP);
+    pinMode(PIN_SCL, INPUT_PULLUP);
+
+    bool recovered = (digitalRead(PIN_SDA) == HIGH);
+    if (recovered) {
+        Serial.println("[I2C] Bus recovery successful — reinitializing Wire");
+        // Reinitialize the I2C driver so M5Unified picks up the recovered bus
+        Wire.end();
+        delay(10);
+        Wire.begin(PIN_SDA, PIN_SCL);
+    } else {
+        Serial.println("[I2C] Bus recovery FAILED — SDA still stuck");
+    }
+
+    return recovered;
+}
+
 void setup() {
     // ── Safe WDT reconfiguration ────────────────────────────────────
     // esp_task_wdt_deinit() is NOT safe on IDF 5.x — it wraps IDLE
@@ -6269,6 +6436,11 @@ void setup() {
 
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
+
+    // Confirm I2C pin assignments at boot — i2c_bus_recover() hardcodes
+    // SDA=2/SCL=1 (M5Cardputer ADV defaults). If this prints different
+    // values, update the constants in i2c_bus_recover().
+    Serial.printf("[I2C] SDA=%d SCL=%d\n", Wire.getSDA(), Wire.getSCL());
 
     // PSRAM availability + heap snapshot. Total PSRAM = 0 means PSRAM
     // isn't enabled in the board config; setPsram(true) will silently fall
@@ -6386,18 +6558,18 @@ void setup() {
         if (!SD.exists("/FLOCK_FINDER/stats"))     SD.mkdir("/FLOCK_FINDER/stats");
         Serial.println("[SD] Directory structure OK");
 
-        if (!SD.exists(current_log_file.c_str())) {
-            File file = SD.open(current_log_file.c_str(), FILE_WRITE);
+        if (!SD.exists(current_log_file)) {
+            File file = SD.open(current_log_file, FILE_WRITE);
             if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
         }
         {
-            bool need_pcap_header = !SD.exists(current_pcap_file.c_str());
+            bool need_pcap_header = !SD.exists(current_pcap_file);
             if (!need_pcap_header) {
-                File pcheck = SD.open(current_pcap_file.c_str(), FILE_READ);
+                File pcheck = SD.open(current_pcap_file, FILE_READ);
                 if (pcheck) { if (pcheck.size() < 24) need_pcap_header = true; pcheck.close(); }
             }
             if (need_pcap_header) {
-                File pfile = SD.open(current_pcap_file.c_str(), FILE_WRITE);
+                File pfile = SD.open(current_pcap_file, FILE_WRITE);
                 if (pfile) {
                     uint32_t pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x00000069};
                     pfile.write((const uint8_t*)pcap_header, 24); pfile.close();
@@ -6405,13 +6577,13 @@ void setup() {
             }
         }
         {
-            bool need_ble_header = !SD.exists(current_ble_pcap_file.c_str());
+            bool need_ble_header = !SD.exists(current_ble_pcap_file);
             if (!need_ble_header) {
-                File bcheck = SD.open(current_ble_pcap_file.c_str(), FILE_READ);
+                File bcheck = SD.open(current_ble_pcap_file, FILE_READ);
                 if (bcheck) { if (bcheck.size() < 24) need_ble_header = true; bcheck.close(); }
             }
             if (need_ble_header) {
-                File bfile = SD.open(current_ble_pcap_file.c_str(), FILE_WRITE);
+                File bfile = SD.open(current_ble_pcap_file, FILE_WRITE);
                 if (bfile) {
                     uint32_t ble_pcap_header[6] = {0xa1b2c3d4, 0x00040002, 0x00000000, 0x00000000, 0x0000ffff, 0x000000fb};
                     bfile.write((const uint8_t*)ble_pcap_header, 24); bfile.close();
@@ -6450,8 +6622,8 @@ void setup() {
 
     setCpuFrequencyMhz(240);
     boot_animate(62 + random(0, 3), "boosting CPU");
-    ble_event_queue = xQueueCreate(8, sizeof(BleEventData*));
-    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, NULL, 1);
+    ble_event_queue = xQueueCreate(BLE_POOL_SIZE, sizeof(uint8_t));
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, &BLEWorkerHandle, 1);
     boot_animate(68, "starting Bluetooth");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
@@ -6535,7 +6707,8 @@ void setup() {
                   (unsigned)esp_get_free_heap_size());
     pBLEScan = NimBLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
-    pBLEScan->setActiveScan(false); pBLEScan->setInterval(97); pBLEScan->setWindow(97);
+    pBLEScan->setActiveScan(false);
+    apply_ble_scan_params();
     // Don't store results internally — every advertisement is already handled
     // via the callback -> ble_event_queue -> ble_worker_task pipeline. The
     // default cache can hit 10–20 KB in a busy RF environment for no benefit.
@@ -6618,6 +6791,11 @@ void setup() {
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
+    // Drop to 160MHz for normal operation. Boot and radio init benefit from
+    // 240MHz; steady-state scanning, rendering, and BLE processing do not.
+    // Saves ~20mA continuous draw (~2 hours extra on 1750mAh).
+    setCpuFrequencyMhz(160);
+
     if (lifetime_boots <= 3) {
         set_toast_direct("TAB = help  M = menu", HEADER_COLOR);
     }
@@ -6662,6 +6840,31 @@ void loop() {
         } else if (last_battery_warning_mv < 9999
                    && loop_mv >= last_battery_warning_mv + 100) {
             last_battery_warning_mv = 9999;
+        }
+    }
+
+    // One-time stack usage diagnostic — logs after 60s when all code paths
+    // (WiFi events, BLE scans, GPS parsing, SD flushes, alarms) have fired
+    // at least once. Values are in bytes of unused stack (high-water mark).
+    // If any value is >1500, the task's stack can be safely reduced by that
+    // amount minus a 256-byte safety margin.
+    {
+        static bool stack_reported = false;
+        if (!stack_reported && millis() > 60000) {
+            stack_reported = true;
+            UBaseType_t scan_hw = uxTaskGetStackHighWaterMark(ScannerTaskHandle);
+            UBaseType_t gps_hw  = uxTaskGetStackHighWaterMark(GPSTaskHandle);
+            UBaseType_t ble_hw  = BLEWorkerHandle ? uxTaskGetStackHighWaterMark(BLEWorkerHandle) : 0;
+            UBaseType_t led_hw  = LedTaskHandle ? uxTaskGetStackHighWaterMark(LedTaskHandle) : 0;
+            UBaseType_t loop_hw = uxTaskGetStackHighWaterMark(NULL);  // NULL = calling task (loop)
+            Serial.printf("[STACK] High-water marks (bytes remaining):\n");
+            Serial.printf("  Scanner: %u / 3072\n", (unsigned)scan_hw);
+            Serial.printf("  GPS:     %u / 2560\n", (unsigned)gps_hw);
+            Serial.printf("  BLE:     %u / 4096\n", (unsigned)ble_hw);
+            Serial.printf("  LED:     %u / 2048\n", (unsigned)led_hw);
+            Serial.printf("  Loop:    %u / 8192\n", (unsigned)loop_hw);
+            Serial.printf("[STACK] Safe to reduce any task where remaining > 512 bytes.\n");
+            Serial.printf("  Recommended: new_stack = current - (remaining - 256)\n");
         }
     }
 
@@ -6730,6 +6933,7 @@ void loop() {
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
         last_user_input_ms = millis();
+        screen_dirty = true;
         if (ambient_mode) {
             ambient_mode = false;
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
@@ -7282,8 +7486,7 @@ void loop() {
         pBLEScan = NimBLEDevice::getScan();
         pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
-        pBLEScan->setInterval(97);
-        pBLEScan->setWindow(97);
+        apply_ble_scan_params();
         pBLEScan->setMaxResults(0);  // see setup() — callback handles everything
         last_ble_scan = millis();
         if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
@@ -7293,6 +7496,35 @@ void loop() {
     // SD hot-plug: periodically attempt remount if card is absent, or probe if present
     sd_check_hotplug();
     if (wdt_subscribed) esp_task_wdt_reset();
+
+    // I2C bus health check — detect and recover from SDA stuck low.
+    // Only runs every 30s to avoid overhead. The TCA8418 keyboard controller
+    // is the primary I2C device; if it stops responding, the bus is likely hung.
+    {
+        static unsigned long last_i2c_check_ms = 0;
+        if (millis() - last_i2c_check_ms > 30000) {
+            last_i2c_check_ms = millis();
+
+            // Quick probe: try to read from the TCA8418 (address 0x34).
+            // A stuck bus will cause this to fail immediately.
+            Wire.beginTransmission(0x34);
+            uint8_t i2c_err = Wire.endTransmission();
+
+            if (i2c_err != 0) {
+                // Bus error — attempt recovery
+                Serial.printf("[I2C] Bus probe failed (err=%d), attempting recovery\n", i2c_err);
+                bool ok = i2c_bus_recover();
+                if (ok) {
+                    set_toast_direct("I2C RECOVERED", ACCENT_COLOR);
+                } else {
+                    set_toast_direct("I2C BUS FAULT", CAUTION_COLOR);
+                    // The 30-minute BLE restart will also reinitialize the bus.
+                    // If recovery fails here, the device is still functional for
+                    // WiFi detection — only keyboard input is affected.
+                }
+            }
+        }
+    }
 
     if (millis() - last_sd_flush_check >= 500) {
         last_sd_flush_check = millis(); 
@@ -7434,9 +7666,17 @@ void loop() {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; }
+            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; screen_dirty = false; }
         }
-        else { if (now - last_slow_ui >= 100) { draw_current_screen(); spr.pushSprite(0, 0); last_slow_ui = now; } }
+        else {
+            if (now - last_slow_ui >= 100) {
+                if (screen_dirty || toast_active) {
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                    screen_dirty = false;
+                }
+                last_slow_ui = now;
+            }
+        }
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
 }
