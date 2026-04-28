@@ -22,7 +22,6 @@
 #include <LittleFS.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
-#include <Wire.h>
 #include <math.h>
 #include "ui_beep.h"  // PCM sound for screen transitions
 
@@ -112,8 +111,6 @@ static bool show_menu = false;
 static int  menu_selected = 0;
 static unsigned long menu_open_ms = 0;
 #define MENU_ITEM_COUNT 11
-static float menu_highlight_ease_y = 0.0f;  // current eased y position of highlight
-static bool  menu_highlight_init = false;   // true after first draw (prevents ease-from-zero)
 static int   menu_scroll_offset = 0;        // index of first visible item
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
@@ -3639,9 +3636,9 @@ void draw_menu_overlay() {
     if (menu_selected < 0) menu_selected = 0;
     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
 
-    const int row_h    = 14;  // textSize 1.5 = 12px tall + 2px breathing room
-    const int row_gap  = 6;   // more vertical breathing between items
-    const int start_y  = CONTENT_Y + 2;
+    const int row_h    = 14;
+    const int row_gap  = UI_PAD_SM;          // 6px standard gap
+    const int start_y  = CONTENT_Y + UI_PAD_XS;  // 2px below header
 
     // Scrollable viewport — compute how many items fit between start_y and bottom
     // (footer was removed; the row space extends to the bottom of the screen).
@@ -3660,22 +3657,10 @@ void draw_menu_overlay() {
     if (max_scroll < 0) max_scroll = 0;
     if (menu_scroll_offset > max_scroll) menu_scroll_offset = max_scroll;
 
-    // Eased highlight — smoothly interpolates toward the selected item's
-    // screen position. Frame-rate-independent so the motion feels identical
-    // at 15fps and 60fps. 80ms time constant for a snappy slide.
+    // Instant highlight snap — no easing. The reduced row height makes
+    // interpolation look like jitter rather than smooth motion.
     int sel_vi = menu_selected - menu_scroll_offset;
-    float target_y = (float)(start_y + sel_vi * (row_h + row_gap));
-    if (!menu_highlight_init) {
-        menu_highlight_ease_y = target_y;
-        menu_highlight_init = true;
-    } else {
-        static unsigned long menu_last_frame_ms = 0;
-        float frame_dt = (menu_last_frame_ms == 0) ? 16.0f : (float)(now_ms - menu_last_frame_ms);
-        if (frame_dt > 100.0f) frame_dt = 16.0f;
-        menu_last_frame_ms = now_ms;
-        menu_highlight_ease_y = anim_filter(menu_highlight_ease_y, target_y, 80.0f, frame_dt);
-    }
-    int ease_y = (int)(menu_highlight_ease_y + 0.5f);
+    int ease_y = start_y + sel_vi * (row_h + row_gap);
 
     // ── Row grid — only draw visible items ──
     for (int vi = 0; vi < menu_visible_count && (vi + menu_scroll_offset) < MENU_ITEM_COUNT; vi++) {
@@ -3684,28 +3669,21 @@ void draw_menu_overlay() {
 
         spr.fillRect(0, y, DISP_W, row_h, BG_COLOR);
 
-        int text_x = 16;  // padded to clear the selection-indicator dash area
-        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+        int text_x = 16;  // padded to clear the selection bar
+        // Selected item renders in header color (ice blue), others in text color.
+        // Creates a "glow" effect without position shifts.
+        uint16_t item_col = (i == menu_selected) ? HEADER_COLOR : TEXT_COLOR;
+        spr.setTextColor(ea(item_col), BG_COLOR);
         spr.setTextSize(TS_STRONG);
         spr.setCursor(text_x, y + 1);
         spr.print(items[i].label);
     }
 
-    // ── Eased highlight bar ──
+    // ── Selection bar ──
+    // 3px wide vertical bar on the left edge, full row height.
+    // Text color is already set per-item in the row grid loop.
     {
-        uint16_t sel_bg = BG_COLOR;
-
-        // Selection indicator: 6×2px horizontal dash, vertically centered.
-        int dash_y = ease_y + row_h / 2;
-        spr.drawFastHLine(4, dash_y,     6, ea(HEADER_COLOR));
-        spr.drawFastHLine(4, dash_y - 1, 6, ea(HEADER_COLOR));
-
-        // Redraw selected item text on highlight.
-        int text_x = 16;
-        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-        spr.setTextSize(TS_STRONG);
-        spr.setCursor(text_x, ease_y + 1);
-        spr.print(items[menu_selected].label);  // see row-grid path
+        spr.fillRect(UI_PAD_XS, ease_y, 3, row_h, ea(HEADER_COLOR));
     }
 
     // ── Scrollbar — only show if list exceeds viewport ──
@@ -5350,14 +5328,15 @@ void draw_gps_screen() {
             int   n_sats;    // satellites in this plane
             float phase_off; // phase offset for plane
         };
-        const OrbPlane planes[3] = {
-            { radians(55.0f), (float)(gr + 12), 0.0003f,  3, 0.0f },
-            { radians(55.0f), (float)(gr + 16), 0.00025f, 2, 2.09f },
+        // Fewer satellites (5 total instead of 7), spread across 2 planes.
+        // Cleaner visual, bigger triangles have room to breathe.
+        const OrbPlane planes[2] = {
+            { radians(55.0f), (float)(gr + 14), 0.0003f,  3, 0.0f },
             { radians(80.0f), (float)(gr + 10), 0.0004f,  2, 1.05f },
         };
 
         // Per-plane projection lambda — applies globe tilt/roll then inclination
-        for (int pi = 0; pi < 3; pi++) {
+        for (int pi = 0; pi < 2; pi++) {
             const OrbPlane& pl = planes[pi];
             float ci = cosf(pl.inc), si2 = sinf(pl.inc);
 
@@ -5435,13 +5414,14 @@ void draw_gps_screen() {
                     float perpx = -ny;
                     float perpy =  nx;
 
-                    // Tip 3px outward, base 1px inward + 2px to each side
-                    int tip_x  = dpx + (int)(nx * 3.0f);
-                    int tip_y  = dpy + (int)(ny * 3.0f);
-                    int base1x = dpx - (int)(nx * 1.0f) + (int)(perpx * 2.0f);
-                    int base1y = dpy - (int)(ny * 1.0f) + (int)(perpy * 2.0f);
-                    int base2x = dpx - (int)(nx * 1.0f) - (int)(perpx * 2.0f);
-                    int base2y = dpy - (int)(ny * 1.0f) - (int)(perpy * 2.0f);
+                    // Tip 5px outward, base 2px inward + 3px to each side.
+                    // Sized to be individually legible on the 240x135 display.
+                    int tip_x  = dpx + (int)(nx * 5.0f);
+                    int tip_y  = dpy + (int)(ny * 5.0f);
+                    int base1x = dpx - (int)(nx * 2.0f) + (int)(perpx * 3.0f);
+                    int base1y = dpy - (int)(ny * 2.0f) + (int)(perpy * 3.0f);
+                    int base2x = dpx - (int)(nx * 2.0f) - (int)(perpx * 3.0f);
+                    int base2y = dpy - (int)(ny * 2.0f) - (int)(perpy * 3.0f);
 
                     if (acquired) {
                         spr.fillTriangle(tip_x, tip_y, base1x, base1y,
@@ -5465,8 +5445,8 @@ void draw_gps_screen() {
         const char* status_base;
         uint16_t    status_col;
         bool        status_anim = false;
-        if      (has_loc && !stale) { status_base = "GPS LOCKED";   status_col = GPS_COLOR; }
-        else if (stale)             { status_base = "SIGNAL LOST";  status_col = CAUTION_COLOR; }
+        if      (has_loc && !stale) { status_base = "GPS LOCKED";    status_col = GPS_COLOR; }
+        else if (stale)             { status_base = "REATTEMPTING";  status_col = CAUTION_COLOR; status_anim = true; }
         else                        { status_base = "GPS";           status_col = GPS_COLOR; status_anim = true; }
         char status_str[22];
         if (status_anim) {
@@ -6384,76 +6364,6 @@ static void apply_ble_scan_params() {
     }
 }
 
-// ── I2C bus recovery ────────────────────────────────────────────────────────
-// If a peripheral holds SDA low (lost state during power transient), the
-// entire I2C bus hangs. Per the I2C spec, clocking SCL 9 times releases
-// any stuck slave because it completes the partial byte transfer.
-//
-// Called only on detected bus failure — zero overhead during normal operation.
-// Uses the default Wire pins from M5Unified (SDA=2, SCL=1 on Cardputer ADV).
-//
-// Returns true if SDA was released (bus recovered), false if still stuck.
-static bool i2c_bus_recover() {
-    // M5Cardputer ADV I2C pins — match M5Unified defaults
-    const int PIN_SDA = 2;
-    const int PIN_SCL = 1;
-
-    // Check if SDA is actually stuck low
-    pinMode(PIN_SDA, INPUT_PULLUP);
-    pinMode(PIN_SCL, INPUT_PULLUP);
-    delayMicroseconds(10);
-
-    if (digitalRead(PIN_SDA) == HIGH) {
-        // SDA is not stuck — bus is fine, no recovery needed
-        return true;
-    }
-
-    Serial.println("[I2C] SDA stuck low — attempting bus recovery");
-
-    // Clock SCL up to 9 times to free the stuck slave
-    pinMode(PIN_SCL, OUTPUT);
-    for (int i = 0; i < 9; i++) {
-        digitalWrite(PIN_SCL, LOW);
-        delayMicroseconds(5);
-        digitalWrite(PIN_SCL, HIGH);
-        delayMicroseconds(5);
-
-        // Check if SDA released
-        pinMode(PIN_SDA, INPUT_PULLUP);
-        delayMicroseconds(5);
-        if (digitalRead(PIN_SDA) == HIGH) {
-            Serial.printf("[I2C] SDA released after %d clock pulses\n", i + 1);
-            break;
-        }
-    }
-
-    // Send a STOP condition (SDA low→high while SCL is high)
-    pinMode(PIN_SDA, OUTPUT);
-    digitalWrite(PIN_SDA, LOW);
-    delayMicroseconds(5);
-    digitalWrite(PIN_SCL, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(PIN_SDA, HIGH);
-    delayMicroseconds(5);
-
-    // Restore pins to I2C function
-    pinMode(PIN_SDA, INPUT_PULLUP);
-    pinMode(PIN_SCL, INPUT_PULLUP);
-
-    bool recovered = (digitalRead(PIN_SDA) == HIGH);
-    if (recovered) {
-        Serial.println("[I2C] Bus recovery successful — reinitializing Wire");
-        // Reinitialize the I2C driver so M5Unified picks up the recovered bus
-        Wire.end();
-        delay(10);
-        Wire.begin(PIN_SDA, PIN_SCL);
-    } else {
-        Serial.println("[I2C] Bus recovery FAILED — SDA still stuck");
-    }
-
-    return recovered;
-}
-
 void setup() {
     // ── Safe WDT reconfiguration ────────────────────────────────────
     // esp_task_wdt_deinit() is NOT safe on IDF 5.x — it wraps IDLE
@@ -6661,7 +6571,7 @@ void setup() {
     setCpuFrequencyMhz(240);
     boot_animate(62 + random(0, 3), "boosting CPU");
     ble_event_queue = xQueueCreate(BLE_POOL_SIZE, sizeof(uint8_t));
-    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, &BLEWorkerHandle, 1);
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 2560, NULL, 1, &BLEWorkerHandle, 1);
     boot_animate(68, "starting Bluetooth");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
@@ -6756,14 +6666,14 @@ void setup() {
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 3072, NULL, 1, &ScannerTaskHandle, 0);
-    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 2560, NULL, 1, &GPSTaskHandle, 0);
+    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 1792, NULL, 1, &ScannerTaskHandle, 0);
+    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 1536, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
 
     // Spawn the LED task at priority 1 on Core 1 — must come after WiFi+BLE
     // are up so RMT/radio contention is avoided.
-    xTaskCreatePinnedToCore(LedTask, "LedTask", 2048, NULL, 1, &LedTaskHandle, 1);
+    xTaskCreatePinnedToCore(LedTask, "LedTask", 1536, NULL, 1, &LedTaskHandle, 1);
 
     // WDT was already initialized early in setup(); each watched task
     // self-subscribes via esp_task_wdt_add(NULL) inside its loop.
@@ -6896,10 +6806,10 @@ void loop() {
             UBaseType_t led_hw  = LedTaskHandle ? uxTaskGetStackHighWaterMark(LedTaskHandle) : 0;
             UBaseType_t loop_hw = uxTaskGetStackHighWaterMark(NULL);  // NULL = calling task (loop)
             Serial.printf("[STACK] High-water marks (bytes remaining):\n");
-            Serial.printf("  Scanner: %u / 3072\n", (unsigned)scan_hw);
-            Serial.printf("  GPS:     %u / 2560\n", (unsigned)gps_hw);
-            Serial.printf("  BLE:     %u / 4096\n", (unsigned)ble_hw);
-            Serial.printf("  LED:     %u / 2048\n", (unsigned)led_hw);
+            Serial.printf("  Scanner: %u / 1792\n", (unsigned)scan_hw);
+            Serial.printf("  GPS:     %u / 1536\n", (unsigned)gps_hw);
+            Serial.printf("  BLE:     %u / 2560\n", (unsigned)ble_hw);
+            Serial.printf("  LED:     %u / 1536\n", (unsigned)led_hw);
             Serial.printf("  Loop:    %u / 8192\n", (unsigned)loop_hw);
             Serial.printf("[STACK] Safe to reduce any task where remaining > 512 bytes.\n");
             Serial.printf("  Recommended: new_stack = current - (remaining - 256)\n");
@@ -7143,7 +7053,6 @@ void loop() {
                     show_menu = !show_menu;
                     if (show_menu) {
                         menu_open_ms = millis();
-                        menu_highlight_init = false;
                         menu_scroll_offset = 0;
                         show_feed_expanded = false;
                         show_help_overlay = false;
@@ -7539,35 +7448,6 @@ void loop() {
     // SD hot-plug: periodically attempt remount if card is absent, or probe if present
     sd_check_hotplug();
     if (wdt_subscribed) esp_task_wdt_reset();
-
-    // I2C bus health check — detect and recover from SDA stuck low.
-    // Only runs every 30s to avoid overhead. The TCA8418 keyboard controller
-    // is the primary I2C device; if it stops responding, the bus is likely hung.
-    {
-        static unsigned long last_i2c_check_ms = 0;
-        if (millis() - last_i2c_check_ms > 30000) {
-            last_i2c_check_ms = millis();
-
-            // Quick probe: try to read from the TCA8418 (address 0x34).
-            // A stuck bus will cause this to fail immediately.
-            Wire.beginTransmission(0x34);
-            uint8_t i2c_err = Wire.endTransmission();
-
-            if (i2c_err != 0) {
-                // Bus error — attempt recovery
-                Serial.printf("[I2C] Bus probe failed (err=%d), attempting recovery\n", i2c_err);
-                bool ok = i2c_bus_recover();
-                if (ok) {
-                    set_toast_direct("I2C RECOVERED", ACCENT_COLOR);
-                } else {
-                    set_toast_direct("I2C BUS FAULT", CAUTION_COLOR);
-                    // The 30-minute BLE restart will also reinitialize the bus.
-                    // If recovery fails here, the device is still functional for
-                    // WiFi detection — only keyboard input is affected.
-                }
-            }
-        }
-    }
 
     if (millis() - last_sd_flush_check >= 500) {
         last_sd_flush_check = millis(); 
