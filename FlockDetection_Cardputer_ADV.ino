@@ -574,8 +574,6 @@ SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
 bool hist_detail_open   = false;
-static int device_info_scroll = 0;
-static const int DEVICE_INFO_CONTENT_HEIGHT = 320;
 volatile bool sd_hist_dirty = false;
 
 #define TOAST_QUEUE_SIZE 3
@@ -5535,179 +5533,209 @@ void draw_gps_screen() {
 
 void draw_device_info_screen() {
     unsigned long frame_ms = millis();
+
+    // Snapshot stats under mutex
+    long lt, sr, sw, sb, lb, lfw;
+    unsigned long l_sec;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    long lt = lifetime_flock_total;
-    long sr = session_raven;
-    long sw = session_flock_wifi;
-    long sb = session_flock_ble;
-    long lb = lifetime_boots;
-    long lfw = lifetime_flash_writes;
+    lt    = lifetime_flock_total;
+    sr    = session_raven;
+    sw    = session_flock_wifi;
+    sb    = session_flock_ble;
+    lb    = lifetime_boots;
+    lfw   = lifetime_flash_writes;
+    l_sec = lifetime_seconds;
     xSemaphoreGive(dataMutex);
 
     spr.fillSprite(BG_COLOR);
     draw_header_spr(4);
 
-    const int content_top_y = CONTENT_Y;
-    const int content_bottom_y = DISP_H - 1;
-    spr.setClipRect(0, content_top_y, DISP_W - 6, content_bottom_y - content_top_y);
+    // ── Hero card: DETECTIONS + breakdown ──
+    // Outlined rounded rect, no fill — matches boot bar style.
+    const int card_x = 4;
+    const int card_w = DISP_W - 8;
+    const int hero_y = CONTENT_Y + 2;
+    const int hero_h = 50;
+    const int hero_r = 4;
 
-    int yoff = CONTENT_Y - device_info_scroll;
+    spr.drawRoundRect(card_x, hero_y, card_w, hero_h, hero_r, CARD_BORDER);
 
-    const int COL_L   = 4;
-    const int COL_R   = 124;
-    const int CARD_W  = 112;
-    const int CARD_H  = 42;
-    const int ROW_GAP = 4;
+    // Big detection count — left side
+    {
+        char det_str[8];
+        snprintf(det_str, sizeof(det_str), "%ld", lt);
 
-    // Helper: stat card with kerned ACCENT label + value below.
-    auto stat_card = [&](int x, int y, const char* label, const char* value,
-                         uint16_t val_col = TEXT_COLOR, float val_size = TS_H2) {
-        drawCard(x, y, CARD_W, CARD_H);
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
-        spr.setCursor(x + UI_PAD_SM, y + 4);
-        kprint(spr, label);
-        spr.setTextColor(val_col, CARD_COLOR);
-        spr.setTextSize(val_size);
-        spr.setCursor(x + UI_PAD_SM, y + UI_PAD_LG);
-        spr.print(value);
-    };
+        spr.setCursor(card_x + UI_PAD_SM, hero_y + 5);
+        kprint(spr, "DETECTIONS");
 
-    // Row 0: Version (full width, shorter)
-    drawCard(COL_L, yoff, DISP_W - 8, 20);
-    spr.setTextColor(HEADER_COLOR, CARD_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(10, yoff + 5);
-    spr.print(VERSION_STRING);
-
-    int row_y;
-
-    // Row 1: BOOTS / LIFETIME
-    row_y = yoff + 24;
-    {
-        char boots_str[12];
-        snprintf(boots_str, sizeof(boots_str), "%ld", lb);
-        stat_card(COL_L, row_y, "BOOTS", boots_str);
-    }
-    {
-        char time_str[9];
-        format_time_buf(lifetime_seconds, time_str, sizeof(time_str));
-        stat_card(COL_R, row_y, "LIFETIME", time_str, TEXT_COLOR, TS_STRONG);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_H1);
+        spr.setCursor(card_x + UI_PAD_SM, hero_y + 18);
+        spr.print(det_str);
     }
 
-    // Row 2: SESSION / ALL-TIME
-    row_y += CARD_H + ROW_GAP;
+    // Vertical divider inside hero card
+    const int div_x = card_x + 100;
+    spr.drawFastVLine(div_x, hero_y + 6, hero_h - 12, CARD_BORDER);
+
+    // WiFi / BLE / Raven breakdown — right side
     {
+        const int rx = div_x + UI_PAD_SM;
+        int rry = hero_y + 6;
+        const int row_gap = 12;
+
+        char wifi_str[8], ble_str[8], raven_str[8];
+        snprintf(wifi_str,  sizeof(wifi_str),  "%ld", sw);
+        snprintf(ble_str,   sizeof(ble_str),   "%ld", sb);
+        snprintf(raven_str, sizeof(raven_str), "%ld", sr);
+
+        spr.setTextSize(TS_BODY);
+
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(rx, rry);
+        spr.print("WIFI");
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(rx + 42, rry);
+        spr.print(wifi_str);
+        rry += row_gap;
+
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(rx, rry);
+        spr.print("BLE");
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(rx + 42, rry);
+        spr.print(ble_str);
+        rry += row_gap;
+
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(rx, rry);
+        spr.print("RAVEN");
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setCursor(rx + 42, rry);
+        spr.print(raven_str);
+    }
+
+    // ── Bottom row: two outlined cards side by side ──
+    const int bot_y = hero_y + hero_h + UI_PAD_SM;
+    const int bot_h = 40;
+    const int bot_gap = UI_PAD_SM;
+    const int bot_w = (card_w - bot_gap) / 2;
+    const int bot_r = 4;
+
+    // ── Left card: SESSION / LIFETIME with horizontal divider ──
+    {
+        int cx = card_x;
+        spr.drawRoundRect(cx, bot_y, bot_w, bot_h, bot_r, CARD_BORDER);
+
+        // Session time — top half
         char sess_str[9];
         format_time_buf((frame_ms - session_start_time) / 1000, sess_str, sizeof(sess_str));
-        stat_card(COL_L, row_y, "SESSION", sess_str, TEXT_COLOR, TS_STRONG);
-    }
-    {
-        char total_str[12];
-        snprintf(total_str, sizeof(total_str), "%ld", lt);
-        stat_card(COL_R, row_y, "ALL-TIME", total_str, CAUTION_COLOR);
-    }
 
-    // Row 3: WIFI SESS / BLE SESS
-    row_y += CARD_H + ROW_GAP;
-    {
-        char wifi_str[12];
-        snprintf(wifi_str, sizeof(wifi_str), "%ld", sw);
-        stat_card(COL_L, row_y, "WIFI SESS", wifi_str, CAUTION_COLOR);
-    }
-    {
-        char ble_str[12];
-        snprintf(ble_str, sizeof(ble_str), "%ld", sb);
-        stat_card(COL_R, row_y, "BLE SESS", ble_str, PURPLE_COLOR);
-    }
-
-    // Row 4: RAVEN / FLASH
-    row_y += CARD_H + ROW_GAP;
-    {
-        char raven_str[12];
-        snprintf(raven_str, sizeof(raven_str), "%ld", sr);
-        stat_card(COL_L, row_y, "RAVEN", raven_str, TEAL_COLOR);
-    }
-    {
-        int wear_pct = (int)((lfw * 100) / 100000);
-        if (wear_pct > 100) wear_pct = 100;
-        uint16_t wear_col = (wear_pct >= 80) ? CAUTION_COLOR : ACCENT_COLOR;
-        char fw_str[12];
-        snprintf(fw_str, sizeof(fw_str), "%ld", lfw);
-
-        drawCard(COL_R, row_y, CARD_W, CARD_H);
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
-        spr.setCursor(COL_R + 4, row_y + 4);
-        kprint(spr, "FLASH");
-        spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-        spr.setTextSize(TS_STRONG);
-        spr.setCursor(COL_R + 4, row_y + 16);
-        spr.print(fw_str);
+        spr.setCursor(cx + UI_PAD_SM, bot_y + 4);
+        spr.print("SESSION");
 
-        // Mini progress bar — runs along the bottom of the card.
-        int bar_x = COL_R + 60, bar_y2 = row_y + 20, bar_w = 46, bar_h2 = 6;
-        spr.drawRect(bar_x, bar_y2, bar_w, bar_h2, CARD_BORDER);
-        int fill = (wear_pct * (bar_w - 2)) / 100;
-        if (fill > 0) spr.fillRect(bar_x + 1, bar_y2 + 1, fill, bar_h2 - 2, wear_col);
-        char pct_str[6];
-        snprintf(pct_str, sizeof(pct_str), "%d%%", wear_pct);
-        spr.setTextColor(wear_col, CARD_COLOR);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        int sess_vw = (int)strlen(sess_str) * 7;
+        spr.setCursor(cx + bot_w - UI_PAD_SM - sess_vw, bot_y + 4);
+        spr.print(sess_str);
+
+        // Horizontal divider
+        int mid_y = bot_y + bot_h / 2;
+        spr.drawFastHLine(cx + 4, mid_y, bot_w - 8, CARD_BORDER);
+
+        // Lifetime — bottom half
+        char life_str[9];
+        format_time_buf(l_sec, life_str, sizeof(life_str));
+
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
-        spr.setCursor(bar_x, bar_y2 + bar_h2 + 2);
-        spr.print(pct_str);
+        spr.setCursor(cx + UI_PAD_SM, mid_y + 4);
+        spr.print("LIFETIME");
+
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        int life_vw = (int)strlen(life_str) * 7;
+        spr.setCursor(cx + bot_w - UI_PAD_SM - life_vw, mid_y + 4);
+        spr.print(life_str);
     }
 
-    // Row 5: VOLTAGE / POWER
-    row_y += CARD_H + ROW_GAP;
+    // ── Right card: BATTERY + system info ──
     {
-        int32_t bat_mv_snap = get_filtered_voltage();
+        int cx = card_x + bot_w + bot_gap;
+        spr.drawRoundRect(cx, bot_y, bot_w, bot_h, bot_r, CARD_BORDER);
+
+        int32_t bat_mv = get_filtered_voltage();
         uint16_t v_col;
-        if      (bat_mv_snap >= 3800) v_col = ACCENT_COLOR;
-        else if (bat_mv_snap >= 3600) v_col = CAUTION_COLOR;
-        else                          v_col = lgfx::color565(220, 60, 60);
-        char volt_str[10];
-        snprintf(volt_str, sizeof(volt_str), "%.2fV", bat_mv_snap / 1000.0f);
-        stat_card(COL_L, row_y, "VOLTAGE", volt_str, v_col);
+        if      (bat_mv >= 3800) v_col = ACCENT_COLOR;
+        else if (bat_mv >= 3600) v_col = CAUTION_COLOR;
+        else                     v_col = lgfx::color565(220, 60, 60);
 
-        const char* pwr_label = (bat_mv_snap >= 4200) ? "USB" : "BATTERY";
-        stat_card(COL_R, row_y, "POWER", pwr_label, TEXT_COLOR, TS_STRONG);
+        char volt_str[8];
+        snprintf(volt_str, sizeof(volt_str), "%.2fV", bat_mv / 1000.0f);
+
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(cx + UI_PAD_SM, bot_y + 4);
+        spr.print("BATTERY");
+
+        spr.setTextColor(v_col, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        int volt_vw = (int)strlen(volt_str) * 7;
+        spr.setCursor(cx + bot_w - UI_PAD_SM - volt_vw, bot_y + 4);
+        spr.print(volt_str);
+
+        // Horizontal divider
+        int mid_y = bot_y + bot_h / 2;
+        spr.drawFastHLine(cx + 4, mid_y, bot_w - 8, CARD_BORDER);
+
+        // HEAP + SD on the bottom half
+        size_t free_heap = esp_get_free_heap_size();
+        char heap_str[10];
+        snprintf(heap_str, sizeof(heap_str), "%uKB", (unsigned)(free_heap / 1024));
+        uint16_t heap_col = (free_heap < 8000) ? CAUTION_COLOR : TEXT_COLOR;
+
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(cx + UI_PAD_SM, mid_y + 4);
+        spr.print("HEAP");
+
+        spr.setTextColor(heap_col, BG_COLOR);
+        spr.setCursor(cx + 36, mid_y + 4);
+        spr.print(heap_str);
+
+        // SD status right-aligned on same line
+        const char* sd_str = sd_available ? "SD OK" : "NO SD";
+        uint16_t sd_col = sd_available ? DIM_COLOR : CAUTION_COLOR;
+        int sd_vw = (int)strlen(sd_str) * 6;
+        spr.setTextColor(sd_col, BG_COLOR);
+        spr.setCursor(cx + bot_w - UI_PAD_SM - sd_vw, mid_y + 4);
+        spr.print(sd_str);
     }
 
-    // Row 6: SD STATUS (left only — second column reserved for future use)
-    row_y += CARD_H + ROW_GAP;
+    // ── Footer: version + boots + flash — plain text, no cards ──
     {
-        char sd_str[24];
-        snprintf(sd_str, sizeof(sd_str), "%s  %s",
-                 sd_available ? "MOUNTED" : "NO CARD",
-                 littlefs_available ? "FS OK" : "FS ERR");
-        uint16_t sd_col = sd_available ? ACCENT_COLOR : DIM_COLOR;
-        stat_card(COL_L, row_y, "SD CARD", sd_str, sd_col, TS_MICRO);
-    }
+        int fy = bot_y + bot_h + UI_PAD_SM;
 
-    spr.clearClipRect();
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(card_x + UI_PAD_XS, fy);
+        spr.print("v9.6");
 
-    {
-        const int visible_h = (DISP_H - 1) - 18;
-        const int max_scroll_for_fade = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
-        if (max_scroll_for_fade > 0) {
-            if (device_info_scroll > 0)
-                draw_scroll_fade(21, visible_h, 6, true);
-            if (device_info_scroll < max_scroll_for_fade)
-                draw_scroll_fade(21, visible_h, 6, false);
-        }
-    }
+        char boots_str[16];
+        snprintf(boots_str, sizeof(boots_str), "BOOTS %ld", lb);
+        spr.setCursor(DISP_W / 2 - 24, fy);
+        spr.print(boots_str);
 
-    const int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - (content_bottom_y - content_top_y);
-    if (max_scroll > 0) {
-        const int track_x = DISP_W - 4;
-        const int track_y = content_top_y + 2;
-        const int track_h = (content_bottom_y - content_top_y) - 4;
-        spr.drawFastVLine(track_x + 1, track_y, track_h, CARD_BORDER);
-        int thumb_h = (track_h * (content_bottom_y - content_top_y)) / DEVICE_INFO_CONTENT_HEIGHT;
-        if (thumb_h < 12) thumb_h = 12;
-        int thumb_y = track_y + ((track_h - thumb_h) * device_info_scroll) / max_scroll;
-        spr.fillRect(track_x, thumb_y, 3, thumb_h, HEADER_COLOR);
+        char flash_str[16];
+        snprintf(flash_str, sizeof(flash_str), "FLASH %ld", lfw);
+        int fw = (int)strlen(flash_str) * 6;
+        spr.setCursor(DISP_W - UI_PAD_SM - fw, fy);
+        spr.print(flash_str);
     }
 }
 
@@ -5915,9 +5943,6 @@ void transition_screen(int new_screen, int dir) {
             xSemaphoreGive(sdMutex);
             sd_hist_dirty = false;
         }
-    }
-    if (new_screen == 4) {
-        device_info_scroll = 0;
     }
     if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
     current_screen = new_screen;
@@ -7081,11 +7106,8 @@ void loop() {
                     history_selected_idx--;
                     if (history_selected_idx < 0) history_selected_idx = 0;
                     draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (current_screen == 4) {
-                    device_info_scroll -= 12;
-                    if (device_info_scroll < 0) device_info_scroll = 0;
-                    draw_current_screen(); spr.pushSprite(0, 0);
                 }
+                // Screen 4 (stats) no longer scrolls — fits on one screen
             }
             else if (c == '.') {
                 // Down arrow — context-dependent scroll
@@ -7094,14 +7116,8 @@ void loop() {
                     history_selected_idx++;
                     if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
                     draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (current_screen == 4) {
-                    int visible_h = DISP_H - 18;
-                    int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
-                    if (max_scroll < 0) max_scroll = 0;
-                    device_info_scroll += 12;
-                    if (device_info_scroll > max_scroll) device_info_scroll = max_scroll;
-                    draw_current_screen(); spr.pushSprite(0, 0);
                 }
+                // Screen 4 (stats) no longer scrolls — fits on one screen
             }
             else if (c == '-') {
                 // Volume down
@@ -7322,19 +7338,8 @@ void loop() {
                             if (history_selected_idx >= ht) history_selected_idx = max(0, ht - 1);
                         }
                         draw_current_screen(); spr.pushSprite(0, 0);
-                    } else if (current_screen == 4) {
-                        int visible_h = DISP_H - 18;
-                        int ms = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
-                        if (ms < 0) ms = 0;
-                        if (cur_arrow == ';') {
-                            device_info_scroll -= 12;
-                            if (device_info_scroll < 0) device_info_scroll = 0;
-                        } else {
-                            device_info_scroll += 12;
-                            if (device_info_scroll > ms) device_info_scroll = ms;
-                        }
-                        draw_current_screen(); spr.pushSprite(0, 0);
                     }
+                    // Screen 4 (stats) no longer scrolls — fits on one screen
                     arrow_last_repeat = millis();
                 }
             } else if (cur_arrow) {
