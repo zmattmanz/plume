@@ -576,11 +576,17 @@ int  history_selected_idx = 0;
 bool hist_detail_open   = false;
 volatile bool sd_hist_dirty = false;
 
-// Stats screen vertical scroll (Option D — uniform card grid).
-static int stats_scroll_y = 0;
-static const int STATS_CONTENT_H   = 290;  // total virtual height (hero 50 + 6×34 + 7×6 gaps)
+// Stats screen vertical scroll (Option D — uniform card grid, smoothed).
+// Keys set stats_scroll_target (instant). Renderer eases stats_scroll_y_f
+// toward the target via anim_filter() with a snappy 120 ms time constant.
+static int   stats_scroll_target  = 0;
+static float stats_scroll_y_f     = 0.0f;
+static unsigned long stats_last_frame_ms = 0;
+static const int STATS_CONTENT_H   = 344;  // hero 56 + 6×42 + 7×6 gaps
 static const int STATS_VIEW_H      = 115;  // DISP_H - CONTENT_Y
-static const int STATS_SCROLL_STEP = 40;   // one standard card height (34) + gap (6)
+static const int STATS_SCROLL_STEP = 48;   // one standard card (42) + gap (6)
+static const int STATS_MAX_SCROLL  = STATS_CONTENT_H - STATS_VIEW_H;
+static const float STATS_SCROLL_TC = 120.0f;  // ms — snappy easing tier
 
 #define TOAST_QUEUE_SIZE 3
 struct ToastEntry {
@@ -5553,11 +5559,11 @@ static void draw_stat_card(int x, int y, int w, int h,
     spr.setCursor(x + UI_PAD_SM, y + UI_PAD_SM);
     kprint(spr, label, 2);  // extra=2 → wide tracking, caption feel
 
-    // Value: large, bright, tight — anchored 3px above the card bottom
+    // Value: large, bright — bottom inset matches top via UI_PAD_SM
     int value_glyph_h = (int)(value_size * 8.0f);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(value_size);
-    spr.setCursor(x + UI_PAD_SM, y + h - value_glyph_h - 3);
+    spr.setCursor(x + UI_PAD_SM, y + h - value_glyph_h - UI_PAD_SM);
     spr.print(value);
 }
 
@@ -5605,9 +5611,23 @@ void draw_device_info_screen() {
     char boots_str[10]; snprintf(boots_str, sizeof(boots_str), "%ld", lb);
     char flash_str[10]; snprintf(flash_str, sizeof(flash_str), "%ld", lfw);
 
+    // ── Smooth scroll easing ──
+    // Renderer eases stats_scroll_y_f toward stats_scroll_target each frame.
+    // Frame-rate independent via anim_filter; clamp dt after long gaps.
+    {
+        unsigned long now = millis();
+        float dt = (stats_last_frame_ms == 0) ? 16.0f
+                                              : (float)(now - stats_last_frame_ms);
+        if (dt > 100.0f) dt = 100.0f;
+        stats_last_frame_ms = now;
+        stats_scroll_y_f = anim_filter(stats_scroll_y_f, (float)stats_scroll_target,
+                                        STATS_SCROLL_TC, dt);
+    }
+    int scroll_y = (int)(stats_scroll_y_f + 0.5f);
+
     // ── Layout: scroll-aware card grid ──
     // Virtual coordinates (pre-scroll) → screen coordinates via:
-    //   screen_y = CONTENT_Y + virtual_y - stats_scroll_y
+    //   screen_y = CONTENT_Y + virtual_y - scroll_y
     // Cards entirely outside the viewport are skipped.
     const int x_full   = 4;        // full-width card x
     const int w_full   = 224;      // 240 - 8 (right edge at 228, scrollbar gutter 6 + track at 234)
@@ -5619,12 +5639,12 @@ void draw_device_info_screen() {
     const int x_h1     = 4;        // half-card x positions
     const int x_h2     = 119;      // x_h1 + 109 + 6 gap
     const int w_half   = 109;
-    const int H_HERO   = 50;       // accommodates TS_H1 value without crowding label
-    const int H_NORMAL = 34;
+    const int H_HERO   = 56;       // 6+8+12+24+6 — generous TS_H1 hero
+    const int H_NORMAL = 42;       // 6+8+6+16+6 — internal label/value gap = UI_PAD_SM
 
     auto card = [&](int vx, int vy, int w, int h, const char* label, const char* value,
-                    float val_size = TS_STRONG) {
-        int sy = CONTENT_Y + vy - stats_scroll_y;
+                    float val_size = TS_H2) {
+        int sy = CONTENT_Y + vy - scroll_y;
         if (sy + h <= CONTENT_Y) return;             // entirely above viewport
         if (sy >= CONTENT_Y + STATS_VIEW_H) return;  // entirely below viewport
         draw_stat_card(vx, sy, w, h, label, value, val_size);
@@ -5634,49 +5654,47 @@ void draw_device_info_screen() {
     // into the header strip or off the bottom edge.
     spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
 
-    // Row 1 (vy = 0):   DETECTIONS hero, full width, 50px tall, big value
-    card(x_full, 0,  w_full, H_HERO, "DETECTIONS", det_str, TS_H1);
+    // Row 1 (vy = 0):   DETECTIONS hero, full width, 56px tall, big value
+    card(x_full, 0,   w_full, H_HERO, "DETECTIONS", det_str, TS_H1);
 
-    // Row 2 (vy = 56):  WIFI | BLE | RAVEN
-    card(x_t1, 56, w_tA, H_NORMAL, "WIFI",  wifi_str);
-    card(x_t2, 56, w_tA, H_NORMAL, "BLE",   ble_str);
-    card(x_t3, 56, w_tC, H_NORMAL, "RAVEN", raven_str);
+    // Row 2 (vy = 62):  WIFI | BLE | RAVEN
+    card(x_t1, 62,  w_tA, H_NORMAL, "WIFI",  wifi_str);
+    card(x_t2, 62,  w_tA, H_NORMAL, "BLE",   ble_str);
+    card(x_t3, 62,  w_tC, H_NORMAL, "RAVEN", raven_str);
 
-    // Row 3 (vy = 96):  SESSION | LIFETIME
-    card(x_h1, 96, w_half, H_NORMAL, "SESSION",  sess_str);
-    card(x_h2, 96, w_half, H_NORMAL, "LIFETIME", life_str);
+    // Row 3 (vy = 110): SESSION | LIFETIME
+    card(x_h1, 110, w_half, H_NORMAL, "SESSION",  sess_str);
+    card(x_h2, 110, w_half, H_NORMAL, "LIFETIME", life_str);
 
-    // Row 4 (vy = 136): BATTERY | HEAP
-    card(x_h1, 136, w_half, H_NORMAL, "BATTERY", volt_str);
-    card(x_h2, 136, w_half, H_NORMAL, "HEAP",    heap_str);
+    // Row 4 (vy = 158): BATTERY | HEAP
+    card(x_h1, 158, w_half, H_NORMAL, "BATTERY", volt_str);
+    card(x_h2, 158, w_half, H_NORMAL, "HEAP",    heap_str);
 
-    // Row 5 (vy = 176): PACKETS | SD CARD
-    card(x_h1, 176, w_half, H_NORMAL, "PACKETS", pkt_str);
-    card(x_h2, 176, w_half, H_NORMAL, "SD CARD", sd_str);
+    // Row 5 (vy = 206): PACKETS | SD CARD
+    card(x_h1, 206, w_half, H_NORMAL, "PACKETS", pkt_str);
+    card(x_h2, 206, w_half, H_NORMAL, "SD CARD", sd_str);
 
-    // Row 6 (vy = 216): BOOTS | FLASH
-    card(x_h1, 216, w_half, H_NORMAL, "BOOTS", boots_str);
-    card(x_h2, 216, w_half, H_NORMAL, "FLASH", flash_str);
+    // Row 6 (vy = 254): BOOTS | FLASH
+    card(x_h1, 254, w_half, H_NORMAL, "BOOTS", boots_str);
+    card(x_h2, 254, w_half, H_NORMAL, "FLASH", flash_str);
 
-    // Row 7 (vy = 256): VERSION (half width, left only)
-    card(x_h1, 256, w_half, H_NORMAL, "VERSION", "v9.6");
+    // Row 7 (vy = 302): VERSION (half width, left only)
+    card(x_h1, 302, w_half, H_NORMAL, "VERSION", "v9.6");
 
     spr.clearClipRect();
 
     // ── Scroll fade hints ──
-    const int max_scroll = STATS_CONTENT_H - STATS_VIEW_H;
-    if (max_scroll > 0) {
-        if (stats_scroll_y > 0)            draw_scroll_fade(CONTENT_Y, STATS_VIEW_H, 5, true);
-        if (stats_scroll_y < max_scroll)   draw_scroll_fade(CONTENT_Y, STATS_VIEW_H, 5, false);
+    if (STATS_MAX_SCROLL > 0) {
+        if (scroll_y > 0)                draw_scroll_fade(CONTENT_Y, STATS_VIEW_H, 5, true);
+        if (scroll_y < STATS_MAX_SCROLL) draw_scroll_fade(CONTENT_Y, STATS_VIEW_H, 5, false);
     }
 
-    // ── Scrollbar — only when content overflows ──
+    // ── Scrollbar — only when content overflows. Tracks the eased value. ──
     if (STATS_CONTENT_H > STATS_VIEW_H) {
         spr.drawFastVLine(DISP_W - 4, CONTENT_Y, STATS_VIEW_H, CARD_BORDER);
         int thumb_h = (STATS_VIEW_H * STATS_VIEW_H) / STATS_CONTENT_H;
         if (thumb_h < 8) thumb_h = 8;
-        int thumb_y = CONTENT_Y + (stats_scroll_y * (STATS_VIEW_H - thumb_h)) /
-                                  (STATS_CONTENT_H - STATS_VIEW_H);
+        int thumb_y = CONTENT_Y + (scroll_y * (STATS_VIEW_H - thumb_h)) / STATS_MAX_SCROLL;
         spr.fillRect(DISP_W - 5, thumb_y, 3, thumb_h, DIM_COLOR);
     }
 }
@@ -5887,7 +5905,9 @@ void transition_screen(int new_screen, int dir) {
         }
     }
     if (new_screen == 4) {
-        stats_scroll_y = 0;
+        stats_scroll_target  = 0;
+        stats_scroll_y_f     = 0.0f;
+        stats_last_frame_ms  = millis();
     }
     if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
     current_screen = new_screen;
@@ -7052,9 +7072,10 @@ void loop() {
                     if (history_selected_idx < 0) history_selected_idx = 0;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (current_screen == 4) {
-                    stats_scroll_y -= STATS_SCROLL_STEP;
-                    if (stats_scroll_y < 0) stats_scroll_y = 0;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    // Target only — render loop eases via anim_filter
+                    stats_scroll_target -= STATS_SCROLL_STEP;
+                    if (stats_scroll_target < 0) stats_scroll_target = 0;
+                    screen_dirty = true;
                 }
             }
             else if (c == '.') {
@@ -7065,11 +7086,11 @@ void loop() {
                     if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (current_screen == 4) {
-                    int max_scroll = STATS_CONTENT_H - STATS_VIEW_H;
-                    if (max_scroll < 0) max_scroll = 0;
-                    stats_scroll_y += STATS_SCROLL_STEP;
-                    if (stats_scroll_y > max_scroll) stats_scroll_y = max_scroll;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    // Target only — render loop eases via anim_filter
+                    stats_scroll_target += STATS_SCROLL_STEP;
+                    if (stats_scroll_target > STATS_MAX_SCROLL)
+                        stats_scroll_target = STATS_MAX_SCROLL;
+                    screen_dirty = true;
                 }
             }
             else if (c == '-') {
@@ -7292,16 +7313,16 @@ void loop() {
                         }
                         draw_current_screen(); spr.pushSprite(0, 0);
                     } else if (current_screen == 4) {
-                        int ms = STATS_CONTENT_H - STATS_VIEW_H;
-                        if (ms < 0) ms = 0;
+                        // Target only — render loop eases via anim_filter
                         if (cur_arrow == ';') {
-                            stats_scroll_y -= STATS_SCROLL_STEP;
-                            if (stats_scroll_y < 0) stats_scroll_y = 0;
+                            stats_scroll_target -= STATS_SCROLL_STEP;
+                            if (stats_scroll_target < 0) stats_scroll_target = 0;
                         } else {
-                            stats_scroll_y += STATS_SCROLL_STEP;
-                            if (stats_scroll_y > ms) stats_scroll_y = ms;
+                            stats_scroll_target += STATS_SCROLL_STEP;
+                            if (stats_scroll_target > STATS_MAX_SCROLL)
+                                stats_scroll_target = STATS_MAX_SCROLL;
                         }
-                        draw_current_screen(); spr.pushSprite(0, 0);
+                        screen_dirty = true;
                     }
                     arrow_last_repeat = millis();
                 }
@@ -7556,13 +7577,21 @@ void loop() {
     } else {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
-        if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
+        // Screen 4 escalates to the fast path while the eased scroll position
+        // is still chasing its target — keeps the smooth scroll animation
+        // running at ~60fps without permanently promoting stats to fast path.
+        bool stats_scrolling = (current_screen == 4) &&
+            (fabsf(stats_scroll_y_f - (float)stats_scroll_target) > 0.5f);
+
+        if (current_screen == 0 || current_screen == 1 || current_screen == 3 ||
+            show_vol_overlay || toast_active || stats_scrolling ||
+            (now - last_fast_anim < 30)) {
             if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; screen_dirty = false; }
         }
         else {
             // Screen 4 has a live SESSION timer — force a redraw every 1s
             // so the seconds digit ticks. Cheaper than promoting screen 4
-            // to the 60fps fast path.
+            // to the 60fps fast path while idle.
             if (current_screen == 4) {
                 static unsigned long last_stats_tick = 0;
                 if (now - last_stats_tick >= 1000) {
