@@ -578,8 +578,9 @@ volatile bool sd_hist_dirty = false;
 
 // Stats screen vertical scroll (Option D — uniform card grid).
 static int stats_scroll_y = 0;
-static const int STATS_CONTENT_H = 222;  // total virtual height of the card grid
-static const int STATS_VIEW_H    = 115;  // DISP_H - CONTENT_Y
+static const int STATS_CONTENT_H   = 262;  // total virtual height of the card grid
+static const int STATS_VIEW_H      = 115;  // DISP_H - CONTENT_Y
+static const int STATS_SCROLL_STEP = 38;   // one card height (34) + gap (4)
 
 #define TOAST_QUEUE_SIZE 3
 struct ToastEntry {
@@ -5536,19 +5537,27 @@ void draw_gps_screen() {
     }
 }
 
-// Draw a single stat card. Outlined only (no fill), dim label hugs the top,
-// white value hugs the bottom, both left-aligned at x + UI_PAD_SM.
+// Draw a single stat card. Outlined only (no fill).
+// Label: TS_MICRO, DIM_COLOR, kprint with extra=2 letter-spacing — hugs top.
+// Value: TS_H2 by default (TS_H1 for the hero), TEXT_COLOR — hugs bottom.
 static void draw_stat_card(int x, int y, int w, int h,
                            const char* label, const char* value,
-                           float value_size = TS_STRONG) {
-    spr.drawRoundRect(x, y, w, h, 4, CARD_BORDER);
+                           float value_size = TS_H2) {
+    // Outline uses HEADER_COLOR so cards feel like header chrome rather
+    // than receding into the background.
+    spr.drawRoundRect(x, y, w, h, 4, HEADER_COLOR);
+
+    // Label: small, dim, tracked
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(x + UI_PAD_SM, y + UI_PAD_SM);
-    kprint(spr, label);
+    kprint(spr, label, 2);  // extra=2 → wide tracking, caption feel
+
+    // Value: large, bright, tight — anchored 3px above the card bottom
+    int value_glyph_h = (int)(value_size * 8.0f);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(value_size);
-    spr.setCursor(x + UI_PAD_SM, y + h - (int)(value_size * 8) - 2);
+    spr.setCursor(x + UI_PAD_SM, y + h - value_glyph_h - 3);
     spr.print(value);
 }
 
@@ -5610,8 +5619,8 @@ void draw_device_info_screen() {
     const int x_h1     = 4;        // half-card x positions
     const int x_h2     = 117;
     const int w_half   = 109;
-    const int H_HERO   = 30;
-    const int H_NORMAL = 28;
+    const int H_HERO   = 34;
+    const int H_NORMAL = 34;
 
     auto card = [&](int vx, int vy, int w, int h, const char* label, const char* value,
                     float val_size = TS_STRONG) {
@@ -5625,32 +5634,32 @@ void draw_device_info_screen() {
     // into the header strip or off the bottom edge.
     spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
 
-    // Row 1 (vy = 0):  DETECTIONS hero, full width, big value
-    card(x_full, 0, w_full, H_HERO, "DETECTIONS", det_str, TS_H1);
+    // Row 1 (vy = 0):   DETECTIONS hero, full width, big value
+    card(x_full, 0,  w_full, H_HERO, "DETECTIONS", det_str, TS_H1);
 
-    // Row 2 (vy = 34): WIFI | BLE | RAVEN
-    card(x_t1, 34, w_tA, H_NORMAL, "WIFI",  wifi_str);
-    card(x_t2, 34, w_tA, H_NORMAL, "BLE",   ble_str);
-    card(x_t3, 34, w_tC, H_NORMAL, "RAVEN", raven_str);
+    // Row 2 (vy = 38):  WIFI | BLE | RAVEN
+    card(x_t1, 38, w_tA, H_NORMAL, "WIFI",  wifi_str);
+    card(x_t2, 38, w_tA, H_NORMAL, "BLE",   ble_str);
+    card(x_t3, 38, w_tC, H_NORMAL, "RAVEN", raven_str);
 
-    // Row 3 (vy = 66): SESSION | LIFETIME
-    card(x_h1, 66, w_half, H_NORMAL, "SESSION",  sess_str);
-    card(x_h2, 66, w_half, H_NORMAL, "LIFETIME", life_str);
+    // Row 3 (vy = 76):  SESSION | LIFETIME
+    card(x_h1, 76, w_half, H_NORMAL, "SESSION",  sess_str);
+    card(x_h2, 76, w_half, H_NORMAL, "LIFETIME", life_str);
 
-    // Row 4 (vy = 98): BATTERY | HEAP
-    card(x_h1, 98, w_half, H_NORMAL, "BATTERY", volt_str);
-    card(x_h2, 98, w_half, H_NORMAL, "HEAP",    heap_str);
+    // Row 4 (vy = 114): BATTERY | HEAP
+    card(x_h1, 114, w_half, H_NORMAL, "BATTERY", volt_str);
+    card(x_h2, 114, w_half, H_NORMAL, "HEAP",    heap_str);
 
-    // Row 5 (vy = 130): PACKETS | SD CARD
-    card(x_h1, 130, w_half, H_NORMAL, "PACKETS", pkt_str);
-    card(x_h2, 130, w_half, H_NORMAL, "SD CARD", sd_str);
+    // Row 5 (vy = 152): PACKETS | SD CARD
+    card(x_h1, 152, w_half, H_NORMAL, "PACKETS", pkt_str);
+    card(x_h2, 152, w_half, H_NORMAL, "SD CARD", sd_str);
 
-    // Row 6 (vy = 162): BOOTS | FLASH
-    card(x_h1, 162, w_half, H_NORMAL, "BOOTS", boots_str);
-    card(x_h2, 162, w_half, H_NORMAL, "FLASH", flash_str);
+    // Row 6 (vy = 190): BOOTS | FLASH
+    card(x_h1, 190, w_half, H_NORMAL, "BOOTS", boots_str);
+    card(x_h2, 190, w_half, H_NORMAL, "FLASH", flash_str);
 
-    // Row 7 (vy = 194): VERSION (half width, left only)
-    card(x_h1, 194, w_half, H_NORMAL, "VERSION", "v9.6");
+    // Row 7 (vy = 228): VERSION (half width, left only)
+    card(x_h1, 228, w_half, H_NORMAL, "VERSION", VERSION_STRING);
 
     spr.clearClipRect();
 
@@ -7043,7 +7052,7 @@ void loop() {
                     if (history_selected_idx < 0) history_selected_idx = 0;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (current_screen == 4) {
-                    stats_scroll_y -= 32;
+                    stats_scroll_y -= STATS_SCROLL_STEP;
                     if (stats_scroll_y < 0) stats_scroll_y = 0;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
@@ -7058,7 +7067,7 @@ void loop() {
                 } else if (current_screen == 4) {
                     int max_scroll = STATS_CONTENT_H - STATS_VIEW_H;
                     if (max_scroll < 0) max_scroll = 0;
-                    stats_scroll_y += 32;
+                    stats_scroll_y += STATS_SCROLL_STEP;
                     if (stats_scroll_y > max_scroll) stats_scroll_y = max_scroll;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
@@ -7286,10 +7295,10 @@ void loop() {
                         int ms = STATS_CONTENT_H - STATS_VIEW_H;
                         if (ms < 0) ms = 0;
                         if (cur_arrow == ';') {
-                            stats_scroll_y -= 32;
+                            stats_scroll_y -= STATS_SCROLL_STEP;
                             if (stats_scroll_y < 0) stats_scroll_y = 0;
                         } else {
-                            stats_scroll_y += 32;
+                            stats_scroll_y += STATS_SCROLL_STEP;
                             if (stats_scroll_y > ms) stats_scroll_y = ms;
                         }
                         draw_current_screen(); spr.pushSprite(0, 0);
@@ -7551,6 +7560,16 @@ void loop() {
             if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; screen_dirty = false; }
         }
         else {
+            // Screen 4 has a live SESSION timer — force a redraw every 1s
+            // so the seconds digit ticks. Cheaper than promoting screen 4
+            // to the 60fps fast path.
+            if (current_screen == 4) {
+                static unsigned long last_stats_tick = 0;
+                if (now - last_stats_tick >= 1000) {
+                    screen_dirty = true;
+                    last_stats_tick = now;
+                }
+            }
             if (now - last_slow_ui >= 100) {
                 if (screen_dirty || toast_active) {
                     draw_current_screen(); spr.pushSprite(0, 0);
