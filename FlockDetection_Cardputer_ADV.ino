@@ -3885,10 +3885,11 @@ void draw_wifi_config_overlay() {
     spr.setCursor(4, 5);
     kprint(spr, "WIFI CONFIG");
 
-    // Card background
+    // Outer card — outline only on BG, matching the lighter feel of the
+    // stats and detections screens. Selected fields/buttons are
+    // distinguished by border color, never by fill.
     int cx = 4, cy = CONTENT_Y + UI_PAD_XS, cw = DISP_W - 8, ch = DISP_H - CONTENT_Y - UI_PAD_SM;
-    spr.fillRoundRect(cx, cy, cw, ch, 4, ea(CARD_COLOR));
-    spr.drawRoundRect(cx, cy, cw, ch, 4, ea(CARD_BORDER));
+    spr.drawRoundRect(cx, cy, cw, ch, 4, ea(HEADER_COLOR));
 
     unsigned long now_ms = millis();
     bool cursor_visible = ((now_ms / 500) % 2 == 0);
@@ -3898,23 +3899,21 @@ void draw_wifi_config_overlay() {
     bool ssid_selected = (wifi_config_field == 0);
     bool ssid_editing = ssid_selected && wifi_config_editing;
 
-    spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
+    spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, field_y);
     kprint(spr, "SSID");
 
     int input_y = field_y + 12;
-    uint16_t field_bg = ssid_selected ? ea(lerp_col16(CARD_COLOR, HEADER_COLOR, 0.08f)) : ea(CARD_COLOR);
-    uint16_t field_border = ssid_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
-    spr.fillRect(cx + 6, input_y, cw - 12, 16, field_bg);
-    spr.drawRect(cx + 6, input_y, cw - 12, 16, field_border);
+    uint16_t ssid_border = ssid_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
+    spr.drawRect(cx + 6, input_y, cw - 12, 16, ssid_border);
 
     const char* ssid_display = (wifi_config_editing && ssid_selected)
         ? wifi_config_ssid_buf
         : export_ssid;
     bool ssid_empty = (strlen(ssid_display) == 0);
 
-    spr.setTextColor(ssid_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
+    spr.setTextColor(ssid_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 9, input_y + 4);
 
@@ -3936,23 +3935,21 @@ void draw_wifi_config_overlay() {
     bool pass_selected = (wifi_config_field == 1);
     bool pass_editing = pass_selected && wifi_config_editing;
 
-    spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
+    spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, field_y);
     kprint(spr, "PASS");
 
     input_y = field_y + 12;
-    field_bg = pass_selected ? ea(lerp_col16(CARD_COLOR, HEADER_COLOR, 0.08f)) : ea(CARD_COLOR);
-    field_border = pass_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
-    spr.fillRect(cx + 6, input_y, cw - 12, 16, field_bg);
-    spr.drawRect(cx + 6, input_y, cw - 12, 16, field_border);
+    uint16_t pass_border = pass_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
+    spr.drawRect(cx + 6, input_y, cw - 12, 16, pass_border);
 
     const char* pass_src = (wifi_config_editing && pass_selected)
         ? wifi_config_pass_buf
         : export_pass;
     bool pass_empty = (strlen(pass_src) == 0);
 
-    spr.setTextColor(pass_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
+    spr.setTextColor(pass_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 9, input_y + 4);
 
@@ -3974,7 +3971,7 @@ void draw_wifi_config_overlay() {
         }
     }
 
-    // ── Action buttons: Save / Clear ──
+    // ── Action buttons: Save / Clear (outline only) ──
     int btn_y = input_y + 24;
     int btn_w = 70;
     int btn_h = 16;
@@ -3983,27 +3980,23 @@ void draw_wifi_config_overlay() {
     int btn_x2 = btn_x1 + btn_w + btn_gap;
 
     bool save_sel = (wifi_config_field == 2);
-    uint16_t save_bg = save_sel ? ea(lerp_col16(CARD_COLOR, ACCENT_COLOR, 0.2f)) : ea(CARD_COLOR);
     uint16_t save_border = save_sel ? ea(ACCENT_COLOR) : ea(CARD_BORDER);
-    spr.fillRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_bg);
     spr.drawRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_border);
-    spr.setTextColor(save_sel ? ea(ACCENT_COLOR) : ea(TEXT_COLOR), save_bg);
+    spr.setTextColor(save_sel ? ea(ACCENT_COLOR) : ea(TEXT_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(btn_x1 + 18, btn_y + 4);
     spr.print("SAVE");
 
     bool clear_sel = (wifi_config_field == 3);
-    uint16_t clear_bg = clear_sel ? ea(lerp_col16(CARD_COLOR, CAUTION_COLOR, 0.2f)) : ea(CARD_COLOR);
     uint16_t clear_border = clear_sel ? ea(CAUTION_COLOR) : ea(CARD_BORDER);
-    spr.fillRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_bg);
     spr.drawRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_border);
-    spr.setTextColor(clear_sel ? ea(CAUTION_COLOR) : ea(TEXT_COLOR), clear_bg);
+    spr.setTextColor(clear_sel ? ea(CAUTION_COLOR) : ea(TEXT_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(btn_x2 + 14, btn_y + 4);
     spr.print("CLEAR");
 
     // Footer hint
-    spr.setTextColor(ea(DIM_COLOR), ea(CARD_COLOR));
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, cy + ch - 11);
     if (wifi_config_editing) {
@@ -5435,10 +5428,10 @@ void draw_gps_screen() {
         }
         for (int i = 0; i < NUM_STARS; i++) {
             float twinkle = anim_pulse(3000 + i * 200, (float)i / (float)NUM_STARS);
-            // 60..180 brightness — 20..80 was below the LCD's perceptual
-            // floor with the backlight on; baseline 60 keeps stars visible
-            // while the +120 swing still reads as a twinkle.
-            uint8_t b = (uint8_t)(60 + twinkle * 120);
+            // 100..255 brightness — earlier 60..180 still read faint with
+            // the backlight on. Baseline 100 keeps stars clearly visible
+            // while the +155 swing reads as a shimmer.
+            uint8_t b = (uint8_t)(100 + twinkle * 155);
             uint16_t star_col = lgfx::color565(b, b, b);
             spr.drawPixel(star_x[i], star_y[i], star_col);
         }
@@ -5560,44 +5553,52 @@ void draw_gps_screen() {
                         ? lerp_col16(BG_COLOR, GPS_COLOR, depth_fade)
                         : lerp_col16(BG_COLOR, DIM_COLOR, depth_fade * 0.5f);
 
-                    // Orbital-tangent direction (used as the un-tumbled axis)
-                    float dx = (float)(dpx - gx);
-                    float dy = (float)(dpy - gy);
-                    float dist = sqrtf(dx * dx + dy * dy);
-                    if (dist < 1.0f) dist = 1.0f;
-                    float raw_nx = dx / dist;
-                    float raw_ny = dy / dist;
-                    float nx = -raw_ny;
-                    float ny =  raw_nx;
-
-                    // Tumble: each satellite rotates around its own center.
-                    // base_ang * 2 spreads phases between sats so they don't
-                    // tumble in lockstep.
-                    float tumble = (float)frame_ms * 0.003f + base_ang * 2.0f;
-                    float cos_t = cosf(tumble), sin_t = sinf(tumble);
-                    float tnx = nx * cos_t - ny * sin_t;
-                    float tny = nx * sin_t + ny * cos_t;
-                    float tperpx = -tny;
-                    float tperpy =  tnx;
-
                     // Depth-based size scaling — front-facing sats larger.
                     float depth_scale = 0.5f + 0.5f * ((tz2 + 0.3f) / 1.3f);
                     if (depth_scale < 0.4f) depth_scale = 0.4f;
                     if (depth_scale > 1.0f) depth_scale = 1.0f;
 
-                    float tip_dist  = 7.0f * depth_scale;
-                    float base_back = 2.0f * depth_scale;
-                    float base_half = 4.0f * depth_scale;
+                    // Wireframe tetrahedron (4 verts, 6 edges) tumbling on
+                    // two axes with phases derived from base_ang so each
+                    // satellite spins independently. Reads as a real 3D
+                    // body in flight rather than a flat icon.
+                    const float sz = 5.0f * depth_scale;
+                    float tet_v[4][3] = {
+                        {  0.0f,    -sz * 1.2f,  0.0f      },  // top
+                        { -sz,       sz * 0.6f, -sz * 0.5f },  // base L-back
+                        {  sz,       sz * 0.6f, -sz * 0.5f },  // base R-back
+                        {  0.0f,     sz * 0.6f,  sz * 0.8f },  // base front
+                    };
 
-                    int tip_x  = dpx + (int)(tnx * tip_dist);
-                    int tip_y  = dpy + (int)(tny * tip_dist);
-                    int base1x = dpx - (int)(tnx * base_back) + (int)(tperpx * base_half);
-                    int base1y = dpy - (int)(tny * base_back) + (int)(tperpy * base_half);
-                    int base2x = dpx - (int)(tnx * base_back) - (int)(tperpx * base_half);
-                    int base2y = dpy - (int)(tny * base_back) - (int)(tperpy * base_half);
+                    const float tumble_speed = 0.004f;
+                    float t1 = (float)frame_ms * tumble_speed       + base_ang * 3.0f;
+                    float t2 = (float)frame_ms * tumble_speed * 0.7f + base_ang * 2.0f;
+                    float c1 = cosf(t1), s1 = sinf(t1);
+                    float c2 = cosf(t2), s2 = sinf(t2);
 
-                    spr.drawTriangle(tip_x, tip_y, base1x, base1y,
-                                     base2x, base2y, sat_col);
+                    int sx[4], sy[4];
+                    for (int vi = 0; vi < 4; vi++) {
+                        float vx = tet_v[vi][0];
+                        float vy = tet_v[vi][1];
+                        float vz = tet_v[vi][2];
+                        // Y-axis roll
+                        float rx = vx * c1 - vz * s1;
+                        float ry = vy;
+                        float rz = vx * s1 + vz * c1;
+                        // X-axis pitch
+                        float px = rx;
+                        float py = ry * c2 - rz * s2;
+                        sx[vi] = dpx + (int)px;
+                        sy[vi] = dpy + (int)py;
+                    }
+
+                    // 6 edges: 0-1, 0-2, 0-3, 1-2, 2-3, 3-1
+                    spr.drawLine(sx[0], sy[0], sx[1], sy[1], sat_col);
+                    spr.drawLine(sx[0], sy[0], sx[2], sy[2], sat_col);
+                    spr.drawLine(sx[0], sy[0], sx[3], sy[3], sat_col);
+                    spr.drawLine(sx[1], sy[1], sx[2], sy[2], sat_col);
+                    spr.drawLine(sx[2], sy[2], sx[3], sy[3], sat_col);
+                    spr.drawLine(sx[3], sy[3], sx[1], sy[1], sat_col);
                 }
             }
         }
