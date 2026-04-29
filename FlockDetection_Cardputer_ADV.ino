@@ -555,9 +555,14 @@ struct CaptureEntry {
     char  time[9];
     double lat;
     double lng;
+    int   id;       // sequential detection number; 0 = unknown (pre-feature SD load)
 };
 CaptureEntry capture_history[CAPTURE_HISTORY_SIZE];
 int capture_history_count = 0;
+
+// Sequential detection counter — 1-based, persisted in flash so IDs survive
+// reboots. Bumped once per is_new detection inside log_detection().
+long next_detection_id = 1;
 
 // SD-backed detection history (recent detections screen)
 #define SD_HIST_SIZE 20
@@ -569,6 +574,7 @@ struct SDHistEntry {
     int  confidence;
     char method[24];
     char timestamp[9];
+    int  id;        // sequential detection number; 0 = loaded from old SD log
 };
 SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
@@ -614,11 +620,14 @@ enum StatsCardIdx {
     SC_BOOTS, SC_FLASH, SC_VERSION,
     STATS_CARD_COUNT
 };
-// Compare formatted display strings, not raw values: float voltages and
-// other LSB-jittery sources would otherwise re-trigger the animation
-// every frame and the slide would loop continuously instead of settling.
-static char  stats_prev_strings[STATS_CARD_COUNT][16] = {{0}};
-static unsigned long stats_roll_start[STATS_CARD_COUNT] = {0};
+// Per-character roll animation: comparing the formatted string per char
+// lets only the digits that actually changed slide up. Each card owns a
+// row of timestamps (one per glyph column) — a non-zero entry within the
+// last UI_ANIM_QUICK ms means that column is mid-roll. Sized to fit the
+// longest formatted value we surface (uptime, packet counts, etc.).
+#define STAT_MAX_CHARS 12
+static char          stats_prev_strings[STATS_CARD_COUNT][STAT_MAX_CHARS] = {{0}};
+static unsigned long stats_char_anim[STATS_CARD_COUNT][STAT_MAX_CHARS]    = {{0}};
 static bool  stats_values_initialized = false;
 static uint32_t stats_pkt_display       = 0;
 static unsigned long stats_pkt_last_update = 0;
@@ -692,6 +701,7 @@ bool locator_active = false;
 char locator_target_mac[18]  = "";
 char locator_target_name[65] = "";
 char locator_target_type[8]  = "";   // "WiFi", "BLE", or ""
+int  locator_target_id       = 0;    // sequential detection ID; 0 = unknown
 LocSample locator_samples[LOC_MAX_SAMPLES];
 int locator_sample_count = 0;
 unsigned long locator_last_sample = 0;
@@ -1420,6 +1430,9 @@ void load_sd_history() {
         copy_f(10, e.method, 24);
         e.rssi       = atoi(buf + fs[6]);
         e.confidence = atoi(buf + fs[11]);
+        // SD CSV doesn't carry an ID column — entries loaded from disk show
+        // "----" until they're replaced by fresh detections logged this run.
+        e.id         = 0;
         {
             unsigned long uptime = (unsigned long)strtoul(buf + fs[0], NULL, 10);
             format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
@@ -1480,12 +1493,13 @@ static void save_session_to_flash() {
         return;
     }
 
-    long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes;
+    long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes, l_next_id;
     int l_vol;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
     l_writes = lifetime_flash_writes + 1;
+    l_next_id = next_detection_id;
     xSemaphoreGive(dataMutex);
 
     bool write_ok = false;
@@ -1496,9 +1510,9 @@ static void save_session_to_flash() {
             delay(5);
             continue;
         }
-        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n",
+        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n%ld\n",
                                   l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes,
-                                  export_ssid, export_pass);
+                                  export_ssid, export_pass, l_next_id);
         f.close();
         if (written > 10) {
             write_ok = true;
@@ -1704,6 +1718,14 @@ void load_session_from_flash() {
     if (line.length() > 0 && line.length() < sizeof(export_pass)) {
         strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
         export_pass[sizeof(export_pass) - 1] = '\0';
+    }
+    // next_detection_id was added later; older save files end here and the
+    // counter stays at its 1 default. Files that include it pick up where
+    // they left off so detection IDs don't restart on reboot.
+    line = f.readStringUntil('\n');
+    if (line.length() > 0) {
+        long parsed = line.toInt();
+        if (parsed >= 1) next_detection_id = parsed;
     }
     f.close();
 }
@@ -2244,6 +2266,12 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         sd_hist[0].confidence = confidence;
         format_time_buf((millis() - session_start_time) / 1000,
                         sd_hist[0].timestamp, sizeof(sd_hist[0].timestamp));
+        // Sequential ID — assigned to both the SD-history mirror and the
+        // in-memory capture_history entry that add_to_capture_history just
+        // pushed at index 0. Counter is persisted in PERSIST_FILE.
+        sd_hist[0].id          = (int)next_detection_id;
+        capture_history[0].id  = (int)next_detection_id;
+        next_detection_id++;
         if (sd_hist_count < SD_HIST_SIZE) sd_hist_count++;
 
         // Leave sd_hist_dirty alone — the loop's was_dirty path becomes a
@@ -2428,12 +2456,13 @@ void locator_add_sample(const char* mac, int rssi) {
     xSemaphoreGive(dataMutex);
 }
 
-void locator_start(const char* mac, const char* name, const char* type = "") {
+void locator_start(const char* mac, const char* name, const char* type = "", int id = 0) {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     locator_active = true;
     safe_copy(locator_target_mac,  mac,  sizeof(locator_target_mac));
     safe_copy(locator_target_name, name, sizeof(locator_target_name));
     safe_copy(locator_target_type, type, sizeof(locator_target_type));
+    locator_target_id = id;
     locator_sample_count = 0; locator_has_estimate = false; locator_peak_rssi = -120;
     locator_estimate_announced = false;
     locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
@@ -4767,6 +4796,7 @@ void draw_locator_screen() {
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
     char target_name[65]; safe_copy(target_name, locator_target_name, sizeof(target_name));
+    int  target_id = locator_target_id;
     float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
     bool has_loc   = gps.location.isValid();
@@ -4863,87 +4893,27 @@ void draw_locator_screen() {
     }
     float ang = ease_arrow;
 
-    // ── Compass rose ring ──
-    spr.drawCircle(cx, cy, 18, CARD_BORDER);
-    spr.drawCircle(cx, cy, 19, BG_COLOR);  // thin separation from arrow
-
-    // ── Arrow: cursor/pointer shape — 7-point polygon ──
-    auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
-        float ca = cosf(a), sa = sinf(a);
-        *ox = cx + (int)roundf(lx * ca - ly * sa);
-        *oy = cy + (int)roundf(lx * sa + ly * ca);
-    };
-    // Local-space vertices (pointing up before rotation):
-    //   0=tip, 1=right-outer, 2=right-inner, 3=right-base, 4=left-base, 5=left-inner, 6=left-outer
-    const float A_TIP_Y   = -20.5f, A_SHLDR_Y = -5.7f, A_BASE_Y = 13.0f;
-    const float A_HEAD_HW = 11.4f,  A_STEM_HW =  5.7f;
-    const float lx7[7] = {  0,          A_HEAD_HW,  A_STEM_HW,  A_STEM_HW, -A_STEM_HW, -A_STEM_HW, -A_HEAD_HW };
-    const float ly7[7] = { A_TIP_Y, A_SHLDR_Y, A_SHLDR_Y, A_BASE_Y,  A_BASE_Y, A_SHLDR_Y,  A_SHLDR_Y };
-    int ax7[7], ay7[7];
-    for (int vi = 0; vi < 7; vi++) rotpt(lx7[vi], ly7[vi], ang, &ax7[vi], &ay7[vi]);
-
-    // BG fill: arrowhead triangle + stem rectangle (two triangles)
-    spr.fillTriangle(ax7[0], ay7[0], ax7[1], ay7[1], ax7[6], ay7[6], BG_COLOR);
-    spr.fillTriangle(ax7[2], ay7[2], ax7[3], ay7[3], ax7[4], ay7[4], BG_COLOR);
-    spr.fillTriangle(ax7[2], ay7[2], ax7[4], ay7[4], ax7[5], ay7[5], BG_COLOR);
-
-    // Hatching: narrow spacing near tip, wider toward base (quadratic from tip)
+    // ── Direction pointer: thin line from pivot, filled dot at tip ──
+    // Compass needle aesthetic — direction is the line, target lives at
+    // the dot. Pivot circle marks the user's position. Hatching/grid
+    // background gives the panel a tactical feel without the polygon.
     {
-        uint16_t hatch_col = lgfx::color565(45, 135, 210);
-        for (int hi = 1; hi < 16; hi++) {
-            float ly = A_TIP_Y + 0.4f * (float)(hi * hi);  // quadratic from tip → base
-            if (ly > A_BASE_Y) break;
-            // Half-width at this y level
-            float hw;
-            if (ly <= A_SHLDR_Y) {
-                float t = (ly - A_TIP_Y) / (A_SHLDR_Y - A_TIP_Y);
-                hw = A_HEAD_HW * t;
-            } else {
-                hw = A_STEM_HW;
-            }
-            if (hw < 0.5f) continue;
-            int hx0, hy0, hx1, hy1;
-            rotpt(-hw, ly, ang, &hx0, &hy0);
-            rotpt( hw * 0.5f, ly, ang, &hx1, &hy1);  // stop at 3/4 of total width
-            spr.drawLine(hx0, hy0, hx1, hy1, hatch_col);
-        }
+        const int line_len = 28;
+        int tip_x = cx + (int)(line_len * cosf(ang));
+        int tip_y = cy + (int)(line_len * sinf(ang));
+
+        // Direction line and tip dot — full HEADER_COLOR for emphasis.
+        spr.drawLine(cx, cy, tip_x, tip_y, HEADER_COLOR);
+        spr.fillCircle(tip_x, tip_y, 3, HEADER_COLOR);
+
+        // Open pivot ring — sits over the line at the rotation center.
+        spr.drawCircle(cx, cy, 2, DIM_COLOR);
     }
 
-    // GPS_COLOR outline — draw all 7 edges
-    for (int vi = 0; vi < 7; vi++) {
-        int ni = (vi + 1) % 7;
-        spr.drawLine(ax7[vi], ay7[vi], ax7[ni], ay7[ni], GPS_COLOR);
-    }
-
-    // ── Sample acquisition boxes — bottom of grid panel ──
-    {
-        int sc_count = active ? sample_count : 0;
-        const int BOX     = 9;
-        const int BOX_GAP = 5;
-        int total_box_w   = LOC_MIN_SAMPLES_EST * BOX + (LOC_MIN_SAMPLES_EST - 1) * BOX_GAP;
-        int bx0 = cx - total_box_w / 2;
-        int by0 = DISP_H - BOX - 6;
-
-        for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
-            int bxi = bx0 + di * (BOX + BOX_GAP);
-            bool filled = di < sc_count;
-
-            uint16_t box_col;
-            if (filled) {
-                float pulse_t = anim_pulse(UI_PULSE_MEDIUM);
-                uint16_t dark_accent = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.4f);
-                box_col = lerp_col16(dark_accent, ACCENT_COLOR, pulse_t);
-            } else {
-                box_col = lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
-            }
-
-            spr.drawRect(bxi, by0, BOX, BOX, box_col);
-            if (filled) {
-                spr.drawLine(bxi + 1, by0 + 1, bxi + BOX - 2, by0 + BOX - 2, box_col);
-                spr.drawLine(bxi + BOX - 2, by0 + 1, bxi + 1, by0 + BOX - 2, box_col);
-            }
-        }
-    }
+    // (Sample-acquisition boxes removed — the status badge already
+    // communicates LOCKED vs SEARCHING and the box count was an
+    // implementation detail.)
+    (void)sample_count;
 
     // ── Right panel ──
     int rx = 82;
@@ -4982,9 +4952,15 @@ void draw_locator_screen() {
         spr.clearClipRect();
     }
 
-    // ── TARGET (prominent — larger value text) ──
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-    spr.setCursor(rpx, 46); kprint(spr, "TARGET");
+    // ── TARGET label + name + ID ──
+    // Section spacing follows the standard tiers: UI_PAD_MD between the
+    // status pill and the TARGET section, UI_PAD_SM between rows.
+    int target_label_y = 23 + 16 + UI_PAD_MD;          // pill bottom + UI_PAD_MD
+    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
+    spr.setCursor(rpx, target_label_y);
+    kprint(spr, "TARGET");
+
+    int target_name_y = target_label_y + 10;
     {
         char tname[18];
         if (north_mode) {
@@ -5000,18 +4976,37 @@ void draw_locator_screen() {
             safe_copy(tname, "No Target", sizeof(tname));
         }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_STRONG);
-        spr.setCursor(rpx, 58); spr.print(tname);
+        spr.setCursor(rpx, target_name_y); spr.print(tname);
+
+        // Detection ID after the name (DIM, TS_MICRO).
+        if (active && target_id > 0) {
+            int name_w = (int)strlen(tname) * (int)(TS_STRONG * 6.0f);
+            char id_buf[8];
+            snprintf(id_buf, sizeof(id_buf), "#%03d", target_id);
+            spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
+            // Vertical: align baseline to the bottom of the TS_STRONG name
+            int id_y = target_name_y + (int)(TS_STRONG * 8.0f) - 8;
+            spr.setCursor(rpx + name_w + UI_PAD_SM, id_y);
+            spr.print(id_buf);
+        }
     }
 
-    // ── DISTANCE + SIGNAL on same line ──
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-    spr.setCursor(rpx, 80); kprint(spr, "DIST");
+    // ── DIST + SIG (labels TS_MICRO, values TS_STRONG side-by-side) ──
+    // TS_STRONG fits the worst-case strings ("9999ft" / "STRONG") in the
+    // ~154 px right panel without overlap; TS_H2 would overflow.
+    int dist_label_y = target_name_y + (int)(TS_STRONG * 8.0f) + UI_PAD_SM;
+    int dist_value_y = dist_label_y + 10;
+    int sig_x        = rpx + 64;
 
+    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
+    spr.setCursor(rpx,   dist_label_y); kprint(spr, "DIST");
+    spr.setCursor(sig_x, dist_label_y); kprint(spr, "SIG");
+
+    // Trend indicator just past the DIST label
     {
         int trend = (active && has_est) ? locator_distance_trend() : 0;
         if (trend != 0) {
-            int tx = rpx + 34;
-            int ty = 80;
+            int tx = rpx + 28, ty = dist_label_y;
             if (trend < 0) {
                 spr.fillTriangle(tx, ty, tx + 5, ty, tx + 2, ty + 5, ACCENT_COLOR);
             } else {
@@ -5019,39 +5014,26 @@ void draw_locator_screen() {
             }
         }
     }
+
+    // Distance value
     {
         float sd = (active && has_est && !north_mode) ? dist : -1.0f;
         float sd_ft = sd * 3.28084f;
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_H2);
-        spr.setCursor(rpx, 92);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_STRONG);
+        spr.setCursor(rpx, dist_value_y);
         if (sd < 0) {
             spr.print("--");
-            spr.setTextSize(TS_BODY);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.print("ft");
+        } else if (sd < 300) {
+            char db[12]; snprintf(db, sizeof(db), "%.0fft", sd_ft);
+            spr.print(db);
         } else {
-            char db[12];
-            if (sd < 300) {
-                snprintf(db, sizeof(db), "%.0f", sd_ft);
-                spr.print(db);
-                spr.setTextSize(TS_BODY);
-                spr.setTextColor(DIM_COLOR, BG_COLOR);
-                spr.print("ft");
-            } else {
-                snprintf(db, sizeof(db), "%.1f", sd / 1000.0f);
-                spr.print(db);
-                spr.setTextSize(TS_BODY);
-                spr.setTextColor(DIM_COLOR, BG_COLOR);
-                spr.print("km");
-            }
+            char db[12]; snprintf(db, sizeof(db), "%.1fkm", sd / 1000.0f);
+            spr.print(db);
         }
     }
 
+    // Signal value (colored by strength)
     {
-        int sig_x = rpx + 80;
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-        spr.setCursor(sig_x, 80); kprint(spr, "SIGNAL");
-
         int sr = (active && has_rssi && !north_mode) ? target_rssi : -999;
         uint16_t sig_col;
         const char* sig_str;
@@ -5060,8 +5042,8 @@ void draw_locator_screen() {
         else if (sr > -80)   { sig_str = "MED";    sig_col = CAUTION_COLOR; }
         else                 { sig_str = "WEAK";   sig_col = DIM_COLOR; }
 
-        spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(TS_BODY);
-        spr.setCursor(sig_x, 92); spr.print(sig_str);
+        spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(TS_STRONG);
+        spr.setCursor(sig_x, dist_value_y); spr.print(sig_str);
     }
 }
 
@@ -5141,7 +5123,7 @@ void draw_capture_history_screen() {
         // Pull fields from whichever source
         const char* e_type;
         char e_mac[18], e_name[32], e_method[24];
-        int e_rssi, e_conf;
+        int e_rssi, e_conf, e_id;
 
         if (use_sd) {
             e_type = sd_hist[i].type;
@@ -5150,6 +5132,7 @@ void draw_capture_history_screen() {
             strncpy(e_method, sd_hist[i].method, 23); e_method[23] = '\0';
             e_rssi = sd_hist[i].rssi;
             e_conf = sd_hist[i].confidence;
+            e_id   = sd_hist[i].id;
         } else {
             e_type = mem_hist[i].type;
             strncpy(e_mac,  mem_hist[i].mac,  17); e_mac[17]  = '\0';
@@ -5157,6 +5140,7 @@ void draw_capture_history_screen() {
             e_method[0] = '\0';
             e_rssi = mem_hist[i].rssi;
             e_conf = mem_hist[i].confidence;
+            e_id   = mem_hist[i].id;
         }
 
         const char* proto_lbl; uint16_t proto_col_unused;
@@ -5167,11 +5151,23 @@ void draw_capture_history_screen() {
         // is communicated by the eased outline drawn after the loop.
         const int content_x = 6;
 
-        // Protocol label (dim, TS_BODY) — left
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-        spr.setCursor(content_x, y + 8); spr.print(proto_lbl);
+        // Sequential detection ID (#001 …) — leftmost column. Entries
+        // loaded from the SD CSV (no ID column on disk) show "----".
+        char id_str[8];
+        if (e_id > 0) snprintf(id_str, sizeof(id_str), "#%03d", e_id);
+        else          snprintf(id_str, sizeof(id_str), "----");
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(content_x, y + 11);
+        spr.print(id_str);
 
-        // Device name (TEXT, TS_MICRO) — left, after the label
+        const int proto_x = content_x + 30;  // after the 4-char ID + gap
+
+        // Protocol label (dim, TS_BODY)
+        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
+        spr.setCursor(proto_x, y + 8); spr.print(proto_lbl);
+
+        // Device name (TEXT, TS_MICRO) — after the label
         bool name_ok = (e_name[0] != '\0' &&
                         strcmp(e_name, "Hidden")  != 0 &&
                         strcmp(e_name, "Unknown") != 0);
@@ -5179,7 +5175,7 @@ void draw_capture_history_screen() {
         if (name_ok) { strncpy(nom, e_name, 19); nom[19] = '\0'; }
         else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 19); nom[19] = '\0'; }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-        spr.setCursor(content_x + 36, y + 11); spr.print(nom);
+        spr.setCursor(proto_x + 36, y + 11); spr.print(nom);
 
         // Signal + confidence, right-aligned (DIM, TS_MICRO)
         char right_str[16];
@@ -5224,31 +5220,25 @@ void draw_capture_history_screen() {
         if (di < 0) di = 0; if (di >= total) di = total - 1;
 
         char d_mac[18], d_name[32], d_method[24];
-        int d_rssi, d_conf;
+        int d_rssi, d_conf, d_id;
         if (use_sd) {
             strncpy(d_mac,    sd_hist[di].mac,    17); d_mac[17]    = '\0';
             strncpy(d_name,   sd_hist[di].name,   31); d_name[31]   = '\0';
             strncpy(d_method, sd_hist[di].method, 23); d_method[23] = '\0';
             d_rssi = sd_hist[di].rssi; d_conf = sd_hist[di].confidence;
+            d_id   = sd_hist[di].id;
         } else {
             strncpy(d_mac,  mem_hist[di].mac,  17); d_mac[17]  = '\0';
             strncpy(d_name, mem_hist[di].name, 31); d_name[31] = '\0';
             d_method[0] = '\0';
             d_rssi = mem_hist[di].rssi; d_conf = mem_hist[di].confidence;
+            d_id   = mem_hist[di].id;
         }
 
-        // Compute open/close alpha
-        float detail_alpha;
-        if (hist_detail_closing) {
-            detail_alpha = 1.0f - ui_progress(hist_detail_close_ms, UI_FADE_OUT_MS);
-            if (detail_alpha <= 0.01f) {
-                hist_detail_open    = false;
-                hist_detail_closing = false;
-                detail_alpha        = 0.0f;
-            }
-        } else {
-            detail_alpha = ui_progress(hist_detail_open_ms, UI_FADE_IN_MS);
-        }
+        // Open animation only — close is instant. Animated close left a
+        // backdrop-only frame on screen if no further redraw fired before
+        // the user pressed another key, which read as a black screen.
+        float detail_alpha = ui_progress(hist_detail_open_ms, UI_FADE_IN_MS);
 
         // Slide offset — 20px from below for the standard UI feel
         int detail_slide = (int)((1.0f - detail_alpha) * 20.0f);
@@ -5302,6 +5292,12 @@ void draw_capture_history_screen() {
             spr.print(val);
             fy += row_gap;
         };
+
+        if (d_id > 0) {
+            char id_label[8];
+            snprintf(id_label, sizeof(id_label), "#%03d", d_id);
+            detail_row("ID", id_label);
+        }
 
         detail_row("MAC", d_mac);
 
@@ -5412,41 +5408,36 @@ void draw_gps_screen() {
     };
 
     // ─ Background starfield ──────────────────────────────────────────────
-    // Static positions, three brightness tiers, subtle per-star twinkle.
-    // Drawn before the globe so fillCircle erases any star inside the rim.
-    // White/grey only — works in both day and night palettes.
+    // Single-pixel dots with a gentle per-star twinkle. Static positions,
+    // generated once with UI_PAD_MD clearance from the globe rim and bound
+    // to the left panel so they never reach the right-side text column.
     {
         #define NUM_STARS 30
-        static int     star_x[NUM_STARS], star_y[NUM_STARS];
-        static uint8_t star_brightness[NUM_STARS];
-        static bool    stars_init = false;
+        static int  star_x[NUM_STARS], star_y[NUM_STARS];
+        static bool stars_init = false;
         if (!stars_init) {
+            const int min_x = UI_PAD_SM / 2;
+            const int max_x = gx * 2 - UI_PAD_MD;  // stop well before right panel
+            const int min_y = CONTENT_Y + UI_PAD_SM;
+            const int max_y = DISP_H - UI_PAD_SM;
+            const int clear = gr + UI_PAD_MD;
             for (int i = 0; i < NUM_STARS; i++) {
                 int sx, sy;
                 do {
-                    sx = random(2, 118);
-                    sy = random(20, DISP_H - 2);
+                    sx = random(min_x, max_x);
+                    sy = random(min_y, max_y);
                 } while ((sx - gx) * (sx - gx) + (sy - gy) * (sy - gy) <
-                         (gr + 6) * (gr + 6));
+                         clear * clear);
                 star_x[i] = sx;
                 star_y[i] = sy;
-                int tier = random(0, 3);
-                star_brightness[i] = (tier == 0) ? 30 : (tier == 1) ? 70 : 140;
             }
             stars_init = true;
         }
         for (int i = 0; i < NUM_STARS; i++) {
-            uint8_t b = star_brightness[i];
-            float twinkle = anim_pulse(2000 + i * 137, (float)i / NUM_STARS);
-            uint8_t tb = (uint8_t)(b * (0.8f + 0.4f * twinkle));
-            uint16_t star_col = lgfx::color565(tb, tb, tb);
+            float twinkle = anim_pulse(3000 + i * 200, (float)i / (float)NUM_STARS);
+            uint8_t b = (uint8_t)(20 + twinkle * 60);  // 20..80 brightness range
+            uint16_t star_col = lgfx::color565(b, b, b);
             spr.drawPixel(star_x[i], star_y[i], star_col);
-            if (b >= 140) {
-                uint8_t arm = tb / 3;
-                uint16_t dim_arm = lgfx::color565(arm, arm, arm);
-                spr.drawPixel(star_x[i] - 1, star_y[i], dim_arm);
-                spr.drawPixel(star_x[i] + 1, star_y[i], dim_arm);
-            }
         }
     }
 
@@ -5710,30 +5701,50 @@ void draw_gps_screen() {
 // Draw a single stat card. Outlined only (no fill).
 // Label: TS_MICRO, DIM_COLOR, kprint with extra=2 letter-spacing — hugs top.
 // Value: TS_STRONG by default (TS_H2 for hero), TEXT_COLOR — hugs bottom.
-// roll_start: millis timestamp when the value last changed; non-zero
-//   triggers a UI_ANIM_QUICK slide-up animation. The value rect is clipped
-//   to the card interior intersected with the stats viewport, so the slide
-//   doesn't bleed into neighboring cards or the header.
+// prev_str / char_anim_ms (size STAT_MAX_CHARS each): per-character
+//   change tracking. The function compares value[ci] against prev_str[ci]
+//   and bumps char_anim_ms[ci] whenever a column's glyph changes, then
+//   draws each glyph at its own y so only the digits that flipped roll
+//   up — the rest stay perfectly still. Pass nullptr/nullptr to draw a
+//   static card with no roll.
 static void draw_stat_card(int x, int y, int w, int h,
                            const char* label, const char* value,
                            float value_size = TS_STRONG,
-                           unsigned long roll_start = 0) {
-    // Outline uses HEADER_COLOR so cards feel like header chrome rather
-    // than receding into the background.
+                           char* prev_str = nullptr,
+                           unsigned long* char_anim_ms = nullptr) {
     spr.drawRoundRect(x, y, w, h, 4, HEADER_COLOR);
 
-    // Label: small, dim, tracked
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(x + UI_PAD_SM, y + UI_PAD_SM);
-    kprint(spr, label, 2);  // extra=2 → wide tracking, caption feel
+    kprint(spr, label, 2);
 
-    // Value: large, bright — bottom inset matches top via UI_PAD_SM
-    int value_glyph_h = (int)(value_size * 8.0f);
+    int value_glyph_h  = (int)(value_size * 8.0f);
+    int char_w         = (int)(value_size * 6.0f);
     int value_target_y = y + h - value_glyph_h - UI_PAD_SM;
+    int value_x        = x + UI_PAD_SM;
 
-    // Clip to card interior intersected with the scroll viewport, so a
-    // mid-roll value can't escape the card or scribble on the header.
+    int len = (int)strlen(value);
+    if (len > STAT_MAX_CHARS) len = STAT_MAX_CHARS;
+
+    unsigned long now = millis();
+
+    // Per-character change detection. Trailing slots compare against
+    // prev_str's matching position so a shrinking value (e.g. "10" → "9")
+    // also triggers a roll on the column that just dropped a digit.
+    if (prev_str && char_anim_ms) {
+        int prev_len = (int)strlen(prev_str);
+        for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
+            char curc  = (ci < len)      ? value[ci]    : '\0';
+            char prevc = (ci < prev_len) ? prev_str[ci] : '\0';
+            if (curc != prevc) {
+                char_anim_ms[ci] = now;
+            }
+        }
+        strncpy(prev_str, value, STAT_MAX_CHARS - 1);
+        prev_str[STAT_MAX_CHARS - 1] = '\0';
+    }
+
     int clip_x = x + 1;
     int clip_y = (y + 1 > CONTENT_Y) ? (y + 1) : CONTENT_Y;
     int clip_right  = x + w - 1;
@@ -5743,12 +5754,22 @@ static void draw_stat_card(int x, int y, int w, int h,
     int clip_h = clip_bottom - clip_y;
     if (clip_w > 0 && clip_h > 0) {
         spr.setClipRect(clip_x, clip_y, clip_w, clip_h);
-        int draw_y = anim_slide_in(value_target_y, value_glyph_h,
-                                    roll_start, UI_ANIM_QUICK);
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(value_size);
-        spr.setCursor(x + UI_PAD_SM, draw_y);
-        spr.print(value);
+        for (int ci = 0; ci < len; ci++) {
+            int cx     = value_x + ci * char_w;
+            int draw_y = value_target_y;
+            if (char_anim_ms && char_anim_ms[ci] != 0) {
+                unsigned long elapsed = now - char_anim_ms[ci];
+                if (elapsed < UI_ANIM_QUICK) {
+                    draw_y = anim_slide_in(value_target_y, value_glyph_h,
+                                           char_anim_ms[ci], UI_ANIM_QUICK);
+                }
+            }
+            char ch[2] = { value[ci], '\0' };
+            spr.setCursor(cx, draw_y);
+            spr.print(ch);
+        }
         spr.clearClipRect();
     }
 }
@@ -5804,40 +5825,34 @@ void draw_device_info_screen() {
     char boots_str[10]; snprintf(boots_str, sizeof(boots_str), "%ld", lb);
     char flash_str[10]; snprintf(flash_str, sizeof(flash_str), "%ld", lfw);
 
-    // ── Roll-up animation tracking ──
-    // Trigger only when the formatted display string changes — comparing raw
-    // numerics fired every frame on float-jittery sources (battery voltage)
-    // and made the roll loop continuously instead of settling.
-    const char* current_strs[STATS_CARD_COUNT];
-    current_strs[SC_DETECTIONS] = det_str;
-    current_strs[SC_WIFI]       = wifi_str;
-    current_strs[SC_BLE]        = ble_str;
-    current_strs[SC_RAVEN]      = raven_str;
-    current_strs[SC_SESSION]    = sess_str;
-    current_strs[SC_LIFETIME]   = life_str;
-    current_strs[SC_BATTERY]    = volt_str;
-    current_strs[SC_HEAP]       = heap_str;
-    current_strs[SC_PACKETS]    = pkt_str;
-    current_strs[SC_SD]         = sd_str;
-    current_strs[SC_BOOTS]      = boots_str;
-    current_strs[SC_FLASH]      = flash_str;
-    current_strs[SC_VERSION]    = "v9.6";
-
+    // First-frame seed for per-character roll animation. Copy the freshly
+    // formatted strings into stats_prev_strings without stamping any
+    // char_anim slots, so the initial render doesn't fire 13 simultaneous
+    // rolls. Subsequent frames let draw_stat_card do the per-glyph
+    // comparison and timestamp bumping.
     if (!stats_values_initialized) {
+        const char* seed[STATS_CARD_COUNT];
+        seed[SC_DETECTIONS] = det_str;
+        seed[SC_WIFI]       = wifi_str;
+        seed[SC_BLE]        = ble_str;
+        seed[SC_RAVEN]      = raven_str;
+        seed[SC_SESSION]    = sess_str;
+        seed[SC_LIFETIME]   = life_str;
+        seed[SC_BATTERY]    = volt_str;
+        seed[SC_HEAP]       = heap_str;
+        seed[SC_PACKETS]    = pkt_str;
+        seed[SC_SD]         = sd_str;
+        seed[SC_BOOTS]      = boots_str;
+        seed[SC_FLASH]      = flash_str;
+        seed[SC_VERSION]    = "v9.6";
         for (int i = 0; i < STATS_CARD_COUNT; i++) {
-            strncpy(stats_prev_strings[i], current_strs[i], 15);
-            stats_prev_strings[i][15] = '\0';
-            stats_roll_start[i]  = 0;
-        }
-        stats_values_initialized = true;
-    } else {
-        for (int i = 0; i < STATS_CARD_COUNT; i++) {
-            if (strcmp(current_strs[i], stats_prev_strings[i]) != 0) {
-                strncpy(stats_prev_strings[i], current_strs[i], 15);
-                stats_prev_strings[i][15] = '\0';
-                stats_roll_start[i]  = frame_ms;
+            strncpy(stats_prev_strings[i], seed[i], STAT_MAX_CHARS - 1);
+            stats_prev_strings[i][STAT_MAX_CHARS - 1] = '\0';
+            for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
+                stats_char_anim[i][ci] = 0;
             }
         }
+        stats_values_initialized = true;
     }
 
     // ── Smooth scroll easing ──
@@ -5876,7 +5891,8 @@ void draw_device_info_screen() {
         int sy = CONTENT_Y + vy - scroll_y;
         if (sy + h <= CONTENT_Y) return;             // entirely above viewport
         if (sy >= CONTENT_Y + STATS_VIEW_H) return;  // entirely below viewport
-        draw_stat_card(vx, sy, w, h, label, value, val_size, stats_roll_start[idx]);
+        draw_stat_card(vx, sy, w, h, label, value, val_size,
+                       stats_prev_strings[idx], stats_char_anim[idx]);
         // The helper's internal clip rect replaces the outer scroll clip;
         // restore it so the next card's outline still gets viewport-clipped.
         spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
@@ -6150,7 +6166,9 @@ void transition_screen(int new_screen, int dir) {
         // Reseed values on entry so the first render doesn't fire 13
         // simultaneous roll-ups against zero.
         stats_values_initialized = false;
-        for (int i = 0; i < STATS_CARD_COUNT; i++) stats_roll_start[i] = 0;
+        for (int i = 0; i < STATS_CARD_COUNT; i++) {
+            for (int ci = 0; ci < STAT_MAX_CHARS; ci++) stats_char_anim[i][ci] = 0;
+        }
     }
     if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
     current_screen = new_screen;
@@ -7270,9 +7288,10 @@ void loop() {
                     draw_current_screen(); spr.pushSprite(0, 0);
                     continue;
                 }
-                if (current_screen == 2 && hist_detail_open && !hist_detail_closing) {
-                    hist_detail_closing  = true;
-                    hist_detail_close_ms = millis();
+                if (current_screen == 2 && hist_detail_open) {
+                    hist_detail_open    = false;
+                    hist_detail_closing = false;
+                    screen_dirty = true;
                     draw_current_screen(); spr.pushSprite(0, 0);
                     continue;
                 }
@@ -7403,9 +7422,10 @@ void loop() {
                     char t_name[65]; strncpy(t_name, capture_history[target_select_idx].name, 64); t_name[64] = '\0';
                     char t_type[16]; strncpy(t_type, capture_history[target_select_idx].type, 15); t_type[15] = '\0';
                     int t_conf = capture_history[target_select_idx].confidence;
+                    int t_id   = capture_history[target_select_idx].id;
                     xSemaphoreGive(dataMutex);
 
-                    locator_start(t_mac, t_name, t_type);
+                    locator_start(t_mac, t_name, t_type, t_id);
                     trigger_toast("TARGET", t_name, t_conf);
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
@@ -7506,10 +7526,14 @@ void loop() {
                             hist_detail_open    = true;
                             hist_detail_closing = false;
                             hist_detail_open_ms = millis();
-                        } else if (!hist_detail_closing) {
-                            hist_detail_closing  = true;
-                            hist_detail_close_ms = millis();
+                        } else {
+                            // Instant close — animated close left the renderer
+                            // in a backdrop-only state if frames stopped before
+                            // the next redraw, which read as a black screen.
+                            hist_detail_open    = false;
+                            hist_detail_closing = false;
                         }
+                        screen_dirty = true;
                         draw_current_screen(); spr.pushSprite(0, 0);
                     }
                 }
@@ -7601,10 +7625,11 @@ void loop() {
                         hist_detail_open    = true;
                         hist_detail_closing = false;
                         hist_detail_open_ms = millis();
-                    } else if (!hist_detail_closing) {
-                        hist_detail_closing  = true;
-                        hist_detail_close_ms = millis();
+                    } else {
+                        hist_detail_open    = false;
+                        hist_detail_closing = false;
                     }
+                    screen_dirty = true;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
             }
@@ -7636,9 +7661,10 @@ void loop() {
             } else if (show_menu) {
                 show_menu = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
-            } else if (current_screen == 2 && hist_detail_open && !hist_detail_closing) {
-                hist_detail_closing  = true;
-                hist_detail_close_ms = millis();
+            } else if (current_screen == 2 && hist_detail_open) {
+                hist_detail_open    = false;
+                hist_detail_closing = false;
+                screen_dirty = true;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (current_screen != 0) {
                 // Nothing to close — go home to scanner
@@ -7842,31 +7868,34 @@ void loop() {
         bool stats_scrolling = (current_screen == 4) &&
             (fabsf(stats_scroll_y_f - (float)stats_scroll_target) > 0.5f);
 
-        // Same idea for value roll-ups: while any card's anim_slide_in is
+        // Same idea for per-character roll-ups: while any glyph anim is
         // still in flight (within UI_ANIM_QUICK of its start), drive the
         // fast path so the slide is actually animated frame-by-frame.
         bool stats_rolling = false;
         if (current_screen == 4) {
-            for (int i = 0; i < STATS_CARD_COUNT; i++) {
-                if (stats_roll_start[i] != 0 &&
-                    (now - stats_roll_start[i]) < UI_ANIM_QUICK) {
-                    stats_rolling = true;
-                    break;
+            for (int i = 0; i < STATS_CARD_COUNT && !stats_rolling; i++) {
+                for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
+                    if (stats_char_anim[i][ci] != 0 &&
+                        (now - stats_char_anim[i][ci]) < UI_ANIM_QUICK) {
+                        stats_rolling = true;
+                        break;
+                    }
                 }
             }
         }
 
         // Detections screen escalates while the selection ease is chasing
-        // its target or while the detail overlay open/close fade is in flight.
+        // its target or while the detail overlay open fade is in flight.
+        // (Close is instant — no animation to gate.)
         bool hist_animating = false;
         if (current_screen == 2) {
             int hist_target_y = CONTENT_Y +
                 (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
             bool sel_settling = fabsf(hist_sel_y_f - (float)hist_target_y) > 0.5f;
-            bool open_running = (hist_detail_open && !hist_detail_closing &&
+            bool open_running = (hist_detail_open &&
                                  hist_detail_open_ms != 0 &&
                                  (now - hist_detail_open_ms) < UI_FADE_IN_MS + 30);
-            hist_animating = sel_settling || open_running || hist_detail_closing;
+            hist_animating = sel_settling || open_running;
         }
 
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 ||
