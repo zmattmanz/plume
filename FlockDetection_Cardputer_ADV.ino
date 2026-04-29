@@ -576,6 +576,20 @@ int  history_selected_idx = 0;
 bool hist_detail_open   = false;
 volatile bool sd_hist_dirty = false;
 
+// Detections screen — selection ease + detail overlay open/close transition.
+// hist_sel_y_f follows the target row y via anim_filter for smooth motion.
+// The detail overlay tracks open/close timestamps so it can slide-up + fade
+// on open and reverse on close (hist_detail_open stays true through the
+// close anim and is cleared by the renderer when alpha hits zero).
+static const int    HIST_ROW_H       = 28;
+static const int    HIST_VISIBLE_ROWS = 4;
+static const float  HIST_SEL_TC      = 80.0f;     // snappy
+static float        hist_sel_y_f     = 0.0f;
+static unsigned long hist_last_frame_ms  = 0;
+static unsigned long hist_detail_open_ms = 0;
+static unsigned long hist_detail_close_ms = 0;
+static bool          hist_detail_closing  = false;
+
 // Stats screen vertical scroll (Option D — uniform card grid, smoothed).
 // Keys set stats_scroll_target (instant). Renderer eases stats_scroll_y_f
 // toward the target via anim_filter() with a snappy 120 ms time constant.
@@ -3427,10 +3441,12 @@ void draw_vol_overlay() {
 
     auto va = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    const int bar_w = 160;
-    const int bar_h = 10;
+    // Pill geometry — matches the boot bar: thin fill inside a generous
+    // rounded outline, centered on the screen.
+    const int bar_w = 130;
+    const int bar_h = 20;
     const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = DISP_H - bar_h - 8;
+    const int bar_y = DISP_H / 2 + 8;
     const int bar_r = bar_h / 2;
 
     int vol_pct = is_muted ? 0 : map(current_volume, 0, 255, 0, 100);
@@ -3440,22 +3456,30 @@ void draw_vol_overlay() {
     } else {
         snprintf(vol_str, sizeof(vol_str), "VOL %d%%", vol_pct);
     }
-    spr.setTextColor(va(is_muted ? DIM_COLOR : HEADER_COLOR), BG_COLOR);
+    spr.setTextColor(va(is_muted ? DIM_COLOR : TEXT_COLOR), BG_COLOR);
     spr.setTextSize(TS_BODY);
     spr.setTextDatum(TC_DATUM);
-    spr.drawString(vol_str, DISP_W / 2, bar_y - 14);
+    spr.drawString(vol_str, DISP_W / 2, bar_y - 20);
     spr.setTextDatum(TL_DATUM);
 
+    // Outer outline — single 1px rounded rect.
     spr.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, va(HEADER_COLOR));
 
-    int fill_w = is_muted ? 0 : (current_volume * (bar_w - 4)) / 255;
+    // Inner fill — thin 4px pill, vertically centered, inset by the
+    // outline radius so it never enters the rounded corner zone.
+    const int fill_h = 4;
+    const int fill_y = bar_y + (bar_h - fill_h) / 2;
+    const int fill_max_w = bar_w - bar_h;
+    const int fill_x = bar_x + bar_h / 2;
+    int fill_w = is_muted ? 0 : (current_volume * fill_max_w) / 255;
+
     if (fill_w > 0) {
-        int fill_r = (bar_h - 4) / 2;
+        int fill_r = fill_h / 2;
         if (fill_r < 1) fill_r = 1;
         if (fill_w < fill_r * 2) {
-            spr.fillRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, va(HEADER_COLOR));
+            spr.fillRect(fill_x, fill_y, fill_w, fill_h, va(HEADER_COLOR));
         } else {
-            spr.fillRoundRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, fill_r, va(HEADER_COLOR));
+            spr.fillRoundRect(fill_x, fill_y, fill_w, fill_h, fill_r, va(HEADER_COLOR));
         }
     }
 }
@@ -5068,21 +5092,34 @@ void draw_capture_history_screen() {
     else {
         if (history_selected_idx >= total)  history_selected_idx = total - 1;
         if (history_selected_idx < 0)       history_selected_idx = 0;
-        if (history_selected_idx < history_scroll_offset)          history_scroll_offset = history_selected_idx;
-        if (history_selected_idx >= history_scroll_offset + 4)     history_scroll_offset = history_selected_idx - 3;
-        int max_scroll = max(0, total - 4);
+        if (history_selected_idx < history_scroll_offset)
+            history_scroll_offset = history_selected_idx;
+        if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+            history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+        int max_scroll = max(0, total - HIST_VISIBLE_ROWS);
         if (history_scroll_offset > max_scroll) history_scroll_offset = max_scroll;
     }
+
+    // Selection y target — eased toward via anim_filter so quick key
+    // presses produce a visible glide rather than a teleport.
+    unsigned long now_ms = millis();
+    float dt = (hist_last_frame_ms == 0) ? 16.0f
+                                         : (float)(now_ms - hist_last_frame_ms);
+    if (dt > 100.0f) dt = 100.0f;
+    hist_last_frame_ms = now_ms;
+    int target_sel_y = CONTENT_Y +
+        (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
+    hist_sel_y_f = anim_filter(hist_sel_y_f, (float)target_sel_y,
+                                HIST_SEL_TC, dt);
 
     spr.fillSprite(BG_COLOR);
     draw_header_spr(2);
 
     if (total == 0) {
-        for (int i = 0; i < 4; i++) {
-            int y = CONTENT_Y + i * 28;
-            spr.fillRect(0, y, 2, 27, CARD_BORDER);
+        for (int i = 0; i < HIST_VISIBLE_ROWS; i++) {
+            int y = CONTENT_Y + i * HIST_ROW_H;
             spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-            spr.setCursor(10, y + 9); spr.print(use_sd ? "-- No SD log --" : "-- Listening...");
+            spr.setCursor(10, y + 11); spr.print(use_sd ? "-- No SD log --" : "-- Listening...");
         }
         return;
     }
@@ -5096,9 +5133,10 @@ void draw_capture_history_screen() {
     }
 
     int rows_shown = 0;
-    for (int i = history_scroll_offset; i < total && rows_shown < 4; i++, rows_shown++) {
-        int y = CONTENT_Y + rows_shown * 28;
-        bool selected = (i == history_selected_idx);
+    for (int i = history_scroll_offset;
+         i < total && rows_shown < HIST_VISIBLE_ROWS;
+         i++, rows_shown++) {
+        int y = CONTENT_Y + rows_shown * HIST_ROW_H;
 
         // Pull fields from whichever source
         const char* e_type;
@@ -5121,126 +5159,145 @@ void draw_capture_history_screen() {
             e_conf = mem_hist[i].confidence;
         }
 
-        const char* proto_lbl; uint16_t proto_col;
-        hist_type_info(e_type, &proto_lbl, &proto_col);
+        const char* proto_lbl; uint16_t proto_col_unused;
+        hist_type_info(e_type, &proto_lbl, &proto_col_unused);
+        (void)proto_col_unused;
 
-        // Dark BG everywhere — selection is outline-only, accent bar communicates protocol.
-        spr.fillRect(0, y, 2, 27, selected ? HEADER_COLOR : proto_col);
-        if (selected) {
-            spr.drawRect(0, y, DISP_W, 27, HEADER_COLOR);
-        }
+        // Identical layout for every row regardless of selection. Selection
+        // is communicated by the eased outline drawn after the loop.
+        const int content_x = 6;
 
-        const int content_x = 10;
-
-        // Protocol label — dim; the 2px accent bar already conveys protocol via color.
+        // Protocol label (dim, TS_BODY) — left
         spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-        spr.setCursor(content_x, y + 4); spr.print(proto_lbl);
+        spr.setCursor(content_x, y + 8); spr.print(proto_lbl);
 
-        // Name (or last MAC octets)
+        // Device name (TEXT, TS_MICRO) — left, after the label
         bool name_ok = (e_name[0] != '\0' &&
                         strcmp(e_name, "Hidden")  != 0 &&
                         strcmp(e_name, "Unknown") != 0);
-        char nom[13] = "";
-        if (name_ok) { strncpy(nom, e_name, 12); nom[12] = '\0'; }
-        else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 12); nom[12] = '\0'; }
-
+        char nom[20] = "";
+        if (name_ok) { strncpy(nom, e_name, 19); nom[19] = '\0'; }
+        else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 19); nom[19] = '\0'; }
         spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-        spr.setCursor(content_x + 28, y + 4); spr.print(nom);
+        spr.setCursor(content_x + 36, y + 11); spr.print(nom);
 
-        // Right-aligned timestamp
-        const char* ts_src = use_sd ? sd_hist[i].timestamp : "";
-        if (ts_src[0]) {
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setCursor(DISP_W - 52, y + 4); spr.print(ts_src);
-        }
-
-        // Second line: stats for unselected; MAC for selected (method lives in the detail overlay).
+        // Signal + confidence, right-aligned (DIM, TS_MICRO)
+        char right_str[16];
+        snprintf(right_str, sizeof(right_str), "%ddBm %d%%", e_rssi, e_conf);
+        int right_w = (int)strlen(right_str) * 6;  // TS_MICRO char width
         spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setCursor(content_x, y + 17);
-        if (selected) {
-            spr.print(e_mac);
-        } else {
-            char stat_buf[22];
-            snprintf(stat_buf, sizeof(stat_buf), "%d%%  %ddBm", e_conf, e_rssi);
-            spr.print(stat_buf);
-        }
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(DISP_W - right_w - 6, y + 11); spr.print(right_str);
+    }
+
+    // Selection highlight — drawn after rows so it sits on top, at the
+    // eased y so quick key presses produce a glide.
+    {
+        int sel_draw_y = (int)(hist_sel_y_f + 0.5f);
+        spr.drawRect(0, sel_draw_y, DISP_W, HIST_ROW_H, HEADER_COLOR);
     }
 
     {
         const int list_y = CONTENT_Y;
-        const int list_h = 4 * 28;
-        if (total > 4) {
+        const int list_h = HIST_VISIBLE_ROWS * HIST_ROW_H;
+        if (total > HIST_VISIBLE_ROWS) {
             if (history_scroll_offset > 0)
                 draw_scroll_fade(list_y, list_h, 5, true);
-            if (history_scroll_offset < total - 4)
+            if (history_scroll_offset < total - HIST_VISIBLE_ROWS)
                 draw_scroll_fade(list_y, list_h, 5, false);
         }
     }
 
     // Scroll indicator
-    if (total > 4) {
+    if (total > HIST_VISIBLE_ROWS) {
         spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
         spr.setCursor(DISP_W - 56, DISP_H - 8);
         char scr_buf[16]; snprintf(scr_buf, sizeof(scr_buf), "%d/%d -/+", history_selected_idx + 1, total);
         spr.print(scr_buf);
     }
 
-    // Detail overlay — shown when enter was pressed on selected row
+    // Detail overlay — slide-up + fade in on open, reverse on close.
+    // hist_detail_open stays true through the close anim; the renderer
+    // clears it once the fade reaches zero.
     if (hist_detail_open && total > 0) {
         int di = history_selected_idx;
         if (di < 0) di = 0; if (di >= total) di = total - 1;
 
-        const char* d_type;
         char d_mac[18], d_name[32], d_method[24];
         int d_rssi, d_conf;
         if (use_sd) {
-            d_type = sd_hist[di].type;
             strncpy(d_mac,    sd_hist[di].mac,    17); d_mac[17]    = '\0';
             strncpy(d_name,   sd_hist[di].name,   31); d_name[31]   = '\0';
             strncpy(d_method, sd_hist[di].method, 23); d_method[23] = '\0';
             d_rssi = sd_hist[di].rssi; d_conf = sd_hist[di].confidence;
         } else {
-            d_type = mem_hist[di].type;
             strncpy(d_mac,  mem_hist[di].mac,  17); d_mac[17]  = '\0';
             strncpy(d_name, mem_hist[di].name, 31); d_name[31] = '\0';
             d_method[0] = '\0';
             d_rssi = mem_hist[di].rssi; d_conf = mem_hist[di].confidence;
         }
 
-        const char* proto_lbl; uint16_t proto_col;
-        hist_type_info(d_type, &proto_lbl, &proto_col);
+        // Compute open/close alpha
+        float detail_alpha;
+        if (hist_detail_closing) {
+            detail_alpha = 1.0f - ui_progress(hist_detail_close_ms, UI_FADE_OUT_MS);
+            if (detail_alpha <= 0.01f) {
+                hist_detail_open    = false;
+                hist_detail_closing = false;
+                detail_alpha        = 0.0f;
+            }
+        } else {
+            detail_alpha = ui_progress(hist_detail_open_ms, UI_FADE_IN_MS);
+        }
 
-        // Solid backdrop below header — matches menu/help/feed expanded style.
+        // Slide offset — 20px from below for the standard UI feel
+        int detail_slide = (int)((1.0f - detail_alpha) * 20.0f);
+        auto da = [&](uint16_t c) -> uint16_t {
+            return lerp_col16(BG_COLOR, c, detail_alpha);
+        };
+
+        // Solid backdrop below header — wipes the row list.
         spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
-        // Override header with detection type (and name when meaningful).
+        // Override header with literal "DETAILS" — name moves into the body.
         spr.fillRect(0, 0, 120, 18, BG_COLOR);
-        spr.setTextColor(proto_col, BG_COLOR);
+        spr.setTextColor(da(HEADER_COLOR), BG_COLOR);
         spr.setTextSize(TS_BODY);
         spr.setCursor(4, 5);
+        kprint(spr, "DETAILS");
+
+        // First body row: device name (large, bright). Falls back to MAC
+        // tail when we don't have a meaningful name.
         bool dn_ok = (d_name[0] != '\0'
                       && strcmp(d_name, "Hidden")  != 0
                       && strcmp(d_name, "Unknown") != 0);
+        const char* big_name;
+        char mac_tail[12] = "";
         if (dn_ok) {
-            char hdr_str[32];
-            snprintf(hdr_str, sizeof(hdr_str), "%s / %s", proto_lbl, d_name);
-            kprint(spr, hdr_str);
+            big_name = d_name;
         } else {
-            kprint(spr, proto_lbl);
+            const char* sm = (strlen(d_mac) > 8) ? d_mac + 9 : d_mac;
+            strncpy(mac_tail, sm, 11); mac_tail[11] = '\0';
+            big_name = mac_tail;
         }
 
-        // Content rows — ACCENT label + TEXT value, drawn directly on BG.
-        int fy = 26;
-        const int row_gap = 16;
         const int label_x = 8;
         const int value_x = 70;
+        const int row_gap = 14;
+        int fy = 26 + detail_slide;
+
+        spr.setTextColor(da(TEXT_COLOR), BG_COLOR);
+        spr.setTextSize(TS_STRONG);
+        spr.setCursor(label_x, fy);
+        spr.print(big_name);
+        fy += (int)(TS_STRONG * 8.0f) + 6;  // extra space after the name
 
         auto detail_row = [&](const char* lbl, const char* val, uint16_t val_col = TEXT_COLOR) {
-            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+            spr.setTextColor(da(ACCENT_COLOR), BG_COLOR);
             spr.setTextSize(TS_BODY);
             spr.setCursor(label_x, fy);
             kprint(spr, lbl);
-            spr.setTextColor(val_col, BG_COLOR);
+            spr.setTextColor(da(val_col), BG_COLOR);
             spr.setCursor(value_x, fy);
             spr.print(val);
             fy += row_gap;
@@ -5270,11 +5327,11 @@ void draw_capture_history_screen() {
         if (d_method[0]) {
             char human[48];
             methods_to_human(d_method, human, sizeof(human));
-            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+            spr.setTextColor(da(ACCENT_COLOR), BG_COLOR);
             spr.setTextSize(TS_BODY);
             spr.setCursor(label_x, fy);
             kprint(spr, "MATCH");
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setTextColor(da(TEXT_COLOR), BG_COLOR);
             spr.setTextSize(TS_MICRO);
             spr.setCursor(value_x, fy);
             spr.print(human);
@@ -5287,7 +5344,7 @@ void draw_capture_history_screen() {
         }
 
         // Footer hint
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextColor(da(DIM_COLOR), BG_COLOR);
         spr.setTextSize(TS_MICRO);
         spr.setCursor(8, DISP_H - 10);
         spr.print("DEL or ENTER to close");
@@ -5354,7 +5411,47 @@ void draw_gps_screen() {
         return tz;
     };
 
+    // ─ Background starfield ──────────────────────────────────────────────
+    // Static positions, three brightness tiers, subtle per-star twinkle.
+    // Drawn before the globe so fillCircle erases any star inside the rim.
+    // White/grey only — works in both day and night palettes.
+    {
+        #define NUM_STARS 30
+        static int     star_x[NUM_STARS], star_y[NUM_STARS];
+        static uint8_t star_brightness[NUM_STARS];
+        static bool    stars_init = false;
+        if (!stars_init) {
+            for (int i = 0; i < NUM_STARS; i++) {
+                int sx, sy;
+                do {
+                    sx = random(2, 118);
+                    sy = random(20, DISP_H - 2);
+                } while ((sx - gx) * (sx - gx) + (sy - gy) * (sy - gy) <
+                         (gr + 6) * (gr + 6));
+                star_x[i] = sx;
+                star_y[i] = sy;
+                int tier = random(0, 3);
+                star_brightness[i] = (tier == 0) ? 30 : (tier == 1) ? 70 : 140;
+            }
+            stars_init = true;
+        }
+        for (int i = 0; i < NUM_STARS; i++) {
+            uint8_t b = star_brightness[i];
+            float twinkle = anim_pulse(2000 + i * 137, (float)i / NUM_STARS);
+            uint8_t tb = (uint8_t)(b * (0.8f + 0.4f * twinkle));
+            uint16_t star_col = lgfx::color565(tb, tb, tb);
+            spr.drawPixel(star_x[i], star_y[i], star_col);
+            if (b >= 140) {
+                uint8_t arm = tb / 3;
+                uint16_t dim_arm = lgfx::color565(arm, arm, arm);
+                spr.drawPixel(star_x[i] - 1, star_y[i], dim_arm);
+                spr.drawPixel(star_x[i] + 1, star_y[i], dim_arm);
+            }
+        }
+    }
+
     // Solid BG fill so globe interior matches screen background
+    // (also erases any starfield pixel that would land inside the rim).
     spr.fillCircle(gx, gy, gr, BG_COLOR);
 
     // ─ Latitude circles (every 30°, 5 lines) ─
@@ -5449,48 +5546,13 @@ void draw_gps_screen() {
                 return tz2;
             };
 
-            // Draw satellites as directional triangles pointing along the
-            // orbital tangent. Acquired = filled, unacquired = outline.
-            // Motion trails are 6-segment comet tails connected with lines.
+            // Draw satellites as wireframe triangles tumbling around their
+            // own center. No trails — the tumble + depth scaling carries
+            // the motion. Acquired sats are brighter, unacquired dimmer.
             float orbit_t = (float)frame_ms * pl.speed + pl.phase_off;
             for (int si = 0; si < pl.n_sats; si++) {
                 float base_ang = orbit_t + (float)si / (float)pl.n_sats * 2.0f * (float)M_PI;
 
-                // Motion trail: 6-segment comet tail behind each satellite
-                int prev_tx = -1, prev_ty = -1;
-                for (int tr = 5; tr >= 0; tr--) {
-                    float trail_ang = base_ang - (float)(tr + 1) * 0.08f;
-                    int tpx, tpy;
-                    float ttz = orb_proj_p(trail_ang, &tpx, &tpy);
-                    if (ttz > -0.3f) {
-                        float depth_fade = (ttz > 0.3f) ? 1.0f : (ttz + 0.3f) / 0.6f;
-                        if (depth_fade < 0.0f) depth_fade = 0.0f;
-                        if (depth_fade > 1.0f) depth_fade = 1.0f;
-                        float fade = 1.0f - (float)(tr + 1) / 7.0f;
-                        fade *= depth_fade;
-                        if (fade > 0.05f) {
-                            bool acquired = (si < sats);
-                            uint16_t trail_col = acquired
-                                ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.6f)
-                                : lerp_col16(BG_COLOR, DIM_COLOR, fade * 0.3f);
-                            if (prev_tx >= 0 && prev_ty >= 0) {
-                                spr.drawLine(prev_tx, prev_ty, tpx, tpy, trail_col);
-                            } else {
-                                spr.drawPixel(tpx, tpy, trail_col);
-                            }
-                            prev_tx = tpx;
-                            prev_ty = tpy;
-                        } else {
-                            prev_tx = -1;
-                            prev_ty = -1;
-                        }
-                    } else {
-                        prev_tx = -1;
-                        prev_ty = -1;
-                    }
-                }
-
-                // Main satellite — triangle pointing along the orbital tangent
                 int dpx, dpy;
                 float tz2 = orb_proj_p(base_ang, &dpx, &dpy);
                 if (tz2 > -0.3f) {
@@ -5504,25 +5566,27 @@ void draw_gps_screen() {
                         ? lerp_col16(BG_COLOR, GPS_COLOR, depth_fade)
                         : lerp_col16(BG_COLOR, DIM_COLOR, depth_fade * 0.5f);
 
-                    // Triangle points along the orbital tangent — the
-                    // satellite's direction of travel — so it reads as a
-                    // craft flying its path rather than a radial spike.
+                    // Orbital-tangent direction (used as the un-tumbled axis)
                     float dx = (float)(dpx - gx);
                     float dy = (float)(dpy - gy);
                     float dist = sqrtf(dx * dx + dy * dy);
                     if (dist < 1.0f) dist = 1.0f;
                     float raw_nx = dx / dist;
                     float raw_ny = dy / dist;
-                    float nx = -raw_ny;  // tangent = perpendicular to radial
+                    float nx = -raw_ny;
                     float ny =  raw_nx;
-                    // Perpendicular for triangle base
-                    float perpx = -ny;
-                    float perpy =  nx;
 
-                    // Depth-based size scaling: front-facing satellites
-                    // appear larger, back-facing ones smaller — gives a
-                    // parallax cue that pairs with the brightness fade.
-                    // tz2 in [-0.3 .. 1.0] → scale in [0.4 .. 1.0].
+                    // Tumble: each satellite rotates around its own center.
+                    // base_ang * 2 spreads phases between sats so they don't
+                    // tumble in lockstep.
+                    float tumble = (float)frame_ms * 0.003f + base_ang * 2.0f;
+                    float cos_t = cosf(tumble), sin_t = sinf(tumble);
+                    float tnx = nx * cos_t - ny * sin_t;
+                    float tny = nx * sin_t + ny * cos_t;
+                    float tperpx = -tny;
+                    float tperpy =  tnx;
+
+                    // Depth-based size scaling — front-facing sats larger.
                     float depth_scale = 0.5f + 0.5f * ((tz2 + 0.3f) / 1.3f);
                     if (depth_scale < 0.4f) depth_scale = 0.4f;
                     if (depth_scale > 1.0f) depth_scale = 1.0f;
@@ -5531,20 +5595,15 @@ void draw_gps_screen() {
                     float base_back = 2.0f * depth_scale;
                     float base_half = 4.0f * depth_scale;
 
-                    int tip_x  = dpx + (int)(nx * tip_dist);
-                    int tip_y  = dpy + (int)(ny * tip_dist);
-                    int base1x = dpx - (int)(nx * base_back) + (int)(perpx * base_half);
-                    int base1y = dpy - (int)(ny * base_back) + (int)(perpy * base_half);
-                    int base2x = dpx - (int)(nx * base_back) - (int)(perpx * base_half);
-                    int base2y = dpy - (int)(ny * base_back) - (int)(perpy * base_half);
+                    int tip_x  = dpx + (int)(tnx * tip_dist);
+                    int tip_y  = dpy + (int)(tny * tip_dist);
+                    int base1x = dpx - (int)(tnx * base_back) + (int)(tperpx * base_half);
+                    int base1y = dpy - (int)(tny * base_back) + (int)(tperpy * base_half);
+                    int base2x = dpx - (int)(tnx * base_back) - (int)(tperpx * base_half);
+                    int base2y = dpy - (int)(tny * base_back) - (int)(tperpy * base_half);
 
-                    if (acquired) {
-                        spr.fillTriangle(tip_x, tip_y, base1x, base1y,
-                                         base2x, base2y, sat_col);
-                    } else {
-                        spr.drawTriangle(tip_x, tip_y, base1x, base1y,
-                                         base2x, base2y, sat_col);
-                    }
+                    spr.drawTriangle(tip_x, tip_y, base1x, base1y,
+                                     base2x, base2y, sat_col);
                 }
             }
         }
@@ -6066,7 +6125,14 @@ void transition_screen(int new_screen, int dir) {
     if (new_screen == 2) {
         history_scroll_offset = 0;
         history_selected_idx = 0;
-        hist_detail_open = false;
+        hist_detail_open     = false;
+        hist_detail_closing  = false;
+        hist_detail_open_ms  = 0;
+        hist_detail_close_ms = 0;
+        // Seed the eased selection at the first row so there's no fly-in
+        // from a stale position when the user lands on the screen.
+        hist_sel_y_f         = (float)CONTENT_Y;
+        hist_last_frame_ms   = 0;
         // Short timed take so a stuck PersistTask can't freeze the screen
         // transition. If we miss this window, the screen renders with the
         // previous snapshot — sd_hist_dirty stays set so the next loop
@@ -7204,8 +7270,9 @@ void loop() {
                     draw_current_screen(); spr.pushSprite(0, 0);
                     continue;
                 }
-                if (current_screen == 2 && hist_detail_open) {
-                    hist_detail_open = false;
+                if (current_screen == 2 && hist_detail_open && !hist_detail_closing) {
+                    hist_detail_closing  = true;
+                    hist_detail_close_ms = millis();
                     draw_current_screen(); spr.pushSprite(0, 0);
                     continue;
                 }
@@ -7435,7 +7502,14 @@ void loop() {
                 if (!stealth_mode && current_screen == 2) {
                     int hist_total = sd_available ? sd_hist_count : capture_history_count;
                     if (hist_total > 0) {
-                        hist_detail_open = !hist_detail_open;
+                        if (!hist_detail_open) {
+                            hist_detail_open    = true;
+                            hist_detail_closing = false;
+                            hist_detail_open_ms = millis();
+                        } else if (!hist_detail_closing) {
+                            hist_detail_closing  = true;
+                            hist_detail_close_ms = millis();
+                        }
                         draw_current_screen(); spr.pushSprite(0, 0);
                     }
                 }
@@ -7523,7 +7597,14 @@ void loop() {
             } else if (current_screen == 2) {
                 int hist_total = sd_available ? sd_hist_count : capture_history_count;
                 if (hist_total > 0) {
-                    hist_detail_open = !hist_detail_open;
+                    if (!hist_detail_open) {
+                        hist_detail_open    = true;
+                        hist_detail_closing = false;
+                        hist_detail_open_ms = millis();
+                    } else if (!hist_detail_closing) {
+                        hist_detail_closing  = true;
+                        hist_detail_close_ms = millis();
+                    }
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
             }
@@ -7555,8 +7636,9 @@ void loop() {
             } else if (show_menu) {
                 show_menu = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
-            } else if (current_screen == 2 && hist_detail_open) {
-                hist_detail_open = false;
+            } else if (current_screen == 2 && hist_detail_open && !hist_detail_closing) {
+                hist_detail_closing  = true;
+                hist_detail_close_ms = millis();
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (current_screen != 0) {
                 // Nothing to close — go home to scanner
@@ -7774,8 +7856,22 @@ void loop() {
             }
         }
 
+        // Detections screen escalates while the selection ease is chasing
+        // its target or while the detail overlay open/close fade is in flight.
+        bool hist_animating = false;
+        if (current_screen == 2) {
+            int hist_target_y = CONTENT_Y +
+                (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
+            bool sel_settling = fabsf(hist_sel_y_f - (float)hist_target_y) > 0.5f;
+            bool open_running = (hist_detail_open && !hist_detail_closing &&
+                                 hist_detail_open_ms != 0 &&
+                                 (now - hist_detail_open_ms) < UI_FADE_IN_MS + 30);
+            hist_animating = sel_settling || open_running || hist_detail_closing;
+        }
+
         if (current_screen == 0 || current_screen == 1 || current_screen == 3 ||
             show_vol_overlay || toast_active || stats_scrolling || stats_rolling ||
+            hist_animating ||
             (now - last_fast_anim < 30)) {
             if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; screen_dirty = false; }
         }
