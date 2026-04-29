@@ -5341,8 +5341,8 @@ void draw_gps_screen() {
         // Fewer satellites (5 total instead of 7), spread across 2 planes.
         // Cleaner visual, bigger triangles have room to breathe.
         const OrbPlane planes[2] = {
-            { radians(55.0f), (float)(gr + 14), 0.0003f,  3, 0.0f },
-            { radians(80.0f), (float)(gr + 10), 0.0004f,  2, 1.05f },
+            { radians(55.0f), (float)(gr + 14), 0.00015f, 3, 0.0f },
+            { radians(80.0f), (float)(gr + 10), 0.0002f,  2, 1.05f },
         };
 
         // Per-plane projection lambda — applies globe tilt/roll then inclination
@@ -5369,31 +5369,44 @@ void draw_gps_screen() {
                 return tz2;
             };
 
-            // Draw satellites as directional triangles pointing outward
-            // from the globe center. Acquired = filled, unacquired = outline.
-            // Motion trails use single-pixel dots fading behind each triangle.
+            // Draw satellites as directional triangles pointing along the
+            // orbital tangent. Acquired = filled, unacquired = outline.
+            // Motion trails are 6-segment comet tails connected with lines.
             float orbit_t = (float)frame_ms * pl.speed + pl.phase_off;
             for (int si = 0; si < pl.n_sats; si++) {
                 float base_ang = orbit_t + (float)si / (float)pl.n_sats * 2.0f * (float)M_PI;
 
-                // Motion trail: 3 fading dots behind each satellite
-                for (int tr = 2; tr >= 0; tr--) {
-                    float trail_ang = base_ang - (float)(tr + 1) * 0.10f;
+                // Motion trail: 6-segment comet tail behind each satellite
+                int prev_tx = -1, prev_ty = -1;
+                for (int tr = 5; tr >= 0; tr--) {
+                    float trail_ang = base_ang - (float)(tr + 1) * 0.08f;
                     int tpx, tpy;
                     float ttz = orb_proj_p(trail_ang, &tpx, &tpy);
                     if (ttz > -0.3f) {
                         float depth_fade = (ttz > 0.3f) ? 1.0f : (ttz + 0.3f) / 0.6f;
                         if (depth_fade < 0.0f) depth_fade = 0.0f;
                         if (depth_fade > 1.0f) depth_fade = 1.0f;
-                        float fade = 1.0f - (float)(tr + 1) / 4.0f;
+                        float fade = 1.0f - (float)(tr + 1) / 7.0f;
                         fade *= depth_fade;
                         if (fade > 0.05f) {
                             bool acquired = (si < sats);
                             uint16_t trail_col = acquired
-                                ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.5f)
+                                ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.6f)
                                 : lerp_col16(BG_COLOR, DIM_COLOR, fade * 0.3f);
-                            spr.drawPixel(tpx, tpy, trail_col);
+                            if (prev_tx >= 0 && prev_ty >= 0) {
+                                spr.drawLine(prev_tx, prev_ty, tpx, tpy, trail_col);
+                            } else {
+                                spr.drawPixel(tpx, tpy, trail_col);
+                            }
+                            prev_tx = tpx;
+                            prev_ty = tpy;
+                        } else {
+                            prev_tx = -1;
+                            prev_ty = -1;
                         }
+                    } else {
+                        prev_tx = -1;
+                        prev_ty = -1;
                     }
                 }
 
@@ -5426,14 +5439,14 @@ void draw_gps_screen() {
                     float perpx = -ny;
                     float perpy =  nx;
 
-                    // Tip 5px ahead, base 2px behind + 3px to each side.
+                    // Tip 7px ahead, base 2px behind + 4px to each side.
                     // Sized to be individually legible on the 240x135 display.
-                    int tip_x  = dpx + (int)(nx * 5.0f);
-                    int tip_y  = dpy + (int)(ny * 5.0f);
-                    int base1x = dpx - (int)(nx * 2.0f) + (int)(perpx * 3.0f);
-                    int base1y = dpy - (int)(ny * 2.0f) + (int)(perpy * 3.0f);
-                    int base2x = dpx - (int)(nx * 2.0f) - (int)(perpx * 3.0f);
-                    int base2y = dpy - (int)(ny * 2.0f) - (int)(perpy * 3.0f);
+                    int tip_x  = dpx + (int)(nx * 7.0f);
+                    int tip_y  = dpy + (int)(ny * 7.0f);
+                    int base1x = dpx - (int)(nx * 2.0f) + (int)(perpx * 4.0f);
+                    int base1y = dpy - (int)(ny * 2.0f) + (int)(perpy * 4.0f);
+                    int base2x = dpx - (int)(nx * 2.0f) - (int)(perpx * 4.0f);
+                    int base2y = dpy - (int)(ny * 2.0f) - (int)(perpy * 4.0f);
 
                     if (acquired) {
                         spr.fillTriangle(tip_x, tip_y, base1x, base1y,
