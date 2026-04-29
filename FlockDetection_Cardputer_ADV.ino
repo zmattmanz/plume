@@ -578,9 +578,9 @@ volatile bool sd_hist_dirty = false;
 
 // Stats screen vertical scroll (Option D — uniform card grid).
 static int stats_scroll_y = 0;
-static const int STATS_CONTENT_H   = 262;  // total virtual height of the card grid
+static const int STATS_CONTENT_H   = 290;  // total virtual height (hero 50 + 6×34 + 7×6 gaps)
 static const int STATS_VIEW_H      = 115;  // DISP_H - CONTENT_Y
-static const int STATS_SCROLL_STEP = 38;   // one card height (34) + gap (4)
+static const int STATS_SCROLL_STEP = 40;   // one standard card height (34) + gap (6)
 
 #define TOAST_QUEUE_SIZE 3
 struct ToastEntry {
@@ -5612,14 +5612,14 @@ void draw_device_info_screen() {
     const int x_full   = 4;        // full-width card x
     const int w_full   = 224;      // 240 - 8 (right edge at 228, scrollbar gutter 6 + track at 234)
     const int x_t1     = 4;        // triple-card x positions
-    const int x_t2     = 78;
-    const int x_t3     = 152;
+    const int x_t2     = 80;       // x_t1 + 70 + 6 gap
+    const int x_t3     = 156;      // x_t2 + 70 + 6 gap
     const int w_tA     = 70;       // first two triple widths
-    const int w_tC     = 74;       // last triple width (slightly wider — uses remaining space)
+    const int w_tC     = 72;       // last triple — absorbs the rounding
     const int x_h1     = 4;        // half-card x positions
-    const int x_h2     = 117;
+    const int x_h2     = 119;      // x_h1 + 109 + 6 gap
     const int w_half   = 109;
-    const int H_HERO   = 34;
+    const int H_HERO   = 50;       // accommodates TS_H1 value without crowding label
     const int H_NORMAL = 34;
 
     auto card = [&](int vx, int vy, int w, int h, const char* label, const char* value,
@@ -5634,32 +5634,32 @@ void draw_device_info_screen() {
     // into the header strip or off the bottom edge.
     spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
 
-    // Row 1 (vy = 0):   DETECTIONS hero, full width, big value
+    // Row 1 (vy = 0):   DETECTIONS hero, full width, 50px tall, big value
     card(x_full, 0,  w_full, H_HERO, "DETECTIONS", det_str, TS_H1);
 
-    // Row 2 (vy = 38):  WIFI | BLE | RAVEN
-    card(x_t1, 38, w_tA, H_NORMAL, "WIFI",  wifi_str);
-    card(x_t2, 38, w_tA, H_NORMAL, "BLE",   ble_str);
-    card(x_t3, 38, w_tC, H_NORMAL, "RAVEN", raven_str);
+    // Row 2 (vy = 56):  WIFI | BLE | RAVEN
+    card(x_t1, 56, w_tA, H_NORMAL, "WIFI",  wifi_str);
+    card(x_t2, 56, w_tA, H_NORMAL, "BLE",   ble_str);
+    card(x_t3, 56, w_tC, H_NORMAL, "RAVEN", raven_str);
 
-    // Row 3 (vy = 76):  SESSION | LIFETIME
-    card(x_h1, 76, w_half, H_NORMAL, "SESSION",  sess_str);
-    card(x_h2, 76, w_half, H_NORMAL, "LIFETIME", life_str);
+    // Row 3 (vy = 96):  SESSION | LIFETIME
+    card(x_h1, 96, w_half, H_NORMAL, "SESSION",  sess_str);
+    card(x_h2, 96, w_half, H_NORMAL, "LIFETIME", life_str);
 
-    // Row 4 (vy = 114): BATTERY | HEAP
-    card(x_h1, 114, w_half, H_NORMAL, "BATTERY", volt_str);
-    card(x_h2, 114, w_half, H_NORMAL, "HEAP",    heap_str);
+    // Row 4 (vy = 136): BATTERY | HEAP
+    card(x_h1, 136, w_half, H_NORMAL, "BATTERY", volt_str);
+    card(x_h2, 136, w_half, H_NORMAL, "HEAP",    heap_str);
 
-    // Row 5 (vy = 152): PACKETS | SD CARD
-    card(x_h1, 152, w_half, H_NORMAL, "PACKETS", pkt_str);
-    card(x_h2, 152, w_half, H_NORMAL, "SD CARD", sd_str);
+    // Row 5 (vy = 176): PACKETS | SD CARD
+    card(x_h1, 176, w_half, H_NORMAL, "PACKETS", pkt_str);
+    card(x_h2, 176, w_half, H_NORMAL, "SD CARD", sd_str);
 
-    // Row 6 (vy = 190): BOOTS | FLASH
-    card(x_h1, 190, w_half, H_NORMAL, "BOOTS", boots_str);
-    card(x_h2, 190, w_half, H_NORMAL, "FLASH", flash_str);
+    // Row 6 (vy = 216): BOOTS | FLASH
+    card(x_h1, 216, w_half, H_NORMAL, "BOOTS", boots_str);
+    card(x_h2, 216, w_half, H_NORMAL, "FLASH", flash_str);
 
-    // Row 7 (vy = 228): VERSION (half width, left only)
-    card(x_h1, 228, w_half, H_NORMAL, "VERSION", VERSION_STRING);
+    // Row 7 (vy = 256): VERSION (half width, left only)
+    card(x_h1, 256, w_half, H_NORMAL, "VERSION", "v9.6");
 
     spr.clearClipRect();
 
