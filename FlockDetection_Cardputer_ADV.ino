@@ -606,7 +606,7 @@ static const int STATS_CONTENT_H   = 302;  // hero 50 + 6×36 + 6×6 gaps
 static const int STATS_VIEW_H      = 115;  // DISP_H - CONTENT_Y
 static const int STATS_SCROLL_STEP = 42;   // one standard card (36) + gap (6)
 static const int STATS_MAX_SCROLL  = STATS_CONTENT_H - STATS_VIEW_H;
-static const float STATS_SCROLL_TC = 120.0f;  // ms — snappy easing tier
+static const float STATS_SCROLL_TC = 80.0f;   // ms — snappier; 120 felt sluggish
 
 // Stats screen roll-up animation state — one slot per card index.
 // New value vs prev value is checked each draw; if changed, roll_start
@@ -5435,7 +5435,10 @@ void draw_gps_screen() {
         }
         for (int i = 0; i < NUM_STARS; i++) {
             float twinkle = anim_pulse(3000 + i * 200, (float)i / (float)NUM_STARS);
-            uint8_t b = (uint8_t)(20 + twinkle * 60);  // 20..80 brightness range
+            // 60..180 brightness — 20..80 was below the LCD's perceptual
+            // floor with the backlight on; baseline 60 keeps stars visible
+            // while the +120 swing still reads as a twinkle.
+            uint8_t b = (uint8_t)(60 + twinkle * 120);
             uint16_t star_col = lgfx::color565(b, b, b);
             spr.drawPixel(star_x[i], star_y[i], star_col);
         }
@@ -5714,15 +5717,19 @@ static void draw_stat_card(int x, int y, int w, int h,
                            unsigned long* char_anim_ms = nullptr) {
     spr.drawRoundRect(x, y, w, h, 4, HEADER_COLOR);
 
+    // 8px inner inset (UI_PAD_SM + UI_PAD_XS) so glyphs aren't crowding
+    // the 1px outline. Same value used for label and value.
+    const int card_inset = UI_PAD_SM + UI_PAD_XS;
+
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(x + UI_PAD_SM, y + UI_PAD_SM);
+    spr.setCursor(x + card_inset, y + UI_PAD_SM);
     kprint(spr, label, 2);
 
     int value_glyph_h  = (int)(value_size * 8.0f);
     int char_w         = (int)(value_size * 6.0f);
     int value_target_y = y + h - value_glyph_h - UI_PAD_SM;
-    int value_x        = x + UI_PAD_SM;
+    int value_x        = x + card_inset;
 
     int len = (int)strlen(value);
     if (len > STAT_MAX_CHARS) len = STAT_MAX_CHARS;
@@ -7902,7 +7909,21 @@ void loop() {
             show_vol_overlay || toast_active || stats_scrolling || stats_rolling ||
             hist_animating ||
             (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; screen_dirty = false; }
+            // Stats screen caps at 30 fps to suppress the SPI/scan-line
+            // tearing that 60 fps pushes produced. Other animated screens
+            // stay at 60 fps where the artifact isn't visible.
+            unsigned long min_frame_ms = (current_screen == 4) ? 33 : 15;
+            if (now - last_fast_anim >= min_frame_ms) {
+                draw_current_screen();
+                // startWrite/endWrite holds FSPI for the entire push so
+                // an SD transfer on the same bus can't interleave bytes
+                // mid-frame and tear the image.
+                M5Cardputer.Display.startWrite();
+                spr.pushSprite(0, 0);
+                M5Cardputer.Display.endWrite();
+                last_fast_anim = now;
+                screen_dirty = false;
+            }
         }
         else {
             // Screen 4 has a live SESSION timer — force a redraw every 1s
@@ -7917,7 +7938,10 @@ void loop() {
             }
             if (now - last_slow_ui >= 100) {
                 if (screen_dirty || toast_active) {
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen();
+                    M5Cardputer.Display.startWrite();
+                    spr.pushSprite(0, 0);
+                    M5Cardputer.Display.endWrite();
                     screen_dirty = false;
                 }
                 last_slow_ui = now;
