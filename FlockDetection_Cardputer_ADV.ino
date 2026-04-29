@@ -1918,6 +1918,82 @@ static float noise_a[NUM_PARTICLES] = {0};
 static int noise_life[NUM_PARTICLES] = {0};
 static int noise_max_life[NUM_PARTICLES] = {0};
 
+// Per-frame radar snapshot — populated by update_radar_data() and read by
+// both draw_scanner_screen() and the ambient-mode renderer. Hoisted to
+// file scope so ambient mode can render the same blip data the scanner
+// would, without re-running the mutex critical section.
+static float        local_spikes[NUM_RADIAL_BANDS] = {0};
+static uint16_t     local_colors[NUM_RADIAL_BANDS] = {0};
+static unsigned long radar_time_since_blip = 0;
+
+// Drive particle activation from packet counts, decay particle lifetimes,
+// and decay+snapshot radial spikes for the current frame. Idempotent per
+// frame — call once before rendering. Both scanner and ambient call this
+// so ambient mode keeps the radar data alive while the scanner screen is
+// not being drawn.
+static void update_radar_data(unsigned long frame_ms) {
+    static bool p_init = false;
+    if (!p_init) {
+        for (int i = 0; i < NUM_PARTICLES; i++) {
+            noise_r[i]        = (float)random(inner_r + 4, radar_r - 4);
+            noise_a[i]        = random(0, 628) * 0.01f;
+            noise_max_life[i] = random(1200, 2200);
+            noise_life[i]     = 0;
+        }
+        p_init = true;
+    }
+
+    // Particle activation from real packet activity
+    static uint32_t last_ambient_count = 0;
+    static int      particle_pending   = 0;
+    uint32_t cur_ambient = ambient_packet_count;
+    uint32_t delta       = cur_ambient - last_ambient_count;
+    last_ambient_count   = cur_ambient;
+    particle_pending += (int)delta * 2;
+    if (particle_pending > NUM_PARTICLES * 3) particle_pending = NUM_PARTICLES * 3;
+    for (int i = 0; i < NUM_PARTICLES && particle_pending > 0; i++) {
+        if (noise_life[i] <= 0) {
+            noise_r[i]    = (float)random(inner_r + 4, radar_r - 4);
+            noise_a[i]    = random(0, 628) * 0.01f;
+            noise_life[i] = noise_max_life[i];
+            particle_pending--;
+        }
+    }
+
+    // Spike decay + snapshot under mutex (one critical section)
+    static const float SPIKE_DECAY_PER_MS = 0.00004f;
+    static unsigned long last_decay_ms = 0;
+    float decay_amount = SPIKE_DECAY_PER_MS * (float)(frame_ms - last_decay_ms);
+    last_decay_ms = frame_ms;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    radar_time_since_blip = frame_ms - last_blip_time;
+    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
+        // 2-minute max blip lifetime
+        if (radial_spike_birth[i] > 0 && (frame_ms - radial_spike_birth[i]) > 120000UL) {
+            radial_spikes[i]      = 0;
+            radial_spike_birth[i] = 0;
+        }
+        local_spikes[i] = radial_spikes[i];
+        local_colors[i] = radial_colors[i];
+        radial_spikes[i] -= decay_amount;
+        if (radial_spikes[i] < 0) radial_spikes[i] = 0;
+    }
+    xSemaphoreGive(dataMutex);
+
+    // Particle life decay
+    static unsigned long last_particle_ms = 0;
+    unsigned long dt_ms = frame_ms - last_particle_ms;
+    if (dt_ms > 100) dt_ms = 100;
+    last_particle_ms = frame_ms;
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        if (noise_life[i] > 0) {
+            noise_life[i] -= (int)dt_ms;
+            if (noise_life[i] < 0) noise_life[i] = 0;
+        }
+    }
+}
+
 static bool feed_recently_pushed(const char* mac) {
     unsigned long now = millis();
     for (int i = 0; i < feed_count; i++) {
@@ -4135,71 +4211,13 @@ void draw_scanner_screen() {
     spr.drawEllipse(rcx, rcy + 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
 
     float sweep_rad = (frame_ms / 3000.0f) * (float)M_PI * 2.0f;
-
-    static bool p_init = false;
-    if (!p_init) {
-        for (int i = 0; i < NUM_PARTICLES; i++) {
-            noise_r[i]        = (float)random(inner_r + 4, radar_r - 4);
-            noise_a[i]        = random(0, 628) * 0.01f;
-            noise_max_life[i] = random(1200, 2200);
-            noise_life[i]     = 0;
-        }
-        p_init = true;
-    }
-
-    const float TWO_PIf      = (float)M_PI * 2.0f;
+    const float TWO_PIf = (float)M_PI * 2.0f;
     float sweep_norm = fmodf(sweep_rad, TWO_PIf);
 
-    // Drive particles from real ambient packet activity
-    {
-        static uint32_t last_ambient_count = 0;
-        static int particle_pending = 0;
-        uint32_t cur_ambient = ambient_packet_count;
-        uint32_t delta = cur_ambient - last_ambient_count;
-        last_ambient_count = cur_ambient;
-        // Each packet contributes 1–3 particles (clamped)
-        particle_pending += (int)delta * 2;
-        if (particle_pending > NUM_PARTICLES * 3) particle_pending = NUM_PARTICLES * 3;
-        // Activate up to particle_pending idle particles this frame
-        for (int i = 0; i < NUM_PARTICLES && particle_pending > 0; i++) {
-            if (noise_life[i] <= 0) {
-                noise_r[i]    = (float)random(inner_r + 4, radar_r - 4);
-                noise_a[i]    = random(0, 628) * 0.01f;
-                noise_life[i] = noise_max_life[i];
-                particle_pending--;
-            }
-        }
-    }
-
-    // Static to avoid stack pressure — rendering is single-threaded from loop().
-    static float local_spikes[NUM_RADIAL_BANDS];
-    static uint16_t local_colors[NUM_RADIAL_BANDS];
-
-    static const float SPIKE_DECAY_PER_MS = 0.00004f;
-    static unsigned long last_decay_ms = 0;
-    unsigned long now_ms = millis();
-    float decay_amount = SPIKE_DECAY_PER_MS * (float)(now_ms - last_decay_ms);
-
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    unsigned long time_since_blip = now_ms - last_blip_time;
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        // Enforce 2-minute max detection lifetime
-        if (radial_spike_birth[i] > 0 && (now_ms - radial_spike_birth[i]) > 120000UL) {
-            radial_spikes[i]      = 0;
-            radial_spike_birth[i] = 0;
-        }
-        local_spikes[i] = radial_spikes[i];
-        local_colors[i] = radial_colors[i];
-        radial_spikes[i] -= decay_amount;
-        if (radial_spikes[i] < 0) radial_spikes[i] = 0;
-    }
-    xSemaphoreGive(dataMutex);
-    last_decay_ms = now_ms;
-
-    static unsigned long last_particle_ms = 0;
-    unsigned long dt_ms = now_ms - last_particle_ms;
-    if (dt_ms > 100) dt_ms = 100;
-    last_particle_ms = now_ms;
+    // Particle driver, spike decay, and snapshot are shared with ambient
+    // mode — see update_radar_data().
+    update_radar_data(frame_ms);
+    unsigned long time_since_blip = radar_time_since_blip;
 
     float noise_dimming = 1.0f;
     if (time_since_blip < 10000) {
@@ -4211,9 +4229,6 @@ void draw_scanner_screen() {
     if (noise_dimming > 0.01f) {
         for (int i = 0; i < NUM_PARTICLES; i++) {
             if (noise_life[i] <= 0) continue;
-
-            noise_life[i] -= (int)dt_ms;
-            if (noise_life[i] < 0) noise_life[i] = 0;
 
             float fade = (float)noise_life[i] / (float)noise_max_life[i];
             int intensity = (int)(fade * 180.0f * noise_dimming);
@@ -7822,36 +7837,174 @@ void loop() {
     }
 
     if (ambient_mode) {
+        // Fullscreen radar — flat circles centered on the display, driven
+        // by the same particle/blip data the scanner uses (via shared
+        // update_radar_data). Sweeps and particles render dimmer so the
+        // screen reads as "idle". A small detection counter sits in the
+        // bottom-right corner and flashes ACCENT briefly after each blip.
         static unsigned long last_ambient_draw = 0;
-        static float amb_x = DISP_W / 2.0f, amb_y = DISP_H / 2.0f;
-        static float amb_vx = 0.7f, amb_vy = 0.5f;
         unsigned long now_amb = millis();
-        if (now_amb - last_ambient_draw > 33) {  // ~30fps
+        if (now_amb - last_ambient_draw > 33) {  // ~30 fps
+            spr.fillSprite(BG_COLOR);
+
+            const int   amb_cx       = DISP_W / 2;            // 120
+            const int   amb_cy       = DISP_H / 2;            // 67
+            const int   amb_r        = 60;
+            const int   amb_inner_r  = 20;
+            const float TWO_PIf      = (float)M_PI * 2.0f;
+
+            unsigned long frame_ms = now_amb;
+            update_radar_data(frame_ms);
+
+            // Sweep math
+            float sweep_rad  = (frame_ms / 3000.0f) * TWO_PIf;
+            float sweep_norm = fmodf(sweep_rad, TWO_PIf);
+
+            // Concentric rings
+            spr.drawCircle(amb_cx, amb_cy, amb_r,        CARD_BORDER);
+            spr.drawCircle(amb_cx, amb_cy, amb_inner_r,  CARD_BORDER);
+            spr.drawCircle(amb_cx, amb_cy, (amb_r + amb_inner_r) / 2, CARD_BORDER);
+
+            // Rotating crosshairs — DIM_COLOR (subdued vs scanner)
+            float    breathe   = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;
+            uint16_t cross_col = (breathe > 0) ? DIM_COLOR : CARD_BORDER;
+            int   dynamic_r = (amb_r - 6) + (int)(6 * breathe);
+            float cos_rot   = cosf(hud_rotation);
+            float sin_rot   = sinf(hud_rotation);
+            spr.drawLine(amb_cx - dynamic_r * cos_rot, amb_cy - dynamic_r * sin_rot,
+                         amb_cx + dynamic_r * cos_rot, amb_cy + dynamic_r * sin_rot, cross_col);
+            spr.drawLine(amb_cx - dynamic_r * -sin_rot, amb_cy - dynamic_r * cos_rot,
+                         amb_cx + dynamic_r * -sin_rot, amb_cy + dynamic_r * cos_rot, cross_col);
+
+            // Sweep trail — half-bright vs scanner
+            for (int i = 1; i <= 24; i++) {
+                float trail_angle = sweep_rad - (i * 0.05f);
+                float ratio = (24.0f - i) / 24.0f;
+                int tr = (int)(5  + (0   - 5)   * ratio);
+                int tg = (int)(10 + (120 - 10)  * ratio);
+                int tb = (int)(24 + (130 - 24)  * ratio);
+                uint16_t fade_col = night_mode
+                    ? lgfx::color565(tb / 2, 0, 0)
+                    : lgfx::color565(tr, tg, tb);
+                for (int r_step = amb_inner_r + 2; r_step < amb_r; r_step += 3) {
+                    spr.drawPixel(amb_cx + (int)(r_step * cosf(trail_angle)),
+                                  amb_cy + (int)(r_step * sinf(trail_angle)), fade_col);
+                }
+            }
+            // Sweep line — DIM_COLOR (was HEADER_COLOR on scanner)
+            spr.drawLine(amb_cx, amb_cy,
+                         amb_cx + (int)((amb_r - 1) * cosf(sweep_rad)),
+                         amb_cy + (int)((amb_r - 1) * sinf(sweep_rad)), DIM_COLOR);
+
+            // Particles — same life/sweep-trail logic as scanner, scaled
+            // radius and halved intensity for ambient feel.
+            unsigned long time_since_blip = radar_time_since_blip;
+            float noise_dimming = 1.0f;
+            if (time_since_blip < 10000)      noise_dimming = 0.0f;
+            else if (time_since_blip < 13000) noise_dimming = (time_since_blip - 10000) / 3000.0f;
+
+            if (noise_dimming > 0.01f) {
+                for (int i = 0; i < NUM_PARTICLES; i++) {
+                    if (noise_life[i] <= 0) continue;
+                    float fade = (float)noise_life[i] / (float)noise_max_life[i];
+                    int intensity = (int)(fade * 180.0f * noise_dimming);
+                    if (intensity > 200) intensity = 200;
+                    if (intensity < 20) continue;
+
+                    float pa = fmodf(noise_a[i], TWO_PIf);
+                    float diff_sweep = sweep_norm - pa;
+                    if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
+                    if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
+                    float trail_arc = 2.0f;
+                    if (diff_sweep < 0) diff_sweep += TWO_PIf;
+                    if (diff_sweep > trail_arc) continue;
+                    float sweep_proximity = 1.0f - (diff_sweep / trail_arc);
+                    int sweep_boost = (int)(sweep_proximity * 80);
+                    int total_intensity = intensity + sweep_boost;
+                    if (total_intensity > 255) total_intensity = 255;
+                    int total_intensity_amb = total_intensity / 2;  // ambient is dimmer
+
+                    // Scale particle r from scanner range → ambient range
+                    float scaled_r = ((noise_r[i] - (float)inner_r) / (float)(radar_r - inner_r))
+                                   * (float)(amb_r - amb_inner_r) + (float)amb_inner_r;
+
+                    int px = amb_cx + (int)(scaled_r * cosf(noise_a[i]));
+                    int py = amb_cy + (int)(scaled_r * sinf(noise_a[i]));
+
+                    uint16_t p_col = night_mode
+                        ? lgfx::color565(total_intensity_amb, total_intensity_amb / 8, total_intensity_amb / 12)
+                        : lgfx::color565(total_intensity_amb / 3, (total_intensity_amb * 3) / 4, total_intensity_amb);
+
+                    spr.drawTriangle(px - 1, py + 1, px + 1, py + 1, px, py - 2, p_col);
+                }
+            }
+
+            // Detection blips — same triangle/diamond shape vocabulary as
+            // scanner, larger spike cap to suit the fullscreen radar.
+            float angle_step = TWO_PIf / NUM_RADIAL_BANDS;
+            for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
+                if (local_spikes[i] < 0.05f) continue;
+                float a = i * angle_step;
+                bool is_strong = (local_spikes[i] > 0.8f);
+
+                int spike_len = (int)((amb_r - amb_inner_r) * local_spikes[i] * 0.7f);
+                if (spike_len < 3)  spike_len = 3;
+                if (spike_len > 35) spike_len = 35;
+
+                float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
+                int blip_dist = amb_inner_r + 4 + (int)((amb_r - amb_inner_r - 6) * dist_ratio);
+
+                int base_x = amb_cx + (int)(blip_dist * cosf(a));
+                int base_y = amb_cy + (int)(blip_dist * sinf(a));
+                uint16_t line_col = local_colors[i];
+
+                if (is_strong) {
+                    int shape_bottom = base_y - spike_len + 8;
+                    if (shape_bottom < base_y) {
+                        spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
+                    }
+                    bool is_ble_blip = (line_col == PURPLE_COLOR);
+                    int tip_y = base_y - spike_len;
+                    if (is_ble_blip) {
+                        int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
+                        spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
+                        spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
+                        spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
+                        spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
+                    } else {
+                        spr.drawTriangle(base_x - 4, tip_y + 7,
+                                         base_x + 4, tip_y + 7,
+                                         base_x,     tip_y, line_col);
+                    }
+                } else {
+                    spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
+                }
+            }
+
+            // Advance the HUD rotation so re-entering the scanner doesn't jump.
+            hud_rotation = fmodf(hud_rotation + 0.0033f, TWO_PIf);
+
+            // Detection counter — bottom-right, flashes ACCENT briefly
+            // after a fresh blip, otherwise dim.
             long det_total;
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             det_total = session_flock_wifi + session_flock_ble + session_raven;
             xSemaphoreGive(dataMutex);
-
-            // Bounce the text block (approx 48px wide, 26px tall)
-            const int text_half_w = 24, text_half_h = 13;
-            amb_x += amb_vx;
-            amb_y += amb_vy;
-            if (amb_x - text_half_w < 2)  { amb_x = 2 + text_half_w;  amb_vx = fabsf(amb_vx); }
-            if (amb_x + text_half_w > DISP_W - 2) { amb_x = DISP_W - 2 - text_half_w; amb_vx = -fabsf(amb_vx); }
-            if (amb_y - text_half_h < 2)  { amb_y = 2 + text_half_h;  amb_vy = fabsf(amb_vy); }
-            if (amb_y + text_half_h > DISP_H - 2) { amb_y = DISP_H - 2 - text_half_h; amb_vy = -fabsf(amb_vy); }
-
-            spr.fillSprite(BG_COLOR);
-            char det_buf[16];
-            snprintf(det_buf, sizeof(det_buf), "%ld", det_total);
-            spr.setTextDatum(MC_DATUM);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(TS_H1);
-            spr.drawString(det_buf, (int)amb_x, (int)amb_y - 6);
+            uint16_t det_col = (time_since_blip < 3000) ? ACCENT_COLOR : DIM_COLOR;
+            char det_str[16];
+            snprintf(det_str, sizeof(det_str), "D:%ld", det_total);
+            int det_w = (int)strlen(det_str) * 6;  // TS_MICRO char width
+            spr.setTextColor(det_col, BG_COLOR);
             spr.setTextSize(TS_MICRO);
-            spr.drawString("DETECTIONS", (int)amb_x, (int)amb_y + 16);
-            spr.setTextDatum(TL_DATUM);
+            spr.setCursor(DISP_W - det_w - 4, DISP_H - 9);
+            spr.print(det_str);
+
+            // Toast still shows on top so alerts surface in ambient mode.
+            draw_toast_spr();
+
+            M5Cardputer.Display.startWrite();
             spr.pushSprite(0, 0);
+            M5Cardputer.Display.endWrite();
             last_ambient_draw = now_amb;
         }
     } else if (stealth_mode) {
