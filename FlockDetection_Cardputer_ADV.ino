@@ -5397,7 +5397,7 @@ void draw_gps_screen() {
                     }
                 }
 
-                // Main satellite — triangle pointing outward from globe center
+                // Main satellite — triangle pointing along the orbital tangent
                 int dpx, dpy;
                 float tz2 = orb_proj_p(base_ang, &dpx, &dpy);
                 if (tz2 > -0.3f) {
@@ -5411,20 +5411,22 @@ void draw_gps_screen() {
                         ? lerp_col16(BG_COLOR, GPS_COLOR, depth_fade)
                         : lerp_col16(BG_COLOR, DIM_COLOR, depth_fade * 0.5f);
 
-                    // Triangle pointing radially outward from globe center.
-                    // Compute the outward unit vector from globe center to
-                    // satellite position, then build a 5px triangle along it.
+                    // Triangle points along the orbital tangent — the
+                    // satellite's direction of travel — so it reads as a
+                    // craft flying its path rather than a radial spike.
                     float dx = (float)(dpx - gx);
                     float dy = (float)(dpy - gy);
                     float dist = sqrtf(dx * dx + dy * dy);
                     if (dist < 1.0f) dist = 1.0f;
-                    float nx = dx / dist;  // outward unit vector
-                    float ny = dy / dist;
+                    float raw_nx = dx / dist;
+                    float raw_ny = dy / dist;
+                    float nx = -raw_ny;  // tangent = perpendicular to radial
+                    float ny =  raw_nx;
                     // Perpendicular for triangle base
                     float perpx = -ny;
                     float perpy =  nx;
 
-                    // Tip 5px outward, base 2px inward + 3px to each side.
+                    // Tip 5px ahead, base 2px behind + 3px to each side.
                     // Sized to be individually legible on the 240x135 display.
                     int tip_x  = dpx + (int)(nx * 5.0f);
                     int tip_y  = dpy + (int)(ny * 5.0f);
