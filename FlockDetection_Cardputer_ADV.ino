@@ -4245,30 +4245,14 @@ void draw_scanner_screen() {
     }
 
     // ── Left panel: 2.4GHz waveform ──
-    // Ring buffer of recent ambient_packet_count deltas, sampled every
-    // 200 ms. Renders as a sinusoidal line whose amplitude tracks the
-    // packet rate — quiet RF flatlines, busy bursts spike.
+    // Continuous scrolling sine wave. Amplitude is exponentially smoothed
+    // from recent ambient_packet_count deltas — busy RF makes the wave
+    // tall, quiet RF flattens it. Two overlapping frequencies give it an
+    // organic look instead of a perfect textbook sine.
     {
-        #define WAVE_SAMPLES 48
-        static uint8_t       wave_data[WAVE_SAMPLES] = {0};
-        static int           wave_head = 0;
-        static unsigned long wave_last_sample = 0;
-        static uint32_t      wave_last_pkt_count = 0;
-
-        if (wave_last_sample == 0 || frame_ms - wave_last_sample >= 200) {
-            uint32_t cur_pkt = ambient_packet_count;
-            uint32_t delta   = cur_pkt - wave_last_pkt_count;
-            wave_last_pkt_count = cur_pkt;
-            uint32_t scaled  = delta * 5;
-            if (scaled > 255) scaled = 255;
-            wave_data[wave_head] = (uint8_t)scaled;
-            wave_head = (wave_head + 1) % WAVE_SAMPLES;
-            wave_last_sample = frame_ms;
-        }
-
-        const int wave_x = 4;
+        const int wave_x = 6;
         const int wave_y = CONTENT_Y + 52;
-        const int wave_w = 104;
+        const int wave_w = 100;
         const int wave_h = 50;
 
         spr.drawRoundRect(wave_x, wave_y, wave_w, wave_h, 4, CARD_BORDER);
@@ -4286,14 +4270,36 @@ void draw_scanner_screen() {
 
         spr.drawFastHLine(plot_x, mid_y, plot_w, CARD_BORDER);
 
+        static float         wave_amplitude = 0.3f;
+        static uint32_t      wave_prev_pkt = 0;
+        static unsigned long wave_last_amp_update = 0;
+
+        if (frame_ms - wave_last_amp_update >= 500) {
+            uint32_t delta = ambient_packet_count - wave_prev_pkt;
+            wave_prev_pkt = ambient_packet_count;
+            float target = (float)delta / 40.0f;
+            if (target < 0.1f) target = 0.1f;
+            if (target > 1.0f) target = 1.0f;
+            wave_amplitude += (target - wave_amplitude) * 0.3f;
+            wave_last_amp_update = frame_ms;
+        }
+
+        float scroll = (float)frame_ms * 0.002f;
+        float max_amp = (float)(plot_h / 2 - 2) * wave_amplitude;
+
         int prev_px = -1, prev_py = -1;
-        for (int i = 0; i < WAVE_SAMPLES; i++) {
-            int idx = (wave_head + i) % WAVE_SAMPLES;
-            int amplitude = (int)((float)wave_data[idx] / 255.0f * (float)(plot_h / 2));
-            float phase = (float)i / (float)WAVE_SAMPLES * 4.0f * (float)M_PI;
-            int y_offset = (int)(sinf(phase) * (float)amplitude);
-            int px = plot_x + (i * plot_w) / WAVE_SAMPLES;
-            int py = mid_y - y_offset;
+        for (int i = 0; i <= plot_w; i++) {
+            float t = (float)i / (float)plot_w;
+            float wave1 = sinf((t * 3.0f + scroll) * 2.0f * (float)M_PI);
+            float wave2 = sinf((t * 1.7f + scroll * 0.6f) * 2.0f * (float)M_PI) * 0.4f;
+            float combined = (wave1 + wave2) * max_amp;
+
+            int px = plot_x + i;
+            int py = mid_y - (int)combined;
+
+            if (py < plot_y + 2)            py = plot_y + 2;
+            if (py > plot_y + plot_h - 2)   py = plot_y + plot_h - 2;
+
             if (prev_px >= 0) {
                 spr.drawLine(prev_px, prev_py, px, py, HEADER_COLOR);
             }
@@ -4306,15 +4312,23 @@ void draw_scanner_screen() {
     spr.drawFastVLine(divider_x, CONTENT_Y + 2, DISP_H - CONTENT_Y - 4, CARD_BORDER);
 
     // ── Right panel: full-height live feed ──
-    // 7 visible rows. Each row: protocol letter (W/B/R) + flock star + name
-    // (truncated to ~12 chars) + right-aligned RSSI. Throttled snapshot at
-    // 2 s cadence with slide-in animation when the top entry changes.
+    // Each row: protocol letter (W/B/R) + flock star + name (truncated to
+    // ~12 chars) + right-aligned RSSI. Throttled snapshot at 2 s cadence
+    // with slide-in animation when the top entry changes. Visible row
+    // count is computed from the available space, not hardcoded.
     {
         const int feed_x        = divider_x + 4;
-        const int feed_top      = CONTENT_Y + 4;
+        const int feed_header_y = CONTENT_Y + 2;
+        const int feed_top      = feed_header_y + 10;
         const int feed_row_h    = 14;
-        const int max_visible   = 7;
+        const int feed_bottom   = DISP_H - 2;
+        const int max_visible   = (feed_bottom - feed_top) / feed_row_h;
         const int feed_right    = DISP_W - 2;
+
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(feed_x, feed_header_y);
+        kprint(spr, "FEED");
 
         static FeedEntry display_feed[FEED_SIZE];
         static int display_count = 0;
@@ -4362,12 +4376,13 @@ void draw_scanner_screen() {
             anim_ellipsis(dots, sizeof(dots));
             char load_str[20];
             snprintf(load_str, sizeof(load_str), "scanning%s", dots);
-            spr.setCursor(feed_x + 4, feed_top + 4);
+            int load_y = feed_top + (feed_bottom - feed_top) / 2 - 4;
+            spr.setCursor(feed_x + 4, load_y);
             spr.print(load_str);
         } else {
-            spr.setClipRect(feed_x, feed_top - 1,
+            spr.setClipRect(feed_x, feed_top,
                             feed_right - feed_x,
-                            DISP_H - feed_top);
+                            feed_bottom - feed_top);
 
             int rows_to_draw = (local_count < max_visible) ? local_count : max_visible;
 
