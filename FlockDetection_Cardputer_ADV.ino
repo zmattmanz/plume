@@ -674,6 +674,12 @@ static unsigned long last_feed_push_ms = 0;
 static FeedEntry feed_pending;
 static bool feed_pending_valid = false;
 
+// Scanner reactive-animation triggers — fired from log_detection() is_new
+// path, consumed and decayed inside draw_scanner_screen().
+static unsigned long scanner_flash_ms = 0;
+static uint16_t      scanner_flash_color = 0;
+static volatile bool wave_spike_pending = false;
+
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
 static unsigned long bs_pending_until = 0;
@@ -2369,6 +2375,13 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         trigger_toast(type, name, confidence);
         add_blip(blip_col, rssi);
         screen_dirty = true;
+
+        // Scanner-screen reactive animations — consumed inside
+        // draw_scanner_screen(). Tint colour mirrors the LED flash
+        // colour pattern (WiFi=accent, BLE=purple).
+        scanner_flash_ms    = millis();
+        scanner_flash_color = (strcmp(proto, "WIFI") == 0) ? ACCENT_COLOR : PURPLE_COLOR;
+        wave_spike_pending  = true;
     }
 
     // Heavy work outside mutex
@@ -4172,8 +4185,38 @@ void handle_menu_select() {
 // ============================================================================
 void draw_scanner_screen() {
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(0);
     unsigned long frame_ms = millis();
+
+    // ── Detection flash — brief background tint ──
+    // Drawn first so it sits behind every other element. Peaks at 50ms
+    // and fully decays by 300ms; capped at 15% to avoid washing out
+    // content drawn on top.
+    if (scanner_flash_ms > 0) {
+        unsigned long flash_elapsed = frame_ms - scanner_flash_ms;
+        if (flash_elapsed < 300) {
+            float flash_t;
+            if (flash_elapsed < 50) flash_t = (float)flash_elapsed / 50.0f;
+            else                    flash_t = 1.0f - (float)(flash_elapsed - 50) / 250.0f;
+            flash_t *= 0.15f;
+            uint16_t tint = lerp_col16(BG_COLOR, scanner_flash_color, flash_t);
+            spr.fillRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y, tint);
+        }
+    }
+
+    // ── CRT scan line ──
+    // Single 1px line sweeping top-to-bottom every 4s with two faint
+    // glow lines above and below. Reads as "constantly monitoring".
+    {
+        float scan_t = fmodf((float)frame_ms / 4000.0f, 1.0f);
+        int   scan_y = CONTENT_Y + (int)(scan_t * (float)(DISP_H - CONTENT_Y));
+        uint16_t scan_main = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
+        uint16_t scan_glow = lerp_col16(BG_COLOR, CARD_BORDER, 0.2f);
+        spr.drawFastHLine(0, scan_y, DISP_W, scan_main);
+        if (scan_y > CONTENT_Y)  spr.drawFastHLine(0, scan_y - 1, DISP_W, scan_glow);
+        if (scan_y < DISP_H - 1) spr.drawFastHLine(0, scan_y + 1, DISP_W, scan_glow);
+    }
+
+    draw_header_spr(0);
 
     const int divider_x = 112;
 
@@ -4193,14 +4236,27 @@ void draw_scanner_screen() {
     // ── Left panel: WIFI / BLE counts (TS_H1, zero-padded, with roll) ──
     // Per-counter roll: when the displayed value changes, run
     // anim_slide_in for 300 ms so the new digits glide up rather than
-    // teleporting in.
+    // teleporting in. A separate "punch" timestamp drives a brief size
+    // increase so the new value catches the eye.
     static long prev_sw = -1, prev_sb = -1;
     static unsigned long sw_anim_start = 0, sb_anim_start = 0;
+    static unsigned long wifi_punch_ms = 0, ble_punch_ms = 0;
     const unsigned long ROLL_DURATION = 300;
     if (prev_sw == -1) prev_sw = sw;
     if (prev_sb == -1) prev_sb = sb;
-    if (sw != prev_sw) { sw_anim_start = frame_ms; prev_sw = sw; }
-    if (sb != prev_sb) { sb_anim_start = frame_ms; prev_sb = sb; }
+    if (sw != prev_sw) { sw_anim_start = frame_ms; wifi_punch_ms = frame_ms; prev_sw = sw; }
+    if (sb != prev_sb) { sb_anim_start = frame_ms; ble_punch_ms  = frame_ms; prev_sb = sb; }
+
+    // Punch envelope: ramps up to +0.3 size over 60ms, then eases back
+    // over the remaining 140ms. Returns 0 once the punch has decayed.
+    auto compute_punch = [frame_ms](unsigned long punch_ms) -> float {
+        if (punch_ms == 0) return 0.0f;
+        unsigned long pe = frame_ms - punch_ms;
+        if (pe >= 200) return 0.0f;
+        float pt = (float)pe / 200.0f;
+        return (pt < 0.3f) ? (pt / 0.3f) * 0.3f
+                           : 0.3f * (1.0f - (pt - 0.3f) / 0.7f);
+    };
 
     char wifi_str[6], ble_str[6];
     snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
@@ -4217,10 +4273,11 @@ void draw_scanner_screen() {
     kprint(spr, "WIFI");
     {
         const int num_x = 8;
+        float wifi_size = TS_H1 + compute_punch(wifi_punch_ms);
         spr.setClipRect(num_x, counts_num_y, 50, counts_num_h);
         spr.fillRect(num_x, counts_num_y, 50, counts_num_h, BG_COLOR);
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(TS_H1);
+        spr.setTextSize(wifi_size);
         int draw_y = anim_slide_in(counts_num_y, counts_num_h, sw_anim_start, ROLL_DURATION);
         spr.setCursor(num_x, draw_y);
         spr.print(wifi_str);
@@ -4234,10 +4291,11 @@ void draw_scanner_screen() {
     kprint(spr, "BLE");
     {
         const int num_x = 62;
+        float ble_size = TS_H1 + compute_punch(ble_punch_ms);
         spr.setClipRect(num_x, counts_num_y, 50, counts_num_h);
         spr.fillRect(num_x, counts_num_y, 50, counts_num_h, BG_COLOR);
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(TS_H1);
+        spr.setTextSize(ble_size);
         int draw_y = anim_slide_in(counts_num_y, counts_num_h, sb_anim_start, ROLL_DURATION);
         spr.setCursor(num_x, draw_y);
         spr.print(ble_str);
@@ -4248,14 +4306,26 @@ void draw_scanner_screen() {
     // Continuous scrolling sine wave. Amplitude is exponentially smoothed
     // from recent ambient_packet_count deltas — busy RF makes the wave
     // tall, quiet RF flattens it. Two overlapping frequencies give it an
-    // organic look instead of a perfect textbook sine.
+    // organic look instead of a perfect textbook sine. Detections spike
+    // the amplitude to 1.0 instantly; the existing 0.3 filter decays it
+    // back over ~1s. Wave colour shifts toward CAUTION_COLOR with
+    // activity, and the box border briefly flashes HEADER_COLOR on
+    // detection (synchronised with the screen flash).
     {
         const int wave_x = 6;
         const int wave_y = CONTENT_Y + 52;
         const int wave_w = 100;
         const int wave_h = 50;
 
-        spr.drawRoundRect(wave_x, wave_y, wave_w, wave_h, 4, CARD_BORDER);
+        uint16_t box_border = CARD_BORDER;
+        if (scanner_flash_ms > 0) {
+            unsigned long be = frame_ms - scanner_flash_ms;
+            if (be < 500) {
+                float bt = 1.0f - (float)be / 500.0f;
+                box_border = lerp_col16(CARD_BORDER, HEADER_COLOR, bt);
+            }
+        }
+        spr.drawRoundRect(wave_x, wave_y, wave_w, wave_h, 4, box_border);
 
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
@@ -4274,6 +4344,13 @@ void draw_scanner_screen() {
         static uint32_t      wave_prev_pkt = 0;
         static unsigned long wave_last_amp_update = 0;
 
+        // Apply the spike *before* the smoothing tick so it lands on
+        // the next render even when amplitude smoothing isn't due yet.
+        if (wave_spike_pending) {
+            wave_amplitude = 1.0f;
+            wave_spike_pending = false;
+        }
+
         if (frame_ms - wave_last_amp_update >= 500) {
             uint32_t delta = ambient_packet_count - wave_prev_pkt;
             wave_prev_pkt = ambient_packet_count;
@@ -4283,6 +4360,14 @@ void draw_scanner_screen() {
             wave_amplitude += (target - wave_amplitude) * 0.3f;
             wave_last_amp_update = frame_ms;
         }
+
+        // Squared blend keeps the wave in HEADER_COLOR for moderate
+        // activity; it only edges toward CAUTION_COLOR at peak rates.
+        float activity_t = wave_amplitude;
+        if (activity_t < 0.0f) activity_t = 0.0f;
+        if (activity_t > 1.0f) activity_t = 1.0f;
+        uint16_t wave_color = lerp_col16(HEADER_COLOR, CAUTION_COLOR,
+                                         activity_t * activity_t);
 
         float scroll = (float)frame_ms * 0.002f;
         float max_amp = (float)(plot_h / 2 - 2) * wave_amplitude;
@@ -4301,11 +4386,38 @@ void draw_scanner_screen() {
             if (py > plot_y + plot_h - 2)   py = plot_y + plot_h - 2;
 
             if (prev_px >= 0) {
-                spr.drawLine(prev_px, prev_py, px, py, HEADER_COLOR);
+                spr.drawLine(prev_px, prev_py, px, py, wave_color);
             }
             prev_px = px;
             prev_py = py;
         }
+
+        // Channel indicator — current 2.4GHz hopping channel, dim so
+        // the wave reads through it.
+        char ch_str[6];
+        snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(wave_x + wave_w - 26, wave_y + wave_h - 10);
+        spr.print(ch_str);
+
+        // Packet rate (pkt/s) — live counter below the waveform box,
+        // gives the amplitude meaningful context.
+        static uint32_t      pps_prev_count = 0;
+        static unsigned long pps_last_update = 0;
+        static uint32_t      pps_display = 0;
+        if (frame_ms - pps_last_update >= 1000) {
+            uint32_t cur = ambient_packet_count;
+            pps_display    = cur - pps_prev_count;
+            pps_prev_count = cur;
+            pps_last_update = frame_ms;
+        }
+        char pps_str[16];
+        snprintf(pps_str, sizeof(pps_str), "%lu pkt/s", (unsigned long)pps_display);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(wave_x + 4, wave_y + wave_h + 4);
+        spr.print(pps_str);
     }
 
     // ── Vertical divider between left dashboard and right feed ──
@@ -4419,7 +4531,24 @@ void draw_scanner_screen() {
                 }
                 proto_col = lerp_col16(BG_COLOR, proto_col, age_fade);
 
-                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, age_fade);
+                // New-entry highlight on row 0 — synchronised with the
+                // existing slide-in. The display only refreshes every 2s,
+                // so e.timestamp is too coarse for a 500ms highlight;
+                // display_shift_ms instead marks when the new top entry
+                // actually became visible. Only the name flashes bright
+                // — protocol letter and RSSI stay dim so the eye lands
+                // on the useful info.
+                float new_boost = 0.0f;
+                if (i == 0 && display_shift_ms != 0) {
+                    unsigned long shift_age = local_now - display_shift_ms;
+                    if (shift_age < 500) {
+                        new_boost = 1.0f - (float)shift_age / 500.0f;
+                    }
+                }
+                uint16_t name_col = lerp_col16(
+                    lerp_col16(BG_COLOR, TEXT_COLOR, age_fade),
+                    HEADER_COLOR,
+                    new_boost);
                 uint16_t rssi_col = lerp_col16(BG_COLOR, DIM_COLOR, age_fade);
 
                 spr.setTextSize(TS_BODY);
