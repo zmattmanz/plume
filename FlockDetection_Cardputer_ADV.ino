@@ -4171,476 +4171,151 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
-    int divider_x = 112;
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
     unsigned long frame_ms = millis();
-    spr.setClipRect(0, 18, divider_x, DISP_H - 18);
-    
-    float TILT = 0.55f;
-    int rcx = radar_cx;
-    int rcy = radar_cy;
-    int THICKNESS = 7;
 
-    // Shadow below cylinder
-    spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
+    const int divider_x = 112;
 
-    // Cylinder wall: solid gradient fills from bottom to top (lighter toward top)
-    for (int i = THICKNESS; i >= 1; i--) {
-        uint8_t wall_v = 8 + (THICKNESS - i) * 2;
-        spr.fillEllipse(rcx, rcy + i, radar_r, radar_r * TILT,
-                        lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
-    }
-
-    // Left/right edge lines connecting top rim to bottom rim (removed)
-
-    // Top face fill and border — draw ellipse twice (y offset 1) for thicker rim
-    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(rcx, rcy,     radar_r, (int)(radar_r * TILT), HEADER_COLOR);
-    spr.drawEllipse(rcx, rcy + 1, radar_r, (int)(radar_r * TILT), HEADER_COLOR);
-
-    // Hatching on both sides of the cylinder rim seam
-
-    // Redraw bottom rim so it shows over the top face fill — doubled for thickness
-    spr.drawEllipse(rcx, rcy + THICKNESS,     radar_r, radar_r * TILT, DIM_COLOR);
-    spr.drawEllipse(rcx, rcy + THICKNESS + 1, radar_r, radar_r * TILT, DIM_COLOR);
-
-    // Structural ribs on left wall removed
-
-    spr.drawEllipse(rcx, rcy,     inner_r, (int)(inner_r * TILT), DIM_COLOR);
-    spr.drawEllipse(rcx, rcy + 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
-
-    float sweep_rad = (frame_ms / 3000.0f) * (float)M_PI * 2.0f;
-    const float TWO_PIf = (float)M_PI * 2.0f;
-    float sweep_norm = fmodf(sweep_rad, TWO_PIf);
-
-    // Particle driver, spike decay, and snapshot are shared with ambient
-    // mode — see update_radar_data().
+    // Particle driver + spike decay still need to run so the data is fresh
+    // for the ambient screen and so radial_spikes age out correctly when
+    // the user is on the scanner. The radar render itself was removed —
+    // the dashboard layout doesn't need the visual.
     update_radar_data(frame_ms);
-    unsigned long time_since_blip = radar_time_since_blip;
 
-    float noise_dimming = 1.0f;
-    if (time_since_blip < 10000) {
-        noise_dimming = 0.0f;
-    } else if (time_since_blip < 13000) {
-        noise_dimming = (time_since_blip - 10000) / 3000.0f;
-    }
-
-    if (noise_dimming > 0.01f) {
-        for (int i = 0; i < NUM_PARTICLES; i++) {
-            if (noise_life[i] <= 0) continue;
-
-            float fade = (float)noise_life[i] / (float)noise_max_life[i];
-            int intensity = (int)(fade * 180.0f * noise_dimming);
-            if (intensity > 200) intensity = 200;
-            if (intensity < 20) continue;
-
-            // Sweep-tied brightness: particle brightens dramatically when sweep line
-            // passes over its angle, dims otherwise. Makes the sweep feel like it's
-            // "illuminating" the ambient RF environment.
-            float pa = fmodf(noise_a[i], TWO_PIf);
-            float diff_sweep = sweep_norm - pa;
-            if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
-            if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
-            // Only show particles in the sweep's wake (behind the sweep line)
-            // diff_sweep > 0 means sweep has passed this angle
-            float trail_arc = 2.0f;  // radians of visible trail behind sweep
-            if (diff_sweep < 0) diff_sweep += TWO_PIf;  // normalize to [0, 2π]
-            if (diff_sweep > trail_arc) continue;  // too far behind sweep — not visible
-            float sweep_proximity = 1.0f - (diff_sweep / trail_arc);  // 1 at sweep, 0 at trail_arc behind
-            int sweep_boost = (int)(sweep_proximity * 80);
-            int total_intensity = intensity + sweep_boost;
-            if (total_intensity > 255) total_intensity = 255;
-
-            int px = rcx + (int)(noise_r[i] * cosf(noise_a[i]));
-            int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
-
-            // Day: ice-blue tinted particles. Night: red tinted.
-            uint16_t p_col = night_mode
-                ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
-                : lgfx::color565(total_intensity / 3, (total_intensity * 3) / 4, total_intensity);
-
-            // Draw small upward triangle (matches detection triangle vocabulary but smaller)
-            // Size 3: base 3px, height 3px
-            spr.drawTriangle(px - 1, py + 1,
-                             px + 1, py + 1,
-                             px,     py - 2,
-                             p_col);
-
-            // Extra bright near sweep: fill the triangle for emphasis
-            if (sweep_proximity > 0.5f) {
-                spr.drawPixel(px, py - 1, p_col);
-                spr.drawPixel(px, py, p_col);
-            }
-        }
-    }
-
-    float breathe = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;  // remap to -1..1
-    uint16_t modulated_col = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
-    int dynamic_r   = (radar_r - 6) + (int)(4 * breathe);
-    float cos_rot   = cosf(hud_rotation);
-    float sin_rot   = sinf(hud_rotation);
-    spr.drawLine(rcx - dynamic_r * cos_rot, rcy - dynamic_r * sin_rot * TILT,
-                 rcx + dynamic_r * cos_rot, rcy + dynamic_r * sin_rot * TILT, modulated_col);
-    spr.drawLine(rcx - dynamic_r * -sin_rot, rcy - dynamic_r * cos_rot * TILT,
-                 rcx + dynamic_r * -sin_rot, rcy + dynamic_r * cos_rot * TILT, modulated_col);
-
-    for (int i = 1; i <= 24; i++) {
-        float trail_angle = sweep_rad - (i * 0.05f);
-        float ratio = (24.0f - i) / 24.0f;
-        int tr = 10 + (0   - 10)  * ratio;
-        int tg = 20 + (238 - 20)  * ratio;
-        int tb = 48 + (255 - 48)  * ratio;
-        uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0) : lgfx::color565(tr, tg, tb);
-        for (int r_step = inner_r + 2; r_step < radar_r; r_step += 4) {
-            spr.drawPixel(rcx + (int)(r_step * cosf(trail_angle)),
-                          rcy + (int)(r_step * sinf(trail_angle) * TILT), fade_col);
-        }
-    }
-    spr.drawLine(rcx, rcy,
-                 rcx + (int)((radar_r - 1) * cosf(sweep_rad)),
-                 rcy + (int)((radar_r - 1) * sinf(sweep_rad) * TILT), HEADER_COLOR);
-
-    float angle_step = (float)M_PI * 2.0f / NUM_RADIAL_BANDS;
-
-    const float BLIP_RELIGHT_ARC = 0.20f;
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        if (local_spikes[i] < 0.05f) continue;
-        float band_angle = fmodf(i * angle_step, TWO_PIf);
-        float diff = sweep_norm - band_angle;
-        if (diff >  (float)M_PI) diff -= TWO_PIf;
-        if (diff < -(float)M_PI) diff += TWO_PIf;
-        if (diff >= 0.0f && diff < BLIP_RELIGHT_ARC) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            if (radial_spikes[i] > 0.05f) {
-                radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
-            }
-            xSemaphoreGive(dataMutex);
-        }
-    }
-
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        float a = i * angle_step;
-        if (local_spikes[i] > 0) {
-            bool is_strong = (local_spikes[i] > 0.8f);
-
-            int spike_len = (int)((radar_r - inner_r) * local_spikes[i] * 0.7f);
-            if (spike_len < 2)  spike_len = 2;
-            if (spike_len > 22) spike_len = 22; // cap — prevents jarring tall spike on first detection
-
-            float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
-            int blip_dist = inner_r + 4 + (int)((radar_r - inner_r - 6) * dist_ratio);
-
-            int base_x = rcx + (int)(blip_dist * cosf(a));
-            int base_y = rcy + (int)(blip_dist * sinf(a) * TILT);
-            uint16_t line_col = local_colors[i];
-
-            if (is_strong) {
-                // Stop the stem line at the shape's bottom edge so it doesn't
-                // cut through the icon. Triangle bottom = tip_y+7, diamond
-                // bottom = tip_y+8 — use 8 to cover both.
-                int shape_bottom = base_y - spike_len + 8;
-                if (shape_bottom < base_y) {
-                    spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
-                }
-                // Shape encodes protocol — filled, larger for visibility
-                // against the busy sweep/particle background.
-                // BLE = diamond (◆), WiFi = triangle (▲)
-                bool is_ble_blip = (line_col == PURPLE_COLOR);
-                int tip_y = base_y - spike_len;
-                if (is_ble_blip) {
-                    // Outline-only 9px symmetric diamond
-                    int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
-                    spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
-                    spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
-                    spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
-                    spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
-                } else {
-                    // Outline-only 9px upward triangle
-                    spr.drawTriangle(base_x - 4, tip_y + 7,
-                                     base_x + 4, tip_y + 7,
-                                     base_x,     tip_y, line_col);
-                }
-            } else {
-                // Small noise-style dash for weak signals
-                spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
-            }
-        }
-    }
-    hud_rotation = fmodf(hud_rotation + 0.0033f, 2.0f * (float)M_PI);
-
-    spr.clearClipRect();
-
+    // Snapshot session flock counts for the big WIFI / BLE numbers.
+    long sw, sb;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    long sw = session_flock_wifi; long sb = session_flock_ble;
+    sw = session_flock_wifi;
+    sb = session_flock_ble;
     xSemaphoreGive(dataMutex);
 
-    int right_text_x = divider_x + 5;
+    // ── Left panel: WIFI / BLE counts (TS_H1, zero-padded, with roll) ──
+    // Per-counter roll: when the displayed value changes, run
+    // anim_slide_in for 300 ms so the new digits glide up rather than
+    // teleporting in.
+    static long prev_sw = -1, prev_sb = -1;
+    static unsigned long sw_anim_start = 0, sb_anim_start = 0;
+    const unsigned long ROLL_DURATION = 300;
+    if (prev_sw == -1) prev_sw = sw;
+    if (prev_sb == -1) prev_sb = sb;
+    if (sw != prev_sw) { sw_anim_start = frame_ms; prev_sw = sw; }
+    if (sb != prev_sb) { sb_anim_start = frame_ms; prev_sb = sb; }
 
-    bool ble_active = pBLEScan ? pBLEScan->isScanning() : false;
-    bool wifi_active = !ble_active;
+    char wifi_str[6], ble_str[6];
+    snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
+    snprintf(ble_str,  sizeof(ble_str),  "%03ld", sb);
 
-    uint16_t inactive_col = CARD_BORDER;
+    const int counts_label_y = CONTENT_Y + 4;
+    const int counts_num_y   = CONTENT_Y + 16;
+    const int counts_num_h   = (int)(TS_H1 * 8.0f);  // 24px
 
-    // Smooth easing for indicator color transitions
-    static float wf_ease = 0.0f;
-    static float ble_ease = 0.0f;
-    wf_ease  += ((wifi_active ? 1.0f : 0.0f) - wf_ease)  * 0.2f;
-    ble_ease += ((ble_active  ? 1.0f : 0.0f) - ble_ease) * 0.2f;
-
-    uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
-    uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
-
-    // ── Combined segmented pill: [WiFi: ch / BLE] ──
-    // Each segment fills its full half including the diagonal slash region —
-    // the slash is drawn last as a divider line over the seam, not as a fill
-    // boundary. This eliminates the unfilled triangular gaps.
-    // Pad channel to 2 digits for fixed pill width (prevents layout jumps
-    // when cycling between channel 9 and 10)
-    char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi:%2d", current_channel);
-    bool wf_locked = (frame_ms < channel_lock_until);
-    // Fixed width: "WiFi: 12" = 8 chars + optional " L" (2) padding always applied
-    int wf_seg_w = 10 * 6 + 14;  // +4 more horizontal
-    int ble_seg_w = 40;            // +4 more horizontal
-
-    bool ble_pulse_on = ble_active && (((frame_ms / 500) % 2) == 0);
-    float ble_pulse_t = ble_active ? (ble_pulse_on ? 1.0f : 0.35f) : 0.18f;
-    uint16_t ble_badge_col = lerp_col16(CARD_BORDER, ble_col, ble_pulse_t);
-
-    uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
-    uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
-
-    int badge_x = right_text_x + 2;
-    int badge_y = CONTENT_Y + UI_PAD_XS;
-    int badge_h = 18;
-    int total_w = wf_seg_w + ble_seg_w;
-    uint16_t outer_border = lerp_col16(wf_col, ble_badge_col, 0.5f);
-
-    // Step 1: clear pill area
-    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 8, BG_COLOR);
-
-    // Step 2: fill BLE segment (right) FIRST as full pill — gives it the
-    // rounded right corners
-    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 8, ble_fill);
-
-    // Step 3: overdraw WiFi segment (left) — extends slightly past the
-    // diagonal seam so no BLE color leaks through the slash region
+    // WIFI label + number
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(8, counts_label_y);
+    kprint(spr, "WIFI");
     {
-        int seam_x = badge_x + wf_seg_w;
-        // Fill the WiFi-side rounded area
-        spr.fillRoundRect(badge_x, badge_y, wf_seg_w, badge_h, 8, wf_fill);
-        // Square off the right edge of WiFi segment up to the slash midpoint,
-        // covering the seam fully. Use a triangle that extends past the
-        // diagonal so no BLE color shows through.
-        spr.fillRect(badge_x + wf_seg_w - 7, badge_y, 7, badge_h, wf_fill);
-        // Diagonal "wedge" of WiFi color extending into the seam area —
-        // matches the slope of the slash divider so the fill respects the
-        // diagonal boundary, eliminating triangle gaps.
-        for (int dy = 0; dy < badge_h; dy++) {
-            // Slash goes from (seam_x + 4, badge_y + 2) to (seam_x - 4, badge_y + badge_h - 3)
-            // For each y row, compute the x where the slash crosses
-            float t = (float)(dy - 2) / (float)(badge_h - 5);
-            t = (t < 0.0f) ? 0.0f : (t > 1.0f ? 1.0f : t);
-            int slash_x = (int)(seam_x + 4 - t * 8.0f);
-            // Fill from previous WiFi edge up to slash_x with WiFi color
-            int wfill_right = badge_x + wf_seg_w;
-            if (slash_x > wfill_right) {
-                spr.drawFastHLine(wfill_right, badge_y + dy,
-                                  slash_x - wfill_right, wf_fill);
-            }
+        const int num_x = 8;
+        spr.setClipRect(num_x, counts_num_y, 50, counts_num_h);
+        spr.fillRect(num_x, counts_num_y, 50, counts_num_h, BG_COLOR);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_H1);
+        int draw_y = anim_slide_in(counts_num_y, counts_num_h, sw_anim_start, ROLL_DURATION);
+        spr.setCursor(num_x, draw_y);
+        spr.print(wifi_str);
+        spr.clearClipRect();
+    }
+
+    // BLE label + number
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(62, counts_label_y);
+    kprint(spr, "BLE");
+    {
+        const int num_x = 62;
+        spr.setClipRect(num_x, counts_num_y, 50, counts_num_h);
+        spr.fillRect(num_x, counts_num_y, 50, counts_num_h, BG_COLOR);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_H1);
+        int draw_y = anim_slide_in(counts_num_y, counts_num_h, sb_anim_start, ROLL_DURATION);
+        spr.setCursor(num_x, draw_y);
+        spr.print(ble_str);
+        spr.clearClipRect();
+    }
+
+    // ── Left panel: 2.4GHz waveform ──
+    // Ring buffer of recent ambient_packet_count deltas, sampled every
+    // 200 ms. Renders as a sinusoidal line whose amplitude tracks the
+    // packet rate — quiet RF flatlines, busy bursts spike.
+    {
+        #define WAVE_SAMPLES 48
+        static uint8_t       wave_data[WAVE_SAMPLES] = {0};
+        static int           wave_head = 0;
+        static unsigned long wave_last_sample = 0;
+        static uint32_t      wave_last_pkt_count = 0;
+
+        if (wave_last_sample == 0 || frame_ms - wave_last_sample >= 200) {
+            uint32_t cur_pkt = ambient_packet_count;
+            uint32_t delta   = cur_pkt - wave_last_pkt_count;
+            wave_last_pkt_count = cur_pkt;
+            uint32_t scaled  = delta * 5;
+            if (scaled > 255) scaled = 255;
+            wave_data[wave_head] = (uint8_t)scaled;
+            wave_head = (wave_head + 1) % WAVE_SAMPLES;
+            wave_last_sample = frame_ms;
         }
-    }
 
-    // Step 4: outer rounded outline
-    spr.drawRoundRect(badge_x, badge_y, total_w, badge_h, 8, outer_border);
+        const int wave_x = 4;
+        const int wave_y = CONTENT_Y + 52;
+        const int wave_w = 104;
+        const int wave_h = 50;
 
-    // Step 5: 45° slash divider drawn on top of fills
-    {
-        int sx = badge_x + wf_seg_w;
-        int sy_top = badge_y + 2;
-        int sy_bot = badge_y + badge_h - 3;
-        spr.drawLine(sx + 3, sy_top, sx - 3, sy_bot, outer_border);
-        spr.drawLine(sx + 4, sy_top, sx - 2, sy_bot, outer_border);
-    }
+        spr.drawRoundRect(wave_x, wave_y, wave_w, wave_h, 4, CARD_BORDER);
 
-    // WiFi text — centered in WiFi segment
-    spr.setTextColor(wf_col, wf_fill); spr.setTextSize(TS_BODY);
-    {
-        int wf_base_w = (int)strlen(wf_label) * 7;
-        int wf_lock_w = wf_locked ? 14 : 0;
-        int wf_text_w = wf_base_w + wf_lock_w;
-        int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, badge_y + 5);
-        spr.print(wf_label);
-        if (wf_locked) {
-            spr.setTextColor(CAUTION_COLOR, wf_fill);
-            spr.print(" L");
-        }
-    }
-
-    // BLE text — centered in BLE segment
-    spr.setTextColor(ble_badge_col, ble_fill);
-    {
-        int ble_text_w = 3 * 7;
-        int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, badge_y + 5);
-        spr.print("BLE");
-    }
-
-    // ── Ambient packet counter — kerned green label + white number, with
-    // throttled roll-up animation when the displayed value updates ──
-    // Sits between the WiFi/BLE pill and the stats scorecards.
-    {
-        uint32_t pkts = ambient_packet_count;
-        char pkt_str[12];
-
-        // Roll-up animation state — throttled so the count doesn't animate
-        // every frame as new packets arrive.
-        static uint32_t pkt_display_val = 0;
-        static unsigned long pkt_anim_start = 0;
-        static unsigned long pkt_last_update = 0;
-        const unsigned long PKT_UPDATE_INTERVAL = 3000;
-        const unsigned long PKT_ROLL_MS = 300;
-
-        if (frame_ms - pkt_last_update >= PKT_UPDATE_INTERVAL || pkt_display_val == 0) {
-            if (pkts != pkt_display_val) {
-                pkt_display_val = pkts;
-                pkt_anim_start = frame_ms;
-            }
-            pkt_last_update = frame_ms;
-        }
-        snprintf(pkt_str, sizeof(pkt_str), "%lu", (unsigned long)pkt_display_val);
-
-        int pkt_label_y = badge_y + badge_h + 4;  // 4px below the WiFi/BLE pill
-
-        // Line 1: green label, kerned
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
-        {
-            const char* label = "PACKETS SCANNED";
-            int label_x = right_text_x + 2;
-            spr.setTextDatum(TL_DATUM);
-            spr.setCursor(label_x, pkt_label_y);
-            kprint(spr, label);
-        }
+        spr.setCursor(wave_x + 4, wave_y + 4);
+        spr.print("2.4GHz");
 
-        // Line 2: white number with optional roll-up animation.
-        {
-            int num_x = right_text_x + 2;
-            int num_y = pkt_label_y + 10;
-            int num_h = 8;  // textSize 1 height
+        const int plot_x = wave_x + 4;
+        const int plot_y = wave_y + 14;
+        const int plot_w = wave_w - 8;
+        const int plot_h = wave_h - 18;
+        const int mid_y  = plot_y + plot_h / 2;
 
-            spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-            spr.setTextSize(TS_MICRO);
+        spr.drawFastHLine(plot_x, mid_y, plot_w, CARD_BORDER);
 
-            spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
-            spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
-            spr.setTextDatum(TL_DATUM);
-            int draw_y = anim_slide_in(num_y, num_h, pkt_anim_start, PKT_ROLL_MS);
-            spr.setCursor(num_x, draw_y);
-            spr.print(pkt_str);
-            spr.clearClipRect();
-        }
-
-        spr.setTextDatum(TL_DATUM);
-    }
-
-    // ── Stats block — labels above, symbol + number inline below ──
-    // Both blocks left-aligned at a fixed column split. Symbols are
-    // filled + outlined for legibility against the dark background.
-    {
-        long sw_local = sw;
-        long sb_local = sb;
-
-        const int stats_label_y = 62;       // top of size-1 labels
-        const int stats_num_y   = 78;       // top of size-3 numbers
-        const int sd_left       = right_text_x + 2;
-        const int col1_x        = sd_left + 2;
-        const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
-
-        char wifi_num[6];
-        snprintf(wifi_num, sizeof(wifi_num), "%ld", sw_local);
-        char ble_num[6];
-        snprintf(ble_num, sizeof(ble_num), "%ld", sb_local);
-
-        // Roll-in animation: when count changes, new number slides up into place
-        static long prev_sw = 0, prev_sb = 0;
-        static unsigned long sw_anim_start = 0, sb_anim_start = 0;
-        const unsigned long ROLL_DURATION = 300;
-        if (sw_local != prev_sw) { sw_anim_start = frame_ms; prev_sw = sw_local; }
-        if (sb_local != prev_sb) { sb_anim_start = frame_ms; prev_sb = sb_local; }
-
-        // ── WIFI label ──
-        spr.setTextSize(TS_BODY);
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(col1_x, stats_label_y);
-        kprint(spr, "WIFI");
-
-        // WIFI triangle symbol
-        int wtri_x = col1_x + 2;
-        int wtri_y = stats_num_y + 3;
-        spr.drawTriangle(wtri_x,      wtri_y + 10,
-                         wtri_x + 10, wtri_y + 10,
-                         wtri_x + 5,  wtri_y,
-                         CAUTION_COLOR);
-
-        // WIFI number with roll animation
-        {
-            const int num_h = 24;  // textSize(3) height
-            spr.setClipRect(col1_x + 20, stats_num_y, 40, num_h);
-            spr.fillRect(col1_x + 20, stats_num_y, 40, num_h, BG_COLOR);
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(TS_H1);
-            int draw_y = anim_slide_in(stats_num_y, num_h, sw_anim_start, ROLL_DURATION);
-            spr.setCursor(col1_x + 20, draw_y);
-            spr.print(wifi_num);
-            spr.clearClipRect();
-        }
-
-        // ── BLE label ──
-        spr.setTextSize(TS_BODY);
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(col2_x, stats_label_y);
-        kprint(spr, "BLE");
-
-        // BLE diamond symbol
-        int dia_x = col2_x;
-        int dia_y = stats_num_y;
-        int dcx = dia_x + 6, dcy = dia_y + 7, dhr = 7;
-        spr.drawLine(dcx,       dcy - dhr, dcx + dhr, dcy,       PURPLE_COLOR);
-        spr.drawLine(dcx + dhr, dcy,       dcx,       dcy + dhr, PURPLE_COLOR);
-        spr.drawLine(dcx,       dcy + dhr, dcx - dhr, dcy,       PURPLE_COLOR);
-        spr.drawLine(dcx - dhr, dcy,       dcx,       dcy - dhr, PURPLE_COLOR);
-
-        // BLE number with roll animation
-        {
-            const int num_h = 24;
-            spr.setClipRect(col2_x + 20, stats_num_y, 40, num_h);
-            spr.fillRect(col2_x + 20, stats_num_y, 40, num_h, BG_COLOR);
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(TS_H1);
-            int draw_y = anim_slide_in(stats_num_y, num_h, sb_anim_start, ROLL_DURATION);
-            spr.setCursor(col2_x + 20, draw_y);
-            spr.print(ble_num);
-            spr.clearClipRect();
+        int prev_px = -1, prev_py = -1;
+        for (int i = 0; i < WAVE_SAMPLES; i++) {
+            int idx = (wave_head + i) % WAVE_SAMPLES;
+            int amplitude = (int)((float)wave_data[idx] / 255.0f * (float)(plot_h / 2));
+            float phase = (float)i / (float)WAVE_SAMPLES * 4.0f * (float)M_PI;
+            int y_offset = (int)(sinf(phase) * (float)amplitude);
+            int px = plot_x + (i * plot_w) / WAVE_SAMPLES;
+            int py = mid_y - y_offset;
+            if (prev_px >= 0) {
+                spr.drawLine(prev_px, prev_py, px, py, HEADER_COLOR);
+            }
+            prev_px = px;
+            prev_py = py;
         }
     }
 
-    // ── Live device feed (right column) ──
-    // List is anchored at the BOTTOM of the column. Existing rows stay still.
-    // When a new entry arrives, it appears at the top: fades in with slight
-    // slide-down from the section header. When the buffer overflows, the
-    // bottom (oldest) row fades out as it scrolls off. This matches the
-    // mental model of a notification/activity feed (Twitter, Slack, etc).
-    {
-        const int feed_col_left   = 4;
-        const int feed_col_right  = divider_x - 4;
-        const int feed_row_h      = 12;
-        const int max_visible     = 3;
-        const int feed_top_y      = 104;
+    // ── Vertical divider between left dashboard and right feed ──
+    spr.drawFastVLine(divider_x, CONTENT_Y + 2, DISP_H - CONTENT_Y - 4, CARD_BORDER);
 
-        // Throttled display snapshot — only refreshes every 2 seconds.
-        // Eliminates flicker caused by rapid feed_entries mutations between frames.
+    // ── Right panel: full-height live feed ──
+    // 7 visible rows. Each row: protocol letter (W/B/R) + flock star + name
+    // (truncated to ~12 chars) + right-aligned RSSI. Throttled snapshot at
+    // 2 s cadence with slide-in animation when the top entry changes.
+    {
+        const int feed_x        = divider_x + 4;
+        const int feed_top      = CONTENT_Y + 4;
+        const int feed_row_h    = 14;
+        const int max_visible   = 7;
+        const int feed_right    = DISP_W - 2;
+
         static FeedEntry display_feed[FEED_SIZE];
         static int display_count = 0;
         static int display_head = 0;
@@ -4657,10 +4332,6 @@ void draw_scanner_screen() {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             display_count = feed_count;
             display_head = feed_head;
-            // feed_entries is a ring keyed by feed_head; entries past
-            // display_count still hold valid live data the renderer
-            // will reach via its (head - i) modular index. Copy the
-            // whole array so the snapshot matches the renderer's view.
             for (int i = 0; i < FEED_SIZE; i++) display_feed[i] = feed_entries[i];
             xSemaphoreGive(dataMutex);
             display_last_refresh = local_now;
@@ -4684,18 +4355,20 @@ void draw_scanner_screen() {
         int local_count = display_count;
         int local_head = display_head;
 
-        // Feed section label
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(feed_col_left, feed_top_y - 12);
-        kprint(spr, "LIVE FEED");
+        if (!display_ever_populated) {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            char dots[4];
+            anim_ellipsis(dots, sizeof(dots));
+            char load_str[20];
+            snprintf(load_str, sizeof(load_str), "scanning%s", dots);
+            spr.setCursor(feed_x + 4, feed_top + 4);
+            spr.print(load_str);
+        } else {
+            spr.setClipRect(feed_x, feed_top - 1,
+                            feed_right - feed_x,
+                            DISP_H - feed_top);
 
-        // Always render feed — overlay covers it during startup warm-up
-        spr.setClipRect(feed_col_left, feed_top_y - 1,
-                        feed_col_right - feed_col_left,
-                        DISP_H - (feed_top_y - 1));
-
-        {
             int rows_to_draw = (local_count < max_visible) ? local_count : max_visible;
 
             for (int i = 0; i < rows_to_draw; i++) {
@@ -4704,15 +4377,11 @@ void draw_scanner_screen() {
 
                 int row_y;
                 if (i == 0 && display_shift_ms != 0) {
-                    // New entry slides DOWN into target from above (existing
-                    // rows shift down to make room) — negative slide distance.
-                    row_y = anim_slide_in(feed_top_y, -feed_row_h, display_shift_ms, 300);
+                    row_y = anim_slide_in(feed_top, -feed_row_h, display_shift_ms, 300);
                 } else {
-                    row_y = feed_top_y + i * feed_row_h;
+                    row_y = feed_top + i * feed_row_h;
                 }
 
-
-                // Age-based fade-out (separate from shift animation)
                 unsigned long age = local_now - e.timestamp;
                 float age_fade;
                 if      (age < 30000UL) age_fade = 1.0f;
@@ -4720,81 +4389,62 @@ void draw_scanner_screen() {
                 else                    age_fade = 0.0f;
                 if (age_fade < 0.10f) continue;
 
-                float total_alpha = age_fade;
+                bool is_raven = (strstr(e.name, "RAVEN") != nullptr);
+                char proto_letter;
+                uint16_t proto_col;
+                if (is_raven) {
+                    proto_letter = 'R';
+                    proto_col = ACCENT_COLOR;
+                } else if (e.proto == 0) {
+                    proto_letter = 'W';
+                    proto_col = CAUTION_COLOR;
+                } else {
+                    proto_letter = 'B';
+                    proto_col = PURPLE_COLOR;
+                }
+                proto_col = lerp_col16(BG_COLOR, proto_col, age_fade);
 
-                // Type prefix color
-                uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
-                if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
-                proto_col = lerp_col16(BG_COLOR, proto_col, total_alpha);
-
-                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, total_alpha);
+                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, age_fade);
+                uint16_t rssi_col = lerp_col16(BG_COLOR, DIM_COLOR, age_fade);
 
                 spr.setTextSize(TS_BODY);
 
-                // Prefix is a small colored symbol (filled triangle/diamond)
-                // instead of a bracketed letter — more visually distinctive,
-                // uses less width, frees name space.
-                int sym_x = feed_col_left;
-                int sym_y = row_y + 1;
-                uint16_t sym_col = proto_col;
-                if (e.proto == 0) {
-                    // Outline-only triangle (△) — WiFi — matches stats icons
-                    spr.drawTriangle(sym_x,     sym_y + 5,
-                                     sym_x + 5, sym_y + 5,
-                                     sym_x + 2, sym_y,
-                                     sym_col);
-                } else {
-                    // Outline-only symmetric diamond (◇) — BLE — matches stats icons
-                    int fcx = sym_x + 3, fcy = sym_y + 3, fhr = 4;
-                    spr.drawLine(fcx,       fcy - fhr, fcx + fhr, fcy,       sym_col);
-                    spr.drawLine(fcx + fhr, fcy,       fcx,       fcy + fhr, sym_col);
-                    spr.drawLine(fcx,       fcy + fhr, fcx - fhr, fcy,       sym_col);
-                    spr.drawLine(fcx - fhr, fcy,       fcx,       fcy - fhr, sym_col);
-                }
-                // Flock indicator: small asterisk after the symbol
+                spr.setTextColor(proto_col, BG_COLOR);
+                spr.setCursor(feed_x, row_y);
+                spr.print(proto_letter);
+
+                int name_x = feed_x + 8;
                 if (e.is_flock) {
-                    spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, total_alpha), BG_COLOR);
-                    spr.setTextSize(TS_BODY);
-                    spr.setCursor(sym_x + 7, row_y);
+                    spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, age_fade), BG_COLOR);
+                    spr.setCursor(name_x, row_y);
                     spr.print("*");
+                    name_x += 6;
                 }
 
-                // Name — full width available now that strength column is gone
-                int name_x = feed_col_left + (e.is_flock ? 14 : 10);
-                int name_x_end = feed_col_right - 2;
+                char rssi_str[8];
+                snprintf(rssi_str, sizeof(rssi_str), "%d", e.rssi);
+                int rssi_w = (int)strlen(rssi_str) * 7;
+                int rssi_x = feed_right - rssi_w;
+
+                int name_x_end = rssi_x - 4;
                 int name_max_chars = (name_x_end - name_x) / 7;
-                if (name_max_chars > 14) name_max_chars = 14;
+                if (name_max_chars > 12) name_max_chars = 12;
                 if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
                 if (name_max_chars < 1) name_max_chars = 1;
 
                 char name_disp[20];
                 strncpy(name_disp, e.name, name_max_chars);
                 name_disp[name_max_chars] = '\0';
-                spr.setTextSize(TS_BODY);
                 spr.setTextColor(name_col, BG_COLOR);
                 spr.setCursor(name_x, row_y);
                 spr.print(name_disp);
 
+                spr.setTextColor(rssi_col, BG_COLOR);
+                spr.setCursor(rssi_x, row_y);
+                spr.print(rssi_str);
             }
 
-        }
-
-        spr.clearClipRect();
-
-        // Show "scanning..." only until the first snapshot captures data
-        if (!display_ever_populated) {
-            spr.fillRect(feed_col_left, feed_top_y,
-                         feed_col_right - feed_col_left,
-                         max_visible * feed_row_h, BG_COLOR);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(TS_BODY);
-            int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
-            char dots[4];
-            anim_ellipsis(dots, sizeof(dots));
-            char load_str[20];
-            snprintf(load_str, sizeof(load_str), "scanning%s", dots);
-            spr.setCursor(feed_col_left + 8, load_y);
-            spr.print(load_str);
+            spr.clearClipRect();
         }
     }
 }
@@ -5443,12 +5093,17 @@ void draw_gps_screen() {
         }
         for (int i = 0; i < NUM_STARS; i++) {
             float twinkle = anim_pulse(3000 + i * 200, (float)i / (float)NUM_STARS);
-            // 100..255 brightness — earlier 60..180 still read faint with
-            // the backlight on. Baseline 100 keeps stars clearly visible
-            // while the +155 swing reads as a shimmer.
             uint8_t b = (uint8_t)(100 + twinkle * 155);
             uint16_t star_col = lgfx::color565(b, b, b);
-            spr.drawPixel(star_x[i], star_y[i], star_col);
+            int sx = star_x[i];
+            int sy = star_y[i];
+            // 5-pixel X: center + 4 diagonal arms. Reads as a star against
+            // the wireframe globe rather than a stray dot.
+            spr.drawPixel(sx,     sy,     star_col);
+            spr.drawPixel(sx - 1, sy - 1, star_col);
+            spr.drawPixel(sx + 1, sy + 1, star_col);
+            spr.drawPixel(sx - 1, sy + 1, star_col);
+            spr.drawPixel(sx + 1, sy - 1, star_col);
         }
     }
 
@@ -7837,68 +7492,53 @@ void loop() {
     }
 
     if (ambient_mode) {
-        // Fullscreen radar — flat circles centered on the display, driven
-        // by the same particle/blip data the scanner uses (via shared
-        // update_radar_data). Sweeps and particles render dimmer so the
-        // screen reads as "idle". A small detection counter sits in the
-        // bottom-right corner and flashes ACCENT briefly after each blip.
+        // Fullscreen ambient radar — exact scaled-up replica of the scanner
+        // cylinder. Same TILT, sweep, particles, blip vocabulary; just
+        // bigger and centered, with a small detection counter and nothing
+        // else on screen. Toast overlay still surfaces alerts.
         static unsigned long last_ambient_draw = 0;
         unsigned long now_amb = millis();
         if (now_amb - last_ambient_draw > 33) {  // ~30 fps
             spr.fillSprite(BG_COLOR);
 
-            const int   amb_cx       = DISP_W / 2;            // 120
-            const int   amb_cy       = DISP_H / 2;            // 67
-            const int   amb_r        = 60;
-            const int   amb_inner_r  = 20;
-            const float TWO_PIf      = (float)M_PI * 2.0f;
+            const int   amb_cx      = 120;
+            const int   amb_cy      = 68;
+            const int   amb_r       = 56;
+            const int   amb_inner_r = 22;
+            const float AMB_TILT    = 0.55f;
+            const int   AMB_THICK   = 7;
+            const float TWO_PIf     = (float)M_PI * 2.0f;
 
             unsigned long frame_ms = now_amb;
             update_radar_data(frame_ms);
 
+            // ── Cylinder rendering — identical treatment to the scanner ──
+            // Shadow below cylinder
+            spr.fillEllipse(amb_cx, amb_cy + AMB_THICK + 2, amb_r, amb_r * AMB_TILT,
+                            lgfx::color565(4, 8, 16));
+            // Wall gradient — lighter toward the top
+            for (int i = AMB_THICK; i >= 1; i--) {
+                uint8_t wall_v = 8 + (AMB_THICK - i) * 2;
+                spr.fillEllipse(amb_cx, amb_cy + i, amb_r, amb_r * AMB_TILT,
+                                lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
+            }
+            // Top face fill + double-stroked rim
+            spr.fillEllipse(amb_cx, amb_cy, amb_r, amb_r * AMB_TILT, lgfx::color565(14, 26, 52));
+            spr.drawEllipse(amb_cx, amb_cy,     amb_r, (int)(amb_r * AMB_TILT), HEADER_COLOR);
+            spr.drawEllipse(amb_cx, amb_cy + 1, amb_r, (int)(amb_r * AMB_TILT), HEADER_COLOR);
+            // Bottom rim
+            spr.drawEllipse(amb_cx, amb_cy + AMB_THICK,     amb_r, amb_r * AMB_TILT, DIM_COLOR);
+            spr.drawEllipse(amb_cx, amb_cy + AMB_THICK + 1, amb_r, amb_r * AMB_TILT, DIM_COLOR);
+            // Inner ring
+            spr.drawEllipse(amb_cx, amb_cy,     amb_inner_r, (int)(amb_inner_r * AMB_TILT), DIM_COLOR);
+            spr.drawEllipse(amb_cx, amb_cy + 1, amb_inner_r, (int)(amb_inner_r * AMB_TILT), DIM_COLOR);
+
             // Sweep math
             float sweep_rad  = (frame_ms / 3000.0f) * TWO_PIf;
             float sweep_norm = fmodf(sweep_rad, TWO_PIf);
-
-            // Concentric rings
-            spr.drawCircle(amb_cx, amb_cy, amb_r,        CARD_BORDER);
-            spr.drawCircle(amb_cx, amb_cy, amb_inner_r,  CARD_BORDER);
-            spr.drawCircle(amb_cx, amb_cy, (amb_r + amb_inner_r) / 2, CARD_BORDER);
-
-            // Rotating crosshairs — DIM_COLOR (subdued vs scanner)
-            float    breathe   = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;
-            uint16_t cross_col = (breathe > 0) ? DIM_COLOR : CARD_BORDER;
-            int   dynamic_r = (amb_r - 6) + (int)(6 * breathe);
-            float cos_rot   = cosf(hud_rotation);
-            float sin_rot   = sinf(hud_rotation);
-            spr.drawLine(amb_cx - dynamic_r * cos_rot, amb_cy - dynamic_r * sin_rot,
-                         amb_cx + dynamic_r * cos_rot, amb_cy + dynamic_r * sin_rot, cross_col);
-            spr.drawLine(amb_cx - dynamic_r * -sin_rot, amb_cy - dynamic_r * cos_rot,
-                         amb_cx + dynamic_r * -sin_rot, amb_cy + dynamic_r * cos_rot, cross_col);
-
-            // Sweep trail — half-bright vs scanner
-            for (int i = 1; i <= 24; i++) {
-                float trail_angle = sweep_rad - (i * 0.05f);
-                float ratio = (24.0f - i) / 24.0f;
-                int tr = (int)(5  + (0   - 5)   * ratio);
-                int tg = (int)(10 + (120 - 10)  * ratio);
-                int tb = (int)(24 + (130 - 24)  * ratio);
-                uint16_t fade_col = night_mode
-                    ? lgfx::color565(tb / 2, 0, 0)
-                    : lgfx::color565(tr, tg, tb);
-                for (int r_step = amb_inner_r + 2; r_step < amb_r; r_step += 3) {
-                    spr.drawPixel(amb_cx + (int)(r_step * cosf(trail_angle)),
-                                  amb_cy + (int)(r_step * sinf(trail_angle)), fade_col);
-                }
-            }
-            // Sweep line — DIM_COLOR (was HEADER_COLOR on scanner)
-            spr.drawLine(amb_cx, amb_cy,
-                         amb_cx + (int)((amb_r - 1) * cosf(sweep_rad)),
-                         amb_cy + (int)((amb_r - 1) * sinf(sweep_rad)), DIM_COLOR);
-
-            // Particles — same life/sweep-trail logic as scanner, scaled
-            // radius and halved intensity for ambient feel.
             unsigned long time_since_blip = radar_time_since_blip;
+
+            // Particles — identical logic to scanner, ambient coords
             float noise_dimming = 1.0f;
             if (time_since_blip < 10000)      noise_dimming = 0.0f;
             else if (time_since_blip < 13000) noise_dimming = (time_since_blip - 10000) / 3000.0f;
@@ -7922,70 +7562,121 @@ void loop() {
                     int sweep_boost = (int)(sweep_proximity * 80);
                     int total_intensity = intensity + sweep_boost;
                     if (total_intensity > 255) total_intensity = 255;
-                    int total_intensity_amb = total_intensity / 2;  // ambient is dimmer
 
                     // Scale particle r from scanner range → ambient range
                     float scaled_r = ((noise_r[i] - (float)inner_r) / (float)(radar_r - inner_r))
                                    * (float)(amb_r - amb_inner_r) + (float)amb_inner_r;
 
                     int px = amb_cx + (int)(scaled_r * cosf(noise_a[i]));
-                    int py = amb_cy + (int)(scaled_r * sinf(noise_a[i]));
+                    int py = amb_cy + (int)(scaled_r * sinf(noise_a[i]) * AMB_TILT);
 
                     uint16_t p_col = night_mode
-                        ? lgfx::color565(total_intensity_amb, total_intensity_amb / 8, total_intensity_amb / 12)
-                        : lgfx::color565(total_intensity_amb / 3, (total_intensity_amb * 3) / 4, total_intensity_amb);
+                        ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
+                        : lgfx::color565(total_intensity / 3, (total_intensity * 3) / 4, total_intensity);
 
                     spr.drawTriangle(px - 1, py + 1, px + 1, py + 1, px, py - 2, p_col);
+                    if (sweep_proximity > 0.5f) {
+                        spr.drawPixel(px, py - 1, p_col);
+                        spr.drawPixel(px, py,     p_col);
+                    }
                 }
             }
 
-            // Detection blips — same triangle/diamond shape vocabulary as
-            // scanner, larger spike cap to suit the fullscreen radar.
+            // Crosshairs — same breathing modulation as scanner
+            float    breathe        = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;
+            uint16_t modulated_col  = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
+            int      dynamic_r      = (amb_r - 6) + (int)(4 * breathe);
+            float    cos_rot        = cosf(hud_rotation);
+            float    sin_rot        = sinf(hud_rotation);
+            spr.drawLine(amb_cx - dynamic_r * cos_rot, amb_cy - dynamic_r * sin_rot * AMB_TILT,
+                         amb_cx + dynamic_r * cos_rot, amb_cy + dynamic_r * sin_rot * AMB_TILT,
+                         modulated_col);
+            spr.drawLine(amb_cx - dynamic_r * -sin_rot, amb_cy - dynamic_r * cos_rot * AMB_TILT,
+                         amb_cx + dynamic_r * -sin_rot, amb_cy + dynamic_r * cos_rot * AMB_TILT,
+                         modulated_col);
+
+            // Sweep trail — same color formula as scanner
+            for (int i = 1; i <= 24; i++) {
+                float trail_angle = sweep_rad - (i * 0.05f);
+                float ratio = (24.0f - i) / 24.0f;
+                int tr = 10 + (0   - 10) * ratio;
+                int tg = 20 + (238 - 20) * ratio;
+                int tb = 48 + (255 - 48) * ratio;
+                uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0)
+                                               : lgfx::color565(tr, tg, tb);
+                for (int r_step = amb_inner_r + 2; r_step < amb_r; r_step += 4) {
+                    spr.drawPixel(amb_cx + (int)(r_step * cosf(trail_angle)),
+                                  amb_cy + (int)(r_step * sinf(trail_angle) * AMB_TILT), fade_col);
+                }
+            }
+
+            // Sweep line
+            spr.drawLine(amb_cx, amb_cy,
+                         amb_cx + (int)((amb_r - 1) * cosf(sweep_rad)),
+                         amb_cy + (int)((amb_r - 1) * sinf(sweep_rad) * AMB_TILT), HEADER_COLOR);
+
+            // Blip relight — sweep "re-illuminates" blips it passes
             float angle_step = TWO_PIf / NUM_RADIAL_BANDS;
+            const float BLIP_RELIGHT_ARC = 0.20f;
             for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
                 if (local_spikes[i] < 0.05f) continue;
-                float a = i * angle_step;
-                bool is_strong = (local_spikes[i] > 0.8f);
-
-                int spike_len = (int)((amb_r - amb_inner_r) * local_spikes[i] * 0.7f);
-                if (spike_len < 3)  spike_len = 3;
-                if (spike_len > 35) spike_len = 35;
-
-                float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
-                int blip_dist = amb_inner_r + 4 + (int)((amb_r - amb_inner_r - 6) * dist_ratio);
-
-                int base_x = amb_cx + (int)(blip_dist * cosf(a));
-                int base_y = amb_cy + (int)(blip_dist * sinf(a));
-                uint16_t line_col = local_colors[i];
-
-                if (is_strong) {
-                    int shape_bottom = base_y - spike_len + 8;
-                    if (shape_bottom < base_y) {
-                        spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
+                float band_angle = fmodf(i * angle_step, TWO_PIf);
+                float diff = sweep_norm - band_angle;
+                if (diff >  (float)M_PI) diff -= TWO_PIf;
+                if (diff < -(float)M_PI) diff += TWO_PIf;
+                if (diff >= 0.0f && diff < BLIP_RELIGHT_ARC) {
+                    xSemaphoreTake(dataMutex, portMAX_DELAY);
+                    if (radial_spikes[i] > 0.05f) {
+                        radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
                     }
-                    bool is_ble_blip = (line_col == PURPLE_COLOR);
-                    int tip_y = base_y - spike_len;
-                    if (is_ble_blip) {
-                        int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
-                        spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
-                        spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
-                        spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
-                        spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
-                    } else {
-                        spr.drawTriangle(base_x - 4, tip_y + 7,
-                                         base_x + 4, tip_y + 7,
-                                         base_x,     tip_y, line_col);
-                    }
-                } else {
-                    spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
+                    xSemaphoreGive(dataMutex);
                 }
             }
 
-            // Advance the HUD rotation so re-entering the scanner doesn't jump.
+            // Detection blips — identical shape vocabulary, ambient coords
+            for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
+                float a = i * angle_step;
+                if (local_spikes[i] > 0) {
+                    bool is_strong = (local_spikes[i] > 0.8f);
+                    int spike_len = (int)((amb_r - amb_inner_r) * local_spikes[i] * 0.7f);
+                    if (spike_len < 3)  spike_len = 3;
+                    if (spike_len > 35) spike_len = 35;
+
+                    float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
+                    int blip_dist = amb_inner_r + 4 + (int)((amb_r - amb_inner_r - 6) * dist_ratio);
+
+                    int base_x = amb_cx + (int)(blip_dist * cosf(a));
+                    int base_y = amb_cy + (int)(blip_dist * sinf(a) * AMB_TILT);
+                    uint16_t line_col = local_colors[i];
+
+                    if (is_strong) {
+                        int shape_bottom = base_y - spike_len + 8;
+                        if (shape_bottom < base_y) {
+                            spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
+                        }
+                        bool is_ble_blip = (line_col == PURPLE_COLOR);
+                        int tip_y = base_y - spike_len;
+                        if (is_ble_blip) {
+                            int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
+                            spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
+                            spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
+                            spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
+                            spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
+                        } else {
+                            spr.drawTriangle(base_x - 4, tip_y + 7,
+                                             base_x + 4, tip_y + 7,
+                                             base_x,     tip_y, line_col);
+                        }
+                    } else {
+                        spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
+                    }
+                }
+            }
+
+            // Advance HUD rotation — keeps the scanner consistent on wake.
             hud_rotation = fmodf(hud_rotation + 0.0033f, TWO_PIf);
 
-            // Detection counter — bottom-right, flashes ACCENT briefly
-            // after a fresh blip, otherwise dim.
+            // Detection counter (bottom-right, flashes ACCENT after a blip)
             long det_total;
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             det_total = session_flock_wifi + session_flock_ble + session_raven;
