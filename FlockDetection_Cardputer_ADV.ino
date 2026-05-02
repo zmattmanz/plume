@@ -678,7 +678,6 @@ static bool feed_pending_valid = false;
 // path, consumed and decayed inside draw_scanner_screen().
 static unsigned long scanner_flash_ms = 0;
 static uint16_t      scanner_flash_color = 0;
-static volatile bool wave_spike_pending = false;
 
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
@@ -2378,10 +2377,12 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
         // Scanner-screen reactive animations — consumed inside
         // draw_scanner_screen(). Tint colour mirrors the LED flash
-        // colour pattern (WiFi=accent, BLE=purple).
+        // colour pattern (WiFi=accent, BLE=purple). The spectrum bar
+        // for the active channel highlights based on per-channel
+        // packet counts, so no separate per-detection trigger is
+        // needed for that.
         scanner_flash_ms    = millis();
         scanner_flash_color = (strcmp(proto, "WIFI") == 0) ? ACCENT_COLOR : PURPLE_COLOR;
-        wave_spike_pending  = true;
     }
 
     // Heavy work outside mutex
@@ -4184,412 +4185,253 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
+    // ── Layout constants (pixel-precise spec) ──
+    const int DIVIDER_X   = 112;
+    const int SCAN_CX     = 56;
+    const int SCAN_BASE_Y = 130;
+    const int SCAN_R      = 58;
+    const int FEED_X      = 116;
+    const int FEED_RIGHT  = 236;
+    const int FEED_ROW_H  = 15;
+
+    // Step 1: clear and header
     spr.fillSprite(BG_COLOR);
-    unsigned long frame_ms = millis();
-
-    // ── Detection flash — brief background tint ──
-    // Drawn first so it sits behind every other element. Peaks at 50ms
-    // and fully decays by 300ms; capped at 15% to avoid washing out
-    // content drawn on top.
-    if (scanner_flash_ms > 0) {
-        unsigned long flash_elapsed = frame_ms - scanner_flash_ms;
-        if (flash_elapsed < 300) {
-            float flash_t;
-            if (flash_elapsed < 50) flash_t = (float)flash_elapsed / 50.0f;
-            else                    flash_t = 1.0f - (float)(flash_elapsed - 50) / 250.0f;
-            flash_t *= 0.15f;
-            uint16_t tint = lerp_col16(BG_COLOR, scanner_flash_color, flash_t);
-            spr.fillRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y, tint);
-        }
-    }
-
-    // ── CRT scan line ──
-    // Single 1px line sweeping top-to-bottom every 4s with two faint
-    // glow lines above and below. Reads as "constantly monitoring".
-    {
-        float scan_t = fmodf((float)frame_ms / 4000.0f, 1.0f);
-        int   scan_y = CONTENT_Y + (int)(scan_t * (float)(DISP_H - CONTENT_Y));
-        uint16_t scan_main = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
-        uint16_t scan_glow = lerp_col16(BG_COLOR, CARD_BORDER, 0.2f);
-        spr.drawFastHLine(0, scan_y, DISP_W, scan_main);
-        if (scan_y > CONTENT_Y)  spr.drawFastHLine(0, scan_y - 1, DISP_W, scan_glow);
-        if (scan_y < DISP_H - 1) spr.drawFastHLine(0, scan_y + 1, DISP_W, scan_glow);
-    }
-
     draw_header_spr(0);
 
-    const int divider_x = 112;
+    // Step 2: vertical divider between panels
+    spr.drawFastVLine(DIVIDER_X, CONTENT_Y, DISP_H - CONTENT_Y, CARD_BORDER);
 
-    // Particle driver + spike decay still need to run so the data is fresh
-    // for the ambient screen and so radial_spikes age out correctly when
-    // the user is on the scanner. The radar render itself was removed —
-    // the dashboard layout doesn't need the visual.
-    update_radar_data(frame_ms);
-
-    // Snapshot session flock counts for the big WIFI / BLE numbers.
+    // Step 3: WIFI / BLE counts (TS_BODY label + TS_H2 number)
     long sw, sb;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     sw = session_flock_wifi;
     sb = session_flock_ble;
     xSemaphoreGive(dataMutex);
 
-    // ── Left panel: WIFI / BLE counts (TS_H1, zero-padded, with roll) ──
-    // Per-counter roll: when the displayed value changes, run
-    // anim_slide_in for 300 ms so the new digits glide up rather than
-    // teleporting in. A separate "punch" timestamp drives a brief size
-    // increase so the new value catches the eye.
-    static long prev_sw = -1, prev_sb = -1;
-    static unsigned long sw_anim_start = 0, sb_anim_start = 0;
-    static unsigned long wifi_punch_ms = 0, ble_punch_ms = 0;
-    const unsigned long ROLL_DURATION = 300;
-    if (prev_sw == -1) prev_sw = sw;
-    if (prev_sb == -1) prev_sb = sb;
-    if (sw != prev_sw) { sw_anim_start = frame_ms; wifi_punch_ms = frame_ms; prev_sw = sw; }
-    if (sb != prev_sb) { sb_anim_start = frame_ms; ble_punch_ms  = frame_ms; prev_sb = sb; }
-
-    // Punch envelope: ramps up to +0.3 size over 60ms, then eases back
-    // over the remaining 140ms. Returns 0 once the punch has decayed.
-    auto compute_punch = [frame_ms](unsigned long punch_ms) -> float {
-        if (punch_ms == 0) return 0.0f;
-        unsigned long pe = frame_ms - punch_ms;
-        if (pe >= 200) return 0.0f;
-        float pt = (float)pe / 200.0f;
-        return (pt < 0.3f) ? (pt / 0.3f) * 0.3f
-                           : 0.3f * (1.0f - (pt - 0.3f) / 0.7f);
-    };
-
-    char wifi_str[6], ble_str[6];
-    snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
-    snprintf(ble_str,  sizeof(ble_str),  "%03ld", sb);
-
-    const int counts_label_y = CONTENT_Y + 4;
-    const int counts_num_y   = CONTENT_Y + 16;
-    const int counts_num_h   = (int)(TS_H1 * 8.0f);  // 24px
-
-    // WIFI label + number
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_BODY);
-    spr.setCursor(8, counts_label_y);
+    spr.setCursor(8, CONTENT_Y + 2);
     kprint(spr, "WIFI");
-    {
-        const int num_x = 8;
-        float wifi_size = TS_H1 + compute_punch(wifi_punch_ms);
-        spr.setClipRect(num_x, counts_num_y, 50, counts_num_h);
-        spr.fillRect(num_x, counts_num_y, 50, counts_num_h, BG_COLOR);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(wifi_size);
-        int draw_y = anim_slide_in(counts_num_y, counts_num_h, sw_anim_start, ROLL_DURATION);
-        spr.setCursor(num_x, draw_y);
-        spr.print(wifi_str);
-        spr.clearClipRect();
-    }
 
-    // BLE label + number
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_H2);
+    char wifi_str[6];
+    snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
+    spr.setCursor(8, CONTENT_Y + 14);
+    spr.print(wifi_str);
+
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_BODY);
-    spr.setCursor(62, counts_label_y);
+    spr.setCursor(62, CONTENT_Y + 2);
     kprint(spr, "BLE");
-    {
-        const int num_x = 62;
-        float ble_size = TS_H1 + compute_punch(ble_punch_ms);
-        spr.setClipRect(num_x, counts_num_y, 50, counts_num_h);
-        spr.fillRect(num_x, counts_num_y, 50, counts_num_h, BG_COLOR);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(ble_size);
-        int draw_y = anim_slide_in(counts_num_y, counts_num_h, sb_anim_start, ROLL_DURATION);
-        spr.setCursor(num_x, draw_y);
-        spr.print(ble_str);
-        spr.clearClipRect();
+
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_H2);
+    char ble_str[6];
+    snprintf(ble_str, sizeof(ble_str), "%03ld", sb);
+    spr.setCursor(62, CONTENT_Y + 14);
+    spr.print(ble_str);
+
+    // Step 4: RF FIELD label + current channel
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(8, CONTENT_Y + 36);
+    kprint(spr, "RF FIELD", 1);
+
+    char ch_str[6];
+    snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(DIVIDER_X - 24, CONTENT_Y + 36);
+    spr.print(ch_str);
+
+    // Snapshot feed once — used by the radar blips, the sig count, and
+    // the right-side feed list.
+    FeedEntry local_feed[FEED_SIZE];
+    int local_count, local_head;
+    unsigned long local_now = millis();
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    local_count = feed_count;
+    local_head  = feed_head;
+    for (int i = 0; i < FEED_SIZE; i++) local_feed[i] = feed_entries[i];
+    xSemaphoreGive(dataMutex);
+
+    // Step 5: radar — clip to left panel so full circles render as arcs
+    spr.setClipRect(0, CONTENT_Y, DIVIDER_X, DISP_H - CONTENT_Y);
+
+    // 5a: four RSSI rings
+    for (int ri = 1; ri <= 4; ri++) {
+        int ring_r = (SCAN_R * ri) / 4;
+        spr.drawCircle(SCAN_CX, SCAN_BASE_Y, ring_r, CARD_BORDER);
     }
 
-    // ── Left panel: 2.4GHz waveform ──
-    // Continuous scrolling sine wave. Amplitude is exponentially smoothed
-    // from recent ambient_packet_count deltas — busy RF makes the wave
-    // tall, quiet RF flattens it. Two overlapping frequencies give it an
-    // organic look instead of a perfect textbook sine. Detections spike
-    // the amplitude to 1.0 instantly; the existing 0.3 filter decays it
-    // back over ~1s. Wave colour shifts toward CAUTION_COLOR with
-    // activity, and the box border briefly flashes HEADER_COLOR on
-    // detection (synchronised with the screen flash).
-    {
-        const int wave_x = 6;
-        const int wave_y = CONTENT_Y + 52;
-        const int wave_w = 100;
-        const int wave_h = 50;
+    // 5b: crosshairs
+    spr.drawFastHLine(SCAN_CX - SCAN_R, SCAN_BASE_Y, SCAN_R * 2, CARD_BORDER);
+    spr.drawFastVLine(SCAN_CX, SCAN_BASE_Y - SCAN_R, SCAN_R, CARD_BORDER);
 
-        uint16_t box_border = CARD_BORDER;
-        if (scanner_flash_ms > 0) {
-            unsigned long be = frame_ms - scanner_flash_ms;
-            if (be < 500) {
-                float bt = 1.0f - (float)be / 500.0f;
-                box_border = lerp_col16(CARD_BORDER, HEADER_COLOR, bt);
-            }
+    // 5c: per-channel dotted radial tick marks
+    for (int ch = 1; ch <= 13; ch++) {
+        float angle = (float)M_PI * (1.0f - (float)(ch - 1) / 12.0f);
+        for (int step = 8; step <= SCAN_R; step += 4) {
+            int px = SCAN_CX + (int)((float)step * cosf(angle));
+            int py = SCAN_BASE_Y - (int)((float)step * sinf(angle));
+            spr.drawPixel(px, py, CARD_BORDER);
         }
-        spr.drawRoundRect(wave_x, wave_y, wave_w, wave_h, 4, box_border);
-
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(wave_x + 4, wave_y + 4);
-        spr.print("2.4GHz");
-
-        const int plot_x = wave_x + 4;
-        const int plot_y = wave_y + 14;
-        const int plot_w = wave_w - 8;
-        const int plot_h = wave_h - 18;
-        const int mid_y  = plot_y + plot_h / 2;
-
-        spr.drawFastHLine(plot_x, mid_y, plot_w, CARD_BORDER);
-
-        static float         wave_amplitude = 0.3f;
-        static uint32_t      wave_prev_pkt = 0;
-        static unsigned long wave_last_amp_update = 0;
-
-        // Apply the spike *before* the smoothing tick so it lands on
-        // the next render even when amplitude smoothing isn't due yet.
-        if (wave_spike_pending) {
-            wave_amplitude = 1.0f;
-            wave_spike_pending = false;
-        }
-
-        if (frame_ms - wave_last_amp_update >= 500) {
-            uint32_t delta = ambient_packet_count - wave_prev_pkt;
-            wave_prev_pkt = ambient_packet_count;
-            float target = (float)delta / 40.0f;
-            if (target < 0.1f) target = 0.1f;
-            if (target > 1.0f) target = 1.0f;
-            wave_amplitude += (target - wave_amplitude) * 0.3f;
-            wave_last_amp_update = frame_ms;
-        }
-
-        // Squared blend keeps the wave in HEADER_COLOR for moderate
-        // activity; it only edges toward CAUTION_COLOR at peak rates.
-        float activity_t = wave_amplitude;
-        if (activity_t < 0.0f) activity_t = 0.0f;
-        if (activity_t > 1.0f) activity_t = 1.0f;
-        uint16_t wave_color = lerp_col16(HEADER_COLOR, CAUTION_COLOR,
-                                         activity_t * activity_t);
-
-        float scroll = (float)frame_ms * 0.002f;
-        float max_amp = (float)(plot_h / 2 - 2) * wave_amplitude;
-
-        int prev_px = -1, prev_py = -1;
-        for (int i = 0; i <= plot_w; i++) {
-            float t = (float)i / (float)plot_w;
-            float wave1 = sinf((t * 3.0f + scroll) * 2.0f * (float)M_PI);
-            float wave2 = sinf((t * 1.7f + scroll * 0.6f) * 2.0f * (float)M_PI) * 0.4f;
-            float combined = (wave1 + wave2) * max_amp;
-
-            int px = plot_x + i;
-            int py = mid_y - (int)combined;
-
-            if (py < plot_y + 2)            py = plot_y + 2;
-            if (py > plot_y + plot_h - 2)   py = plot_y + plot_h - 2;
-
-            if (prev_px >= 0) {
-                spr.drawLine(prev_px, prev_py, px, py, wave_color);
-            }
-            prev_px = px;
-            prev_py = py;
-        }
-
-        // Channel indicator — current 2.4GHz hopping channel, dim so
-        // the wave reads through it.
-        char ch_str[6];
-        snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(wave_x + wave_w - 26, wave_y + wave_h - 10);
-        spr.print(ch_str);
-
-        // Packet rate (pkt/s) — live counter below the waveform box,
-        // gives the amplitude meaningful context.
-        static uint32_t      pps_prev_count = 0;
-        static unsigned long pps_last_update = 0;
-        static uint32_t      pps_display = 0;
-        if (frame_ms - pps_last_update >= 1000) {
-            uint32_t cur = ambient_packet_count;
-            pps_display    = cur - pps_prev_count;
-            pps_prev_count = cur;
-            pps_last_update = frame_ms;
-        }
-        char pps_str[16];
-        snprintf(pps_str, sizeof(pps_str), "%lu pkt/s", (unsigned long)pps_display);
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(wave_x + 4, wave_y + wave_h + 4);
-        spr.print(pps_str);
     }
 
-    // ── Vertical divider between left dashboard and right feed ──
-    spr.drawFastVLine(divider_x, CONTENT_Y + 2, DISP_H - CONTENT_Y - 4, CARD_BORDER);
-
-    // ── Right panel: full-height live feed ──
-    // Each row: protocol letter (W/B/R) + flock star + name (truncated to
-    // ~12 chars) + right-aligned RSSI. Throttled snapshot at 2 s cadence
-    // with slide-in animation when the top entry changes. Visible row
-    // count is computed from the available space, not hardcoded.
+    // 5d: sweep line on the active channel
     {
-        const int feed_x        = divider_x + 4;
-        const int feed_header_y = CONTENT_Y + 2;
-        const int feed_top      = feed_header_y + 10;
-        const int feed_row_h    = 14;
-        const int feed_bottom   = DISP_H - 2;
-        const int max_visible   = (feed_bottom - feed_top) / feed_row_h;
-        const int feed_right    = DISP_W - 2;
+        float sweep_angle = (float)M_PI * (1.0f - (float)(current_channel - 1) / 12.0f);
+        int sweep_ex = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
+        int sweep_ey = SCAN_BASE_Y - (int)((float)SCAN_R * sinf(sweep_angle));
+        spr.drawLine(SCAN_CX, SCAN_BASE_Y, sweep_ex, sweep_ey,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f));
+    }
 
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(feed_x, feed_header_y);
-        kprint(spr, "FEED");
+    // 5e: 3 trailing sweep lines, fading
+    for (int trail = 1; trail <= 3; trail++) {
+        int trail_ch = current_channel - trail;
+        if (trail_ch < 1) trail_ch += 13;
+        float trail_angle = (float)M_PI * (1.0f - (float)(trail_ch - 1) / 12.0f);
+        float trail_alpha = 0.3f * (1.0f - (float)trail / 4.0f);
+        int tex = SCAN_CX + (int)((float)SCAN_R * cosf(trail_angle));
+        int tey = SCAN_BASE_Y - (int)((float)SCAN_R * sinf(trail_angle));
+        spr.drawLine(SCAN_CX, SCAN_BASE_Y, tex, tey,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, trail_alpha));
+    }
 
-        static FeedEntry display_feed[FEED_SIZE];
-        static int display_count = 0;
-        static int display_head = 0;
-        static unsigned long display_last_refresh = 0;
-        static bool display_ever_populated = false;
-        static char display_prev_top_mac[18] = "";
-        static unsigned long display_shift_ms = 0;
-        static bool display_first_shown = false;
-
-        unsigned long local_now = frame_ms;
-        const unsigned long FEED_DISPLAY_REFRESH_MS = 2000;
-
-        if ((local_now - display_last_refresh) >= FEED_DISPLAY_REFRESH_MS || !display_ever_populated) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            display_count = feed_count;
-            display_head = feed_head;
-            for (int i = 0; i < FEED_SIZE; i++) display_feed[i] = feed_entries[i];
-            xSemaphoreGive(dataMutex);
-            display_last_refresh = local_now;
-            if (display_count > 0) {
-                display_ever_populated = true;
-                int top_idx = (display_head + FEED_SIZE * 2) % FEED_SIZE;
-                if (strcmp(display_feed[top_idx].mac, display_prev_top_mac) != 0) {
-                    strncpy(display_prev_top_mac, display_feed[top_idx].mac, 17);
-                    display_prev_top_mac[17] = '\0';
-                    if (display_first_shown) {
-                        display_shift_ms = local_now;
-                    } else {
-                        display_shift_ms = 0;
-                        display_first_shown = true;
-                    }
-                }
-            }
+    // 5f: phosphor wedge fill behind the sweep
+    for (int offset = 0; offset <= 3; offset++) {
+        int glow_ch = current_channel - offset;
+        if (glow_ch < 1) glow_ch += 13;
+        float ga = (float)M_PI * (1.0f - (float)(glow_ch - 1) / 12.0f);
+        float galpha = 0.05f * (1.0f - (float)offset / 4.0f);
+        if (galpha < 0.01f) continue;
+        uint16_t gc = lerp_col16(BG_COLOR, HEADER_COLOR, galpha);
+        for (int step = 6; step <= SCAN_R; step += 2) {
+            int gpx = SCAN_CX + (int)((float)step * cosf(ga));
+            int gpy = SCAN_BASE_Y - (int)((float)step * sinf(ga));
+            spr.drawPixel(gpx, gpy, gc);
         }
+        float ga2 = (float)M_PI * (1.0f - (float)glow_ch / 12.0f);
+        float mid_a = (ga + ga2) * 0.5f;
+        for (int step = 10; step <= SCAN_R; step += 3) {
+            int mpx = SCAN_CX + (int)((float)step * cosf(mid_a));
+            int mpy = SCAN_BASE_Y - (int)((float)step * sinf(mid_a));
+            spr.drawPixel(mpx, mpy, gc);
+        }
+    }
 
-        FeedEntry* local_feed = display_feed;
-        int local_count = display_count;
-        int local_head = display_head;
+    // 5g: device blips — channel-angle × RSSI distance from centre
+    for (int i = 0; i < local_count && i < FEED_SIZE; i++) {
+        int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = local_feed[idx];
 
-        if (!display_ever_populated) {
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(TS_BODY);
-            char dots[4];
-            anim_ellipsis(dots, sizeof(dots));
-            char load_str[20];
-            snprintf(load_str, sizeof(load_str), "scanning%s", dots);
-            int load_y = feed_top + (feed_bottom - feed_top) / 2 - 4;
-            spr.setCursor(feed_x + 4, load_y);
-            spr.print(load_str);
+        unsigned long age = local_now - e.timestamp;
+        if (age > 60000UL) continue;
+        float fade = 1.0f - (float)age / 60000.0f;
+        if (fade < 0.08f) continue;
+
+        int pseudo_ch = 1 + (hash_mac(e.mac) % 13);
+        float blip_angle = (float)M_PI * (1.0f - (float)(pseudo_ch - 1) / 12.0f);
+
+        float rssi_norm = (float)(e.rssi - (-90)) / (float)((-30) - (-90));
+        if (rssi_norm < 0.0f) rssi_norm = 0.0f;
+        if (rssi_norm > 1.0f) rssi_norm = 1.0f;
+        float blip_dist = (float)SCAN_R * (0.2f + 0.75f * (1.0f - rssi_norm));
+
+        int bx = SCAN_CX + (int)(blip_dist * cosf(blip_angle));
+        int by = SCAN_BASE_Y - (int)(blip_dist * sinf(blip_angle));
+
+        int dot_size = (rssi_norm > 0.6f) ? 3 : (rssi_norm > 0.3f) ? 2 : 1;
+
+        if (e.is_flock) {
+            uint16_t fc = lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.9f);
+            spr.fillCircle(bx, by, dot_size, fc);
+            spr.drawCircle(bx, by, dot_size + 3,
+                           lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.3f));
         } else {
-            spr.setClipRect(feed_x, feed_top,
-                            feed_right - feed_x,
-                            feed_bottom - feed_top);
-
-            int rows_to_draw = (local_count < max_visible) ? local_count : max_visible;
-
-            for (int i = 0; i < rows_to_draw; i++) {
-                int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-                FeedEntry& e = local_feed[idx];
-
-                int row_y;
-                if (i == 0 && display_shift_ms != 0) {
-                    row_y = anim_slide_in(feed_top, -feed_row_h, display_shift_ms, 300);
-                } else {
-                    row_y = feed_top + i * feed_row_h;
-                }
-
-                unsigned long age = local_now - e.timestamp;
-                float age_fade;
-                if      (age < 30000UL) age_fade = 1.0f;
-                else if (age < 90000UL) age_fade = 1.0f - (float)(age - 30000UL) / 60000.0f;
-                else                    age_fade = 0.0f;
-                if (age_fade < 0.10f) continue;
-
-                bool is_raven = (strstr(e.name, "RAVEN") != nullptr);
-                char proto_letter;
-                uint16_t proto_col;
-                if (is_raven) {
-                    proto_letter = 'R';
-                    proto_col = ACCENT_COLOR;
-                } else if (e.proto == 0) {
-                    proto_letter = 'W';
-                    proto_col = CAUTION_COLOR;
-                } else {
-                    proto_letter = 'B';
-                    proto_col = PURPLE_COLOR;
-                }
-                proto_col = lerp_col16(BG_COLOR, proto_col, age_fade);
-
-                // New-entry highlight on row 0 — synchronised with the
-                // existing slide-in. The display only refreshes every 2s,
-                // so e.timestamp is too coarse for a 500ms highlight;
-                // display_shift_ms instead marks when the new top entry
-                // actually became visible. Only the name flashes bright
-                // — protocol letter and RSSI stay dim so the eye lands
-                // on the useful info.
-                float new_boost = 0.0f;
-                if (i == 0 && display_shift_ms != 0) {
-                    unsigned long shift_age = local_now - display_shift_ms;
-                    if (shift_age < 500) {
-                        new_boost = 1.0f - (float)shift_age / 500.0f;
-                    }
-                }
-                uint16_t name_col = lerp_col16(
-                    lerp_col16(BG_COLOR, TEXT_COLOR, age_fade),
-                    HEADER_COLOR,
-                    new_boost);
-                uint16_t rssi_col = lerp_col16(BG_COLOR, DIM_COLOR, age_fade);
-
-                spr.setTextSize(TS_BODY);
-
-                spr.setTextColor(proto_col, BG_COLOR);
-                spr.setCursor(feed_x, row_y);
-                spr.print(proto_letter);
-
-                int name_x = feed_x + 8;
-                if (e.is_flock) {
-                    spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, age_fade), BG_COLOR);
-                    spr.setCursor(name_x, row_y);
-                    spr.print("*");
-                    name_x += 6;
-                }
-
-                char rssi_str[8];
-                snprintf(rssi_str, sizeof(rssi_str), "%d", e.rssi);
-                int rssi_w = (int)strlen(rssi_str) * 7;
-                int rssi_x = feed_right - rssi_w;
-
-                int name_x_end = rssi_x - 4;
-                int name_max_chars = (name_x_end - name_x) / 7;
-                if (name_max_chars > 12) name_max_chars = 12;
-                if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
-                if (name_max_chars < 1) name_max_chars = 1;
-
-                char name_disp[20];
-                strncpy(name_disp, e.name, name_max_chars);
-                name_disp[name_max_chars] = '\0';
-                spr.setTextColor(name_col, BG_COLOR);
-                spr.setCursor(name_x, row_y);
-                spr.print(name_disp);
-
-                spr.setTextColor(rssi_col, BG_COLOR);
-                spr.setCursor(rssi_x, row_y);
-                spr.print(rssi_str);
-            }
-
-            spr.clearClipRect();
+            uint16_t nc = lerp_col16(BG_COLOR, HEADER_COLOR, fade * 0.6f);
+            spr.drawCircle(bx, by, dot_size, nc);
         }
+    }
+
+    // 5h: centre dot
+    spr.fillCircle(SCAN_CX, SCAN_BASE_Y, 1, lerp_col16(BG_COLOR, TEXT_COLOR, 0.25f));
+
+    // 5i: clear clip
+    spr.clearClipRect();
+
+    // Step 6: baseline + bottom labels (unclipped)
+    spr.drawFastHLine(SCAN_CX - SCAN_R - 2, SCAN_BASE_Y,
+                      SCAN_R * 2 + 4, CARD_BORDER);
+
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(SCAN_CX - SCAN_R - 2, SCAN_BASE_Y + 2);
+    spr.print("1");
+    spr.setCursor(SCAN_CX - 2, SCAN_BASE_Y + 2);
+    spr.print("7");
+
+    int sig_count_local = local_count;
+    char sig_str[10];
+    snprintf(sig_str, sizeof(sig_str), "%d sig", sig_count_local);
+    int sig_w = (int)strlen(sig_str) * 6;
+    spr.setCursor(SCAN_CX + SCAN_R - sig_w + 2, SCAN_BASE_Y + 2);
+    spr.print(sig_str);
+
+    // Step 7: feed list on the right panel
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(FEED_X, CONTENT_Y + 2);
+    kprint(spr, "FEED");
+
+    int feed_first_y = CONTENT_Y + 16;
+    int max_vis = (DISP_H - feed_first_y) / FEED_ROW_H;
+
+    for (int i = 0; i < local_count && i < max_vis; i++) {
+        int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = local_feed[idx];
+        int ry = feed_first_y + i * FEED_ROW_H;
+
+        unsigned long age = local_now - e.timestamp;
+        float af;
+        if (age < 30000UL)      af = 1.0f;
+        else if (age < 90000UL) af = 1.0f - (float)(age - 30000UL) / 60000.0f;
+        else                    af = 0.0f;
+        if (af < 0.1f) continue;
+
+        char proto = (e.proto == 0) ? 'W' : 'B';
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(FEED_X, ry);
+        char ps[2] = { proto, '\0' };
+        spr.print(ps);
+
+        int name_x = FEED_X + 12;
+        if (e.is_flock) {
+            spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, af), BG_COLOR);
+            spr.setCursor(FEED_X + 8, ry);
+            spr.print("*");
+            name_x = FEED_X + 18;
+        }
+
+        int max_chars = (FEED_RIGHT - 32 - name_x) / 7;
+        if (max_chars > 10) max_chars = 10;
+        if (max_chars < 1) max_chars = 1;
+        char nd[12];
+        strncpy(nd, e.name, max_chars);
+        nd[max_chars] = '\0';
+        spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
+        spr.setCursor(name_x, ry);
+        spr.print(nd);
+
+        char rs[6];
+        snprintf(rs, sizeof(rs), "%d", e.rssi);
+        int rw = (int)strlen(rs) * 7;
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
+        spr.setCursor(FEED_RIGHT - rw, ry);
+        spr.print(rs);
     }
 }
 
@@ -5239,15 +5081,7 @@ void draw_gps_screen() {
             float twinkle = anim_pulse(3000 + i * 200, (float)i / (float)NUM_STARS);
             uint8_t b = (uint8_t)(100 + twinkle * 155);
             uint16_t star_col = lgfx::color565(b, b, b);
-            int sx = star_x[i];
-            int sy = star_y[i];
-            // 5-pixel X: center + 4 diagonal arms. Reads as a star against
-            // the wireframe globe rather than a stray dot.
-            spr.drawPixel(sx,     sy,     star_col);
-            spr.drawPixel(sx - 1, sy - 1, star_col);
-            spr.drawPixel(sx + 1, sy + 1, star_col);
-            spr.drawPixel(sx - 1, sy + 1, star_col);
-            spr.drawPixel(sx + 1, sy - 1, star_col);
+            spr.drawPixel(star_x[i], star_y[i], star_col);
         }
     }
 
