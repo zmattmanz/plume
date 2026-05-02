@@ -679,6 +679,11 @@ static bool feed_pending_valid = false;
 static unsigned long scanner_flash_ms = 0;
 static uint16_t      scanner_flash_color = 0;
 
+// Eased angle for the scanner radar sweep — interpolates toward the
+// current_channel angle each frame so the line glides between channel
+// positions instead of snapping when the hopper advances.
+static float scan_sweep_display_angle = (float)M_PI;
+
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
 static unsigned long bs_pending_until = 0;
@@ -4185,149 +4190,147 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 void draw_scanner_screen() {
-    // ── Layout constants (pixel-precise spec) ──
-    const int DIVIDER_X   = 112;
-    const int SCAN_CX     = 56;
-    const int SCAN_BASE_Y = 130;
-    const int SCAN_R      = 58;
-    const int FEED_X      = 116;
-    const int FEED_RIGHT  = 236;
-    const int FEED_ROW_H  = 15;
+    // ── Layout constants ──
+    const int SCAN_CX = 120;
+    const int SCAN_CY = 128;
+    const int SCAN_R  = 76;
+    const int SCAN_TRAIL_STEPS = 36;
 
-    // Step 1: clear and header
+    unsigned long frame_ms = millis();
+
+    // Step 1: clear + header
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
 
-    // Step 2: vertical divider between panels
-    spr.drawFastVLine(DIVIDER_X, CONTENT_Y, DISP_H - CONTENT_Y, CARD_BORDER);
-
-    // Step 3: WIFI / BLE counts (TS_BODY label + TS_H2 number)
+    // Step 2: counts line — WIFI nnn  BLE nnn  RF FIELD  CHn
     long sw, sb;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     sw = session_flock_wifi;
     sb = session_flock_ble;
     xSemaphoreGive(dataMutex);
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(8, CONTENT_Y + 2);
-    kprint(spr, "WIFI");
+    char wifi_str[6], ble_str[6];
+    snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
+    snprintf(ble_str,  sizeof(ble_str),  "%03ld", sb);
 
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(6, CONTENT_Y);
+    kprint(spr, "WIFI", 1);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(TS_H2);
-    char wifi_str[6];
-    snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
-    spr.setCursor(8, CONTENT_Y + 14);
+    spr.setCursor(28, CONTENT_Y - 2);
     spr.print(wifi_str);
 
     spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(62, CONTENT_Y + 2);
-    kprint(spr, "BLE");
-
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(80, CONTENT_Y);
+    kprint(spr, "BLE", 1);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(TS_H2);
-    char ble_str[6];
-    snprintf(ble_str, sizeof(ble_str), "%03ld", sb);
-    spr.setCursor(62, CONTENT_Y + 14);
+    spr.setCursor(98, CONTENT_Y - 2);
     spr.print(ble_str);
 
-    // Step 4: RF FIELD label + current channel
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(8, CONTENT_Y + 36);
-    kprint(spr, "RF FIELD", 1);
+    spr.setCursor(152, CONTENT_Y);
+    spr.print("RF FIELD");
 
     char ch_str[6];
     snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(DIVIDER_X - 24, CONTENT_Y + 36);
+    spr.setCursor(DISP_W - 24, CONTENT_Y);
     spr.print(ch_str);
 
-    // Snapshot feed once — used by the radar blips, the sig count, and
-    // the right-side feed list.
-    FeedEntry local_feed[FEED_SIZE];
-    int local_count, local_head;
-    unsigned long local_now = millis();
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    local_count = feed_count;
-    local_head  = feed_head;
-    for (int i = 0; i < FEED_SIZE; i++) local_feed[i] = feed_entries[i];
-    xSemaphoreGive(dataMutex);
+    // Step 3: clip to radar area
+    spr.setClipRect(0, 32, DISP_W, SCAN_CY - 32);
 
-    // Step 5: radar — clip to left panel so full circles render as arcs
-    spr.setClipRect(0, CONTENT_Y, DIVIDER_X, DISP_H - CONTENT_Y);
-
-    // 5a: four RSSI rings
+    // Step 4: RSSI rings — anti-aliased semicircular arcs (top half:
+    // 180°→360° in M5GFX's clockwise-from-3-o'clock angle convention).
     for (int ri = 1; ri <= 4; ri++) {
         int ring_r = (SCAN_R * ri) / 4;
-        spr.drawCircle(SCAN_CX, SCAN_BASE_Y, ring_r, CARD_BORDER);
+        uint16_t ring_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.4f);
+        spr.drawSmoothArc(SCAN_CX, SCAN_CY,
+                          ring_r + 1, ring_r,
+                          180.0f, 360.0f,
+                          ring_col, BG_COLOR);
     }
+    uint16_t outer_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
+    spr.drawSmoothArc(SCAN_CX, SCAN_CY,
+                      SCAN_R + 1, SCAN_R,
+                      180.0f, 360.0f,
+                      outer_col, BG_COLOR);
 
-    // 5b: crosshairs
-    spr.drawFastHLine(SCAN_CX - SCAN_R, SCAN_BASE_Y, SCAN_R * 2, CARD_BORDER);
-    spr.drawFastVLine(SCAN_CX, SCAN_BASE_Y - SCAN_R, SCAN_R, CARD_BORDER);
-
-    // 5c: per-channel dotted radial tick marks
+    // Step 5: channel ticks at outer edge — 13 short smooth lines
     for (int ch = 1; ch <= 13; ch++) {
         float angle = (float)M_PI * (1.0f - (float)(ch - 1) / 12.0f);
-        for (int step = 8; step <= SCAN_R; step += 4) {
-            int px = SCAN_CX + (int)((float)step * cosf(angle));
-            int py = SCAN_BASE_Y - (int)((float)step * sinf(angle));
-            spr.drawPixel(px, py, CARD_BORDER);
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        int t1x = SCAN_CX + (int)((float)SCAN_R * 0.87f * cos_a);
+        int t1y = SCAN_CY - (int)((float)SCAN_R * 0.87f * sin_a);
+        int t2x = SCAN_CX + (int)((float)SCAN_R * cos_a);
+        int t2y = SCAN_CY - (int)((float)SCAN_R * sin_a);
+        if (t1y >= 32 && t2y >= 32) {
+            uint16_t tick_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.2f);
+            spr.drawWideLine(t1x, t1y, t2x, t2y, 1.0f, tick_col, BG_COLOR);
         }
     }
 
-    // 5d: sweep line on the active channel
+    // Smooth-eased sweep angle — interpolates toward current_channel so
+    // the line glides between channel positions instead of snapping when
+    // the hopper advances every CHANNEL_DWELL_MS.
+    float target_angle = (float)M_PI * (1.0f - (float)(current_channel - 1) / 12.0f);
+    float diff = target_angle - scan_sweep_display_angle;
+    while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
+    while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+    scan_sweep_display_angle += diff * 0.12f;
+    float sweep_angle = scan_sweep_display_angle;
+
+    // Step 6: sweep trail — 36 fading anti-aliased radial lines.
+    for (int i = 1; i <= SCAN_TRAIL_STEPS; i++) {
+        float trail_offset = (float)i * 0.028f;
+        float trail_ang = sweep_angle + trail_offset;
+        float ratio = (float)(SCAN_TRAIL_STEPS - i) / (float)SCAN_TRAIL_STEPS;
+        float alpha = ratio * 0.28f;
+        uint16_t trail_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+
+        int lx1 = SCAN_CX + (int)(8.0f * cosf(trail_ang));
+        int ly1 = SCAN_CY - (int)(8.0f * sinf(trail_ang));
+        int lx2 = SCAN_CX + (int)((float)(SCAN_R - 1) * cosf(trail_ang));
+        int ly2 = SCAN_CY - (int)((float)(SCAN_R - 1) * sinf(trail_ang));
+        if (ly1 < 32 || ly2 < 32) continue;
+
+        spr.drawWideLine(lx1, ly1, lx2, ly2, 1.2f, trail_col, BG_COLOR);
+    }
+
+    // Step 7: bright sweep line.
     {
-        float sweep_angle = (float)M_PI * (1.0f - (float)(current_channel - 1) / 12.0f);
-        int sweep_ex = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
-        int sweep_ey = SCAN_BASE_Y - (int)((float)SCAN_R * sinf(sweep_angle));
-        spr.drawLine(SCAN_CX, SCAN_BASE_Y, sweep_ex, sweep_ey,
-                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f));
+        int sx1 = SCAN_CX + (int)(8.0f * cosf(sweep_angle));
+        int sy1 = SCAN_CY - (int)(8.0f * sinf(sweep_angle));
+        int sx2 = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
+        int sy2 = SCAN_CY - (int)((float)SCAN_R * sinf(sweep_angle));
+        uint16_t sweep_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
+        spr.drawWideLine(sx1, sy1, sx2, sy2, 1.5f, sweep_col, BG_COLOR);
     }
 
-    // 5e: 3 trailing sweep lines, fading
-    for (int trail = 1; trail <= 3; trail++) {
-        int trail_ch = current_channel - trail;
-        if (trail_ch < 1) trail_ch += 13;
-        float trail_angle = (float)M_PI * (1.0f - (float)(trail_ch - 1) / 12.0f);
-        float trail_alpha = 0.3f * (1.0f - (float)trail / 4.0f);
-        int tex = SCAN_CX + (int)((float)SCAN_R * cosf(trail_angle));
-        int tey = SCAN_BASE_Y - (int)((float)SCAN_R * sinf(trail_angle));
-        spr.drawLine(SCAN_CX, SCAN_BASE_Y, tex, tey,
-                     lerp_col16(BG_COLOR, HEADER_COLOR, trail_alpha));
-    }
+    // Step 8: device blips — anti-aliased circle outlines, position by
+    // MAC-hashed channel angle × RSSI distance from centre.
+    static FeedEntry scan_local_feed[FEED_SIZE];
+    int scan_local_count, scan_local_head;
+    unsigned long scan_now = frame_ms;
 
-    // 5f: phosphor wedge fill behind the sweep
-    for (int offset = 0; offset <= 3; offset++) {
-        int glow_ch = current_channel - offset;
-        if (glow_ch < 1) glow_ch += 13;
-        float ga = (float)M_PI * (1.0f - (float)(glow_ch - 1) / 12.0f);
-        float galpha = 0.05f * (1.0f - (float)offset / 4.0f);
-        if (galpha < 0.01f) continue;
-        uint16_t gc = lerp_col16(BG_COLOR, HEADER_COLOR, galpha);
-        for (int step = 6; step <= SCAN_R; step += 2) {
-            int gpx = SCAN_CX + (int)((float)step * cosf(ga));
-            int gpy = SCAN_BASE_Y - (int)((float)step * sinf(ga));
-            spr.drawPixel(gpx, gpy, gc);
-        }
-        float ga2 = (float)M_PI * (1.0f - (float)glow_ch / 12.0f);
-        float mid_a = (ga + ga2) * 0.5f;
-        for (int step = 10; step <= SCAN_R; step += 3) {
-            int mpx = SCAN_CX + (int)((float)step * cosf(mid_a));
-            int mpy = SCAN_BASE_Y - (int)((float)step * sinf(mid_a));
-            spr.drawPixel(mpx, mpy, gc);
-        }
-    }
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    scan_local_count = feed_count;
+    scan_local_head  = feed_head;
+    for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
+    xSemaphoreGive(dataMutex);
 
-    // 5g: device blips — channel-angle × RSSI distance from centre
-    for (int i = 0; i < local_count && i < FEED_SIZE; i++) {
-        int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-        FeedEntry& e = local_feed[idx];
+    for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
+        int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
 
-        unsigned long age = local_now - e.timestamp;
+        unsigned long age = scan_now - e.timestamp;
         if (age > 60000UL) continue;
         float fade = 1.0f - (float)age / 60000.0f;
         if (fade < 0.08f) continue;
@@ -4336,103 +4339,64 @@ void draw_scanner_screen() {
         float blip_angle = (float)M_PI * (1.0f - (float)(pseudo_ch - 1) / 12.0f);
 
         float rssi_norm = (float)(e.rssi - (-90)) / (float)((-30) - (-90));
-        if (rssi_norm < 0.0f) rssi_norm = 0.0f;
-        if (rssi_norm > 1.0f) rssi_norm = 1.0f;
-        float blip_dist = (float)SCAN_R * (0.2f + 0.75f * (1.0f - rssi_norm));
+        rssi_norm = constrain(rssi_norm, 0.0f, 1.0f);
+        float blip_dist = (float)SCAN_R * (0.12f + 0.82f * (1.0f - rssi_norm));
 
         int bx = SCAN_CX + (int)(blip_dist * cosf(blip_angle));
-        int by = SCAN_BASE_Y - (int)(blip_dist * sinf(blip_angle));
+        int by = SCAN_CY - (int)(blip_dist * sinf(blip_angle));
+        if (by < 32) continue;
 
-        int dot_size = (rssi_norm > 0.6f) ? 3 : (rssi_norm > 0.3f) ? 2 : 1;
+        int dot_r = (rssi_norm > 0.5f) ? 4 : (rssi_norm > 0.25f) ? 3 : 2;
 
+        uint16_t blip_col;
         if (e.is_flock) {
-            uint16_t fc = lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.9f);
-            spr.fillCircle(bx, by, dot_size, fc);
-            spr.drawCircle(bx, by, dot_size + 3,
-                           lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.3f));
+            blip_col = lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.75f);
         } else {
-            uint16_t nc = lerp_col16(BG_COLOR, HEADER_COLOR, fade * 0.6f);
-            spr.drawCircle(bx, by, dot_size, nc);
+            blip_col = lerp_col16(BG_COLOR, HEADER_COLOR, fade * 0.6f);
         }
+
+        spr.drawSmoothCircle(bx, by, dot_r, blip_col, BG_COLOR);
     }
 
-    // 5h: centre dot
-    spr.fillCircle(SCAN_CX, SCAN_BASE_Y, 1, lerp_col16(BG_COLOR, TEXT_COLOR, 0.25f));
+    // Step 9: centre dot
+    spr.drawSmoothCircle(SCAN_CX, SCAN_CY, 1,
+                         lerp_col16(BG_COLOR, TEXT_COLOR, 0.2f), BG_COLOR);
 
-    // 5i: clear clip
+    // Step 10: clear clip
     spr.clearClipRect();
 
-    // Step 6: baseline + bottom labels (unclipped)
-    spr.drawFastHLine(SCAN_CX - SCAN_R - 2, SCAN_BASE_Y,
-                      SCAN_R * 2 + 4, CARD_BORDER);
+    // Step 11: baseline + bottom labels.
+    spr.drawFastHLine(SCAN_CX - SCAN_R - 3, SCAN_CY,
+                      SCAN_R * 2 + 6, lerp_col16(BG_COLOR, CARD_BORDER, 0.45f));
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(SCAN_CX - SCAN_R - 2, SCAN_BASE_Y + 2);
+    spr.setCursor(SCAN_CX - SCAN_R - 3, SCAN_CY + 2);
     spr.print("1");
-    spr.setCursor(SCAN_CX - 2, SCAN_BASE_Y + 2);
+    spr.setCursor(SCAN_CX - 3, SCAN_CY + 2);
     spr.print("7");
 
-    int sig_count_local = local_count;
-    char sig_str[10];
-    snprintf(sig_str, sizeof(sig_str), "%d sig", sig_count_local);
+    char sig_str[8];
+    int sig_count = scan_local_count;
+    snprintf(sig_str, sizeof(sig_str), "%d sig", sig_count);
     int sig_w = (int)strlen(sig_str) * 6;
-    spr.setCursor(SCAN_CX + SCAN_R - sig_w + 2, SCAN_BASE_Y + 2);
+    spr.setCursor(SCAN_CX + SCAN_R - sig_w + 3, SCAN_CY + 2);
     spr.print(sig_str);
 
-    // Step 7: feed list on the right panel
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(FEED_X, CONTENT_Y + 2);
-    kprint(spr, "FEED");
-
-    int feed_first_y = CONTENT_Y + 16;
-    int max_vis = (DISP_H - feed_first_y) / FEED_ROW_H;
-
-    for (int i = 0; i < local_count && i < max_vis; i++) {
-        int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-        FeedEntry& e = local_feed[idx];
-        int ry = feed_first_y + i * FEED_ROW_H;
-
-        unsigned long age = local_now - e.timestamp;
-        float af;
-        if (age < 30000UL)      af = 1.0f;
-        else if (age < 90000UL) af = 1.0f - (float)(age - 30000UL) / 60000.0f;
-        else                    af = 0.0f;
-        if (af < 0.1f) continue;
-
-        char proto = (e.proto == 0) ? 'W' : 'B';
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
-        spr.setTextSize(TS_BODY);
-        spr.setCursor(FEED_X, ry);
-        char ps[2] = { proto, '\0' };
-        spr.print(ps);
-
-        int name_x = FEED_X + 12;
-        if (e.is_flock) {
-            spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, af), BG_COLOR);
-            spr.setCursor(FEED_X + 8, ry);
-            spr.print("*");
-            name_x = FEED_X + 18;
-        }
-
-        int max_chars = (FEED_RIGHT - 32 - name_x) / 7;
-        if (max_chars > 10) max_chars = 10;
-        if (max_chars < 1) max_chars = 1;
-        char nd[12];
-        strncpy(nd, e.name, max_chars);
-        nd[max_chars] = '\0';
-        spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
-        spr.setCursor(name_x, ry);
-        spr.print(nd);
-
-        char rs[6];
-        snprintf(rs, sizeof(rs), "%d", e.rssi);
-        int rw = (int)strlen(rs) * 7;
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
-        spr.setCursor(FEED_RIGHT - rw, ry);
-        spr.print(rs);
+    // pkt/s — bottom-left, fed by the WiFi sniffer's ambient counter.
+    static uint32_t      pps_prev = 0;
+    static unsigned long pps_last = 0;
+    static uint32_t      pps_val  = 0;
+    if (frame_ms - pps_last >= 1000) {
+        pps_val  = ambient_packet_count - pps_prev;
+        pps_prev = ambient_packet_count;
+        pps_last = frame_ms;
     }
+    char pps_str[12];
+    snprintf(pps_str, sizeof(pps_str), "%lu pkt/s", (unsigned long)pps_val);
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
+    spr.setCursor(4, SCAN_CY + 2);
+    spr.print(pps_str);
 }
 
 void draw_locator_screen() {
