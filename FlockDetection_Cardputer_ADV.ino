@@ -4248,19 +4248,16 @@ void draw_scanner_screen() {
 
     // Step 4: RSSI rings — anti-aliased semicircular arcs (top half:
     // 180°→360° in M5GFX's clockwise-from-3-o'clock angle convention).
+    // M5Canvas doesn't expose drawSmoothArc — fall back to drawCircle.
+    // The clip rect already hides the bottom half so each call renders
+    // as a top semicircular ring.
     for (int ri = 1; ri <= 4; ri++) {
         int ring_r = (SCAN_R * ri) / 4;
         uint16_t ring_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.4f);
-        spr.drawSmoothArc(SCAN_CX, SCAN_CY,
-                          ring_r + 1, ring_r,
-                          180.0f, 360.0f,
-                          ring_col, BG_COLOR);
+        spr.drawCircle(SCAN_CX, SCAN_CY, ring_r, ring_col);
     }
     uint16_t outer_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
-    spr.drawSmoothArc(SCAN_CX, SCAN_CY,
-                      SCAN_R + 1, SCAN_R,
-                      180.0f, 360.0f,
-                      outer_col, BG_COLOR);
+    spr.drawCircle(SCAN_CX, SCAN_CY, SCAN_R, outer_col);
 
     // Step 5: channel ticks at outer edge — 13 short smooth lines
     for (int ch = 1; ch <= 13; ch++) {
@@ -4273,7 +4270,7 @@ void draw_scanner_screen() {
         int t2y = SCAN_CY - (int)((float)SCAN_R * sin_a);
         if (t1y >= 32 && t2y >= 32) {
             uint16_t tick_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.2f);
-            spr.drawWideLine(t1x, t1y, t2x, t2y, 1.0f, tick_col, BG_COLOR);
+            spr.drawWideLine(t1x, t1y, t2x, t2y, 1.0f, tick_col);
         }
     }
 
@@ -4301,7 +4298,7 @@ void draw_scanner_screen() {
         int ly2 = SCAN_CY - (int)((float)(SCAN_R - 1) * sinf(trail_ang));
         if (ly1 < 32 || ly2 < 32) continue;
 
-        spr.drawWideLine(lx1, ly1, lx2, ly2, 1.2f, trail_col, BG_COLOR);
+        spr.drawWideLine(lx1, ly1, lx2, ly2, 1.2f, trail_col);
     }
 
     // Step 7: bright sweep line.
@@ -4311,7 +4308,7 @@ void draw_scanner_screen() {
         int sx2 = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
         int sy2 = SCAN_CY - (int)((float)SCAN_R * sinf(sweep_angle));
         uint16_t sweep_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
-        spr.drawWideLine(sx1, sy1, sx2, sy2, 1.5f, sweep_col, BG_COLOR);
+        spr.drawWideLine(sx1, sy1, sx2, sy2, 1.5f, sweep_col);
     }
 
     // Step 8: device blips — anti-aliased circle outlines, position by
@@ -4355,12 +4352,12 @@ void draw_scanner_screen() {
             blip_col = lerp_col16(BG_COLOR, HEADER_COLOR, fade * 0.6f);
         }
 
-        spr.drawSmoothCircle(bx, by, dot_r, blip_col, BG_COLOR);
+        spr.drawCircle(bx, by, dot_r, blip_col);
     }
 
     // Step 9: centre dot
-    spr.drawSmoothCircle(SCAN_CX, SCAN_CY, 1,
-                         lerp_col16(BG_COLOR, TEXT_COLOR, 0.2f), BG_COLOR);
+    spr.drawCircle(SCAN_CX, SCAN_CY, 1,
+                   lerp_col16(BG_COLOR, TEXT_COLOR, 0.2f));
 
     // Step 10: clear clip
     spr.clearClipRect();
