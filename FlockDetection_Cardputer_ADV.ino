@@ -112,7 +112,7 @@ static unsigned long wifi_config_open_ms = 0;
 static bool show_menu = false;
 static int  menu_selected = 0;
 static unsigned long menu_open_ms = 0;
-#define MENU_ITEM_COUNT 11
+#define MENU_ITEM_COUNT 12
 static int   menu_scroll_offset = 0;        // index of first visible item
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
@@ -452,8 +452,9 @@ int current_screen = 0;
 bool system_fully_booted = false;
 static bool screen_dirty = true;   // Forces redraw; set by any state change
 bool stealth_mode = false;
-bool is_muted = false;       
-int current_volume = 150;    
+bool is_muted = false;
+bool boot_sound_enabled = true;
+int current_volume = 150;
 
 long session_wifi = 0;
 long session_ble = 0;
@@ -1545,11 +1546,13 @@ static void save_session_to_flash() {
 
     long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes, l_next_id;
     int l_vol;
+    bool l_boot_sound;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
     l_writes = lifetime_flash_writes + 1;
     l_next_id = next_detection_id;
+    l_boot_sound = boot_sound_enabled;
     xSemaphoreGive(dataMutex);
 
     bool write_ok = false;
@@ -1560,9 +1563,10 @@ static void save_session_to_flash() {
             delay(5);
             continue;
         }
-        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n%ld\n",
+        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n%ld\n%d\n",
                                   l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes,
-                                  export_ssid, export_pass, l_next_id);
+                                  export_ssid, export_pass, l_next_id,
+                                  l_boot_sound ? 1 : 0);
         f.close();
         if (written > 10) {
             write_ok = true;
@@ -1776,6 +1780,12 @@ void load_session_from_flash() {
     if (line.length() > 0) {
         long parsed = line.toInt();
         if (parsed >= 1) next_detection_id = parsed;
+    }
+    // boot_sound_enabled — added even later; older files end above and the
+    // setting stays at its default (true).
+    line = f.readStringUntil('\n');
+    if (line.length() > 0) {
+        boot_sound_enabled = (line.toInt() != 0);
     }
     f.close();
 }
@@ -3918,10 +3928,11 @@ void draw_menu_overlay() {
         uint16_t    accent;
     };
 
-    char night_label[20], lp_label[20], mute_label[20], export_label[28];
+    char night_label[20], lp_label[20], mute_label[20], export_label[28], boot_label[24];
     snprintf(night_label, sizeof(night_label), "Night Mode: %s", night_mode ? "ON" : "OFF");
     snprintf(lp_label,    sizeof(lp_label),    "Low Power: %s",  low_power_mode ? "ON" : "OFF");
     snprintf(mute_label,  sizeof(mute_label),  "Mute: %s",       is_muted ? "ON" : "OFF");
+    snprintf(boot_label,  sizeof(boot_label),  "Boot Sound: %s", boot_sound_enabled ? "ON" : "OFF");
     if (export_mode_active) {
         snprintf(export_label, sizeof(export_label), "Export: %s", export_ip_str);
     } else {
@@ -3939,6 +3950,7 @@ void draw_menu_overlay() {
         {mute_label,      DIM_COLOR},
         {"WiFi Config",   DIM_COLOR},
         {export_label,    export_mode_active ? ACCENT_COLOR : DIM_COLOR},
+        {boot_label,      DIM_COLOR},
         {"Clear Stats",   CAUTION_COLOR},
     };
 
@@ -4210,7 +4222,15 @@ void handle_menu_select() {
                 draw_current_screen(); spr.pushSprite(0, 0);
             }
             break;
-        case 10: {
+        case 10:
+            boot_sound_enabled = !boot_sound_enabled;
+            if (boot_sound_enabled && !is_muted) {
+                M5Cardputer.Speaker.tone(240, 100);
+            }
+            schedule_persist();
+            draw_current_screen(); spr.pushSprite(0, 0);
+            break;
+        case 11: {
             // Clear all stats — session and lifetime
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             session_wifi = 0; session_ble = 0;
@@ -7053,17 +7073,17 @@ void setup() {
         }
     }
 
-    // Boot chime — plays after the scanner is visible
-    if (!is_muted) {
+    // Boot chime — plays after the scanner is visible. Vintage descending
+    // tone settles on a middle pitch for a 70s-terminal feel. Gated by
+    // boot_sound_enabled so users can silence it without muting the rest
+    // of the device.
+    if (!is_muted && boot_sound_enabled) {
         int boot_vol = current_volume > 25 ? 25 : current_volume;
         M5Cardputer.Speaker.setVolume(boot_vol);
         delay(120);
-        // Vintage chime — F major arpeggio rising slowly. Lower octave + longer
-        // note duration matches the deliberate rhythm of the boot animations
-        // (each note ≈ UI_ANIM_QUICK; gaps ≈ UI_ANIM_QUICK/4).
-        M5Cardputer.Speaker.tone(349, 180); delay(220);  // F4
-        M5Cardputer.Speaker.tone(440, 180); delay(220);  // A4
-        M5Cardputer.Speaker.tone(523, 260); delay(300);  // C5
+        M5Cardputer.Speaker.tone(240, 180); delay(220);
+        M5Cardputer.Speaker.tone(180, 180); delay(220);
+        M5Cardputer.Speaker.tone(200, 260); delay(300);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
