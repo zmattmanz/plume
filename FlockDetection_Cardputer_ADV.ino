@@ -4197,8 +4197,8 @@ void handle_menu_select() {
 void draw_scanner_screen() {
     // ── Layout constants ──
     const int SCAN_CX = 120;
-    const int SCAN_CY = 128;
-    const int SCAN_R  = 65;
+    const int SCAN_CY = 130;
+    const int SCAN_R  = 72;
 
     unsigned long frame_ms = millis();
 
@@ -4206,7 +4206,7 @@ void draw_scanner_screen() {
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
 
-    // Step 2: counts line — WIFI nnn  BLE nnn  RF FIELD  CHn
+    // Step 2: counts line — WIFI nnn  BLE nnn  CHn
     long sw, sb;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     sw = session_flock_wifi;
@@ -4235,11 +4235,6 @@ void draw_scanner_screen() {
     spr.setCursor(98, CONTENT_Y - 2);
     spr.print(ble_str);
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(152, CONTENT_Y);
-    spr.print("RF FIELD");
-
     char ch_str[6];
     snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
@@ -4247,8 +4242,8 @@ void draw_scanner_screen() {
     spr.setCursor(DISP_W - 24, CONTENT_Y);
     spr.print(ch_str);
 
-    // Step 3: clip to radar area
-    spr.setClipRect(0, 32, DISP_W, SCAN_CY - 32);
+    // Step 3: clip to radar area — full width, just below the counts line.
+    spr.setClipRect(0, 30, DISP_W, DISP_H - 30);
 
     // Step 4: RSSI rings — anti-aliased semicircular arcs (top half:
     // 180°→360° in M5GFX's clockwise-from-3-o'clock angle convention).
@@ -4287,7 +4282,7 @@ void draw_scanner_screen() {
         for (int r_step = 12; r_step < SCAN_R; r_step += 6) {
             int tpx = SCAN_CX + (int)((float)r_step * cosf(trail_angle));
             int tpy = SCAN_CY - (int)((float)r_step * sinf(trail_angle));
-            if (tpy >= 32 && tpy < SCAN_CY) {
+            if (tpy >= 30 && tpy < SCAN_CY) {
                 spr.drawPixel(tpx, tpy, trail_col);
             }
         }
@@ -4371,7 +4366,7 @@ void draw_scanner_screen() {
 
         int bx = SCAN_CX + (int)(blip_dist * cosf(blip_angle));
         int by = SCAN_CY - (int)(blip_dist * sinf(blip_angle));
-        if (by < 32) continue;
+        if (by < 30) continue;
 
         int sz = (rssi_norm > 0.5f) ? 4 : (rssi_norm > 0.25f) ? 3 : 2;
 
