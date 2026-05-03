@@ -4297,7 +4297,8 @@ void draw_scanner_screen() {
 
     const int feed_row_h    = 13;
     const int feed_first_y  = CONTENT_Y + 20;
-    const int max_feed_rows = 6;
+    const int feed_last_y   = DISP_H - 2;
+    const int max_feed_rows = (feed_last_y - feed_first_y) / feed_row_h;
     unsigned long feed_now  = frame_ms;
 
     // Detect a new top entry → trigger a slide-down. Skip the very
@@ -4365,21 +4366,6 @@ void draw_scanner_screen() {
 
     spr.clearClipRect();
     feed_commit_pending();
-
-    // Step 5: viz panel chrome — current scan source above, view
-    // indicator below. The status string flips between "BLE" and
-    // "WiFi: CHn" depending on which radio the scanner is exercising.
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(VIZ_X, VIZ_Y - 10);
-    bool ble_scanning = (pBLEScan != nullptr && pBLEScan->isScanning());
-    if (ble_scanning) {
-        spr.print("BLE");
-    } else {
-        char status_str[16];
-        snprintf(status_str, sizeof(status_str), "WiFi: CH%d", current_channel);
-        spr.print(status_str);
-    }
 
     // Step 6: dispatch to active viz renderer, clipped to the panel.
     spr.setClipRect(0, VIZ_Y - 2, DIVIDER_X, VIZ_H + 4);
@@ -4629,6 +4615,24 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     const int plot_h      = VIZ_H - 4;
     const int plot_bottom = plot_y + plot_h;
 
+    // ── Diagonal hatch background ──
+    // Solid 1px lines from upper-left to lower-right at 6px spacing.
+    // Tightened clip keeps the hatch inside the panel; we restore the
+    // outer scanner clip set by draw_scanner_screen() afterwards so
+    // the rest of the spectrum renders against the same bounds.
+    {
+        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.15f);
+        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+        for (int d = -VIZ_H; d < VIZ_W + VIZ_H; d += 6) {
+            int x0 = VIZ_X + d;
+            int y0 = VIZ_Y;
+            int x1 = x0 + VIZ_H;
+            int y1 = VIZ_Y + VIZ_H;
+            spr.drawLine(x0, y0, x1, y1, hatch_col);
+        }
+        spr.setClipRect(0, VIZ_Y - 2, DIVIDER_X, VIZ_H + 4);
+    }
+
     spr.drawFastHLine(plot_x, plot_bottom, plot_w,
                       lerp_col16(BG_COLOR, CARD_BORDER, 0.3f));
 
@@ -4674,11 +4678,11 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         return val;
     };
 
-    // Gradient fill under the curve — drawn FIRST so the line sits on
-    // top. Every other column halves the drawPixel cost; the gradient
-    // still reads as a smooth wash because adjacent columns differ by
-    // only 1 pixel of curve height.
-    for (int px_col = 0; px_col <= plot_w; px_col += 2) {
+    // Gradient fill under the curve. Quadratic falloff (1 - t*t) at 30%
+    // peak makes the fill clearly visible as a colored shape rather
+    // than a faint suggestion. Drawn before the scan line + curve so
+    // both sit on top.
+    for (int px_col = 0; px_col <= plot_w; px_col++) {
         float ch_f = (float)px_col / (float)plot_w * 12.0f;
         int ch_i = (int)ch_f;
         bool flock_fill = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
@@ -4689,15 +4693,30 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         int cy = val_to_y(val);
         for (int fy = cy + 1; fy < plot_bottom; fy++) {
             float fill_t = (float)(fy - cy) / (float)(plot_bottom - cy);
-            float fill_alpha = (1.0f - fill_t) * 0.12f;
+            float fill_alpha = (1.0f - fill_t * fill_t) * 0.30f;
             if (fill_alpha < 0.01f) break;
             spr.drawPixel(cx, fy, lerp_col16(BG_COLOR, fill_base, fill_alpha));
         }
     }
 
-    // Catmull-Rom curve, walked pixel by pixel. drawWideLine at 1.8 px
-    // gives the line enough weight to read as a solid stroke. Color is
-    // full HEADER_COLOR (CAUTION_COLOR near a flock detection).
+    // Smooth scan line — eased x slides between channel positions
+    // instead of snapping when the hopper advances. Initialised on
+    // first render so it doesn't fly in from x=0. Drawn before the
+    // curve so the line sits on top at the column where they cross.
+    float scan_target_x = (float)plot_x +
+        (float)(current_channel - 1) / 12.0f * (float)plot_w;
+    if (scan_line_last_frame == 0) scan_line_x_f = scan_target_x;
+    float scan_dt = (scan_line_last_frame == 0) ? 16.0f
+                  : (float)(frame_ms - scan_line_last_frame);
+    if (scan_dt > 100.0f) scan_dt = 100.0f;
+    scan_line_last_frame = frame_ms;
+    scan_line_x_f = anim_filter(scan_line_x_f, scan_target_x, 120.0f, scan_dt);
+    int scan_x = (int)(scan_line_x_f + 0.5f);
+    spr.drawFastVLine(scan_x, plot_y, plot_h,
+                      lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f));
+
+    // Catmull-Rom curve, walked pixel by pixel. Single 1px drawLine per
+    // segment in full HEADER_COLOR (CAUTION_COLOR near flock detection).
     int prev_px = -1, prev_py = -1;
     for (int px_col = 0; px_col <= plot_w; px_col++) {
         float ch_f = (float)px_col / (float)plot_w * 12.0f;
@@ -4709,26 +4728,11 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         if (prev_px >= 0) {
             bool near_flock = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
             uint16_t line_col = near_flock ? CAUTION_COLOR : HEADER_COLOR;
-            spr.drawWideLine(prev_px, prev_py, cx, cy, 1.8f, line_col);
+            spr.drawLine(prev_px, prev_py, cx, cy, line_col);
         }
         prev_px = cx;
         prev_py = cy;
     }
-
-    // Smooth scan line — eased x slides between channel positions
-    // instead of snapping when the hopper advances. Initialised on
-    // first render so it doesn't fly in from x=0.
-    float scan_target_x = (float)plot_x +
-        (float)(current_channel - 1) / 12.0f * (float)plot_w;
-    if (scan_line_last_frame == 0) scan_line_x_f = scan_target_x;
-    float scan_dt = (scan_line_last_frame == 0) ? 16.0f
-                  : (float)(frame_ms - scan_line_last_frame);
-    if (scan_dt > 100.0f) scan_dt = 100.0f;
-    scan_line_last_frame = frame_ms;
-    scan_line_x_f = anim_filter(scan_line_x_f, scan_target_x, 120.0f, scan_dt);
-    int scan_x = (int)(scan_line_x_f + 0.5f);
-    spr.drawFastVLine(scan_x, plot_y, plot_h,
-                      lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
 
     // CH indicator at the top-right of the viz area.
     char ch_str[6];
