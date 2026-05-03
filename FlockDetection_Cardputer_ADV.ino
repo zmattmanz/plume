@@ -4189,7 +4189,6 @@ void draw_scanner_screen() {
     const int SCAN_CX = 120;
     const int SCAN_CY = 128;
     const int SCAN_R  = 76;
-    const int SCAN_TRAIL_STEPS = 20;
 
     unsigned long frame_ms = millis();
 
@@ -4254,55 +4253,53 @@ void draw_scanner_screen() {
     uint16_t outer_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
     spr.drawCircle(SCAN_CX, SCAN_CY, SCAN_R, outer_col);
 
-    // Step 5: channel ticks at outer edge — 13 short smooth lines
-    for (int ch = 1; ch <= 13; ch++) {
-        float angle = (float)M_PI * (1.0f - (float)(ch - 1) / 12.0f);
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
-        int t1x = SCAN_CX + (int)((float)SCAN_R * 0.87f * cos_a);
-        int t1y = SCAN_CY - (int)((float)SCAN_R * 0.87f * sin_a);
-        int t2x = SCAN_CX + (int)((float)SCAN_R * cos_a);
-        int t2y = SCAN_CY - (int)((float)SCAN_R * sin_a);
-        if (t1y >= 32 && t2y >= 32) {
-            uint16_t tick_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.2f);
-            spr.drawWideLine(t1x, t1y, t2x, t2y, 1.0f, tick_col);
+    // Continuous full-360° sweep — one revolution every 3 s, matching
+    // the original radar's angular velocity. The clip rect hides the
+    // bottom half so the sweep naturally appears in the visible arc and
+    // reappears after the unseen sweep through the lower hemisphere.
+    float sweep_angle = (float)frame_ms / 3000.0f * 2.0f * (float)M_PI;
+
+    // Sweep trail — individual pixels stepped along each radial. Lines
+    // converged at the centre into a wedge; dots stay scattered so the
+    // trail reads as a phosphor afterglow.
+    for (int i = 1; i <= 24; i++) {
+        float trail_angle = sweep_angle + (float)i * 0.05f;
+        float ratio = (24.0f - (float)i) / 24.0f;
+
+        int tr = (int)(10.0f + (0.0f   - 10.0f) * ratio);
+        int tg = (int)(20.0f + (200.0f - 20.0f) * ratio);
+        int tb = (int)(30.0f + (255.0f - 30.0f) * ratio);
+        uint16_t trail_col = night_mode
+            ? lgfx::color565(tb, 0, 0)
+            : lgfx::color565(tr, tg, tb);
+
+        for (int r_step = 10; r_step < SCAN_R; r_step += 4) {
+            int tpx = SCAN_CX + (int)((float)r_step * cosf(trail_angle));
+            int tpy = SCAN_CY - (int)((float)r_step * sinf(trail_angle));
+            if (tpy >= 32 && tpy < SCAN_CY) {
+                spr.drawPixel(tpx, tpy, trail_col);
+            }
         }
     }
 
-    // Continuous time-based sweep — one full π rotation every 8 s, left
-    // (ch1, π) → right (ch13, 0) → wraps. Decoupled from the channel
-    // hopper so the visual stays smooth even as current_channel jumps
-    // around. The CHn label still reflects the real hopper position.
-    float sweep_angle = (float)M_PI -
-                        fmodf((float)frame_ms / 8000.0f, 1.0f) * (float)M_PI;
-
-    // Step 6: sweep trail — 20 individual 1px lines. Wider angular
-    // spacing + plain drawLine so the trail reads as discrete fading
-    // lines rather than blurring into a solid wedge.
-    for (int i = 1; i <= SCAN_TRAIL_STEPS; i++) {
-        float trail_off = (float)i * 0.045f;
-        float trail_ang = sweep_angle + trail_off;
-        float ratio = (float)(SCAN_TRAIL_STEPS - i) / (float)SCAN_TRAIL_STEPS;
-
-        uint16_t trail_col = lerp_col16(BG_COLOR, HEADER_COLOR, ratio * 0.25f);
-
-        int lx1 = SCAN_CX + (int)(8.0f * cosf(trail_ang));
-        int ly1 = SCAN_CY - (int)(8.0f * sinf(trail_ang));
-        int lx2 = SCAN_CX + (int)((float)(SCAN_R - 1) * cosf(trail_ang));
-        int ly2 = SCAN_CY - (int)((float)(SCAN_R - 1) * sinf(trail_ang));
-        if (ly1 < 32 || ly2 < 32) continue;
-
-        spr.drawLine(lx1, ly1, lx2, ly2, trail_col);
-    }
-
-    // Step 7: bright sweep line — slightly thicker than the trail.
+    // Sweep crosshair — two thin 1px arms, primary brighter than the
+    // perpendicular. Both 1px drawLine, no drawWideLine.
     {
-        int sx1 = SCAN_CX + (int)(8.0f * cosf(sweep_angle));
-        int sy1 = SCAN_CY - (int)(8.0f * sinf(sweep_angle));
+        int sx1 = SCAN_CX + (int)(6.0f * cosf(sweep_angle));
+        int sy1 = SCAN_CY - (int)(6.0f * sinf(sweep_angle));
         int sx2 = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
         int sy2 = SCAN_CY - (int)((float)SCAN_R * sinf(sweep_angle));
-        uint16_t sweep_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
-        spr.drawWideLine(sx1, sy1, sx2, sy2, 1.3f, sweep_col);
+        spr.drawLine(sx1, sy1, sx2, sy2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.7f));
+
+        float perp_angle = sweep_angle + (float)M_PI * 0.5f;
+        int px1 = SCAN_CX + (int)(6.0f * cosf(perp_angle));
+        int py1 = SCAN_CY - (int)(6.0f * sinf(perp_angle));
+        int px2 = SCAN_CX + (int)((float)SCAN_R * cosf(perp_angle));
+        int py2 = SCAN_CY - (int)((float)SCAN_R * sinf(perp_angle));
+        if (py1 < SCAN_CY && py2 < SCAN_CY && (py1 >= 32 || py2 >= 32)) {
+            spr.drawLine(px1, py1, px2, py2,
+                         lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
+        }
     }
 
     // Step 8: device blips. Snapshot the feed at most every 500 ms —
@@ -4329,8 +4326,18 @@ void draw_scanner_screen() {
 
         unsigned long age = scan_now - e.timestamp;
         if (age > 60000UL) continue;
-        float fade = 1.0f - (float)age / 60000.0f;
-        if (fade < 0.08f) continue;
+
+        // Smooth fade-in over the first 500 ms (ease-out curve), then
+        // hold at full alpha until the last 15 s of the 60 s lifetime
+        // when the blip eases back down to nothing.
+        float fade_in = (age < 500UL) ? (float)age / 500.0f : 1.0f;
+        fade_in = 1.0f - (1.0f - fade_in) * (1.0f - fade_in);
+        float fade_out = 1.0f;
+        if (age > 45000UL) {
+            fade_out = 1.0f - (float)(age - 45000UL) / 15000.0f;
+        }
+        float alpha = fade_in * fade_out;
+        if (alpha < 0.03f) continue;
 
         int pseudo_ch = 1 + (hash_mac(e.mac) % 13);
         float blip_angle = (float)M_PI * (1.0f - (float)(pseudo_ch - 1) / 12.0f);
@@ -4343,39 +4350,50 @@ void draw_scanner_screen() {
         int by = SCAN_CY - (int)(blip_dist * sinf(blip_angle));
         if (by < 32) continue;
 
-        int dot_r = (rssi_norm > 0.5f) ? 4 : (rssi_norm > 0.25f) ? 3 : 2;
+        int sz = (rssi_norm > 0.5f) ? 4 : (rssi_norm > 0.25f) ? 3 : 2;
 
-        uint16_t blip_col;
-        if (e.is_flock) {
-            blip_col = lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.75f);
+        uint16_t blip_col = e.is_flock
+            ? lerp_col16(BG_COLOR, CAUTION_COLOR, alpha * 0.8f)
+            : lerp_col16(BG_COLOR, HEADER_COLOR,  alpha * 0.6f);
+
+        if (e.proto == 0) {
+            // WiFi — outline triangle pointing up.
+            spr.drawTriangle(bx,      by - sz,
+                             bx - sz, by + sz,
+                             bx + sz, by + sz,
+                             blip_col);
         } else {
-            blip_col = lerp_col16(BG_COLOR, HEADER_COLOR, fade * 0.6f);
+            // BLE — outline diamond.
+            spr.drawLine(bx,      by - sz, bx + sz, by,      blip_col);
+            spr.drawLine(bx + sz, by,      bx,      by + sz, blip_col);
+            spr.drawLine(bx,      by + sz, bx - sz, by,      blip_col);
+            spr.drawLine(bx - sz, by,      bx,      by - sz, blip_col);
         }
 
-        spr.drawCircle(bx, by, dot_r, blip_col);
-
         // Sweep-relight: when the rotating sweep is within ~0.15 rad of
-        // this blip's angle, paint a brighter circle on top so the
-        // blip flares as the sweep crosses it. At peak strength also
-        // throw in a brief expanding ring for extra pop.
+        // this blip's angle, redraw the same shape one size larger and
+        // brighter so the blip flares as the sweep crosses it.
         float angle_diff = sweep_angle - blip_angle;
         while (angle_diff >  (float)M_PI) angle_diff -= 2.0f * (float)M_PI;
         while (angle_diff < -(float)M_PI) angle_diff += 2.0f * (float)M_PI;
         float proximity = fabsf(angle_diff);
         if (proximity < 0.15f) {
             float relight_strength = 1.0f - (proximity / 0.15f);
-            uint16_t relight_col = e.is_flock
-                ? lerp_col16(BG_COLOR, CAUTION_COLOR, relight_strength * 0.9f)
-                : lerp_col16(BG_COLOR, HEADER_COLOR, relight_strength * 0.8f);
-            spr.drawCircle(bx, by, dot_r + 1, relight_col);
-
-            if (relight_strength > 0.5f) {
-                int ring_r = dot_r + 3 + (int)((1.0f - relight_strength) * 4.0f);
-                uint16_t ring_col = lerp_col16(
-                    BG_COLOR,
-                    e.is_flock ? CAUTION_COLOR : HEADER_COLOR,
-                    relight_strength * 0.3f);
-                spr.drawCircle(bx, by, ring_r, ring_col);
+            uint16_t relight_col = lerp_col16(
+                BG_COLOR,
+                e.is_flock ? CAUTION_COLOR : HEADER_COLOR,
+                relight_strength * 0.7f);
+            int rsz = sz + 2;
+            if (e.proto == 0) {
+                spr.drawTriangle(bx,       by - rsz,
+                                 bx - rsz, by + rsz,
+                                 bx + rsz, by + rsz,
+                                 relight_col);
+            } else {
+                spr.drawLine(bx,       by - rsz, bx + rsz, by,       relight_col);
+                spr.drawLine(bx + rsz, by,       bx,       by + rsz, relight_col);
+                spr.drawLine(bx,       by + rsz, bx - rsz, by,       relight_col);
+                spr.drawLine(bx - rsz, by,       bx,       by - rsz, relight_col);
             }
         }
     }
