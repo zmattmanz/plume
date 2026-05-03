@@ -703,6 +703,12 @@ static uint32_t          channel_peak = 1;
 static float             spectrum_smooth[NUM_WIFI_CHANNELS] = {0};
 static unsigned long     spectrum_last_frame = 0;
 
+// Eased x-coordinate of the spectrum scan line — slides smoothly
+// between channel positions instead of snapping when the hopper
+// advances. Initialised on first render so it doesn't fly in from x=0.
+static float             scan_line_x_f = 0.0f;
+static unsigned long     scan_line_last_frame = 0;
+
 // Feed slide-in animation — when scan_local_head changes, all rows
 // shift down together over FEED_SHIFT_ANIM_MS with an ease-out curve.
 static int               feed_anim_prev_head = -1;
@@ -4255,7 +4261,7 @@ void draw_scanner_screen() {
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(TS_H2);
     spr.setCursor(30, CONTENT_Y - 1);
-    char wifi_str[6]; snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
+    char wifi_str[6]; snprintf(wifi_str, sizeof(wifi_str), "%02ld", sw);
     spr.print(wifi_str);
 
     spr.setTextColor(DIM_COLOR, BG_COLOR);
@@ -4265,14 +4271,14 @@ void draw_scanner_screen() {
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(TS_H2);
     spr.setCursor(86, CONTENT_Y - 1);
-    char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%03ld", sb);
+    char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%02ld", sb);
     spr.print(ble_str);
 
     // Step 3: vertical divider
     spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
 
-    // Step 4: feed panel (right side) — FEED label + 7 rows.
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    // Step 4: feed panel (right side) — FEED label + rows.
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_BODY);
     spr.setCursor(FEED_X, CONTENT_Y);
     kprint(spr, "FEED");
@@ -4290,8 +4296,8 @@ void draw_scanner_screen() {
     }
 
     const int feed_row_h    = 13;
-    const int feed_first_y  = CONTENT_Y + 14;
-    const int max_feed_rows = 7;
+    const int feed_first_y  = CONTENT_Y + 20;
+    const int max_feed_rows = 6;
     unsigned long feed_now  = frame_ms;
 
     // Detect a new top entry → trigger a slide-down. Skip the very
@@ -4374,20 +4380,6 @@ void draw_scanner_screen() {
         snprintf(status_str, sizeof(status_str), "WiFi: CH%d", current_channel);
         spr.print(status_str);
     }
-
-    char view_ind[6];
-    snprintf(view_ind, sizeof(view_ind), "%d/%d",
-             scanner_viz_mode + 1, SCANNER_VIZ_COUNT);
-    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f), BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(VIZ_X, VIZ_BOTTOM - 2);
-    spr.print(view_ind);
-
-    const char* viz_names[SCANNER_VIZ_COUNT] = { "RADAR", "SPECTRUM" };
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.3f), BG_COLOR);
-    spr.setCursor(VIZ_RIGHT - (int)strlen(viz_names[scanner_viz_mode]) * 6,
-                  VIZ_BOTTOM - 2);
-    spr.print(viz_names[scanner_viz_mode]);
 
     // Step 6: dispatch to active viz renderer, clipped to the panel.
     spr.setClipRect(0, VIZ_Y - 2, DIVIDER_X, VIZ_H + 4);
@@ -4630,11 +4622,11 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         spectrum_display[i] = v;
     }
 
-    // Plot area
+    // Plot area — chart now fills the panel since no labels live below it.
     const int plot_x      = VIZ_X + 2;
     const int plot_w      = VIZ_W - 4;
     const int plot_y      = VIZ_Y + 2;
-    const int plot_h      = VIZ_H - 14;
+    const int plot_h      = VIZ_H - 4;
     const int plot_bottom = plot_y + plot_h;
 
     spr.drawFastHLine(plot_x, plot_bottom, plot_w,
@@ -4645,7 +4637,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     };
 
     // If a flock detection landed recently, mark the busiest channel as
-    // the "flock" channel so the curve segment over it tints CAUTION.
+    // the "flock" channel so curve and fill near it tint CAUTION.
     bool recent_detection = (scanner_flash_ms > 0 && (frame_ms - scanner_flash_ms) < 3000);
     int  flock_ch_idx = -1;
     if (recent_detection) {
@@ -4658,24 +4650,20 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         }
     }
 
-    // Catmull-Rom spline through all 13 channel points, walked pixel by
-    // pixel for maximum smoothness.
-    int prev_px = -1, prev_py = -1;
-    for (int px_col = 0; px_col <= plot_w; px_col++) {
+    // Inline Catmull-Rom evaluator — used by both the fill and the
+    // curve passes so they trace exactly the same path.
+    auto eval_curve = [&](int px_col) -> float {
         float ch_f = (float)px_col / (float)plot_w * 12.0f;
         int ch_i = (int)ch_f;
         float t = ch_f - (float)ch_i;
-
         int i0 = max(0, ch_i - 1);
         int i1 = min(12, ch_i);
         int i2 = min(12, ch_i + 1);
         int i3 = min(12, ch_i + 2);
-
         float p0 = spectrum_display[i0];
         float p1 = spectrum_display[i1];
         float p2 = spectrum_display[i2];
         float p3 = spectrum_display[i3];
-
         float t2 = t * t, t3 = t2 * t;
         float val = 0.5f * ((-p0 + 3.0f*p1 - 3.0f*p2 + p3) * t3
                           + (2.0f*p0 - 5.0f*p1 + 4.0f*p2 - p3) * t2
@@ -4683,41 +4671,62 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
                           + 2.0f*p1);
         if (val < 0.0f) val = 0.0f;
         if (val > 1.0f) val = 1.0f;
+        return val;
+    };
 
+    // Gradient fill under the curve — drawn FIRST so the line sits on
+    // top. Every other column halves the drawPixel cost; the gradient
+    // still reads as a smooth wash because adjacent columns differ by
+    // only 1 pixel of curve height.
+    for (int px_col = 0; px_col <= plot_w; px_col += 2) {
+        float ch_f = (float)px_col / (float)plot_w * 12.0f;
+        int ch_i = (int)ch_f;
+        bool flock_fill = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
+        uint16_t fill_base = flock_fill ? CAUTION_COLOR : HEADER_COLOR;
+
+        float val = eval_curve(px_col);
+        int cx = plot_x + px_col;
+        int cy = val_to_y(val);
+        for (int fy = cy + 1; fy < plot_bottom; fy++) {
+            float fill_t = (float)(fy - cy) / (float)(plot_bottom - cy);
+            float fill_alpha = (1.0f - fill_t) * 0.12f;
+            if (fill_alpha < 0.01f) break;
+            spr.drawPixel(cx, fy, lerp_col16(BG_COLOR, fill_base, fill_alpha));
+        }
+    }
+
+    // Catmull-Rom curve, walked pixel by pixel. drawWideLine at 1.8 px
+    // gives the line enough weight to read as a solid stroke. Color is
+    // full HEADER_COLOR (CAUTION_COLOR near a flock detection).
+    int prev_px = -1, prev_py = -1;
+    for (int px_col = 0; px_col <= plot_w; px_col++) {
+        float ch_f = (float)px_col / (float)plot_w * 12.0f;
+        int ch_i = (int)ch_f;
+        float val = eval_curve(px_col);
         int cx = plot_x + px_col;
         int cy = val_to_y(val);
 
         if (prev_px >= 0) {
-            // Tint the segment near the flock-detection channel.
             bool near_flock = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
-            uint16_t line_col = near_flock
-                ? lerp_col16(BG_COLOR, CAUTION_COLOR, 0.7f)
-                : lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f);
-            spr.drawLine(prev_px, prev_py, cx, cy, line_col);
+            uint16_t line_col = near_flock ? CAUTION_COLOR : HEADER_COLOR;
+            spr.drawWideLine(prev_px, prev_py, cx, cy, 1.8f, line_col);
         }
         prev_px = cx;
         prev_py = cy;
     }
 
-    // Dithered fill under the curve — every other column, then every
-    // other y row from just below the curve down to the baseline.
-    uint16_t fill_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
-    for (int px_col = 0; px_col <= plot_w; px_col += 2) {
-        float ch_f = (float)px_col / (float)plot_w * 12.0f;
-        int ch_i = (int)ch_f;
-        float t = ch_f - (float)ch_i;
-        int i1 = min(12, ch_i), i2 = min(12, ch_i + 1);
-        float val = spectrum_display[i1]
-                  + (spectrum_display[i2] - spectrum_display[i1]) * t;
-        int cx = plot_x + px_col;
-        int cy = val_to_y(val);
-        for (int fy = cy + 2; fy < plot_bottom; fy += 2) {
-            spr.drawPixel(cx, fy, fill_col);
-        }
-    }
-
-    // Scan line — single 1px vertical at the current hopper channel.
-    int scan_x = plot_x + (int)((float)(current_channel - 1) / 12.0f * (float)plot_w);
+    // Smooth scan line — eased x slides between channel positions
+    // instead of snapping when the hopper advances. Initialised on
+    // first render so it doesn't fly in from x=0.
+    float scan_target_x = (float)plot_x +
+        (float)(current_channel - 1) / 12.0f * (float)plot_w;
+    if (scan_line_last_frame == 0) scan_line_x_f = scan_target_x;
+    float scan_dt = (scan_line_last_frame == 0) ? 16.0f
+                  : (float)(frame_ms - scan_line_last_frame);
+    if (scan_dt > 100.0f) scan_dt = 100.0f;
+    scan_line_last_frame = frame_ms;
+    scan_line_x_f = anim_filter(scan_line_x_f, scan_target_x, 120.0f, scan_dt);
+    int scan_x = (int)(scan_line_x_f + 0.5f);
     spr.drawFastVLine(scan_x, plot_y, plot_h,
                       lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
 
