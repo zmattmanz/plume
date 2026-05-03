@@ -69,6 +69,8 @@ static void set_toast_direct(const char* text, uint16_t accent);
 static void apply_ble_scan_params();
 struct WifiEvent;
 static void parse_wifi_event(struct WifiEvent* ev);
+static void draw_scanner_viz_radar(unsigned long frame_ms);
+static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -678,6 +680,22 @@ static bool feed_pending_valid = false;
 // path, consumed and decayed inside draw_scanner_screen().
 static unsigned long scanner_flash_ms = 0;
 static uint16_t      scanner_flash_color = 0;
+
+// Cycleable visualization in the scanner's bottom-left panel. 'v' key
+// advances through the modes; the renderer dispatches on this value.
+static int       scanner_viz_mode  = 0;   // 0 = RADAR, 1 = SPECTRUM
+static const int SCANNER_VIZ_COUNT = 2;
+
+// Per-channel packet counter used by the SPECTRUM viz. Counts are
+// incremented in wifi_sniffer_packet_handler() (single 32-bit store on
+// ESP32 is atomic, no mutex needed); the renderer snapshots them every
+// 2 s into channel_pkt_display and decays the live counts so the bars
+// represent a rolling window rather than session totals.
+#define NUM_WIFI_CHANNELS 13
+static volatile uint32_t channel_pkt_counts[NUM_WIFI_CHANNELS] = {0};
+static uint32_t          channel_pkt_display[NUM_WIFI_CHANNELS] = {0};
+static unsigned long     channel_display_last_update = 0;
+static uint32_t          channel_peak = 1;
 
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
@@ -2616,6 +2634,14 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (ppkt->rx_ctrl.sig_len < 24) return;
     ambient_packet_count++;
 
+    // Per-channel histogram for the SPECTRUM viz on the scanner screen.
+    {
+        uint8_t pkt_ch = ppkt->rx_ctrl.channel;
+        if (pkt_ch >= 1 && pkt_ch <= NUM_WIFI_CHANNELS) {
+            channel_pkt_counts[pkt_ch - 1]++;
+        }
+    }
+
     const wifi_ieee80211_packet_t* ipkt = (wifi_ieee80211_packet_t*)ppkt->payload;
     const wifi_ieee80211_mac_hdr_t* hdr = &ipkt->hdr;
     uint8_t frame_type    = (hdr->frame_ctrl & 0x0C) >> 2;
@@ -3665,6 +3691,7 @@ void draw_help_overlay() {
     };
 
     static const HelpKey scanner_keys[] = {
+        {"v",   "cycle viz"},
         {"x",   "simulate"},
         {"t",   "locate"},
         {"m",   "menu"},
@@ -4184,28 +4211,30 @@ void handle_menu_select() {
 // ============================================================================
 // UI RENDERING - SCREENS 
 // ============================================================================
-void draw_scanner_screen() {
-    // ── Layout constants ──
-    const int SCAN_CX = 120;
-    const int SCAN_CY = 130;
-    const int SCAN_R  = 72;
+// ── Layout constants for the scanner screen's cycleable viz panel ──
+static const int VIZ_X      = 4;
+static const int VIZ_Y      = 52;
+static const int VIZ_W      = 106;
+static const int VIZ_H      = 80;
+static const int VIZ_RIGHT  = VIZ_X + VIZ_W;
+static const int VIZ_BOTTOM = VIZ_Y + VIZ_H;
+static const int DIVIDER_X  = 112;
+static const int FEED_X     = 116;
+static const int FEED_RIGHT = 236;
 
+void draw_scanner_screen() {
     unsigned long frame_ms = millis();
 
     // Step 1: clear + header
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
 
-    // Step 2: counts line — WIFI nnn  BLE nnn  CHn
+    // Step 2: WIFI / BLE counts (top-left)
     long sw, sb;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     sw = session_flock_wifi;
     sb = session_flock_ble;
     xSemaphoreGive(dataMutex);
-
-    char wifi_str[6], ble_str[6];
-    snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
-    snprintf(ble_str,  sizeof(ble_str),  "%03ld", sb);
 
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
@@ -4213,69 +4242,177 @@ void draw_scanner_screen() {
     kprint(spr, "WIFI", 1);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(TS_H2);
-    spr.setCursor(28, CONTENT_Y - 2);
+    spr.setCursor(30, CONTENT_Y - 1);
+    char wifi_str[6]; snprintf(wifi_str, sizeof(wifi_str), "%03ld", sw);
     spr.print(wifi_str);
 
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(80, CONTENT_Y);
+    spr.setCursor(68, CONTENT_Y);
     kprint(spr, "BLE", 1);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
     spr.setTextSize(TS_H2);
-    spr.setCursor(98, CONTENT_Y - 2);
+    spr.setCursor(86, CONTENT_Y - 1);
+    char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%03ld", sb);
     spr.print(ble_str);
 
-    char ch_str[6];
-    snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
-    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    // Step 3: vertical divider
+    spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
+
+    // Step 4: feed panel (right side) — FEED label + 7 rows.
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(FEED_X, CONTENT_Y);
+    kprint(spr, "FEED");
+
+    static FeedEntry scan_local_feed[FEED_SIZE];
+    static int scan_local_count = 0, scan_local_head = 0;
+    static unsigned long scan_feed_last_snapshot = 0;
+    if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        scan_local_count = feed_count;
+        scan_local_head  = feed_head;
+        for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
+        xSemaphoreGive(dataMutex);
+        scan_feed_last_snapshot = frame_ms;
+    }
+
+    const int feed_row_h    = 14;
+    const int feed_first_y  = CONTENT_Y + 14;
+    const int max_feed_rows = 7;
+    unsigned long feed_now  = frame_ms;
+
+    for (int i = 0; i < scan_local_count && i < max_feed_rows; i++) {
+        int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
+        int ry = feed_first_y + i * feed_row_h;
+
+        unsigned long age = feed_now - e.timestamp;
+        float af;
+        if (age < 30000UL)      af = 1.0f;
+        else if (age < 90000UL) af = 1.0f - (float)(age - 30000UL) / 60000.0f;
+        else                    af = 0.0f;
+        if (af < 0.1f) continue;
+
+        char proto = (e.proto == 0) ? 'W' : 'B';
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(FEED_X, ry);
+        char ps[2] = { proto, '\0' };
+        spr.print(ps);
+
+        int name_x = FEED_X + 12;
+        if (e.is_flock) {
+            spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, af), BG_COLOR);
+            spr.setCursor(FEED_X + 8, ry);
+            spr.print("*");
+            name_x = FEED_X + 18;
+        }
+
+        int max_chars = (FEED_RIGHT - 30 - name_x) / 7;
+        if (max_chars > 10) max_chars = 10;
+        if (max_chars < 1)  max_chars = 1;
+        char nd[12];
+        strncpy(nd, e.name, max_chars);
+        nd[max_chars] = '\0';
+        spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
+        spr.setCursor(name_x, ry);
+        spr.print(nd);
+
+        char rs[6];
+        snprintf(rs, sizeof(rs), "%d", e.rssi);
+        int rw = (int)strlen(rs) * 7;
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
+        spr.setCursor(FEED_RIGHT - rw, ry);
+        spr.print(rs);
+    }
+
+    feed_commit_pending();
+
+    // Step 5: viz panel chrome — RATE label above, view indicator below.
+    static uint32_t      viz_pps_prev = 0;
+    static unsigned long viz_pps_last = 0;
+    static uint32_t      viz_pps_val  = 0;
+    if (frame_ms - viz_pps_last >= 1000) {
+        viz_pps_val  = ambient_packet_count - viz_pps_prev;
+        viz_pps_prev = ambient_packet_count;
+        viz_pps_last = frame_ms;
+    }
+    char rate_str[16];
+    snprintf(rate_str, sizeof(rate_str), "RATE: %lu/s", (unsigned long)viz_pps_val);
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(DISP_W - 24, CONTENT_Y);
-    spr.print(ch_str);
+    spr.setCursor(VIZ_X, VIZ_Y - 10);
+    spr.print(rate_str);
 
-    // Step 3: clip to radar area — full width, just below the counts line.
-    spr.setClipRect(0, 30, DISP_W, DISP_H - 30);
+    char view_ind[6];
+    snprintf(view_ind, sizeof(view_ind), "%d/%d",
+             scanner_viz_mode + 1, SCANNER_VIZ_COUNT);
+    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(VIZ_X, VIZ_BOTTOM - 2);
+    spr.print(view_ind);
 
-    // ── Original cylinder radar — ported verbatim from the ambient
-    //    renderer with bigger constants (cx=120, cy=130, r=72,
-    //    inner_r=24) and sunk so the bottom hemisphere falls below the
-    //    screen. The clip rect handles hiding what's clipped; we draw
-    //    the full cylinder and the bottom is naturally invisible.
-    const int   scan_inner_r = 24;
-    const float SCAN_TILT    = 0.55f;
-    const int   SCAN_THICK   = 7;
-    const float TWO_PIf      = (float)M_PI * 2.0f;
+    const char* viz_names[SCANNER_VIZ_COUNT] = { "RADAR", "SPECTRUM" };
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.3f), BG_COLOR);
+    spr.setCursor(VIZ_RIGHT - (int)strlen(viz_names[scanner_viz_mode]) * 6,
+                  VIZ_BOTTOM - 2);
+    spr.print(viz_names[scanner_viz_mode]);
+
+    // Step 6: dispatch to active viz renderer, clipped to the panel.
+    spr.setClipRect(0, VIZ_Y - 2, DIVIDER_X, VIZ_H + 4);
+    switch (scanner_viz_mode) {
+        case 0: draw_scanner_viz_radar(frame_ms);    break;
+        case 1: draw_scanner_viz_spectrum(frame_ms); break;
+    }
+    spr.clearClipRect();
+}
+
+// ── Viz mode 0: RADAR ──────────────────────────────────────────────────────
+// Sunk port of the ambient-mode cylinder radar, scaled down for the viz
+// panel and pivoted below the bottom of that panel so only the top of
+// the cylinder shows. The clip rect set by draw_scanner_screen() hides
+// everything outside the panel; we draw the full cylinder anyway and
+// the bottom half is naturally invisible.
+static void draw_scanner_viz_radar(unsigned long frame_ms) {
+    const int   R_CX    = 56;
+    const int   R_CY    = 145;
+    const int   R_R     = 48;
+    const int   R_IR    = 16;
+    const float R_TILT  = 0.55f;
+    const int   R_THICK = 6;
+    const float TWO_PIf = (float)M_PI * 2.0f;
 
     update_radar_data(frame_ms);
 
     // Cylinder shadow
-    spr.fillEllipse(SCAN_CX, SCAN_CY + SCAN_THICK + 2, SCAN_R, SCAN_R * SCAN_TILT,
+    spr.fillEllipse(R_CX, R_CY + R_THICK + 2, R_R, R_R * R_TILT,
                     lgfx::color565(4, 8, 16));
     // Wall gradient — lighter toward the top
-    for (int i = SCAN_THICK; i >= 1; i--) {
-        uint8_t wall_v = 8 + (SCAN_THICK - i) * 2;
-        spr.fillEllipse(SCAN_CX, SCAN_CY + i, SCAN_R, SCAN_R * SCAN_TILT,
+    for (int i = R_THICK; i >= 1; i--) {
+        uint8_t wall_v = 8 + (R_THICK - i) * 2;
+        spr.fillEllipse(R_CX, R_CY + i, R_R, R_R * R_TILT,
                         lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
     }
     // Top face fill + double-stroked rim
-    spr.fillEllipse(SCAN_CX, SCAN_CY, SCAN_R, SCAN_R * SCAN_TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(SCAN_CX, SCAN_CY,     SCAN_R, (int)(SCAN_R * SCAN_TILT), HEADER_COLOR);
-    spr.drawEllipse(SCAN_CX, SCAN_CY + 1, SCAN_R, (int)(SCAN_R * SCAN_TILT), HEADER_COLOR);
+    spr.fillEllipse(R_CX, R_CY, R_R, R_R * R_TILT, lgfx::color565(14, 26, 52));
+    spr.drawEllipse(R_CX, R_CY,     R_R, (int)(R_R * R_TILT), HEADER_COLOR);
+    spr.drawEllipse(R_CX, R_CY + 1, R_R, (int)(R_R * R_TILT), HEADER_COLOR);
     // Bottom rim
-    spr.drawEllipse(SCAN_CX, SCAN_CY + SCAN_THICK,     SCAN_R, SCAN_R * SCAN_TILT, DIM_COLOR);
-    spr.drawEllipse(SCAN_CX, SCAN_CY + SCAN_THICK + 1, SCAN_R, SCAN_R * SCAN_TILT, DIM_COLOR);
+    spr.drawEllipse(R_CX, R_CY + R_THICK,     R_R, R_R * R_TILT, DIM_COLOR);
+    spr.drawEllipse(R_CX, R_CY + R_THICK + 1, R_R, R_R * R_TILT, DIM_COLOR);
     // Inner ring
-    spr.drawEllipse(SCAN_CX, SCAN_CY,     scan_inner_r, (int)(scan_inner_r * SCAN_TILT), DIM_COLOR);
-    spr.drawEllipse(SCAN_CX, SCAN_CY + 1, scan_inner_r, (int)(scan_inner_r * SCAN_TILT), DIM_COLOR);
+    spr.drawEllipse(R_CX, R_CY,     R_IR, (int)(R_IR * R_TILT), DIM_COLOR);
+    spr.drawEllipse(R_CX, R_CY + 1, R_IR, (int)(R_IR * R_TILT), DIM_COLOR);
 
-    // Sweep math — full 360° rotation every 3 s, identical to ambient.
+    // Sweep math — 360° rotation every 3 s, identical to ambient.
     float sweep_rad  = (frame_ms / 3000.0f) * TWO_PIf;
     float sweep_norm = fmodf(sweep_rad, TWO_PIf);
     unsigned long time_since_blip = radar_time_since_blip;
 
-    // Particles — outline triangles with sweep-proximity boost. Dim
-    // out 10s after the most recent detection so quiet periods feel
-    // calm; positions scale from update_radar_data's small-radar range
-    // (radar_r/inner_r macros) into our scaled-up cylinder.
+    // Particles — outline triangles with sweep-proximity boost. Positions
+    // scale from update_radar_data's small-radar range (radar_r/inner_r
+    // macros) into our local R_R/R_IR.
     float noise_dimming = 1.0f;
     if (time_since_blip < 10000)      noise_dimming = 0.0f;
     else if (time_since_blip < 13000) noise_dimming = (time_since_blip - 10000) / 3000.0f;
@@ -4301,19 +4438,19 @@ void draw_scanner_screen() {
             if (total_intensity > 255) total_intensity = 255;
 
             float scaled_r = ((noise_r[i] - (float)inner_r) / (float)(radar_r - inner_r))
-                           * (float)(SCAN_R - scan_inner_r) + (float)scan_inner_r;
+                           * (float)(R_R - R_IR) + (float)R_IR;
 
-            int px = SCAN_CX + (int)(scaled_r * cosf(noise_a[i]));
-            int py = SCAN_CY + (int)(scaled_r * sinf(noise_a[i]) * SCAN_TILT);
+            int ppx = R_CX + (int)(scaled_r * cosf(noise_a[i]));
+            int ppy = R_CY + (int)(scaled_r * sinf(noise_a[i]) * R_TILT);
 
             uint16_t p_col = night_mode
                 ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
                 : lgfx::color565(total_intensity / 3, (total_intensity * 3) / 4, total_intensity);
 
-            spr.drawTriangle(px - 1, py + 1, px + 1, py + 1, px, py - 2, p_col);
+            spr.drawTriangle(ppx - 1, ppy + 1, ppx + 1, ppy + 1, ppx, ppy - 2, p_col);
             if (sweep_proximity > 0.5f) {
-                spr.drawPixel(px, py - 1, p_col);
-                spr.drawPixel(px, py,     p_col);
+                spr.drawPixel(ppx, ppy - 1, p_col);
+                spr.drawPixel(ppx, ppy,     p_col);
             }
         }
     }
@@ -4321,14 +4458,14 @@ void draw_scanner_screen() {
     // Breathing crosshair
     float    breathe       = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;
     uint16_t modulated_col = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
-    int      dynamic_r     = (SCAN_R - 6) + (int)(4 * breathe);
+    int      dynamic_r     = (R_R - 6) + (int)(4 * breathe);
     float    cos_rot       = cosf(hud_rotation);
     float    sin_rot       = sinf(hud_rotation);
-    spr.drawLine(SCAN_CX - dynamic_r * cos_rot, SCAN_CY - dynamic_r * sin_rot * SCAN_TILT,
-                 SCAN_CX + dynamic_r * cos_rot, SCAN_CY + dynamic_r * sin_rot * SCAN_TILT,
+    spr.drawLine(R_CX - dynamic_r * cos_rot, R_CY - dynamic_r * sin_rot * R_TILT,
+                 R_CX + dynamic_r * cos_rot, R_CY + dynamic_r * sin_rot * R_TILT,
                  modulated_col);
-    spr.drawLine(SCAN_CX - dynamic_r * -sin_rot, SCAN_CY - dynamic_r * cos_rot * SCAN_TILT,
-                 SCAN_CX + dynamic_r * -sin_rot, SCAN_CY + dynamic_r * cos_rot * SCAN_TILT,
+    spr.drawLine(R_CX - dynamic_r * -sin_rot, R_CY - dynamic_r * cos_rot * R_TILT,
+                 R_CX + dynamic_r * -sin_rot, R_CY + dynamic_r * cos_rot * R_TILT,
                  modulated_col);
 
     // 24-step dot trail — original RGB formula.
@@ -4340,16 +4477,16 @@ void draw_scanner_screen() {
         int tb = 48 + (255 - 48) * ratio;
         uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0)
                                        : lgfx::color565(tr, tg, tb);
-        for (int r_step = scan_inner_r + 2; r_step < SCAN_R; r_step += 4) {
-            spr.drawPixel(SCAN_CX + (int)(r_step * cosf(trail_angle)),
-                          SCAN_CY + (int)(r_step * sinf(trail_angle) * SCAN_TILT), fade_col);
+        for (int r_step = R_IR + 2; r_step < R_R; r_step += 4) {
+            spr.drawPixel(R_CX + (int)(r_step * cosf(trail_angle)),
+                          R_CY + (int)(r_step * sinf(trail_angle) * R_TILT), fade_col);
         }
     }
 
     // Sweep line
-    spr.drawLine(SCAN_CX, SCAN_CY,
-                 SCAN_CX + (int)((SCAN_R - 1) * cosf(sweep_rad)),
-                 SCAN_CY + (int)((SCAN_R - 1) * sinf(sweep_rad) * SCAN_TILT), HEADER_COLOR);
+    spr.drawLine(R_CX, R_CY,
+                 R_CX + (int)((R_R - 1) * cosf(sweep_rad)),
+                 R_CY + (int)((R_R - 1) * sinf(sweep_rad) * R_TILT), HEADER_COLOR);
 
     // Blip relight — sweep "re-illuminates" radial-band blips it passes.
     float angle_step = TWO_PIf / NUM_RADIAL_BANDS;
@@ -4374,15 +4511,15 @@ void draw_scanner_screen() {
         float a = i * angle_step;
         if (local_spikes[i] > 0) {
             bool is_strong = (local_spikes[i] > 0.8f);
-            int spike_len = (int)((SCAN_R - scan_inner_r) * local_spikes[i] * 0.7f);
+            int spike_len = (int)((R_R - R_IR) * local_spikes[i] * 0.7f);
             if (spike_len < 3)  spike_len = 3;
             if (spike_len > 35) spike_len = 35;
 
             float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
-            int blip_dist = scan_inner_r + 4 + (int)((SCAN_R - scan_inner_r - 6) * dist_ratio);
+            int blip_dist = R_IR + 4 + (int)((R_R - R_IR - 6) * dist_ratio);
 
-            int base_x = SCAN_CX + (int)(blip_dist * cosf(a));
-            int base_y = SCAN_CY + (int)(blip_dist * sinf(a) * SCAN_TILT);
+            int base_x = R_CX + (int)(blip_dist * cosf(a));
+            int base_y = R_CY + (int)(blip_dist * sinf(a) * R_TILT);
             uint16_t line_col = local_colors[i];
 
             if (is_strong) {
@@ -4409,47 +4546,136 @@ void draw_scanner_screen() {
         }
     }
 
-    // Advance HUD rotation — keeps continuity with ambient on wake.
     hud_rotation = fmodf(hud_rotation + 0.0033f, TWO_PIf);
+}
 
-    // Step 10: clear clip
-    spr.clearClipRect();
+// ── Viz mode 1: SPECTRUM ───────────────────────────────────────────────────
+// 13-bar 2.4 GHz channel histogram driven by channel_pkt_counts[],
+// incremented in the WiFi sniffer ISR. Display values refresh every 2 s
+// with a 2/3 decay so the bars represent a rolling window. Current
+// hopping channel renders bright with a triangle marker; flock
+// detections briefly flash the peak bar in CAUTION_COLOR.
+static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
+    if (frame_ms - channel_display_last_update >= 2000) {
+        channel_peak = 1;
+        for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+            channel_pkt_display[i] = channel_pkt_counts[i];
+            channel_pkt_counts[i]  = channel_pkt_counts[i] / 3;
+            if (channel_pkt_display[i] > channel_peak)
+                channel_peak = channel_pkt_display[i];
+        }
+        channel_display_last_update = frame_ms;
+    }
 
-    // Step 11: baseline + bottom labels.
-    spr.drawFastHLine(SCAN_CX - SCAN_R - 3, SCAN_CY,
-                      SCAN_R * 2 + 6, lerp_col16(BG_COLOR, CARD_BORDER, 0.45f));
+    // Subtle dotted grid background
+    uint16_t grid_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.15f);
+    for (int gx = VIZ_X; gx <= VIZ_RIGHT; gx += 12) {
+        for (int gy = VIZ_Y; gy <= VIZ_BOTTOM - 10; gy += 2) {
+            spr.drawPixel(gx, gy, grid_col);
+        }
+    }
+    for (int gy = VIZ_Y; gy <= VIZ_BOTTOM - 10; gy += 12) {
+        for (int gx = VIZ_X; gx <= VIZ_RIGHT; gx += 2) {
+            spr.drawPixel(gx, gy, grid_col);
+        }
+    }
 
+    const int bar_area_top    = VIZ_Y + 2;
+    const int bar_area_bottom = VIZ_BOTTOM - 12;
+    const int bar_area_h      = bar_area_bottom - bar_area_top;
+
+    spr.drawFastHLine(VIZ_X, bar_area_bottom, VIZ_W,
+                      lerp_col16(BG_COLOR, CARD_BORDER, 0.4f));
+
+    const int bar_w = 6;
+    const int bar_gap = 1;
+    int total_bars_w = NUM_WIFI_CHANNELS * bar_w + (NUM_WIFI_CHANNELS - 1) * bar_gap;
+    int bars_start_x = VIZ_X + (VIZ_W - total_bars_w) / 2;
+
+    bool recent_detection = (scanner_flash_ms > 0 && (frame_ms - scanner_flash_ms) < 3000);
+
+    for (int ch = 0; ch < NUM_WIFI_CHANNELS; ch++) {
+        int bx = bars_start_x + ch * (bar_w + bar_gap);
+
+        int bar_h = 0;
+        if (channel_peak > 0 && channel_pkt_display[ch] > 0) {
+            bar_h = (int)((float)channel_pkt_display[ch]
+                          / (float)channel_peak * (float)bar_area_h);
+            if (bar_h < 2)          bar_h = 2;
+            if (bar_h > bar_area_h) bar_h = bar_area_h;
+        }
+        if (bar_h == 0) continue;
+
+        int by = bar_area_bottom - bar_h;
+        bool is_current = ((ch + 1) == current_channel);
+        uint16_t bar_col = is_current
+            ? lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f)
+            : lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f);
+        spr.fillRect(bx, by, bar_w, bar_h, bar_col);
+
+        if (is_current) {
+            int mx = bx + bar_w / 2;
+            int marker_y = by - 4;
+            if (marker_y < VIZ_Y) marker_y = VIZ_Y;
+            spr.fillTriangle(mx - 2, marker_y, mx + 2, marker_y,
+                             mx,     marker_y + 3, HEADER_COLOR);
+        }
+    }
+
+    // Detection flash on the busiest bar — fades over 3 s.
+    if (recent_detection) {
+        int      max_ch  = 0;
+        uint32_t max_val = 0;
+        for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+            if (channel_pkt_display[i] > max_val) {
+                max_val = channel_pkt_display[i];
+                max_ch  = i;
+            }
+        }
+        if (max_val > 0) {
+            int flash_bx = bars_start_x + max_ch * (bar_w + bar_gap);
+            int flash_h  = (int)((float)max_val / (float)channel_peak * (float)bar_area_h);
+            if (flash_h < 2) flash_h = 2;
+            int flash_by = bar_area_bottom - flash_h;
+            float flash_t = 1.0f - (float)(frame_ms - scanner_flash_ms) / 3000.0f;
+            if (flash_t < 0.0f) flash_t = 0.0f;
+            uint16_t flash_col = lerp_col16(BG_COLOR, CAUTION_COLOR, flash_t * 0.8f);
+            spr.fillRect(flash_bx, flash_by, bar_w, flash_h, flash_col);
+            if (flash_t > 0.3f) {
+                spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+                spr.setTextSize(TS_MICRO);
+                spr.setCursor(flash_bx + 1, flash_by - 8);
+                spr.print("!");
+            }
+        }
+    }
+
+    // Channel labels (1, 6, 13) — channel 6 highlights when current.
     spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(SCAN_CX - SCAN_R - 3, SCAN_CY + 2);
+    spr.setCursor(bars_start_x, bar_area_bottom + 2);
     spr.print("1");
-    spr.setCursor(SCAN_CX - 3, SCAN_CY + 2);
-    spr.print("7");
 
-    int sig_count = 0;
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        if (local_spikes[i] > 0.05f) sig_count++;
-    }
-    char sig_str[8];
-    snprintf(sig_str, sizeof(sig_str), "%d sig", sig_count);
-    int sig_w = (int)strlen(sig_str) * 6;
-    spr.setCursor(SCAN_CX + SCAN_R - sig_w + 3, SCAN_CY + 2);
-    spr.print(sig_str);
+    int ch6_x = bars_start_x + 5 * (bar_w + bar_gap);
+    spr.setTextColor(lerp_col16(BG_COLOR,
+                                (current_channel == 6) ? HEADER_COLOR : DIM_COLOR,
+                                0.5f),
+                     BG_COLOR);
+    spr.setCursor(ch6_x, bar_area_bottom + 2);
+    spr.print("6");
 
-    // pkt/s — bottom-left, fed by the WiFi sniffer's ambient counter.
-    static uint32_t      pps_prev = 0;
-    static unsigned long pps_last = 0;
-    static uint32_t      pps_val  = 0;
-    if (frame_ms - pps_last >= 1000) {
-        pps_val  = ambient_packet_count - pps_prev;
-        pps_prev = ambient_packet_count;
-        pps_last = frame_ms;
-    }
-    char pps_str[12];
-    snprintf(pps_str, sizeof(pps_str), "%lu pkt/s", (unsigned long)pps_val);
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
-    spr.setCursor(4, SCAN_CY + 2);
-    spr.print(pps_str);
+    int ch13_x = bars_start_x + 12 * (bar_w + bar_gap);
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
+    spr.setCursor(ch13_x - 2, bar_area_bottom + 2);
+    spr.print("13");
+
+    // CH indicator at the top-right of the viz area.
+    char ch_str[6];
+    snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
+    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(VIZ_RIGHT - 18, VIZ_Y - 10);
+    spr.print(ch_str);
 }
 
 void draw_locator_screen() {
@@ -7054,6 +7280,13 @@ void loop() {
                     if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
                 }
                 draw_current_screen(); spr.pushSprite(0, 0);
+            }
+            else if (c == 'v') {
+                if (!stealth_mode && current_screen == 0) {
+                    scanner_viz_mode = (scanner_viz_mode + 1) % SCANNER_VIZ_COUNT;
+                    screen_dirty = true;
+                    menu_click();
+                }
             }
             else if (c == 'x') {
                 if (!stealth_mode) {
