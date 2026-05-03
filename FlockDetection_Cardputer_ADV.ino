@@ -703,6 +703,15 @@ static uint32_t          channel_peak = 1;
 static float             spectrum_smooth[NUM_WIFI_CHANNELS] = {0};
 static unsigned long     spectrum_last_frame = 0;
 
+// Ghost-trail buffer — captures the last N spectrum_display snapshots
+// so the curve leaves a fading afterimage. Captured every 200ms so
+// individual ghosts read as discrete echoes rather than blurring.
+#define SPECTRUM_GHOST_FRAMES 4
+static float             spectrum_ghost[SPECTRUM_GHOST_FRAMES][NUM_WIFI_CHANNELS] = {{0}};
+static int               spectrum_ghost_head = 0;
+static bool              spectrum_ghost_filled = false;
+static unsigned long     spectrum_ghost_last_ms = 0;
+
 // Eased x-coordinate of the spectrum scan line — slides smoothly
 // between channel positions instead of snapping when the hopper
 // advances. Initialised on first render so it doesn't fly in from x=0.
@@ -4392,10 +4401,10 @@ void draw_scanner_screen() {
 // everything outside the panel; we draw the full cylinder anyway and
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
-    const int   R_CX    = 68;
-    const int   R_CY    = VIZ_BOTTOM;
-    const int   R_R     = 52;
-    const int   R_IR    = 18;
+    const int   R_CX    = VIZ_X + 8;
+    const int   R_CY    = VIZ_BOTTOM + 4;
+    const int   R_R     = 55;
+    const int   R_IR    = 19;
     const float R_TILT  = 0.55f;
     const int   R_THICK = 6;
     const float TWO_PIf = (float)M_PI * 2.0f;
@@ -4617,6 +4626,20 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         spectrum_display[i] = v;
     }
 
+    // Ghost-trail capture — every 200ms, snapshot spectrum_display into
+    // the ring buffer so the renderer below can draw the last few curves
+    // as a fading afterimage.
+    if (frame_ms - spectrum_ghost_last_ms >= 200) {
+        for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+            spectrum_ghost[spectrum_ghost_head][i] = spectrum_display[i];
+        }
+        spectrum_ghost_head = (spectrum_ghost_head + 1) % SPECTRUM_GHOST_FRAMES;
+        if (!spectrum_ghost_filled && spectrum_ghost_head == 0) {
+            spectrum_ghost_filled = true;
+        }
+        spectrum_ghost_last_ms = frame_ms;
+    }
+
     // Plot area — chart now fills the panel since no labels live below it.
     const int plot_x      = VIZ_X + 2;
     const int plot_w      = VIZ_W - 4;
@@ -4708,6 +4731,49 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         }
     }
 
+    // Ghost curves — older snapshots of spectrum_display traced with the
+    // same Catmull-Rom path as the current curve, in HEADER_COLOR at
+    // 6%..18% opacity (oldest faintest). Drawn after the fill so they
+    // sit above the colored area but below the wake / current curve.
+    int ghost_count = spectrum_ghost_filled ? SPECTRUM_GHOST_FRAMES
+                                            : spectrum_ghost_head;
+    for (int gi = 0; gi < ghost_count; gi++) {
+        int ring_idx = (spectrum_ghost_head - ghost_count + gi
+                        + SPECTRUM_GHOST_FRAMES) % SPECTRUM_GHOST_FRAMES;
+        float ghost_alpha = 0.06f
+                          + ((float)gi / (float)ghost_count) * 0.12f;
+        uint16_t ghost_col = lerp_col16(BG_COLOR, HEADER_COLOR, ghost_alpha);
+
+        int gp_prev_x = -1, gp_prev_y = -1;
+        for (int px_col = 0; px_col <= plot_w; px_col++) {
+            float ch_f = (float)px_col / (float)plot_w * 12.0f;
+            int ch_i = (int)ch_f;
+            float t = ch_f - (float)ch_i;
+            int i0 = max(0, ch_i - 1);
+            int i1 = min(12, ch_i);
+            int i2 = min(12, ch_i + 1);
+            int i3 = min(12, ch_i + 2);
+            float p0 = spectrum_ghost[ring_idx][i0];
+            float p1 = spectrum_ghost[ring_idx][i1];
+            float p2 = spectrum_ghost[ring_idx][i2];
+            float p3 = spectrum_ghost[ring_idx][i3];
+            float t2 = t * t, t3 = t2 * t;
+            float val = 0.5f * ((-p0 + 3.0f*p1 - 3.0f*p2 + p3) * t3
+                              + (2.0f*p0 - 5.0f*p1 + 4.0f*p2 - p3) * t2
+                              + (-p0 + p2) * t
+                              + 2.0f*p1);
+            if (val < 0.0f) val = 0.0f;
+            if (val > 1.0f) val = 1.0f;
+            int gx = plot_x + px_col;
+            int gy = val_to_y(val);
+            if (gp_prev_x >= 0) {
+                spr.drawLine(gp_prev_x, gp_prev_y, gx, gy, ghost_col);
+            }
+            gp_prev_x = gx;
+            gp_prev_y = gy;
+        }
+    }
+
     // Smooth scan line — eased x slides between channel positions
     // instead of snapping when the hopper advances. On wrap from a high
     // channel back to ch1, snap the eased position to just past the left
@@ -4727,6 +4793,19 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     scan_line_last_frame = frame_ms;
     scan_line_x_f = anim_filter(scan_line_x_f, scan_target_x, 120.0f, scan_dt);
     int scan_x = (int)(scan_line_x_f + 0.5f);
+
+    // Trailing wake — 8 vertical pixels left of the scan line, fading
+    // from 25% to 0% so the scanning direction reads as "→". Drawn
+    // before the main line so the line sits brightest on top.
+    const int WAKE_LENGTH = 8;
+    for (int wi = 1; wi <= WAKE_LENGTH; wi++) {
+        int wake_x = scan_x - wi;
+        if (wake_x < plot_x || wake_x > plot_x + plot_w) continue;
+        float wake_t = (float)wi / (float)WAKE_LENGTH;
+        float wake_alpha = (1.0f - wake_t) * 0.25f;
+        spr.drawFastVLine(wake_x, plot_y, plot_h,
+                          lerp_col16(BG_COLOR, HEADER_COLOR, wake_alpha));
+    }
     spr.drawFastVLine(scan_x, plot_y, plot_h,
                       lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f));
 
