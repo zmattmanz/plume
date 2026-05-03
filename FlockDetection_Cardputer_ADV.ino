@@ -4232,13 +4232,13 @@ void handle_menu_select() {
 // ── Layout constants for the scanner screen's cycleable viz panel ──
 static const int VIZ_X      = 4;
 static const int VIZ_Y      = 52;
-static const int VIZ_W      = 118;
+static const int VIZ_W      = 134;
 static const int VIZ_H      = 80;
 static const int VIZ_RIGHT  = VIZ_X + VIZ_W;
 static const int VIZ_BOTTOM = VIZ_Y + VIZ_H;
-static const int DIVIDER_X  = 124;
-static const int FEED_X     = 128;
-static const int FEED_RIGHT = 236;
+static const int DIVIDER_X  = 140;
+static const int FEED_X     = 144;
+static const int FEED_RIGHT = DISP_W - 4;
 
 void draw_scanner_screen() {
     unsigned long frame_ms = millis();
@@ -4346,22 +4346,15 @@ void draw_scanner_screen() {
             name_x = FEED_X + 18;
         }
 
-        int max_chars = (FEED_RIGHT - 28 - name_x) / 7;
-        if (max_chars > 9) max_chars = 9;
-        if (max_chars < 1) max_chars = 1;
-        char nd[12];
+        int max_chars = (FEED_RIGHT - name_x - 4) / 7;
+        if (max_chars > 12) max_chars = 12;
+        if (max_chars < 1)  max_chars = 1;
+        char nd[16];
         strncpy(nd, e.name, max_chars);
         nd[max_chars] = '\0';
         spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
         spr.setCursor(name_x, ry);
         spr.print(nd);
-
-        char rs[6];
-        snprintf(rs, sizeof(rs), "%d", e.rssi);
-        int rw = (int)strlen(rs) * 7;
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
-        spr.setCursor(FEED_RIGHT - rw, ry);
-        spr.print(rs);
     }
 
     spr.clearClipRect();
@@ -4383,8 +4376,8 @@ void draw_scanner_screen() {
 // everything outside the panel; we draw the full cylinder anyway and
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
-    const int   R_CX    = 62;
-    const int   R_CY    = 140;
+    const int   R_CX    = 68;
+    const int   R_CY    = 118;
     const int   R_R     = 52;
     const int   R_IR    = 18;
     const float R_TILT  = 0.55f;
@@ -6964,10 +6957,6 @@ void setup() {
     // 240MHz; steady-state scanning, rendering, and BLE processing do not.
     // Saves ~20mA continuous draw (~2 hours extra on 1750mAh).
     setCpuFrequencyMhz(160);
-
-    if (lifetime_boots <= 3) {
-        set_toast_direct("TAB = help  M = menu", HEADER_COLOR);
-    }
 }
 
 // ============================================================================
