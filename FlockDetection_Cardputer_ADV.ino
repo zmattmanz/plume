@@ -697,11 +697,17 @@ static uint32_t          channel_pkt_display[NUM_WIFI_CHANNELS] = {0};
 static unsigned long     channel_display_last_update = 0;
 static uint32_t          channel_peak = 1;
 
-// Per-bar smoothed display height [0..1], eased toward the normalised
-// channel_pkt_display ratio every frame so the chart glides instead of
-// snapping with each 400ms hop.
-static float             channel_bar_height[NUM_WIFI_CHANNELS] = {0};
-static unsigned long     channel_bar_last_frame = 0;
+// Per-channel smoothed [0..1] display height for the spectrum curve.
+// Eased toward the normalised channel_pkt_display ratio every frame
+// so the line glides instead of snapping with each 400ms hop.
+static float             spectrum_smooth[NUM_WIFI_CHANNELS] = {0};
+static unsigned long     spectrum_last_frame = 0;
+
+// Feed slide-in animation — when scan_local_head changes, all rows
+// shift down together over FEED_SHIFT_ANIM_MS with an ease-out curve.
+static int               feed_anim_prev_head = -1;
+static unsigned long     feed_anim_shift_ms  = 0;
+static const unsigned long FEED_SHIFT_ANIM_MS = 250;
 
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
@@ -4220,12 +4226,12 @@ void handle_menu_select() {
 // ── Layout constants for the scanner screen's cycleable viz panel ──
 static const int VIZ_X      = 4;
 static const int VIZ_Y      = 52;
-static const int VIZ_W      = 106;
+static const int VIZ_W      = 118;
 static const int VIZ_H      = 80;
 static const int VIZ_RIGHT  = VIZ_X + VIZ_W;
 static const int VIZ_BOTTOM = VIZ_Y + VIZ_H;
-static const int DIVIDER_X  = 112;
-static const int FEED_X     = 116;
+static const int DIVIDER_X  = 124;
+static const int FEED_X     = 128;
 static const int FEED_RIGHT = 236;
 
 void draw_scanner_screen() {
@@ -4283,15 +4289,33 @@ void draw_scanner_screen() {
         scan_feed_last_snapshot = frame_ms;
     }
 
-    const int feed_row_h    = 14;
+    const int feed_row_h    = 13;
     const int feed_first_y  = CONTENT_Y + 14;
     const int max_feed_rows = 7;
     unsigned long feed_now  = frame_ms;
 
+    // Detect a new top entry → trigger a slide-down. Skip the very
+    // first frame after the screen opens (prev_head == -1) so we
+    // don't slide on the initial render.
+    if (scan_local_head != feed_anim_prev_head && feed_anim_prev_head != -1) {
+        feed_anim_shift_ms = frame_ms;
+    }
+    feed_anim_prev_head = scan_local_head;
+
+    float slide_t = 1.0f;
+    if (feed_anim_shift_ms > 0 && (frame_ms - feed_anim_shift_ms) < FEED_SHIFT_ANIM_MS) {
+        slide_t = ui_ease((float)(frame_ms - feed_anim_shift_ms)
+                          / (float)FEED_SHIFT_ANIM_MS);
+    }
+    int slide_offset = (int)((1.0f - slide_t) * (float)feed_row_h);
+
+    spr.setClipRect(FEED_X, feed_first_y,
+                    DISP_W - FEED_X, DISP_H - feed_first_y);
+
     for (int i = 0; i < scan_local_count && i < max_feed_rows; i++) {
         int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
         FeedEntry& e = scan_local_feed[idx];
-        int ry = feed_first_y + i * feed_row_h;
+        int ry = feed_first_y + i * feed_row_h - slide_offset;
 
         unsigned long age = feed_now - e.timestamp;
         float af;
@@ -4315,9 +4339,9 @@ void draw_scanner_screen() {
             name_x = FEED_X + 18;
         }
 
-        int max_chars = (FEED_RIGHT - 30 - name_x) / 7;
-        if (max_chars > 10) max_chars = 10;
-        if (max_chars < 1)  max_chars = 1;
+        int max_chars = (FEED_RIGHT - 28 - name_x) / 7;
+        if (max_chars > 9) max_chars = 9;
+        if (max_chars < 1) max_chars = 1;
         char nd[12];
         strncpy(nd, e.name, max_chars);
         nd[max_chars] = '\0';
@@ -4333,23 +4357,23 @@ void draw_scanner_screen() {
         spr.print(rs);
     }
 
+    spr.clearClipRect();
     feed_commit_pending();
 
-    // Step 5: viz panel chrome — RATE label above, view indicator below.
-    static uint32_t      viz_pps_prev = 0;
-    static unsigned long viz_pps_last = 0;
-    static uint32_t      viz_pps_val  = 0;
-    if (frame_ms - viz_pps_last >= 1000) {
-        viz_pps_val  = ambient_packet_count - viz_pps_prev;
-        viz_pps_prev = ambient_packet_count;
-        viz_pps_last = frame_ms;
-    }
-    char rate_str[16];
-    snprintf(rate_str, sizeof(rate_str), "RATE: %lu/s", (unsigned long)viz_pps_val);
+    // Step 5: viz panel chrome — current scan source above, view
+    // indicator below. The status string flips between "BLE" and
+    // "WiFi: CHn" depending on which radio the scanner is exercising.
     spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(VIZ_X, VIZ_Y - 10);
-    spr.print(rate_str);
+    bool ble_scanning = (pBLEScan != nullptr && pBLEScan->isScanning());
+    if (ble_scanning) {
+        spr.print("BLE");
+    } else {
+        char status_str[16];
+        snprintf(status_str, sizeof(status_str), "WiFi: CH%d", current_channel);
+        spr.print(status_str);
+    }
 
     char view_ind[6];
     snprintf(view_ind, sizeof(view_ind), "%d/%d",
@@ -4381,10 +4405,10 @@ void draw_scanner_screen() {
 // everything outside the panel; we draw the full cylinder anyway and
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
-    const int   R_CX    = 56;
-    const int   R_CY    = 145;
-    const int   R_R     = 48;
-    const int   R_IR    = 16;
+    const int   R_CX    = 62;
+    const int   R_CY    = 140;
+    const int   R_R     = 52;
+    const int   R_IR    = 18;
     const float R_TILT  = 0.55f;
     const int   R_THICK = 6;
     const float TWO_PIf = (float)M_PI * 2.0f;
@@ -4576,103 +4600,126 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         channel_display_last_update = frame_ms;
     }
 
-    // Per-bar smoothing — eases each bar's normalised height toward the
-    // current display ratio with a 200 ms time constant so bars rise
-    // and fall fluidly across hop cycles instead of spiking per dwell.
-    float bar_dt = (channel_bar_last_frame == 0) ? 16.0f
-                 : (float)(frame_ms - channel_bar_last_frame);
-    if (bar_dt > 100.0f) bar_dt = 100.0f;
-    channel_bar_last_frame = frame_ms;
+    // Per-channel smoothing — eases each value toward the normalised
+    // packet ratio with a 300 ms time constant so the curve glides
+    // across hop cycles instead of spiking per 400ms dwell.
+    float sdt = (spectrum_last_frame == 0) ? 16.0f
+              : (float)(frame_ms - spectrum_last_frame);
+    if (sdt > 100.0f) sdt = 100.0f;
+    spectrum_last_frame = frame_ms;
     for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
         float target = 0.0f;
         if (channel_peak > 0 && channel_pkt_display[i] > 0) {
             target = (float)channel_pkt_display[i] / (float)channel_peak;
         }
-        channel_bar_height[i] = anim_filter(channel_bar_height[i], target,
-                                            200.0f, bar_dt);
+        spectrum_smooth[i] = anim_filter(spectrum_smooth[i], target, 300.0f, sdt);
     }
 
-    // Subtle dotted grid background
-    uint16_t grid_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.15f);
-    for (int gx = VIZ_X; gx <= VIZ_RIGHT; gx += 12) {
-        for (int gy = VIZ_Y; gy <= VIZ_BOTTOM - 10; gy += 2) {
-            spr.drawPixel(gx, gy, grid_col);
-        }
+    // Ambient waviness — two overlapping sines per channel at different
+    // frequencies and per-channel phase offsets so the curve undulates
+    // organically when data is flat. Amplitudes (0.04 + 0.025) are
+    // small enough not to distort real packet ratios.
+    float spectrum_display[NUM_WIFI_CHANNELS];
+    for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+        float wave_phase  = (float)i * 0.8f + (float)frame_ms * 0.002f;
+        float wave2_phase = (float)i * 1.3f + (float)frame_ms * 0.0013f;
+        float ambient_wave = sinf(wave_phase) * 0.04f + sinf(wave2_phase) * 0.025f;
+        float v = spectrum_smooth[i] + ambient_wave;
+        if (v < 0.02f) v = 0.02f;  // never fully flatlines
+        if (v > 1.0f)  v = 1.0f;
+        spectrum_display[i] = v;
     }
-    for (int gy = VIZ_Y; gy <= VIZ_BOTTOM - 10; gy += 12) {
-        for (int gx = VIZ_X; gx <= VIZ_RIGHT; gx += 2) {
-            spr.drawPixel(gx, gy, grid_col);
-        }
-    }
 
-    const int bar_area_top    = VIZ_Y + 2;
-    const int bar_area_bottom = VIZ_BOTTOM - 12;
-    const int bar_area_h      = bar_area_bottom - bar_area_top;
+    // Plot area
+    const int plot_x      = VIZ_X + 2;
+    const int plot_w      = VIZ_W - 4;
+    const int plot_y      = VIZ_Y + 2;
+    const int plot_h      = VIZ_H - 14;
+    const int plot_bottom = plot_y + plot_h;
 
-    spr.drawFastHLine(VIZ_X, bar_area_bottom, VIZ_W,
-                      lerp_col16(BG_COLOR, CARD_BORDER, 0.4f));
+    spr.drawFastHLine(plot_x, plot_bottom, plot_w,
+                      lerp_col16(BG_COLOR, CARD_BORDER, 0.3f));
 
-    const int bar_w = 6;
-    const int bar_gap = 1;
-    int total_bars_w = NUM_WIFI_CHANNELS * bar_w + (NUM_WIFI_CHANNELS - 1) * bar_gap;
-    int bars_start_x = VIZ_X + (VIZ_W - total_bars_w) / 2;
+    auto val_to_y = [&](float val) -> int {
+        return plot_bottom - (int)(val * (float)plot_h);
+    };
 
+    // If a flock detection landed recently, mark the busiest channel as
+    // the "flock" channel so the curve segment over it tints CAUTION.
     bool recent_detection = (scanner_flash_ms > 0 && (frame_ms - scanner_flash_ms) < 3000);
-
-    for (int ch = 0; ch < NUM_WIFI_CHANNELS; ch++) {
-        int bx = bars_start_x + ch * (bar_w + bar_gap);
-        bool is_current = ((ch + 1) == current_channel);
-
-        int bar_h = (int)(channel_bar_height[ch] * (float)bar_area_h);
-        if (bar_h < 0)          bar_h = 0;
-        if (bar_h > bar_area_h) bar_h = bar_area_h;
-        // Floor of 1 px so a channel with any pending count at least
-        // shows a sliver while the smoothing winds up.
-        if (bar_h < 1 && channel_pkt_display[ch] > 0) bar_h = 1;
-
-        if (bar_h > 0) {
-            int by = bar_area_bottom - bar_h;
-            uint16_t bar_col = is_current
-                ? lerp_col16(BG_COLOR, HEADER_COLOR, 1.0f)
-                : lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f);
-            spr.fillRect(bx, by, bar_w, bar_h, bar_col);
-        }
-
-        // Bright 2px underline — sits on the baseline under the active
-        // channel, drawn even when the bar itself is zero so the
-        // hopper position is always obvious.
-        if (is_current) {
-            spr.fillRect(bx, bar_area_bottom + 1, bar_w, 2, HEADER_COLOR);
-        }
-    }
-
-    // Detection flash on the busiest bar — fades over 3 s.
+    int  flock_ch_idx = -1;
     if (recent_detection) {
-        int      max_ch  = 0;
         uint32_t max_val = 0;
         for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
             if (channel_pkt_display[i] > max_val) {
                 max_val = channel_pkt_display[i];
-                max_ch  = i;
-            }
-        }
-        if (max_val > 0) {
-            int flash_bx = bars_start_x + max_ch * (bar_w + bar_gap);
-            int flash_h  = (int)((float)max_val / (float)channel_peak * (float)bar_area_h);
-            if (flash_h < 2) flash_h = 2;
-            int flash_by = bar_area_bottom - flash_h;
-            float flash_t = 1.0f - (float)(frame_ms - scanner_flash_ms) / 3000.0f;
-            if (flash_t < 0.0f) flash_t = 0.0f;
-            uint16_t flash_col = lerp_col16(BG_COLOR, CAUTION_COLOR, flash_t * 0.8f);
-            spr.fillRect(flash_bx, flash_by, bar_w, flash_h, flash_col);
-            if (flash_t > 0.3f) {
-                spr.setTextColor(CAUTION_COLOR, BG_COLOR);
-                spr.setTextSize(TS_MICRO);
-                spr.setCursor(flash_bx + 1, flash_by - 8);
-                spr.print("!");
+                flock_ch_idx = i;
             }
         }
     }
+
+    // Catmull-Rom spline through all 13 channel points, walked pixel by
+    // pixel for maximum smoothness.
+    int prev_px = -1, prev_py = -1;
+    for (int px_col = 0; px_col <= plot_w; px_col++) {
+        float ch_f = (float)px_col / (float)plot_w * 12.0f;
+        int ch_i = (int)ch_f;
+        float t = ch_f - (float)ch_i;
+
+        int i0 = max(0, ch_i - 1);
+        int i1 = min(12, ch_i);
+        int i2 = min(12, ch_i + 1);
+        int i3 = min(12, ch_i + 2);
+
+        float p0 = spectrum_display[i0];
+        float p1 = spectrum_display[i1];
+        float p2 = spectrum_display[i2];
+        float p3 = spectrum_display[i3];
+
+        float t2 = t * t, t3 = t2 * t;
+        float val = 0.5f * ((-p0 + 3.0f*p1 - 3.0f*p2 + p3) * t3
+                          + (2.0f*p0 - 5.0f*p1 + 4.0f*p2 - p3) * t2
+                          + (-p0 + p2) * t
+                          + 2.0f*p1);
+        if (val < 0.0f) val = 0.0f;
+        if (val > 1.0f) val = 1.0f;
+
+        int cx = plot_x + px_col;
+        int cy = val_to_y(val);
+
+        if (prev_px >= 0) {
+            // Tint the segment near the flock-detection channel.
+            bool near_flock = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
+            uint16_t line_col = near_flock
+                ? lerp_col16(BG_COLOR, CAUTION_COLOR, 0.7f)
+                : lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f);
+            spr.drawLine(prev_px, prev_py, cx, cy, line_col);
+        }
+        prev_px = cx;
+        prev_py = cy;
+    }
+
+    // Dithered fill under the curve — every other column, then every
+    // other y row from just below the curve down to the baseline.
+    uint16_t fill_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
+    for (int px_col = 0; px_col <= plot_w; px_col += 2) {
+        float ch_f = (float)px_col / (float)plot_w * 12.0f;
+        int ch_i = (int)ch_f;
+        float t = ch_f - (float)ch_i;
+        int i1 = min(12, ch_i), i2 = min(12, ch_i + 1);
+        float val = spectrum_display[i1]
+                  + (spectrum_display[i2] - spectrum_display[i1]) * t;
+        int cx = plot_x + px_col;
+        int cy = val_to_y(val);
+        for (int fy = cy + 2; fy < plot_bottom; fy += 2) {
+            spr.drawPixel(cx, fy, fill_col);
+        }
+    }
+
+    // Scan line — single 1px vertical at the current hopper channel.
+    int scan_x = plot_x + (int)((float)(current_channel - 1) / 12.0f * (float)plot_w);
+    spr.drawFastVLine(scan_x, plot_y, plot_h,
+                      lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
 
     // CH indicator at the top-right of the viz area.
     char ch_str[6];
@@ -6041,6 +6088,12 @@ void transition_screen(int new_screen, int dir) {
     if (stealth_mode) { current_screen = new_screen; return; }
     if (!is_muted) {
         M5Cardputer.Speaker.tone(660, 5);   // soft warm tap, matches menu click
+    }
+    if (new_screen == 0) {
+        // Reset feed slide-in so the first scanner render doesn't fly
+        // a row in from a stale snapshot.
+        feed_anim_prev_head = -1;
+        feed_anim_shift_ms  = 0;
     }
     if (new_screen == 2) {
         history_scroll_offset = 0;
