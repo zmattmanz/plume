@@ -4188,7 +4188,7 @@ void draw_scanner_screen() {
     // ── Layout constants ──
     const int SCAN_CX = 120;
     const int SCAN_CY = 128;
-    const int SCAN_R  = 76;
+    const int SCAN_R  = 72;
 
     unsigned long frame_ms = millis();
 
@@ -4253,27 +4253,28 @@ void draw_scanner_screen() {
     uint16_t outer_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
     spr.drawCircle(SCAN_CX, SCAN_CY, SCAN_R, outer_col);
 
-    // Continuous full-360° sweep — one revolution every 3 s, matching
-    // the original radar's angular velocity. The clip rect hides the
-    // bottom half so the sweep naturally appears in the visible arc and
-    // reappears after the unseen sweep through the lower hemisphere.
-    float sweep_angle = (float)frame_ms / 3000.0f * 2.0f * (float)M_PI;
+    // Continuous full-360° sweep — one revolution every 3 s, rotating
+    // clockwise (negated angle). The clip rect hides the bottom half so
+    // the sweep naturally appears in the visible arc and reappears
+    // after the unseen sweep through the lower hemisphere.
+    float sweep_angle = -((float)frame_ms / 3000.0f * 2.0f * (float)M_PI);
 
-    // Sweep trail — individual pixels stepped along each radial. Lines
-    // converged at the centre into a wedge; dots stay scattered so the
-    // trail reads as a phosphor afterglow.
-    for (int i = 1; i <= 24; i++) {
-        float trail_angle = sweep_angle + (float)i * 0.05f;
-        float ratio = (24.0f - (float)i) / 24.0f;
+    // Sweep trail — pixel stipple along each radial. Cubic falloff +
+    // wider angular and radial spacing so only the leading 2-3 trails
+    // register, fading fast into nothing instead of filling a wedge.
+    for (int i = 1; i <= 12; i++) {
+        float trail_angle = sweep_angle + (float)i * 0.09f;
+        float ratio = (12.0f - (float)i) / 12.0f;
+        ratio = ratio * ratio * ratio;
 
-        int tr = (int)(10.0f + (0.0f   - 10.0f) * ratio);
-        int tg = (int)(20.0f + (200.0f - 20.0f) * ratio);
-        int tb = (int)(30.0f + (255.0f - 30.0f) * ratio);
+        int tr = (int)(8.0f   * ratio);
+        int tg = (int)(140.0f * ratio);
+        int tb = (int)(180.0f * ratio);
         uint16_t trail_col = night_mode
             ? lgfx::color565(tb, 0, 0)
             : lgfx::color565(tr, tg, tb);
 
-        for (int r_step = 10; r_step < SCAN_R; r_step += 4) {
+        for (int r_step = 12; r_step < SCAN_R; r_step += 6) {
             int tpx = SCAN_CX + (int)((float)r_step * cosf(trail_angle));
             int tpy = SCAN_CY - (int)((float)r_step * sinf(trail_angle));
             if (tpy >= 32 && tpy < SCAN_CY) {
@@ -4370,30 +4371,37 @@ void draw_scanner_screen() {
             spr.drawLine(bx - sz, by,      bx,      by - sz, blip_col);
         }
 
-        // Sweep-relight: when the rotating sweep is within ~0.15 rad of
-        // this blip's angle, redraw the same shape one size larger and
-        // brighter so the blip flares as the sweep crosses it.
-        float angle_diff = sweep_angle - blip_angle;
-        while (angle_diff >  (float)M_PI) angle_diff -= 2.0f * (float)M_PI;
-        while (angle_diff < -(float)M_PI) angle_diff += 2.0f * (float)M_PI;
+        // Sweep-relight: redraw the blip's shape one size up and
+        // brighter when the rotating sweep is within ~0.20 rad of its
+        // angle. Both angles get normalised into [0, 2π] first because
+        // sweep_angle accumulates negatively forever via millis() while
+        // blip_angle is a fixed [0, π] value — without normalisation
+        // the diff is unbounded and the proximity check never fires.
+        float sweep_norm = fmodf(sweep_angle, 2.0f * (float)M_PI);
+        if (sweep_norm < 0.0f) sweep_norm += 2.0f * (float)M_PI;
+        float blip_norm = fmodf(blip_angle, 2.0f * (float)M_PI);
+        if (blip_norm < 0.0f) blip_norm += 2.0f * (float)M_PI;
+        float angle_diff = sweep_norm - blip_norm;
+        if (angle_diff >  (float)M_PI) angle_diff -= 2.0f * (float)M_PI;
+        if (angle_diff < -(float)M_PI) angle_diff += 2.0f * (float)M_PI;
         float proximity = fabsf(angle_diff);
-        if (proximity < 0.15f) {
-            float relight_strength = 1.0f - (proximity / 0.15f);
-            uint16_t relight_col = lerp_col16(
+        if (proximity < 0.20f) {
+            float relight_t = 1.0f - (proximity / 0.20f);
+            uint16_t rl_col = lerp_col16(
                 BG_COLOR,
                 e.is_flock ? CAUTION_COLOR : HEADER_COLOR,
-                relight_strength * 0.7f);
+                relight_t * 0.8f);
             int rsz = sz + 2;
             if (e.proto == 0) {
                 spr.drawTriangle(bx,       by - rsz,
                                  bx - rsz, by + rsz,
                                  bx + rsz, by + rsz,
-                                 relight_col);
+                                 rl_col);
             } else {
-                spr.drawLine(bx,       by - rsz, bx + rsz, by,       relight_col);
-                spr.drawLine(bx + rsz, by,       bx,       by + rsz, relight_col);
-                spr.drawLine(bx,       by + rsz, bx - rsz, by,       relight_col);
-                spr.drawLine(bx - rsz, by,       bx,       by - rsz, relight_col);
+                spr.drawLine(bx,       by - rsz, bx + rsz, by,       rl_col);
+                spr.drawLine(bx + rsz, by,       bx,       by + rsz, rl_col);
+                spr.drawLine(bx,       by + rsz, bx - rsz, by,       rl_col);
+                spr.drawLine(bx - rsz, by,       bx,       by - rsz, rl_col);
             }
         }
     }
