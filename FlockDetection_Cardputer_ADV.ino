@@ -679,6 +679,16 @@ static bool feed_pending_valid = false;
 static unsigned long scanner_flash_ms = 0;
 static uint16_t      scanner_flash_color = 0;
 
+// Per-blip sweep-time tracking. When the radar crosshair passes over a
+// blip its MAC + timestamp are recorded here, and the renderer keeps a
+// brighter shape painted on top for ~800 ms after that moment so the
+// blip "lights up" and slowly dims back to its resting state. Slots
+// are claimed by MAC, then reused via the oldest-timestamp eviction in
+// the renderer once all slots are taken.
+#define MAX_SCAN_BLIPS 16
+static unsigned long blip_last_swept[MAX_SCAN_BLIPS] = {0};
+static char          blip_swept_mac[MAX_SCAN_BLIPS][18] = {{0}};
+
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
 static unsigned long bs_pending_until = 0;
@@ -4188,7 +4198,7 @@ void draw_scanner_screen() {
     // ── Layout constants ──
     const int SCAN_CX = 120;
     const int SCAN_CY = 128;
-    const int SCAN_R  = 72;
+    const int SCAN_R  = 65;
 
     unsigned long frame_ms = millis();
 
@@ -4253,11 +4263,11 @@ void draw_scanner_screen() {
     uint16_t outer_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.5f);
     spr.drawCircle(SCAN_CX, SCAN_CY, SCAN_R, outer_col);
 
-    // Continuous full-360° sweep — one revolution every 3 s, rotating
+    // Continuous full-360° sweep — one revolution every 6 s, rotating
     // clockwise (negated angle). The clip rect hides the bottom half so
     // the sweep naturally appears in the visible arc and reappears
     // after the unseen sweep through the lower hemisphere.
-    float sweep_angle = -((float)frame_ms / 3000.0f * 2.0f * (float)M_PI);
+    float sweep_angle = -((float)frame_ms / 6000.0f * 2.0f * (float)M_PI);
 
     // Sweep trail — pixel stipple along each radial. Cubic falloff +
     // wider angular and radial spacing so only the leading 2-3 trails
@@ -4283,24 +4293,36 @@ void draw_scanner_screen() {
         }
     }
 
-    // Sweep crosshair — two thin 1px arms, primary brighter than the
-    // perpendicular. Both 1px drawLine, no drawWideLine.
+    // Sweep crosshair — four thin 1px arms (primary, opposite,
+    // perpendicular, opposite-perpendicular). All identical colour and
+    // weight; the clip rect handles hiding anything below the baseline.
     {
-        int sx1 = SCAN_CX + (int)(6.0f * cosf(sweep_angle));
-        int sy1 = SCAN_CY - (int)(6.0f * sinf(sweep_angle));
-        int sx2 = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
-        int sy2 = SCAN_CY - (int)((float)SCAN_R * sinf(sweep_angle));
-        spr.drawLine(sx1, sy1, sx2, sy2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.7f));
+        uint16_t cross_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f);
+        float perp = sweep_angle + (float)M_PI * 0.5f;
 
-        float perp_angle = sweep_angle + (float)M_PI * 0.5f;
-        int px1 = SCAN_CX + (int)(6.0f * cosf(perp_angle));
-        int py1 = SCAN_CY - (int)(6.0f * sinf(perp_angle));
-        int px2 = SCAN_CX + (int)((float)SCAN_R * cosf(perp_angle));
-        int py2 = SCAN_CY - (int)((float)SCAN_R * sinf(perp_angle));
-        if (py1 < SCAN_CY && py2 < SCAN_CY && (py1 >= 32 || py2 >= 32)) {
-            spr.drawLine(px1, py1, px2, py2,
-                         lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
-        }
+        int ax1 = SCAN_CX + (int)(6.0f * cosf(sweep_angle));
+        int ay1 = SCAN_CY - (int)(6.0f * sinf(sweep_angle));
+        int ax2 = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
+        int ay2 = SCAN_CY - (int)((float)SCAN_R * sinf(sweep_angle));
+        spr.drawLine(ax1, ay1, ax2, ay2, cross_col);
+
+        int bx1 = SCAN_CX - (int)(6.0f * cosf(sweep_angle));
+        int by1 = SCAN_CY + (int)(6.0f * sinf(sweep_angle));
+        int bx2 = SCAN_CX - (int)((float)SCAN_R * cosf(sweep_angle));
+        int by2 = SCAN_CY + (int)((float)SCAN_R * sinf(sweep_angle));
+        spr.drawLine(bx1, by1, bx2, by2, cross_col);
+
+        int cx1 = SCAN_CX + (int)(6.0f * cosf(perp));
+        int cy1 = SCAN_CY - (int)(6.0f * sinf(perp));
+        int cx2 = SCAN_CX + (int)((float)SCAN_R * cosf(perp));
+        int cy2 = SCAN_CY - (int)((float)SCAN_R * sinf(perp));
+        spr.drawLine(cx1, cy1, cx2, cy2, cross_col);
+
+        int dx1 = SCAN_CX - (int)(6.0f * cosf(perp));
+        int dy1 = SCAN_CY + (int)(6.0f * sinf(perp));
+        int dx2 = SCAN_CX - (int)((float)SCAN_R * cosf(perp));
+        int dy2 = SCAN_CY + (int)((float)SCAN_R * sinf(perp));
+        spr.drawLine(dx1, dy1, dx2, dy2, cross_col);
     }
 
     // Step 8: device blips. Snapshot the feed at most every 500 ms —
@@ -4371,37 +4393,77 @@ void draw_scanner_screen() {
             spr.drawLine(bx - sz, by,      bx,      by - sz, blip_col);
         }
 
-        // Sweep-relight: redraw the blip's shape one size up and
-        // brighter when the rotating sweep is within ~0.20 rad of its
-        // angle. Both angles get normalised into [0, 2π] first because
-        // sweep_angle accumulates negatively forever via millis() while
-        // blip_angle is a fixed [0, π] value — without normalisation
-        // the diff is unbounded and the proximity check never fires.
+        // Sweep-glow: when the crosshair passes within 0.12 rad of this
+        // blip's angle, stamp the timestamp into the per-MAC tracking
+        // table; the glow then fades smoothly over 800 ms after the
+        // sweep moves away. Both angles are normalised into [0, 2π]
+        // first — sweep_angle accumulates negatively forever via
+        // millis(), so without normalisation the diff is unbounded.
         float sweep_norm = fmodf(sweep_angle, 2.0f * (float)M_PI);
         if (sweep_norm < 0.0f) sweep_norm += 2.0f * (float)M_PI;
         float blip_norm = fmodf(blip_angle, 2.0f * (float)M_PI);
         if (blip_norm < 0.0f) blip_norm += 2.0f * (float)M_PI;
-        float angle_diff = sweep_norm - blip_norm;
-        if (angle_diff >  (float)M_PI) angle_diff -= 2.0f * (float)M_PI;
-        if (angle_diff < -(float)M_PI) angle_diff += 2.0f * (float)M_PI;
-        float proximity = fabsf(angle_diff);
-        if (proximity < 0.20f) {
-            float relight_t = 1.0f - (proximity / 0.20f);
-            uint16_t rl_col = lerp_col16(
+        float adiff = sweep_norm - blip_norm;
+        if (adiff >  (float)M_PI) adiff -= 2.0f * (float)M_PI;
+        if (adiff < -(float)M_PI) adiff += 2.0f * (float)M_PI;
+
+        if (fabsf(adiff) < 0.12f) {
+            int free_slot = -1;
+            int oldest_slot = 0;
+            unsigned long oldest_ts = blip_last_swept[0];
+            bool found = false;
+            for (int si = 0; si < MAX_SCAN_BLIPS; si++) {
+                if (strncmp(blip_swept_mac[si], e.mac, 17) == 0 &&
+                    blip_swept_mac[si][0] != '\0') {
+                    blip_last_swept[si] = frame_ms;
+                    found = true;
+                    break;
+                }
+                if (free_slot < 0 && blip_swept_mac[si][0] == '\0') {
+                    free_slot = si;
+                }
+                if (blip_last_swept[si] < oldest_ts) {
+                    oldest_ts = blip_last_swept[si];
+                    oldest_slot = si;
+                }
+            }
+            if (!found) {
+                int slot = (free_slot >= 0) ? free_slot : oldest_slot;
+                strncpy(blip_swept_mac[slot], e.mac, 17);
+                blip_swept_mac[slot][17] = '\0';
+                blip_last_swept[slot] = frame_ms;
+            }
+        }
+
+        unsigned long last_swept = 0;
+        for (int si = 0; si < MAX_SCAN_BLIPS; si++) {
+            if (blip_swept_mac[si][0] != '\0' &&
+                strncmp(blip_swept_mac[si], e.mac, 17) == 0) {
+                last_swept = blip_last_swept[si];
+                break;
+            }
+        }
+
+        float glow = 0.0f;
+        if (last_swept > 0 && (frame_ms - last_swept) < 800UL) {
+            glow = 1.0f - (float)(frame_ms - last_swept) / 800.0f;
+        }
+        if (glow > 0.05f) {
+            uint16_t glow_col = lerp_col16(
                 BG_COLOR,
                 e.is_flock ? CAUTION_COLOR : HEADER_COLOR,
-                relight_t * 0.8f);
-            int rsz = sz + 2;
+                glow * 0.7f);
+            int gsz = sz + 2 + (int)(glow * 2.0f);
             if (e.proto == 0) {
-                spr.drawTriangle(bx,       by - rsz,
-                                 bx - rsz, by + rsz,
-                                 bx + rsz, by + rsz,
-                                 rl_col);
+                spr.drawTriangle(bx,       by - gsz,
+                                 bx - gsz, by + gsz,
+                                 bx + gsz, by + gsz,
+                                 glow_col);
             } else {
-                spr.drawLine(bx,       by - rsz, bx + rsz, by,       rl_col);
-                spr.drawLine(bx + rsz, by,       bx,       by + rsz, rl_col);
-                spr.drawLine(bx,       by + rsz, bx - rsz, by,       rl_col);
-                spr.drawLine(bx - rsz, by,       bx,       by - rsz, rl_col);
+                spr.drawLine(bx,       by - gsz, bx + gsz, by,       glow_col);
+                spr.drawLine(bx + gsz, by,       bx,       by + gsz, glow_col);
+                spr.drawLine(bx,       by + gsz, bx - gsz, by,       glow_col);
+                spr.drawLine(bx - gsz, by,       bx,       by - gsz, glow_col);
             }
         }
     }
