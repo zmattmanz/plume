@@ -4233,7 +4233,7 @@ void handle_menu_select() {
 static const int VIZ_X      = 4;
 static const int VIZ_Y      = 52;
 static const int VIZ_W      = 134;
-static const int VIZ_H      = 80;
+static const int VIZ_H      = 72;
 static const int VIZ_RIGHT  = VIZ_X + VIZ_W;
 static const int VIZ_BOTTOM = VIZ_Y + VIZ_H;
 static const int DIVIDER_X  = 140;
@@ -4273,6 +4273,22 @@ void draw_scanner_screen() {
     spr.setCursor(86, CONTENT_Y - 1);
     char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%02ld", sb);
     spr.print(ble_str);
+
+    // Scanning status — what the radio is doing right now. Renders just
+    // above the viz panel so it's visible regardless of viz mode.
+    {
+        bool ble_scanning = (pBLEScan != nullptr && pBLEScan->isScanning());
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(6, 44);
+        if (ble_scanning) {
+            spr.print("BLE scanning");
+        } else {
+            char scan_status[20];
+            snprintf(scan_status, sizeof(scan_status), "WiFi: CH%d", current_channel);
+            spr.print(scan_status);
+        }
+    }
 
     // Step 3: vertical divider
     spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
@@ -4377,7 +4393,7 @@ void draw_scanner_screen() {
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
     const int   R_CX    = 68;
-    const int   R_CY    = 118;
+    const int   R_CY    = VIZ_BOTTOM;
     const int   R_R     = 52;
     const int   R_IR    = 18;
     const float R_TILT  = 0.55f;
@@ -4614,7 +4630,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     // outer scanner clip set by draw_scanner_screen() afterwards so
     // the rest of the spectrum renders against the same bounds.
     {
-        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.15f);
+        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.30f);
         spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
         for (int d = -VIZ_H; d < VIZ_W + VIZ_H; d += 6) {
             int x0 = VIZ_X + d;
@@ -4693,12 +4709,18 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     }
 
     // Smooth scan line — eased x slides between channel positions
-    // instead of snapping when the hopper advances. Initialised on
-    // first render so it doesn't fly in from x=0. Drawn before the
-    // curve so the line sits on top at the column where they cross.
+    // instead of snapping when the hopper advances. On wrap from a high
+    // channel back to ch1, snap the eased position to just past the left
+    // edge so the line resets and sweeps in from the left rather than
+    // easing backwards across the chart.
+    static int scan_prev_channel = 0;
+    bool channel_wrapped = (current_channel == 1 && scan_prev_channel > 10);
+    scan_prev_channel = current_channel;
+
     float scan_target_x = (float)plot_x +
         (float)(current_channel - 1) / 12.0f * (float)plot_w;
     if (scan_line_last_frame == 0) scan_line_x_f = scan_target_x;
+    if (channel_wrapped)           scan_line_x_f = (float)(plot_x - 4);
     float scan_dt = (scan_line_last_frame == 0) ? 16.0f
                   : (float)(frame_ms - scan_line_last_frame);
     if (scan_dt > 100.0f) scan_dt = 100.0f;
@@ -4725,6 +4747,19 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         }
         prev_px = cx;
         prev_py = cy;
+    }
+
+    // Intersection dot — bright marker where the eased scan line meets
+    // the curve. Uses the same Catmull-Rom evaluator as the curve so
+    // the dot sits exactly on the rendered line.
+    {
+        int dot_col = scan_x - plot_x;
+        if (dot_col < 0)      dot_col = 0;
+        if (dot_col > plot_w) dot_col = plot_w;
+        float dot_val = eval_curve(dot_col);
+        int dot_y = val_to_y(dot_val);
+        spr.fillCircle(scan_x, dot_y, 1, HEADER_COLOR);
+        spr.drawCircle(scan_x, dot_y, 2, HEADER_COLOR);
     }
 
     // CH indicator at the top-right of the viz area.
