@@ -679,11 +679,6 @@ static bool feed_pending_valid = false;
 static unsigned long scanner_flash_ms = 0;
 static uint16_t      scanner_flash_color = 0;
 
-// Eased angle for the scanner radar sweep — interpolates toward the
-// current_channel angle each frame so the line glides between channel
-// positions instead of snapping when the hopper advances.
-static float scan_sweep_display_angle = (float)M_PI;
-
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
 static unsigned long bs_pending_until = 0;
@@ -4194,7 +4189,7 @@ void draw_scanner_screen() {
     const int SCAN_CX = 120;
     const int SCAN_CY = 128;
     const int SCAN_R  = 76;
-    const int SCAN_TRAIL_STEPS = 36;
+    const int SCAN_TRAIL_STEPS = 20;
 
     unsigned long frame_ms = millis();
 
@@ -4274,23 +4269,22 @@ void draw_scanner_screen() {
         }
     }
 
-    // Smooth-eased sweep angle — interpolates toward current_channel so
-    // the line glides between channel positions instead of snapping when
-    // the hopper advances every CHANNEL_DWELL_MS.
-    float target_angle = (float)M_PI * (1.0f - (float)(current_channel - 1) / 12.0f);
-    float diff = target_angle - scan_sweep_display_angle;
-    while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
-    while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-    scan_sweep_display_angle += diff * 0.12f;
-    float sweep_angle = scan_sweep_display_angle;
+    // Continuous time-based sweep — one full π rotation every 8 s, left
+    // (ch1, π) → right (ch13, 0) → wraps. Decoupled from the channel
+    // hopper so the visual stays smooth even as current_channel jumps
+    // around. The CHn label still reflects the real hopper position.
+    float sweep_angle = (float)M_PI -
+                        fmodf((float)frame_ms / 8000.0f, 1.0f) * (float)M_PI;
 
-    // Step 6: sweep trail — 36 fading anti-aliased radial lines.
+    // Step 6: sweep trail — 20 individual 1px lines. Wider angular
+    // spacing + plain drawLine so the trail reads as discrete fading
+    // lines rather than blurring into a solid wedge.
     for (int i = 1; i <= SCAN_TRAIL_STEPS; i++) {
-        float trail_offset = (float)i * 0.028f;
-        float trail_ang = sweep_angle + trail_offset;
+        float trail_off = (float)i * 0.045f;
+        float trail_ang = sweep_angle + trail_off;
         float ratio = (float)(SCAN_TRAIL_STEPS - i) / (float)SCAN_TRAIL_STEPS;
-        float alpha = ratio * 0.28f;
-        uint16_t trail_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+
+        uint16_t trail_col = lerp_col16(BG_COLOR, HEADER_COLOR, ratio * 0.25f);
 
         int lx1 = SCAN_CX + (int)(8.0f * cosf(trail_ang));
         int ly1 = SCAN_CY - (int)(8.0f * sinf(trail_ang));
@@ -4298,30 +4292,36 @@ void draw_scanner_screen() {
         int ly2 = SCAN_CY - (int)((float)(SCAN_R - 1) * sinf(trail_ang));
         if (ly1 < 32 || ly2 < 32) continue;
 
-        spr.drawWideLine(lx1, ly1, lx2, ly2, 1.2f, trail_col);
+        spr.drawLine(lx1, ly1, lx2, ly2, trail_col);
     }
 
-    // Step 7: bright sweep line.
+    // Step 7: bright sweep line — slightly thicker than the trail.
     {
         int sx1 = SCAN_CX + (int)(8.0f * cosf(sweep_angle));
         int sy1 = SCAN_CY - (int)(8.0f * sinf(sweep_angle));
         int sx2 = SCAN_CX + (int)((float)SCAN_R * cosf(sweep_angle));
         int sy2 = SCAN_CY - (int)((float)SCAN_R * sinf(sweep_angle));
         uint16_t sweep_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
-        spr.drawWideLine(sx1, sy1, sx2, sy2, 1.5f, sweep_col);
+        spr.drawWideLine(sx1, sy1, sx2, sy2, 1.3f, sweep_col);
     }
 
-    // Step 8: device blips — anti-aliased circle outlines, position by
-    // MAC-hashed channel angle × RSSI distance from centre.
+    // Step 8: device blips. Snapshot the feed at most every 500 ms —
+    // blip positions don't need frame-level precision and the mutex +
+    // copy were running every frame.
     static FeedEntry scan_local_feed[FEED_SIZE];
-    int scan_local_count, scan_local_head;
+    static int scan_local_count = 0;
+    static int scan_local_head  = 0;
+    static unsigned long scan_feed_last_snapshot = 0;
+    if (frame_ms - scan_feed_last_snapshot >= 500 ||
+        scan_feed_last_snapshot == 0) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        scan_local_count = feed_count;
+        scan_local_head  = feed_head;
+        for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
+        xSemaphoreGive(dataMutex);
+        scan_feed_last_snapshot = frame_ms;
+    }
     unsigned long scan_now = frame_ms;
-
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    scan_local_count = feed_count;
-    scan_local_head  = feed_head;
-    for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
-    xSemaphoreGive(dataMutex);
 
     for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
         int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
@@ -4353,6 +4353,31 @@ void draw_scanner_screen() {
         }
 
         spr.drawCircle(bx, by, dot_r, blip_col);
+
+        // Sweep-relight: when the rotating sweep is within ~0.15 rad of
+        // this blip's angle, paint a brighter circle on top so the
+        // blip flares as the sweep crosses it. At peak strength also
+        // throw in a brief expanding ring for extra pop.
+        float angle_diff = sweep_angle - blip_angle;
+        while (angle_diff >  (float)M_PI) angle_diff -= 2.0f * (float)M_PI;
+        while (angle_diff < -(float)M_PI) angle_diff += 2.0f * (float)M_PI;
+        float proximity = fabsf(angle_diff);
+        if (proximity < 0.15f) {
+            float relight_strength = 1.0f - (proximity / 0.15f);
+            uint16_t relight_col = e.is_flock
+                ? lerp_col16(BG_COLOR, CAUTION_COLOR, relight_strength * 0.9f)
+                : lerp_col16(BG_COLOR, HEADER_COLOR, relight_strength * 0.8f);
+            spr.drawCircle(bx, by, dot_r + 1, relight_col);
+
+            if (relight_strength > 0.5f) {
+                int ring_r = dot_r + 3 + (int)((1.0f - relight_strength) * 4.0f);
+                uint16_t ring_col = lerp_col16(
+                    BG_COLOR,
+                    e.is_flock ? CAUTION_COLOR : HEADER_COLOR,
+                    relight_strength * 0.3f);
+                spr.drawCircle(bx, by, ring_r, ring_col);
+            }
+        }
     }
 
     // Step 9: centre dot
