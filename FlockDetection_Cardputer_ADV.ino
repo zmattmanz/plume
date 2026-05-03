@@ -697,6 +697,12 @@ static uint32_t          channel_pkt_display[NUM_WIFI_CHANNELS] = {0};
 static unsigned long     channel_display_last_update = 0;
 static uint32_t          channel_peak = 1;
 
+// Per-bar smoothed display height [0..1], eased toward the normalised
+// channel_pkt_display ratio every frame so the chart glides instead of
+// snapping with each 400ms hop.
+static float             channel_bar_height[NUM_WIFI_CHANNELS] = {0};
+static unsigned long     channel_bar_last_frame = 0;
+
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
 static unsigned long bs_pending_until = 0;
@@ -4556,15 +4562,34 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
 // hopping channel renders bright with a triangle marker; flock
 // detections briefly flash the peak bar in CAUTION_COLOR.
 static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
-    if (frame_ms - channel_display_last_update >= 2000) {
+    // Longer accumulation window — 13 channels × 400ms hop ≈ 5s/cycle,
+    // so a 5s snapshot represents a full hop cycle and gentler /2 decay
+    // keeps a couple cycles of history alive in the bars.
+    if (frame_ms - channel_display_last_update >= 5000) {
         channel_peak = 1;
         for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
             channel_pkt_display[i] = channel_pkt_counts[i];
-            channel_pkt_counts[i]  = channel_pkt_counts[i] / 3;
+            channel_pkt_counts[i]  = channel_pkt_counts[i] / 2;
             if (channel_pkt_display[i] > channel_peak)
                 channel_peak = channel_pkt_display[i];
         }
         channel_display_last_update = frame_ms;
+    }
+
+    // Per-bar smoothing — eases each bar's normalised height toward the
+    // current display ratio with a 200 ms time constant so bars rise
+    // and fall fluidly across hop cycles instead of spiking per dwell.
+    float bar_dt = (channel_bar_last_frame == 0) ? 16.0f
+                 : (float)(frame_ms - channel_bar_last_frame);
+    if (bar_dt > 100.0f) bar_dt = 100.0f;
+    channel_bar_last_frame = frame_ms;
+    for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+        float target = 0.0f;
+        if (channel_peak > 0 && channel_pkt_display[i] > 0) {
+            target = (float)channel_pkt_display[i] / (float)channel_peak;
+        }
+        channel_bar_height[i] = anim_filter(channel_bar_height[i], target,
+                                            200.0f, bar_dt);
     }
 
     // Subtle dotted grid background
@@ -4596,29 +4621,28 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 
     for (int ch = 0; ch < NUM_WIFI_CHANNELS; ch++) {
         int bx = bars_start_x + ch * (bar_w + bar_gap);
-
-        int bar_h = 0;
-        if (channel_peak > 0 && channel_pkt_display[ch] > 0) {
-            bar_h = (int)((float)channel_pkt_display[ch]
-                          / (float)channel_peak * (float)bar_area_h);
-            if (bar_h < 2)          bar_h = 2;
-            if (bar_h > bar_area_h) bar_h = bar_area_h;
-        }
-        if (bar_h == 0) continue;
-
-        int by = bar_area_bottom - bar_h;
         bool is_current = ((ch + 1) == current_channel);
-        uint16_t bar_col = is_current
-            ? lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f)
-            : lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f);
-        spr.fillRect(bx, by, bar_w, bar_h, bar_col);
 
+        int bar_h = (int)(channel_bar_height[ch] * (float)bar_area_h);
+        if (bar_h < 0)          bar_h = 0;
+        if (bar_h > bar_area_h) bar_h = bar_area_h;
+        // Floor of 1 px so a channel with any pending count at least
+        // shows a sliver while the smoothing winds up.
+        if (bar_h < 1 && channel_pkt_display[ch] > 0) bar_h = 1;
+
+        if (bar_h > 0) {
+            int by = bar_area_bottom - bar_h;
+            uint16_t bar_col = is_current
+                ? lerp_col16(BG_COLOR, HEADER_COLOR, 1.0f)
+                : lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f);
+            spr.fillRect(bx, by, bar_w, bar_h, bar_col);
+        }
+
+        // Bright 2px underline — sits on the baseline under the active
+        // channel, drawn even when the bar itself is zero so the
+        // hopper position is always obvious.
         if (is_current) {
-            int mx = bx + bar_w / 2;
-            int marker_y = by - 4;
-            if (marker_y < VIZ_Y) marker_y = VIZ_Y;
-            spr.fillTriangle(mx - 2, marker_y, mx + 2, marker_y,
-                             mx,     marker_y + 3, HEADER_COLOR);
+            spr.fillRect(bx, bar_area_bottom + 1, bar_w, 2, HEADER_COLOR);
         }
     }
 
@@ -4649,25 +4673,6 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
             }
         }
     }
-
-    // Channel labels (1, 6, 13) — channel 6 highlights when current.
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(bars_start_x, bar_area_bottom + 2);
-    spr.print("1");
-
-    int ch6_x = bars_start_x + 5 * (bar_w + bar_gap);
-    spr.setTextColor(lerp_col16(BG_COLOR,
-                                (current_channel == 6) ? HEADER_COLOR : DIM_COLOR,
-                                0.5f),
-                     BG_COLOR);
-    spr.setCursor(ch6_x, bar_area_bottom + 2);
-    spr.print("6");
-
-    int ch13_x = bars_start_x + 12 * (bar_w + bar_gap);
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
-    spr.setCursor(ch13_x - 2, bar_area_bottom + 2);
-    spr.print("13");
 
     // CH indicator at the top-right of the viz area.
     char ch_str[6];
