@@ -4354,16 +4354,22 @@ void handle_menu_select() {
 // ============================================================================
 // UI RENDERING - SCREENS 
 // ============================================================================
-// ── Layout constants for the scanner screen's cycleable viz panel ──
-static const int VIZ_X      = 4;
-static const int VIZ_Y      = 52;
-static const int VIZ_W      = 134;
-static const int VIZ_H      = DISP_H - VIZ_Y - 1;  // = 82 — extends to 1px above screen bottom
-static const int VIZ_RIGHT  = VIZ_X + VIZ_W;
-static const int VIZ_BOTTOM = VIZ_Y + VIZ_H;
-static const int DIVIDER_X  = 140;
-static const int FEED_X     = 144;
-static const int FEED_RIGHT = DISP_W - 4;
+// ── Layout constants for the scanner screen ──
+// Viz panel sits TOP-LEFT directly below the header; counts and RATE
+// stack BELOW it. Feed runs full-height down the right side of the
+// divider.
+static const int DIVIDER_X    = 140;
+static const int VIZ_X        = 4;
+static const int VIZ_Y        = 20;
+static const int VIZ_H        = 68;
+static const int VIZ_W        = DIVIDER_X - VIZ_X - 2;   // 134
+static const int VIZ_RIGHT    = VIZ_X + VIZ_W;            // 138
+static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;            // 88
+static const int COUNTS_Y     = VIZ_BOTTOM + 4;           // 92
+static const int FEED_X       = 144;
+static const int FEED_LABEL_Y = 20;
+static const int FEED_FIRST_Y = 34;
+static const int FEED_RIGHT   = DISP_W - 4;               // 236
 
 void draw_scanner_screen() {
     unsigned long frame_ms = millis();
@@ -4372,7 +4378,19 @@ void draw_scanner_screen() {
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
 
-    // Step 2: WIFI / BLE counts (top-left)
+    // Step 2: vertical divider
+    spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
+
+    // Step 3: viz panel — TOP LEFT, directly below the header.
+    spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+    switch (scanner_viz_mode) {
+        case 0: draw_scanner_viz_radar(frame_ms);    break;
+        case 1: draw_scanner_viz_spectrum(frame_ms); break;
+        case 2: draw_scanner_viz_cloud(frame_ms);    break;
+    }
+    spr.clearClipRect();
+
+    // Step 4: WIFI / BLE counts — stacked label-over-number BELOW the viz.
     long sw, sb;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     sw = session_flock_wifi;
@@ -4381,47 +4399,49 @@ void draw_scanner_screen() {
 
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(6, CONTENT_Y);
+    spr.setCursor(6, COUNTS_Y);
     kprint(spr, "WIFI", 1);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setTextSize(TS_H2);
-    spr.setCursor(30, CONTENT_Y - 1);
+    spr.setTextSize(TS_H1);
+    spr.setCursor(6, COUNTS_Y + 10);
     char wifi_str[6]; snprintf(wifi_str, sizeof(wifi_str), "%02ld", sw);
     spr.print(wifi_str);
 
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(68, CONTENT_Y);
+    spr.setCursor(66, COUNTS_Y);
     kprint(spr, "BLE", 1);
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setTextSize(TS_H2);
-    spr.setCursor(86, CONTENT_Y - 1);
+    spr.setTextSize(TS_H1);
+    spr.setCursor(66, COUNTS_Y + 10);
     char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%02ld", sb);
     spr.print(ble_str);
 
-    // Scanning status — what the radio is doing right now. Renders just
-    // above the viz panel so it's visible regardless of viz mode.
-    {
-        bool ble_scanning = (pBLEScan != nullptr && pBLEScan->isScanning());
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(6, 44);
-        if (ble_scanning) {
-            spr.print("BLE scanning");
-        } else {
-            char scan_status[20];
-            snprintf(scan_status, sizeof(scan_status), "WiFi: CH%d", current_channel);
-            spr.print(scan_status);
-        }
+    // Step 5: RATE — packets-per-second sampled over a 1s window. Label
+    // sits left-aligned with WIFI/BLE; value right-aligned to the divider.
+    static uint32_t      viz_pps_prev = 0;
+    static unsigned long viz_pps_last = 0;
+    static uint32_t      viz_pps_val  = 0;
+    if (frame_ms - viz_pps_last >= 1000) {
+        uint32_t cur = ambient_packet_count;
+        viz_pps_val  = cur - viz_pps_prev;
+        viz_pps_prev = cur;
+        viz_pps_last = frame_ms;
     }
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(6, DISP_H - 10);
+    kprint(spr, "RATE", 1);
+    char rate_str[10];
+    snprintf(rate_str, sizeof(rate_str), "%lu/s", (unsigned long)viz_pps_val);
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setCursor(DIVIDER_X - (int)strlen(rate_str) * 6 - 4, DISP_H - 10);
+    spr.print(rate_str);
 
-    // Step 3: vertical divider
-    spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
-
-    // Step 4: feed panel (right side) — FEED label + rows.
+    // Step 6: feed panel (right side) — FEED label + rows.
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_BODY);
-    spr.setCursor(FEED_X, CONTENT_Y);
+    spr.setCursor(FEED_X, FEED_LABEL_Y);
     kprint(spr, "FEED");
 
     static FeedEntry scan_local_feed[FEED_SIZE];
@@ -4436,10 +4456,9 @@ void draw_scanner_screen() {
         scan_feed_last_snapshot = frame_ms;
     }
 
-    const int feed_row_h    = 13;
-    const int feed_first_y  = CONTENT_Y + 20;
+    const int feed_row_h    = 14;
     const int feed_last_y   = DISP_H - 2;
-    const int max_feed_rows = (feed_last_y - feed_first_y) / feed_row_h;
+    const int max_feed_rows = (feed_last_y - FEED_FIRST_Y) / feed_row_h;
     unsigned long feed_now  = frame_ms;
 
     // Detect a new top entry → trigger a slide-down. Skip the very
@@ -4457,13 +4476,13 @@ void draw_scanner_screen() {
     }
     int slide_offset = (int)((1.0f - slide_t) * (float)feed_row_h);
 
-    spr.setClipRect(FEED_X, feed_first_y,
-                    DISP_W - FEED_X, DISP_H - feed_first_y);
+    spr.setClipRect(FEED_X, FEED_FIRST_Y,
+                    DISP_W - FEED_X, DISP_H - FEED_FIRST_Y);
 
     for (int i = 0; i < scan_local_count && i < max_feed_rows; i++) {
         int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
         FeedEntry& e = scan_local_feed[idx];
-        int ry = feed_first_y + i * feed_row_h - slide_offset;
+        int ry = FEED_FIRST_Y + i * feed_row_h - slide_offset;
 
         unsigned long age = feed_now - e.timestamp;
         float af;
@@ -4500,15 +4519,6 @@ void draw_scanner_screen() {
 
     spr.clearClipRect();
     feed_commit_pending();
-
-    // Step 6: dispatch to active viz renderer, clipped to the panel.
-    spr.setClipRect(0, VIZ_Y - 2, DIVIDER_X, VIZ_H + 4);
-    switch (scanner_viz_mode) {
-        case 0: draw_scanner_viz_radar(frame_ms);    break;
-        case 1: draw_scanner_viz_spectrum(frame_ms); break;
-        case 2: draw_scanner_viz_cloud(frame_ms);    break;
-    }
-    spr.clearClipRect();
 
     // View indicator pill — appears for ~1.5s after pressing 'v', then
     // fades out and stops rendering completely. Drawn after the viz so
@@ -4558,9 +4568,9 @@ void draw_scanner_screen() {
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
     const int   R_CX    = VIZ_X + 20;
-    const int   R_CY    = VIZ_BOTTOM + 12;
-    const int   R_R     = 62;
-    const int   R_IR    = 22;
+    const int   R_CY    = VIZ_BOTTOM + 10;
+    const int   R_R     = 58;
+    const int   R_IR    = 20;
     const float R_TILT  = 0.55f;
     const int   R_THICK = 6;
     const float TWO_PIf = (float)M_PI * 2.0f;
