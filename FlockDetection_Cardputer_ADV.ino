@@ -71,6 +71,9 @@ struct WifiEvent;
 static void parse_wifi_event(struct WifiEvent* ev);
 static void draw_scanner_viz_radar(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
+static void draw_scanner_viz_cloud(unsigned long frame_ms);
+static void cloud_update_device(const char* mac, const char* name,
+                                int rssi, int proto, bool is_flock);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -684,8 +687,10 @@ static uint16_t      scanner_flash_color = 0;
 
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
-static int       scanner_viz_mode  = 0;   // 0 = RADAR, 1 = SPECTRUM
-static const int SCANNER_VIZ_COUNT = 2;
+static int       scanner_viz_mode  = 0;   // 0 = RADAR, 1 = SPECTRUM, 2 = CLOUD
+static const int SCANNER_VIZ_COUNT = 3;
+static unsigned long viz_indicator_show_ms = 0;
+static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
 
 // Per-channel packet counter used by the SPECTRUM viz. Counts are
 // incremented in wifi_sniffer_packet_handler() (single 32-bit store on
@@ -712,6 +717,28 @@ static float             spectrum_ghost[SPECTRUM_GHOST_FRAMES][NUM_WIFI_CHANNELS
 static int               spectrum_ghost_head = 0;
 static bool              spectrum_ghost_filled = false;
 static unsigned long     spectrum_ghost_last_ms = 0;
+
+// Device cloud — spatial map of recently-seen devices, separate from the
+// scrolling feed. Each device gets a deterministic position from its MAC
+// hash so it always appears in the same spot, plus a depth derived from
+// RSSI so close devices render bigger and brighter.
+#define CLOUD_MAX_DEVICES        30
+#define CLOUD_DEVICE_EXPIRY_MS   60000UL
+
+struct CloudDevice {
+    char          name[16];
+    char          mac[18];
+    float         x;          // 0..1 normalised position from MAC hash
+    float         y;
+    float         depth;      // 0=far/dim, 1=close/bright (from RSSI)
+    int8_t        rssi;
+    uint8_t       proto;      // 0=WiFi, 1=BLE
+    bool          is_flock;
+    unsigned long last_seen;
+    bool          occupied;
+};
+
+static CloudDevice cloud_devices[CLOUD_MAX_DEVICES] = {};
 
 // Eased x-coordinate of the spectrum scan line — slides smoothly
 // between channel positions instead of snapping when the hopper
@@ -2085,7 +2112,76 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
     feed_pending.is_flock  = is_flock;
     feed_pending.timestamp = millis();
     feed_pending_valid     = true;
+    cloud_update_device(mac, name, rssi, proto, is_flock);
     xSemaphoreGive(dataMutex);
+}
+
+// Cloud devices live in their own ring; populated from feed_push_candidate
+// so every observed device gets a spatial slot. Existing devices have
+// their RSSI/depth refreshed; new devices land in a free slot, evicting
+// the oldest if the ring is full. Position is deterministic from the MAC
+// hash so the same device renders in the same spot every time.
+static void cloud_update_device(const char* mac, const char* name,
+                                int rssi, int proto, bool is_flock) {
+    if (!mac || mac[0] == '\0') return;
+    unsigned long now = millis();
+    auto rssi_to_depth = [](int r) -> float {
+        float v = (float)(r - (-90)) / (float)((-30) - (-90));
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        return v;
+    };
+
+    int free_slot   = -1;
+    int oldest_slot = 0;
+    unsigned long oldest_ts = ULONG_MAX;
+
+    for (int i = 0; i < CLOUD_MAX_DEVICES; i++) {
+        if (cloud_devices[i].occupied) {
+            if (strncmp(cloud_devices[i].mac, mac, 17) == 0) {
+                cloud_devices[i].rssi      = (int8_t)rssi;
+                cloud_devices[i].is_flock  = cloud_devices[i].is_flock || is_flock;
+                cloud_devices[i].depth     = rssi_to_depth(rssi);
+                cloud_devices[i].last_seen = now;
+                return;
+            }
+            if (cloud_devices[i].last_seen < oldest_ts) {
+                oldest_ts   = cloud_devices[i].last_seen;
+                oldest_slot = i;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+
+    // Reap expired entries to free up a slot before falling back to LRU.
+    for (int i = 0; i < CLOUD_MAX_DEVICES; i++) {
+        if (cloud_devices[i].occupied &&
+            (now - cloud_devices[i].last_seen) > CLOUD_DEVICE_EXPIRY_MS) {
+            cloud_devices[i].occupied = false;
+            if (free_slot < 0) free_slot = i;
+        }
+    }
+
+    int slot = (free_slot >= 0) ? free_slot : oldest_slot;
+    CloudDevice& d = cloud_devices[slot];
+    d.occupied = true;
+    strncpy(d.mac, mac, 17); d.mac[17] = '\0';
+    if (name && name[0] != '\0') {
+        strncpy(d.name, name, 15); d.name[15] = '\0';
+    } else {
+        const char* tail = (strlen(mac) > 8) ? mac + 9 : mac;
+        strncpy(d.name, tail, 15); d.name[15] = '\0';
+    }
+
+    uint32_t h = hash_mac(mac);
+    d.x         = (float)(h % 1000) / 1000.0f;
+    d.y         = (float)((h >> 10) % 1000) / 1000.0f;
+    d.depth     = rssi_to_depth(rssi);
+    d.rssi      = (int8_t)rssi;
+    d.proto     = (uint8_t)proto;
+    d.is_flock  = is_flock;
+    d.last_seen = now;
 }
 
 static void feed_commit_pending() {
@@ -4262,7 +4358,7 @@ void handle_menu_select() {
 static const int VIZ_X      = 4;
 static const int VIZ_Y      = 52;
 static const int VIZ_W      = 134;
-static const int VIZ_H      = 72;
+static const int VIZ_H      = DISP_H - VIZ_Y - 1;  // = 82 — extends to 1px above screen bottom
 static const int VIZ_RIGHT  = VIZ_X + VIZ_W;
 static const int VIZ_BOTTOM = VIZ_Y + VIZ_H;
 static const int DIVIDER_X  = 140;
@@ -4410,8 +4506,48 @@ void draw_scanner_screen() {
     switch (scanner_viz_mode) {
         case 0: draw_scanner_viz_radar(frame_ms);    break;
         case 1: draw_scanner_viz_spectrum(frame_ms); break;
+        case 2: draw_scanner_viz_cloud(frame_ms);    break;
     }
     spr.clearClipRect();
+
+    // View indicator pill — appears for ~1.5s after pressing 'v', then
+    // fades out and stops rendering completely. Drawn after the viz so
+    // it sits on top.
+    if (viz_indicator_show_ms > 0) {
+        unsigned long ind_elapsed = frame_ms - viz_indicator_show_ms;
+        if (ind_elapsed > VIZ_INDICATOR_HOLD_MS + UI_FADE_OUT_MS) {
+            viz_indicator_show_ms = 0;
+        } else {
+            float ind_alpha;
+            if (ind_elapsed < UI_FADE_IN_MS) {
+                ind_alpha = ui_ease((float)ind_elapsed / (float)UI_FADE_IN_MS);
+            } else if (ind_elapsed > VIZ_INDICATOR_HOLD_MS) {
+                float ft = (float)(ind_elapsed - VIZ_INDICATOR_HOLD_MS)
+                         / (float)UI_FADE_OUT_MS;
+                ind_alpha = 1.0f - ui_ease(ft);
+            } else {
+                ind_alpha = 1.0f;
+            }
+            if (ind_alpha > 0.02f) {
+                char ind_str[6];
+                snprintf(ind_str, sizeof(ind_str), "%d/%d",
+                         scanner_viz_mode + 1, SCANNER_VIZ_COUNT);
+                int ind_w  = (int)strlen(ind_str) * 6 + 4;
+                int ind_h  = 9;
+                int ind_x  = VIZ_X + 3;
+                int ind_y  = VIZ_BOTTOM - ind_h - 1;
+                uint16_t pill_bg     = lerp_col16(BG_COLOR, CARD_COLOR,   0.7f * ind_alpha);
+                uint16_t pill_border = lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f * ind_alpha);
+                uint16_t text_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.8f * ind_alpha);
+                spr.fillRoundRect(ind_x, ind_y, ind_w, ind_h, 2, pill_bg);
+                spr.drawRoundRect(ind_x, ind_y, ind_w, ind_h, 2, pill_border);
+                spr.setTextColor(text_col, pill_bg);
+                spr.setTextSize(TS_MICRO);
+                spr.setCursor(ind_x + 2, ind_y + 1);
+                spr.print(ind_str);
+            }
+        }
+    }
 }
 
 // ── Viz mode 0: RADAR ──────────────────────────────────────────────────────
@@ -4421,10 +4557,10 @@ void draw_scanner_screen() {
 // everything outside the panel; we draw the full cylinder anyway and
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
-    const int   R_CX    = VIZ_X + 8;
-    const int   R_CY    = VIZ_BOTTOM + 4;
-    const int   R_R     = 55;
-    const int   R_IR    = 19;
+    const int   R_CX    = VIZ_X + 20;
+    const int   R_CY    = VIZ_BOTTOM + 12;
+    const int   R_R     = 62;
+    const int   R_IR    = 22;
     const float R_TILT  = 0.55f;
     const int   R_THICK = 6;
     const float TWO_PIf = (float)M_PI * 2.0f;
@@ -4868,6 +5004,173 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     spr.setTextSize(TS_MICRO);
     spr.setCursor(VIZ_RIGHT - 18, VIZ_Y - 10);
     spr.print(ch_str);
+}
+
+// ── Viz mode 2: DEVICE CLOUD ───────────────────────────────────────────────
+// Spatial map of every device feed_push_candidate has seen in the last
+// 60s. Position is deterministic from the MAC hash; depth (size +
+// brightness + parallax magnitude) comes from RSSI. Two slow sine waves
+// stand in for IMU-driven parallax — drop in real accel readings later
+// to make the field react to device tilt.
+static void draw_scanner_viz_cloud(unsigned long frame_ms) {
+    float parallax_x = sinf((float)frame_ms * 0.0004f) * 4.0f;
+    float parallax_y = cosf((float)frame_ms * 0.00027f) * 3.0f;
+    // IMU hook: parallax_x = imu_accel_x * 6.0f; parallax_y = imu_accel_y * 6.0f;
+
+    int sorted[CLOUD_MAX_DEVICES];
+    int count = 0;
+    for (int i = 0; i < CLOUD_MAX_DEVICES; i++) {
+        if (!cloud_devices[i].occupied) continue;
+        if ((frame_ms - cloud_devices[i].last_seen) > CLOUD_DEVICE_EXPIRY_MS) {
+            cloud_devices[i].occupied = false;
+            continue;
+        }
+        sorted[count++] = i;
+    }
+
+    // Insertion sort by depth ascending so close devices render last and
+    // sit visually on top of distant ones.
+    for (int i = 1; i < count; i++) {
+        int   key   = sorted[i];
+        float key_d = cloud_devices[key].depth;
+        int   j     = i - 1;
+        while (j >= 0 && cloud_devices[sorted[j]].depth > key_d) {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = key;
+    }
+
+    for (int si = 0; si < count; si++) {
+        CloudDevice& d = cloud_devices[sorted[si]];
+
+        // Age fade — full brightness for the first 45s, then ramp to zero
+        // over the remaining 15s of the 60s expiry window.
+        unsigned long age = frame_ms - d.last_seen;
+        float age_alpha = 1.0f;
+        if (age > 45000UL) {
+            age_alpha = 1.0f - (float)(age - 45000UL) / 15000.0f;
+        }
+        if (age_alpha < 0.05f) continue;
+
+        float px_shift = parallax_x * d.depth;
+        float py_shift = parallax_y * d.depth;
+        int dx = VIZ_X + 4 + (int)(d.x * (float)(VIZ_W - 8) + px_shift);
+        int dy = VIZ_Y + 4 + (int)(d.y * (float)(VIZ_H - 8) + py_shift);
+
+        if (dx < VIZ_X + 2 || dx > VIZ_RIGHT - 2) continue;
+        if (dy < VIZ_Y + 2 || dy > VIZ_BOTTOM - 2) continue;
+
+        float drift_phase = (float)(hash_mac(d.mac) % 1000) / 1000.0f;
+        float drift_x = sinf(drift_phase * 6.28f + (float)frame_ms * 0.0008f) * 2.0f * d.depth;
+        float drift_y = cosf(drift_phase * 4.17f + (float)frame_ms * 0.0006f) * 1.5f * d.depth;
+        dx += (int)drift_x;
+        dy += (int)drift_y;
+
+        if (dx < VIZ_X + 2 || dx > VIZ_RIGHT - 2) continue;
+        if (dy < VIZ_Y + 2 || dy > VIZ_BOTTOM - 2) continue;
+
+        float alpha = age_alpha;
+
+        if (d.is_flock) {
+            // Flock — coral pulsing halo + bright core + name when close.
+            int   glow_r = 4 + (int)(d.depth * 6.0f);
+            float pulse  = anim_pulse(UI_PULSE_MEDIUM, drift_phase);
+            glow_r += (int)(pulse * 2.0f);
+
+            for (int gy = -glow_r; gy <= glow_r; gy++) {
+                for (int gx = -glow_r; gx <= glow_r; gx++) {
+                    float dist = sqrtf((float)(gx * gx + gy * gy));
+                    if (dist > (float)glow_r) continue;
+                    int px2 = dx + gx, py2 = dy + gy;
+                    if (px2 < VIZ_X || px2 >= VIZ_RIGHT ||
+                        py2 < VIZ_Y || py2 >= VIZ_BOTTOM) continue;
+                    float glow_alpha = (1.0f - dist / (float)glow_r) * 0.25f * alpha;
+                    if (glow_alpha < 0.01f) continue;
+                    spr.drawPixel(px2, py2,
+                                  lerp_col16(BG_COLOR, CAUTION_COLOR, glow_alpha));
+                }
+            }
+
+            int dot_r = 1 + (int)(d.depth * 1.5f);
+            for (int gy = -dot_r; gy <= dot_r; gy++) {
+                for (int gx = -dot_r; gx <= dot_r; gx++) {
+                    if (gx * gx + gy * gy <= dot_r * dot_r) {
+                        int px2 = dx + gx, py2 = dy + gy;
+                        if (px2 >= VIZ_X && px2 < VIZ_RIGHT &&
+                            py2 >= VIZ_Y && py2 < VIZ_BOTTOM) {
+                            spr.drawPixel(px2, py2,
+                                          lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f * alpha));
+                        }
+                    }
+                }
+            }
+
+            if (d.depth > 0.4f) {
+                int label_x = dx + dot_r + 3;
+                int label_y = dy - 3;
+                if (label_x + 30 < VIZ_RIGHT && label_y >= VIZ_Y &&
+                    label_y + 6 < VIZ_BOTTOM) {
+                    spr.setTextColor(
+                        lerp_col16(BG_COLOR, CAUTION_COLOR, 0.6f * alpha), BG_COLOR);
+                    spr.setTextSize(TS_MICRO);
+                    spr.setCursor(label_x, label_y);
+                    char short_name[10];
+                    strncpy(short_name, d.name, 9);
+                    short_name[9] = '\0';
+                    spr.print(short_name);
+                }
+            }
+        } else if (d.depth > 0.35f) {
+            // Mid/close normal — visible dot scaling with depth.
+            int dot_r = (int)(d.depth * 1.5f);
+            if (dot_r < 1) dot_r = 1;
+            float dot_alpha = (0.15f + d.depth * 0.45f) * alpha;
+            for (int gy = -dot_r; gy <= dot_r; gy++) {
+                for (int gx = -dot_r; gx <= dot_r; gx++) {
+                    if (gx * gx + gy * gy <= dot_r * dot_r) {
+                        int px2 = dx + gx, py2 = dy + gy;
+                        if (px2 >= VIZ_X && px2 < VIZ_RIGHT &&
+                            py2 >= VIZ_Y && py2 < VIZ_BOTTOM) {
+                            spr.drawPixel(px2, py2,
+                                          lerp_col16(BG_COLOR, HEADER_COLOR, dot_alpha));
+                        }
+                    }
+                }
+            }
+            if (d.depth > 0.6f) {
+                int label_x = dx + dot_r + 2;
+                int label_y = dy - 2;
+                if (label_x + 24 < VIZ_RIGHT && label_y >= VIZ_Y &&
+                    label_y + 6 < VIZ_BOTTOM) {
+                    spr.setTextColor(
+                        lerp_col16(BG_COLOR, DIM_COLOR, 0.35f * alpha), BG_COLOR);
+                    spr.setTextSize(TS_MICRO);
+                    spr.setCursor(label_x, label_y);
+                    char short_name[8];
+                    strncpy(short_name, d.name, 7);
+                    short_name[7] = '\0';
+                    spr.print(short_name);
+                }
+            }
+        } else {
+            // Far background — single pixel, with a faint companion for
+            // mid-distant devices so they don't all look identical.
+            float dot_alpha = (0.08f + d.depth * 0.15f) * alpha;
+            spr.drawPixel(dx, dy, lerp_col16(BG_COLOR, HEADER_COLOR, dot_alpha));
+            if (d.depth > 0.15f) {
+                spr.drawPixel(dx + 1, dy,
+                              lerp_col16(BG_COLOR, HEADER_COLOR, dot_alpha * 0.5f));
+            }
+        }
+    }
+
+    char count_str[12];
+    snprintf(count_str, sizeof(count_str), "%d dev", count);
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.3f), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(VIZ_X + 2, VIZ_BOTTOM - 8);
+    spr.print(count_str);
 }
 
 void draw_locator_screen() {
@@ -7478,6 +7781,7 @@ void loop() {
             else if (c == 'v') {
                 if (!stealth_mode && current_screen == 0) {
                     scanner_viz_mode = (scanner_viz_mode + 1) % SCANNER_VIZ_COUNT;
+                    viz_indicator_show_ms = millis();
                     screen_dirty = true;
                     menu_click();
                 }
