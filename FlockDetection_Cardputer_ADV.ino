@@ -3925,17 +3925,6 @@ void draw_help_overlay() {
     spr.print("v9.6");
 }
 
-// Draw a dithered darkening overlay — fast checkerboard pattern that
-// darkens every-other pixel toward a target color, creating the visual
-// effect of semi-transparency without per-pixel alpha blending.
-static void draw_dither_overlay(int x0, int y0, int w, int h, uint16_t dark_color) {
-    for (int y = y0; y < y0 + h; y++) {
-        for (int x = x0 + ((y & 1) ? 1 : 0); x < x0 + w; x += 2) {
-            spr.drawPixel(x, y, dark_color);
-        }
-    }
-}
-
 // Soft UI click — brief tone that reads as a tactile tick.
 static void menu_click() {
     if (stealth_mode || is_muted) return;
@@ -4507,51 +4496,42 @@ void draw_scanner_screen() {
     }
 }
 
-// ── Viz mode 0: RADAR ──────────────────────────────────────────────────────
-// Sunk port of the ambient-mode cylinder radar, scaled down for the viz
-// panel and pivoted below the bottom of that panel so only the top of
-// the cylinder shows. The clip rect set by draw_scanner_screen() hides
-// everything outside the panel; we draw the full cylinder anyway and
-// the bottom half is naturally invisible.
-static void draw_scanner_viz_radar(unsigned long frame_ms) {
-    const int   R_CX    = VIZ_X + VIZ_W / 2;
-    const int   R_CY    = VIZ_Y + (int)(VIZ_H * 0.6f);
-    const int   R_R     = 30;
-    const int   R_IR    = 10;
-    const float R_TILT  = 0.55f;
-    const int   R_THICK = 4;
+// Shared cylinder-radar renderer used by both the scanner viz panel and
+// the fullscreen ambient mode. All geometry is parameterised so the
+// same drawing code serves both layouts; particles are scaled from the
+// global radar_r/inner_r range into the caller's r/ir range.
+static void draw_radar_common(unsigned long frame_ms,
+                              int cx, int cy, int r, int ir,
+                              float tilt, int thickness) {
     const float TWO_PIf = (float)M_PI * 2.0f;
 
-    update_radar_data(frame_ms);
-
     // Cylinder shadow
-    spr.fillEllipse(R_CX, R_CY + R_THICK + 2, R_R, R_R * R_TILT,
+    spr.fillEllipse(cx, cy + thickness + 2, r, r * tilt,
                     lgfx::color565(4, 8, 16));
     // Wall gradient — lighter toward the top
-    for (int i = R_THICK; i >= 1; i--) {
-        uint8_t wall_v = 8 + (R_THICK - i) * 2;
-        spr.fillEllipse(R_CX, R_CY + i, R_R, R_R * R_TILT,
+    for (int i = thickness; i >= 1; i--) {
+        uint8_t wall_v = 8 + (thickness - i) * 2;
+        spr.fillEllipse(cx, cy + i, r, r * tilt,
                         lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
     }
     // Top face fill + double-stroked rim
-    spr.fillEllipse(R_CX, R_CY, R_R, R_R * R_TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(R_CX, R_CY,     R_R, (int)(R_R * R_TILT), HEADER_COLOR);
-    spr.drawEllipse(R_CX, R_CY + 1, R_R, (int)(R_R * R_TILT), HEADER_COLOR);
+    spr.fillEllipse(cx, cy, r, r * tilt, lgfx::color565(14, 26, 52));
+    spr.drawEllipse(cx, cy,     r, (int)(r * tilt), HEADER_COLOR);
+    spr.drawEllipse(cx, cy + 1, r, (int)(r * tilt), HEADER_COLOR);
     // Bottom rim
-    spr.drawEllipse(R_CX, R_CY + R_THICK,     R_R, R_R * R_TILT, DIM_COLOR);
-    spr.drawEllipse(R_CX, R_CY + R_THICK + 1, R_R, R_R * R_TILT, DIM_COLOR);
+    spr.drawEllipse(cx, cy + thickness,     r, r * tilt, DIM_COLOR);
+    spr.drawEllipse(cx, cy + thickness + 1, r, r * tilt, DIM_COLOR);
     // Inner ring
-    spr.drawEllipse(R_CX, R_CY,     R_IR, (int)(R_IR * R_TILT), DIM_COLOR);
-    spr.drawEllipse(R_CX, R_CY + 1, R_IR, (int)(R_IR * R_TILT), DIM_COLOR);
+    spr.drawEllipse(cx, cy,     ir, (int)(ir * tilt), DIM_COLOR);
+    spr.drawEllipse(cx, cy + 1, ir, (int)(ir * tilt), DIM_COLOR);
 
-    // Sweep math — 360° rotation every 3 s, identical to ambient.
+    // Sweep math — 360° rotation every 3 s.
     float sweep_rad  = (frame_ms / 3000.0f) * TWO_PIf;
     float sweep_norm = fmodf(sweep_rad, TWO_PIf);
     unsigned long time_since_blip = radar_time_since_blip;
 
-    // Particles — outline triangles with sweep-proximity boost. Positions
-    // scale from update_radar_data's small-radar range (radar_r/inner_r
-    // macros) into our local R_R/R_IR.
+    // Particles — outline triangles with sweep-proximity boost. Scaled
+    // from the global radar_r/inner_r range into the caller's r/ir range.
     float noise_dimming = 1.0f;
     if (time_since_blip < 10000)      noise_dimming = 0.0f;
     else if (time_since_blip < 13000) noise_dimming = (time_since_blip - 10000) / 3000.0f;
@@ -4577,10 +4557,10 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
             if (total_intensity > 255) total_intensity = 255;
 
             float scaled_r = ((noise_r[i] - (float)inner_r) / (float)(radar_r - inner_r))
-                           * (float)(R_R - R_IR) + (float)R_IR;
+                           * (float)(r - ir) + (float)ir;
 
-            int ppx = R_CX + (int)(scaled_r * cosf(noise_a[i]));
-            int ppy = R_CY + (int)(scaled_r * sinf(noise_a[i]) * R_TILT);
+            int ppx = cx + (int)(scaled_r * cosf(noise_a[i]));
+            int ppy = cy + (int)(scaled_r * sinf(noise_a[i]) * tilt);
 
             uint16_t p_col = night_mode
                 ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
@@ -4597,14 +4577,14 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
     // Breathing crosshair
     float    breathe       = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;
     uint16_t modulated_col = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
-    int      dynamic_r     = (R_R - 6) + (int)(4 * breathe);
+    int      dynamic_r     = (r - 6) + (int)(4 * breathe);
     float    cos_rot       = cosf(hud_rotation);
     float    sin_rot       = sinf(hud_rotation);
-    spr.drawLine(R_CX - dynamic_r * cos_rot, R_CY - dynamic_r * sin_rot * R_TILT,
-                 R_CX + dynamic_r * cos_rot, R_CY + dynamic_r * sin_rot * R_TILT,
+    spr.drawLine(cx - dynamic_r * cos_rot, cy - dynamic_r * sin_rot * tilt,
+                 cx + dynamic_r * cos_rot, cy + dynamic_r * sin_rot * tilt,
                  modulated_col);
-    spr.drawLine(R_CX - dynamic_r * -sin_rot, R_CY - dynamic_r * cos_rot * R_TILT,
-                 R_CX + dynamic_r * -sin_rot, R_CY + dynamic_r * cos_rot * R_TILT,
+    spr.drawLine(cx - dynamic_r * -sin_rot, cy - dynamic_r * cos_rot * tilt,
+                 cx + dynamic_r * -sin_rot, cy + dynamic_r * cos_rot * tilt,
                  modulated_col);
 
     // 24-step dot trail — original RGB formula.
@@ -4616,16 +4596,16 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
         int tb = 48 + (255 - 48) * ratio;
         uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0)
                                        : lgfx::color565(tr, tg, tb);
-        for (int r_step = R_IR + 2; r_step < R_R; r_step += 4) {
-            spr.drawPixel(R_CX + (int)(r_step * cosf(trail_angle)),
-                          R_CY + (int)(r_step * sinf(trail_angle) * R_TILT), fade_col);
+        for (int r_step = ir + 2; r_step < r; r_step += 4) {
+            spr.drawPixel(cx + (int)(r_step * cosf(trail_angle)),
+                          cy + (int)(r_step * sinf(trail_angle) * tilt), fade_col);
         }
     }
 
     // Sweep line
-    spr.drawLine(R_CX, R_CY,
-                 R_CX + (int)((R_R - 1) * cosf(sweep_rad)),
-                 R_CY + (int)((R_R - 1) * sinf(sweep_rad) * R_TILT), HEADER_COLOR);
+    spr.drawLine(cx, cy,
+                 cx + (int)((r - 1) * cosf(sweep_rad)),
+                 cy + (int)((r - 1) * sinf(sweep_rad) * tilt), HEADER_COLOR);
 
     // Blip relight — sweep "re-illuminates" radial-band blips it passes.
     float angle_step = TWO_PIf / NUM_RADIAL_BANDS;
@@ -4650,15 +4630,15 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
         float a = i * angle_step;
         if (local_spikes[i] > 0) {
             bool is_strong = (local_spikes[i] > 0.8f);
-            int spike_len = (int)((R_R - R_IR) * local_spikes[i] * 0.7f);
+            int spike_len = (int)((r - ir) * local_spikes[i] * 0.7f);
             if (spike_len < 3)  spike_len = 3;
             if (spike_len > 35) spike_len = 35;
 
             float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
-            int blip_dist = R_IR + 4 + (int)((R_R - R_IR - 6) * dist_ratio);
+            int blip_dist = ir + 4 + (int)((r - ir - 6) * dist_ratio);
 
-            int base_x = R_CX + (int)(blip_dist * cosf(a));
-            int base_y = R_CY + (int)(blip_dist * sinf(a) * R_TILT);
+            int base_x = cx + (int)(blip_dist * cosf(a));
+            int base_y = cy + (int)(blip_dist * sinf(a) * tilt);
             uint16_t line_col = local_colors[i];
 
             if (is_strong) {
@@ -4686,6 +4666,24 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
     }
 
     hud_rotation = fmodf(hud_rotation + 0.0033f, TWO_PIf);
+}
+
+// ── Viz mode 0: RADAR ──────────────────────────────────────────────────────
+// Sunk port of the ambient-mode cylinder radar, scaled down for the viz
+// panel and pivoted below the bottom of that panel so only the top of
+// the cylinder shows. The clip rect set by draw_scanner_screen() hides
+// everything outside the panel; we draw the full cylinder anyway and
+// the bottom half is naturally invisible.
+static void draw_scanner_viz_radar(unsigned long frame_ms) {
+    const int   R_CX    = VIZ_X + VIZ_W / 2;
+    const int   R_CY    = VIZ_Y + (int)(VIZ_H * 0.6f);
+    const int   R_R     = 30;
+    const int   R_IR    = 10;
+    const float R_TILT  = 0.55f;
+    const int   R_THICK = 4;
+
+    update_radar_data(frame_ms);
+    draw_radar_common(frame_ms, R_CX, R_CY, R_R, R_IR, R_TILT, R_THICK);
 }
 
 // ── Viz mode 1: SPECTRUM ───────────────────────────────────────────────────
@@ -4971,14 +4969,29 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 // to make the field react to device tilt.
 static void draw_scanner_viz_cloud(unsigned long frame_ms) {
 
-    // ── STEP 1: ingest the feed snapshot directly ─────────────────────
-    // scan_local_feed / scan_local_count / scan_local_head are file-scope
-    // statics refreshed by draw_scanner_screen() once per ~500ms; we read
-    // them every frame and fold each entry into cloud_cards[].
-    for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
-        int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
-        FeedEntry& e = scan_local_feed[idx];
+    // ── STEP 1: take our own snapshot of the global feed ──────────────
+    // The cloud is self-contained — it does not rely on any other
+    // function's snapshot. Refresh every 500ms so we don't hammer
+    // dataMutex 60×/sec.
+    static FeedEntry     cloud_snap[FEED_SIZE];
+    static int           cloud_snap_count = 0;
+    static int           cloud_snap_head  = 0;
+    static unsigned long cloud_snap_ms    = 0;
+    if (cloud_snap_ms == 0 || frame_ms - cloud_snap_ms >= 500) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        cloud_snap_count = feed_count;
+        cloud_snap_head  = feed_head;
+        for (int i = 0; i < FEED_SIZE; i++) cloud_snap[i] = feed_entries[i];
+        xSemaphoreGive(dataMutex);
+        cloud_snap_ms = frame_ms;
+    }
 
+    // ── STEP 2: fold each snapshot entry into cloud_cards[] ───────────
+    for (int fi = 0; fi < cloud_snap_count && fi < FEED_SIZE; fi++) {
+        int idx = (cloud_snap_head - fi + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = cloud_snap[idx];
+
+        if (e.mac[0] == '\0') continue;
         if ((frame_ms - e.timestamp) > 60000UL) continue;
 
         char display_name[16];
@@ -5131,10 +5144,10 @@ static void draw_scanner_viz_cloud(unsigned long frame_ms) {
         CloudCard& c = cloud_cards[render_order[ri]];
 
         float drift_phase = (float)(hash_mac(c.mac) % 1000) / 1000.0f;
-        float drift_y = cosf(drift_phase * 4.17f + (float)frame_ms * 0.0006f) * 2.5f * 0.3f;
+        float drift_y_px = cosf(drift_phase * 4.17f + (float)frame_ms * 0.0006f) * 2.5f;
 
         int card_x = VIZ_X + (int)(c.x * (float)VIZ_W);
-        int card_y = VIZ_Y + (int)((c.y + drift_y / (float)VIZ_H) * (float)(VIZ_H - 18));
+        int card_y = VIZ_Y + (int)(c.y * (float)(VIZ_H - 18)) + (int)drift_y_px;
 
         const int char_w = 7;
         int card_w = (int)strlen(c.name) * char_w + 18;
@@ -8234,196 +8247,23 @@ void loop() {
     }
 
     if (ambient_mode) {
-        // Fullscreen ambient radar — exact scaled-up replica of the scanner
-        // cylinder. Same TILT, sweep, particles, blip vocabulary; just
-        // bigger and centered, with a small detection counter and nothing
-        // else on screen. Toast overlay still surfaces alerts.
+        // Fullscreen ambient radar — same cylinder vocabulary as the
+        // scanner viz, just larger and centred with a detection counter.
         static unsigned long last_ambient_draw = 0;
         unsigned long now_amb = millis();
         if (now_amb - last_ambient_draw > 33) {  // ~30 fps
             spr.fillSprite(BG_COLOR);
 
-            const int   amb_cx      = 120;
-            const int   amb_cy      = 68;
-            const int   amb_r       = 56;
-            const int   amb_inner_r = 22;
-            const float AMB_TILT    = 0.55f;
-            const int   AMB_THICK   = 7;
-            const float TWO_PIf     = (float)M_PI * 2.0f;
-
             unsigned long frame_ms = now_amb;
             update_radar_data(frame_ms);
-
-            // ── Cylinder rendering — identical treatment to the scanner ──
-            // Shadow below cylinder
-            spr.fillEllipse(amb_cx, amb_cy + AMB_THICK + 2, amb_r, amb_r * AMB_TILT,
-                            lgfx::color565(4, 8, 16));
-            // Wall gradient — lighter toward the top
-            for (int i = AMB_THICK; i >= 1; i--) {
-                uint8_t wall_v = 8 + (AMB_THICK - i) * 2;
-                spr.fillEllipse(amb_cx, amb_cy + i, amb_r, amb_r * AMB_TILT,
-                                lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
-            }
-            // Top face fill + double-stroked rim
-            spr.fillEllipse(amb_cx, amb_cy, amb_r, amb_r * AMB_TILT, lgfx::color565(14, 26, 52));
-            spr.drawEllipse(amb_cx, amb_cy,     amb_r, (int)(amb_r * AMB_TILT), HEADER_COLOR);
-            spr.drawEllipse(amb_cx, amb_cy + 1, amb_r, (int)(amb_r * AMB_TILT), HEADER_COLOR);
-            // Bottom rim
-            spr.drawEllipse(amb_cx, amb_cy + AMB_THICK,     amb_r, amb_r * AMB_TILT, DIM_COLOR);
-            spr.drawEllipse(amb_cx, amb_cy + AMB_THICK + 1, amb_r, amb_r * AMB_TILT, DIM_COLOR);
-            // Inner ring
-            spr.drawEllipse(amb_cx, amb_cy,     amb_inner_r, (int)(amb_inner_r * AMB_TILT), DIM_COLOR);
-            spr.drawEllipse(amb_cx, amb_cy + 1, amb_inner_r, (int)(amb_inner_r * AMB_TILT), DIM_COLOR);
-
-            // Sweep math
-            float sweep_rad  = (frame_ms / 3000.0f) * TWO_PIf;
-            float sweep_norm = fmodf(sweep_rad, TWO_PIf);
-            unsigned long time_since_blip = radar_time_since_blip;
-
-            // Particles — identical logic to scanner, ambient coords
-            float noise_dimming = 1.0f;
-            if (time_since_blip < 10000)      noise_dimming = 0.0f;
-            else if (time_since_blip < 13000) noise_dimming = (time_since_blip - 10000) / 3000.0f;
-
-            if (noise_dimming > 0.01f) {
-                for (int i = 0; i < NUM_PARTICLES; i++) {
-                    if (noise_life[i] <= 0) continue;
-                    float fade = (float)noise_life[i] / (float)noise_max_life[i];
-                    int intensity = (int)(fade * 180.0f * noise_dimming);
-                    if (intensity > 200) intensity = 200;
-                    if (intensity < 20) continue;
-
-                    float pa = fmodf(noise_a[i], TWO_PIf);
-                    float diff_sweep = sweep_norm - pa;
-                    if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
-                    if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
-                    float trail_arc = 2.0f;
-                    if (diff_sweep < 0) diff_sweep += TWO_PIf;
-                    if (diff_sweep > trail_arc) continue;
-                    float sweep_proximity = 1.0f - (diff_sweep / trail_arc);
-                    int sweep_boost = (int)(sweep_proximity * 80);
-                    int total_intensity = intensity + sweep_boost;
-                    if (total_intensity > 255) total_intensity = 255;
-
-                    // Scale particle r from scanner range → ambient range
-                    float scaled_r = ((noise_r[i] - (float)inner_r) / (float)(radar_r - inner_r))
-                                   * (float)(amb_r - amb_inner_r) + (float)amb_inner_r;
-
-                    int px = amb_cx + (int)(scaled_r * cosf(noise_a[i]));
-                    int py = amb_cy + (int)(scaled_r * sinf(noise_a[i]) * AMB_TILT);
-
-                    uint16_t p_col = night_mode
-                        ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
-                        : lgfx::color565(total_intensity / 3, (total_intensity * 3) / 4, total_intensity);
-
-                    spr.drawTriangle(px - 1, py + 1, px + 1, py + 1, px, py - 2, p_col);
-                    if (sweep_proximity > 0.5f) {
-                        spr.drawPixel(px, py - 1, p_col);
-                        spr.drawPixel(px, py,     p_col);
-                    }
-                }
-            }
-
-            // Crosshairs — same breathing modulation as scanner
-            float    breathe        = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;
-            uint16_t modulated_col  = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
-            int      dynamic_r      = (amb_r - 6) + (int)(4 * breathe);
-            float    cos_rot        = cosf(hud_rotation);
-            float    sin_rot        = sinf(hud_rotation);
-            spr.drawLine(amb_cx - dynamic_r * cos_rot, amb_cy - dynamic_r * sin_rot * AMB_TILT,
-                         amb_cx + dynamic_r * cos_rot, amb_cy + dynamic_r * sin_rot * AMB_TILT,
-                         modulated_col);
-            spr.drawLine(amb_cx - dynamic_r * -sin_rot, amb_cy - dynamic_r * cos_rot * AMB_TILT,
-                         amb_cx + dynamic_r * -sin_rot, amb_cy + dynamic_r * cos_rot * AMB_TILT,
-                         modulated_col);
-
-            // Sweep trail — same color formula as scanner
-            for (int i = 1; i <= 24; i++) {
-                float trail_angle = sweep_rad - (i * 0.05f);
-                float ratio = (24.0f - i) / 24.0f;
-                int tr = 10 + (0   - 10) * ratio;
-                int tg = 20 + (238 - 20) * ratio;
-                int tb = 48 + (255 - 48) * ratio;
-                uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0)
-                                               : lgfx::color565(tr, tg, tb);
-                for (int r_step = amb_inner_r + 2; r_step < amb_r; r_step += 4) {
-                    spr.drawPixel(amb_cx + (int)(r_step * cosf(trail_angle)),
-                                  amb_cy + (int)(r_step * sinf(trail_angle) * AMB_TILT), fade_col);
-                }
-            }
-
-            // Sweep line
-            spr.drawLine(amb_cx, amb_cy,
-                         amb_cx + (int)((amb_r - 1) * cosf(sweep_rad)),
-                         amb_cy + (int)((amb_r - 1) * sinf(sweep_rad) * AMB_TILT), HEADER_COLOR);
-
-            // Blip relight — sweep "re-illuminates" blips it passes
-            float angle_step = TWO_PIf / NUM_RADIAL_BANDS;
-            const float BLIP_RELIGHT_ARC = 0.20f;
-            for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-                if (local_spikes[i] < 0.05f) continue;
-                float band_angle = fmodf(i * angle_step, TWO_PIf);
-                float diff = sweep_norm - band_angle;
-                if (diff >  (float)M_PI) diff -= TWO_PIf;
-                if (diff < -(float)M_PI) diff += TWO_PIf;
-                if (diff >= 0.0f && diff < BLIP_RELIGHT_ARC) {
-                    xSemaphoreTake(dataMutex, portMAX_DELAY);
-                    if (radial_spikes[i] > 0.05f) {
-                        radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
-                    }
-                    xSemaphoreGive(dataMutex);
-                }
-            }
-
-            // Detection blips — identical shape vocabulary, ambient coords
-            for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-                float a = i * angle_step;
-                if (local_spikes[i] > 0) {
-                    bool is_strong = (local_spikes[i] > 0.8f);
-                    int spike_len = (int)((amb_r - amb_inner_r) * local_spikes[i] * 0.7f);
-                    if (spike_len < 3)  spike_len = 3;
-                    if (spike_len > 35) spike_len = 35;
-
-                    float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
-                    int blip_dist = amb_inner_r + 4 + (int)((amb_r - amb_inner_r - 6) * dist_ratio);
-
-                    int base_x = amb_cx + (int)(blip_dist * cosf(a));
-                    int base_y = amb_cy + (int)(blip_dist * sinf(a) * AMB_TILT);
-                    uint16_t line_col = local_colors[i];
-
-                    if (is_strong) {
-                        int shape_bottom = base_y - spike_len + 8;
-                        if (shape_bottom < base_y) {
-                            spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
-                        }
-                        bool is_ble_blip = (line_col == PURPLE_COLOR);
-                        int tip_y = base_y - spike_len;
-                        if (is_ble_blip) {
-                            int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
-                            spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
-                            spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
-                            spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
-                            spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
-                        } else {
-                            spr.drawTriangle(base_x - 4, tip_y + 7,
-                                             base_x + 4, tip_y + 7,
-                                             base_x,     tip_y, line_col);
-                        }
-                    } else {
-                        spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
-                    }
-                }
-            }
-
-            // Advance HUD rotation — keeps the scanner consistent on wake.
-            hud_rotation = fmodf(hud_rotation + 0.0033f, TWO_PIf);
+            draw_radar_common(frame_ms, 120, 68, 56, 22, 0.55f, 7);
 
             // Detection counter (bottom-right, flashes ACCENT after a blip)
             long det_total;
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             det_total = session_flock_wifi + session_flock_ble + session_raven;
             xSemaphoreGive(dataMutex);
-            uint16_t det_col = (time_since_blip < 3000) ? ACCENT_COLOR : DIM_COLOR;
+            uint16_t det_col = (radar_time_since_blip < 3000) ? ACCENT_COLOR : DIM_COLOR;
             char det_str[16];
             snprintf(det_str, sizeof(det_str), "D:%ld", det_total);
             int det_w = (int)strlen(det_str) * 6;  // TS_MICRO char width
