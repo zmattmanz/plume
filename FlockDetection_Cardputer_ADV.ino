@@ -72,8 +72,8 @@ static void parse_wifi_event(struct WifiEvent* ev);
 static void draw_scanner_viz_radar(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_cloud(unsigned long frame_ms);
-static void cloud_update_device(const char* mac, const char* name,
-                                int rssi, int proto, bool is_flock);
+static void cloud_try_add_card(const char* mac, const char* name,
+                               int rssi, int proto, bool is_flock);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -722,23 +722,25 @@ static unsigned long     spectrum_ghost_last_ms = 0;
 // scrolling feed. Each device gets a deterministic position from its MAC
 // hash so it always appears in the same spot, plus a depth derived from
 // RSSI so close devices render bigger and brighter.
-#define CLOUD_MAX_DEVICES        30
-#define CLOUD_DEVICE_EXPIRY_MS   60000UL
+#define CLOUD_MAX_CARDS  8
 
-struct CloudDevice {
+struct CloudCard {
     char          name[16];
     char          mac[18];
-    float         x;          // 0..1 normalised position from MAC hash
-    float         y;
-    float         depth;      // 0=far/dim, 1=close/bright (from RSSI)
+    float         x;            // 0=left edge, 1=right edge
+    float         y;            // 0=top, 1=bottom
+    float         drift_speed;  // panel-widths per second drifting left
+    float         target_x;     // eased toward by anim_filter
     int8_t        rssi;
-    uint8_t       proto;      // 0=WiFi, 1=BLE
+    uint8_t       proto;        // 0=WiFi, 1=BLE
     bool          is_flock;
-    unsigned long last_seen;
     bool          occupied;
+    unsigned long birth_ms;
+    unsigned long last_seen;
 };
 
-static CloudDevice cloud_devices[CLOUD_MAX_DEVICES] = {};
+static CloudCard cloud_cards[CLOUD_MAX_CARDS] = {};
+static bool      cloud_cards_initialized = false;
 
 // Eased x-coordinate of the spectrum scan line — slides smoothly
 // between channel positions instead of snapping when the hopper
@@ -2112,76 +2114,110 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
     feed_pending.is_flock  = is_flock;
     feed_pending.timestamp = millis();
     feed_pending_valid     = true;
-    cloud_update_device(mac, name, rssi, proto, is_flock);
+    cloud_try_add_card(mac, name, rssi, proto, is_flock);
     xSemaphoreGive(dataMutex);
 }
 
-// Cloud devices live in their own ring; populated from feed_push_candidate
-// so every observed device gets a spatial slot. Existing devices have
-// their RSSI/depth refreshed; new devices land in a free slot, evicting
-// the oldest if the ring is full. Position is deterministic from the MAC
-// hash so the same device renders in the same spot every time.
-static void cloud_update_device(const char* mac, const char* name,
-                                int rssi, int proto, bool is_flock) {
+// Cloud cards model a flowing river: each named device gets one card
+// drifting right-to-left, slower with stronger signal. Active devices
+// (refreshed within 5s) hold position; once they go quiet the card
+// resumes drifting and eventually exits the panel left edge. Flock
+// cards barely move and gently oscillate in place.
+static void cloud_try_add_card(const char* mac, const char* name,
+                               int rssi, int proto, bool is_flock) {
     if (!mac || mac[0] == '\0') return;
     unsigned long now = millis();
-    auto rssi_to_depth = [](int r) -> float {
-        float v = (float)(r - (-90)) / (float)((-30) - (-90));
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
-        return v;
-    };
 
-    int free_slot   = -1;
-    int oldest_slot = 0;
-    unsigned long oldest_ts = ULONG_MAX;
-
-    for (int i = 0; i < CLOUD_MAX_DEVICES; i++) {
-        if (cloud_devices[i].occupied) {
-            if (strncmp(cloud_devices[i].mac, mac, 17) == 0) {
-                cloud_devices[i].rssi      = (int8_t)rssi;
-                cloud_devices[i].is_flock  = cloud_devices[i].is_flock || is_flock;
-                cloud_devices[i].depth     = rssi_to_depth(rssi);
-                cloud_devices[i].last_seen = now;
-                return;
-            }
-            if (cloud_devices[i].last_seen < oldest_ts) {
-                oldest_ts   = cloud_devices[i].last_seen;
-                oldest_slot = i;
-            }
-        } else if (free_slot < 0) {
-            free_slot = i;
-        }
-    }
-
-    // Reap expired entries to free up a slot before falling back to LRU.
-    for (int i = 0; i < CLOUD_MAX_DEVICES; i++) {
-        if (cloud_devices[i].occupied &&
-            (now - cloud_devices[i].last_seen) > CLOUD_DEVICE_EXPIRY_MS) {
-            cloud_devices[i].occupied = false;
-            if (free_slot < 0) free_slot = i;
-        }
-    }
-
-    int slot = (free_slot >= 0) ? free_slot : oldest_slot;
-    CloudDevice& d = cloud_devices[slot];
-    d.occupied = true;
-    strncpy(d.mac, mac, 17); d.mac[17] = '\0';
-    if (name && name[0] != '\0') {
-        strncpy(d.name, name, 15); d.name[15] = '\0';
+    char display_name[16];
+    bool is_mac_name = (!name || name[0] == '\0' ||
+                        (strlen(name) >= 8 && name[2] == ':'));
+    if (is_mac_name) {
+        int mac_len = (int)strlen(mac);
+        const char* tail = mac + max(0, mac_len - 8);
+        strncpy(display_name, tail, 15);
     } else {
-        const char* tail = (strlen(mac) > 8) ? mac + 9 : mac;
-        strncpy(d.name, tail, 15); d.name[15] = '\0';
+        strncpy(display_name, name, 15);
+    }
+    display_name[15] = '\0';
+
+    // Same name already on screen — refresh and bail.
+    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
+        if (cloud_cards[i].occupied &&
+            strncmp(cloud_cards[i].name, display_name, 15) == 0) {
+            cloud_cards[i].rssi      = (int8_t)rssi;
+            cloud_cards[i].last_seen = now;
+            cloud_cards[i].is_flock  = cloud_cards[i].is_flock || is_flock;
+            return;
+        }
     }
 
-    uint32_t h = hash_mac(mac);
-    d.x         = (float)(h % 1000) / 1000.0f;
-    d.y         = (float)((h >> 10) % 1000) / 1000.0f;
-    d.depth     = rssi_to_depth(rssi);
-    d.rssi      = (int8_t)rssi;
-    d.proto     = (uint8_t)proto;
-    d.is_flock  = is_flock;
-    d.last_seen = now;
+    // Find a free slot, recycling cards that have drifted past the left edge.
+    int slot = -1;
+    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
+        if (!cloud_cards[i].occupied) { slot = i; break; }
+        if (cloud_cards[i].x < -0.3f) {
+            cloud_cards[i].occupied = false;
+            slot = i;
+            break;
+        }
+    }
+    // Fall back to evicting the oldest non-flock card.
+    if (slot < 0) {
+        unsigned long oldest = ULONG_MAX;
+        int oldest_idx = -1;
+        for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
+            if (!cloud_cards[i].is_flock && cloud_cards[i].birth_ms < oldest) {
+                oldest = cloud_cards[i].birth_ms;
+                oldest_idx = i;
+            }
+        }
+        if (oldest_idx >= 0) slot = oldest_idx;
+        else return;
+    }
+
+    CloudCard& c = cloud_cards[slot];
+    c.occupied = true;
+    strncpy(c.name, display_name, 15); c.name[15] = '\0';
+    strncpy(c.mac,  mac, 17);          c.mac[17] = '\0';
+
+    c.x        = 1.15f;
+    c.target_x = 1.15f;
+
+    // Lane-based y assignment: pick the candidate position furthest from
+    // every existing card so new cards spread out instead of clustering.
+    float best_y = 0.15f;
+    float best_min_dist = 0.0f;
+    for (int test = 0; test < 8; test++) {
+        float candidate_y = 0.08f + (float)test / 7.0f * 0.82f;
+        float min_dist = 1.0f;
+        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
+            if (!cloud_cards[ci].occupied) continue;
+            if (ci == slot) continue;
+            float dy = fabsf(cloud_cards[ci].y - candidate_y);
+            if (dy < min_dist) min_dist = dy;
+        }
+        if (min_dist > best_min_dist) {
+            best_min_dist = min_dist;
+            best_y = candidate_y;
+        }
+    }
+    c.y = best_y;
+
+    float rssi_norm = (float)(rssi - (-90)) / (float)((-30) - (-90));
+    if (rssi_norm < 0.0f) rssi_norm = 0.0f;
+    if (rssi_norm > 1.0f) rssi_norm = 1.0f;
+
+    if (is_flock) {
+        c.drift_speed = 0.025f;
+    } else {
+        c.drift_speed = 0.30f - rssi_norm * 0.22f;
+    }
+
+    c.rssi      = (int8_t)rssi;
+    c.proto     = (uint8_t)proto;
+    c.is_flock  = is_flock;
+    c.birth_ms  = now;
+    c.last_seen = now;
 }
 
 static void feed_commit_pending() {
@@ -4355,21 +4391,21 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 // ── Layout constants for the scanner screen ──
-// Viz panel sits TOP-LEFT directly below the header; counts and RATE
-// stack BELOW it. Feed runs full-height down the right side of the
-// divider.
+// Viz panel sits TOP-LEFT directly below the header; counts stack
+// BELOW it (RATE removed — counts own the bottom-left quadrant).
+// Feed runs full-height down the right side of the divider.
 static const int DIVIDER_X    = 140;
 static const int VIZ_X        = 4;
 static const int VIZ_Y        = 20;
-static const int VIZ_H        = 68;
+static const int VIZ_H        = 53;
 static const int VIZ_W        = DIVIDER_X - VIZ_X - 2;   // 134
 static const int VIZ_RIGHT    = VIZ_X + VIZ_W;            // 138
-static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;            // 88
-static const int COUNTS_Y     = VIZ_BOTTOM + 4;           // 92
+static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;            // 73
+static const int COUNTS_Y     = VIZ_BOTTOM + 6;           // 79
 static const int FEED_X       = 144;
 static const int FEED_LABEL_Y = 20;
 static const int FEED_FIRST_Y = 34;
-static const int FEED_RIGHT   = DISP_W - 4;               // 236
+static const int FEED_RIGHT   = DISP_W - 1;               // 239
 
 void draw_scanner_screen() {
     unsigned long frame_ms = millis();
@@ -4377,6 +4413,9 @@ void draw_scanner_screen() {
     // Step 1: clear + header
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
+
+    // Header divider — full width, separates the SCANNER strip from content.
+    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
 
     // Step 2: vertical divider
     spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
@@ -4390,53 +4429,45 @@ void draw_scanner_screen() {
     }
     spr.clearClipRect();
 
-    // Step 4: WIFI / BLE counts — stacked label-over-number BELOW the viz.
+    // Step 4: scorecard — scanning status, then WIFI/BLE labels + numbers.
+    // Vertical rhythm uses named spacing tokens (UI_PAD_SM, UI_PAD_XS).
     long sw, sb;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     sw = session_flock_wifi;
     sb = session_flock_ble;
     xSemaphoreGive(dataMutex);
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(6, COUNTS_Y);
-    kprint(spr, "WIFI", 1);
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setTextSize(TS_H1);
-    spr.setCursor(6, COUNTS_Y + 10);
-    char wifi_str[6]; snprintf(wifi_str, sizeof(wifi_str), "%02ld", sw);
-    spr.print(wifi_str);
+    int status_y  = VIZ_BOTTOM + UI_PAD_SM;          // 73 + 6 = 79
+    int labels_y  = status_y + 8 + UI_PAD_SM;        // 79 + 8 + 6 = 93
+    int numbers_y = labels_y + 10 + UI_PAD_XS;       // 93 + 10 + 2 = 105
 
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    bool ble_scanning = (pBLEScan != nullptr && pBLEScan->isScanning());
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(66, COUNTS_Y);
-    kprint(spr, "BLE", 1);
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setTextSize(TS_H1);
-    spr.setCursor(66, COUNTS_Y + 10);
-    char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%02ld", sb);
-    spr.print(ble_str);
-
-    // Step 5: RATE — packets-per-second sampled over a 1s window. Label
-    // sits left-aligned with WIFI/BLE; value right-aligned to the divider.
-    static uint32_t      viz_pps_prev = 0;
-    static unsigned long viz_pps_last = 0;
-    static uint32_t      viz_pps_val  = 0;
-    if (frame_ms - viz_pps_last >= 1000) {
-        uint32_t cur = ambient_packet_count;
-        viz_pps_val  = cur - viz_pps_prev;
-        viz_pps_prev = cur;
-        viz_pps_last = frame_ms;
+    spr.setCursor(6, status_y);
+    if (ble_scanning) {
+        spr.print("BLE scanning");
+    } else {
+        char scan_status[20];
+        snprintf(scan_status, sizeof(scan_status), "WiFi: CH%d", current_channel);
+        spr.print(scan_status);
     }
+
     spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(6, DISP_H - 10);
-    kprint(spr, "RATE", 1);
-    char rate_str[10];
-    snprintf(rate_str, sizeof(rate_str), "%lu/s", (unsigned long)viz_pps_val);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(6, labels_y);
+    kprint(spr, "WIFI", 1);
+    spr.setCursor(72, labels_y);
+    kprint(spr, "BLE", 1);
+
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setCursor(DIVIDER_X - (int)strlen(rate_str) * 6 - 4, DISP_H - 10);
-    spr.print(rate_str);
+    spr.setTextSize(TS_H1);
+    char wifi_str[6]; snprintf(wifi_str, sizeof(wifi_str), "%ld", sw);
+    spr.setCursor(6, numbers_y);
+    spr.print(wifi_str);
+    char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%ld", sb);
+    spr.setCursor(72, numbers_y);
+    spr.print(ble_str);
 
     // Step 6: feed panel (right side) — FEED label + rows.
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
@@ -4457,7 +4488,7 @@ void draw_scanner_screen() {
     }
 
     const int feed_row_h    = 14;
-    const int feed_last_y   = DISP_H - 2;
+    const int feed_last_y   = DISP_H - 1;
     const int max_feed_rows = (feed_last_y - FEED_FIRST_Y) / feed_row_h;
     unsigned long feed_now  = frame_ms;
 
@@ -4491,29 +4522,46 @@ void draw_scanner_screen() {
         else                    af = 0.0f;
         if (af < 0.1f) continue;
 
-        char proto = (e.proto == 0) ? 'W' : 'B';
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, af), BG_COLOR);
-        spr.setTextSize(TS_BODY);
-        spr.setCursor(FEED_X, ry);
-        char ps[2] = { proto, '\0' };
-        spr.print(ps);
+        // Symbol — identical geometry/colors to draw_feed_expanded_overlay,
+        // with the row's age-fade applied as a final blend toward BG.
+        int sym_x = FEED_X;
+        int sym_y = ry + 3;
+        uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
+        if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
+        proto_col = lerp_col16(BG_COLOR, proto_col, af);
+
+        if (e.proto == 0) {
+            spr.drawTriangle(sym_x,     sym_y + 7,
+                             sym_x + 8, sym_y + 7,
+                             sym_x + 4, sym_y,
+                             proto_col);
+        } else {
+            int ecx = sym_x + 4, ecy = sym_y + 4, ehr = 4;
+            spr.drawLine(ecx,       ecy - ehr, ecx + ehr, ecy,       proto_col);
+            spr.drawLine(ecx + ehr, ecy,       ecx,       ecy + ehr, proto_col);
+            spr.drawLine(ecx,       ecy + ehr, ecx - ehr, ecy,       proto_col);
+            spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
+        }
 
         int name_x = FEED_X + 12;
         if (e.is_flock) {
             spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, af), BG_COLOR);
-            spr.setCursor(FEED_X + 8, ry);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(sym_x + 10, ry + 3);
             spr.print("*");
-            name_x = FEED_X + 18;
+            name_x = FEED_X + 20;
         }
 
-        int max_chars = (FEED_RIGHT - name_x - 4) / 7;
-        if (max_chars > 12) max_chars = 12;
+        spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
+        spr.setTextSize(TS_BODY);
+
+        int max_chars = (FEED_RIGHT - name_x - 2) / 7;
+        if (max_chars > 14) max_chars = 14;
         if (max_chars < 1)  max_chars = 1;
         char nd[16];
         strncpy(nd, e.name, max_chars);
         nd[max_chars] = '\0';
-        spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
-        spr.setCursor(name_x, ry);
+        spr.setCursor(name_x, ry + 3);
         spr.print(nd);
     }
 
@@ -4567,12 +4615,12 @@ void draw_scanner_screen() {
 // everything outside the panel; we draw the full cylinder anyway and
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
-    const int   R_CX    = VIZ_X + 20;
-    const int   R_CY    = VIZ_BOTTOM + 10;
-    const int   R_R     = 58;
-    const int   R_IR    = 20;
+    const int   R_CX    = VIZ_X + VIZ_W / 2;
+    const int   R_CY    = VIZ_Y + (int)(VIZ_H * 0.6f);
+    const int   R_R     = 30;
+    const int   R_IR    = 10;
     const float R_TILT  = 0.55f;
-    const int   R_THICK = 6;
+    const int   R_THICK = 4;
     const float TWO_PIf = (float)M_PI * 2.0f;
 
     update_radar_data(frame_ms);
@@ -5023,161 +5071,168 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 // stand in for IMU-driven parallax — drop in real accel readings later
 // to make the field react to device tilt.
 static void draw_scanner_viz_cloud(unsigned long frame_ms) {
-    float parallax_x = sinf((float)frame_ms * 0.0004f) * 4.0f;
-    float parallax_y = cosf((float)frame_ms * 0.00027f) * 3.0f;
-    // IMU hook: parallax_x = imu_accel_x * 6.0f; parallax_y = imu_accel_y * 6.0f;
-
-    int sorted[CLOUD_MAX_DEVICES];
-    int count = 0;
-    for (int i = 0; i < CLOUD_MAX_DEVICES; i++) {
-        if (!cloud_devices[i].occupied) continue;
-        if ((frame_ms - cloud_devices[i].last_seen) > CLOUD_DEVICE_EXPIRY_MS) {
-            cloud_devices[i].occupied = false;
-            continue;
-        }
-        sorted[count++] = i;
+    if (!cloud_cards_initialized) {
+        memset(cloud_cards, 0, sizeof(cloud_cards));
+        cloud_cards_initialized = true;
     }
 
-    // Insertion sort by depth ascending so close devices render last and
-    // sit visually on top of distant ones.
-    for (int i = 1; i < count; i++) {
-        int   key   = sorted[i];
-        float key_d = cloud_devices[key].depth;
-        int   j     = i - 1;
-        while (j >= 0 && cloud_devices[sorted[j]].depth > key_d) {
-            sorted[j + 1] = sorted[j];
-            j--;
+    static unsigned long cloud_last_frame = 0;
+    float dt = (cloud_last_frame == 0) ? 16.0f
+             : (float)(frame_ms - cloud_last_frame);
+    if (dt > 100.0f) dt = 100.0f;
+    cloud_last_frame = frame_ms;
+
+    // ── Update positions: drift left, hold while active, oscillate Flock ──
+    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
+        if (!cloud_cards[i].occupied) continue;
+        CloudCard& c = cloud_cards[i];
+
+        c.target_x -= c.drift_speed * dt / 1000.0f;
+        c.x = anim_filter(c.x, c.target_x, 200.0f, dt);
+
+        bool still_active = (frame_ms - c.last_seen) < 5000;
+        if (still_active && !c.is_flock) {
+            c.target_x = c.x;
         }
-        sorted[j + 1] = key;
+        if (c.is_flock) {
+            float base_x = 0.3f + (float)(hash_mac(c.mac) % 40) / 100.0f;
+            c.target_x = base_x + sinf((float)frame_ms * 0.0003f) * 0.05f;
+        }
+
+        if (c.x < -0.5f) c.occupied = false;
+        if ((frame_ms - c.last_seen) > 120000UL) c.occupied = false;
     }
 
-    for (int si = 0; si < count; si++) {
-        CloudDevice& d = cloud_devices[sorted[si]];
-
-        // Age fade — full brightness for the first 45s, then ramp to zero
-        // over the remaining 15s of the 60s expiry window.
-        unsigned long age = frame_ms - d.last_seen;
-        float age_alpha = 1.0f;
-        if (age > 45000UL) {
-            age_alpha = 1.0f - (float)(age - 45000UL) / 15000.0f;
+    // Always show something — if fewer than 3 cards are visible, seed
+    // from the most-recent feed entries that aren't already on screen.
+    int visible_count = 0;
+    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
+        if (cloud_cards[i].occupied &&
+            cloud_cards[i].x > -0.1f && cloud_cards[i].x < 1.1f) {
+            visible_count++;
         }
-        if (age_alpha < 0.05f) continue;
+    }
+    if (visible_count < 3) {
+        FeedEntry feed_snap[FEED_SIZE];
+        int snap_count, snap_head;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        snap_count = feed_count;
+        snap_head  = feed_head;
+        for (int i = 0; i < FEED_SIZE; i++) feed_snap[i] = feed_entries[i];
+        xSemaphoreGive(dataMutex);
 
-        float px_shift = parallax_x * d.depth;
-        float py_shift = parallax_y * d.depth;
-        int dx = VIZ_X + 4 + (int)(d.x * (float)(VIZ_W - 8) + px_shift);
-        int dy = VIZ_Y + 4 + (int)(d.y * (float)(VIZ_H - 8) + py_shift);
+        for (int fi = 0; fi < snap_count && visible_count < 3; fi++) {
+            int idx = (snap_head - fi + FEED_SIZE * 2) % FEED_SIZE;
+            FeedEntry& e = feed_snap[idx];
+            if ((frame_ms - e.timestamp) > 30000UL) continue;
 
-        if (dx < VIZ_X + 2 || dx > VIZ_RIGHT - 2) continue;
-        if (dy < VIZ_Y + 2 || dy > VIZ_BOTTOM - 2) continue;
-
-        float drift_phase = (float)(hash_mac(d.mac) % 1000) / 1000.0f;
-        float drift_x = sinf(drift_phase * 6.28f + (float)frame_ms * 0.0008f) * 2.0f * d.depth;
-        float drift_y = cosf(drift_phase * 4.17f + (float)frame_ms * 0.0006f) * 1.5f * d.depth;
-        dx += (int)drift_x;
-        dy += (int)drift_y;
-
-        if (dx < VIZ_X + 2 || dx > VIZ_RIGHT - 2) continue;
-        if (dy < VIZ_Y + 2 || dy > VIZ_BOTTOM - 2) continue;
-
-        float alpha = age_alpha;
-
-        if (d.is_flock) {
-            // Flock — coral pulsing halo + bright core + name when close.
-            int   glow_r = 4 + (int)(d.depth * 6.0f);
-            float pulse  = anim_pulse(UI_PULSE_MEDIUM, drift_phase);
-            glow_r += (int)(pulse * 2.0f);
-
-            for (int gy = -glow_r; gy <= glow_r; gy++) {
-                for (int gx = -glow_r; gx <= glow_r; gx++) {
-                    float dist = sqrtf((float)(gx * gx + gy * gy));
-                    if (dist > (float)glow_r) continue;
-                    int px2 = dx + gx, py2 = dy + gy;
-                    if (px2 < VIZ_X || px2 >= VIZ_RIGHT ||
-                        py2 < VIZ_Y || py2 >= VIZ_BOTTOM) continue;
-                    float glow_alpha = (1.0f - dist / (float)glow_r) * 0.25f * alpha;
-                    if (glow_alpha < 0.01f) continue;
-                    spr.drawPixel(px2, py2,
-                                  lerp_col16(BG_COLOR, CAUTION_COLOR, glow_alpha));
+            bool already_shown = false;
+            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
+                if (cloud_cards[ci].occupied &&
+                    strncmp(cloud_cards[ci].name, e.name, 15) == 0) {
+                    already_shown = true;
+                    break;
                 }
             }
+            if (already_shown) continue;
 
-            int dot_r = 1 + (int)(d.depth * 1.5f);
-            for (int gy = -dot_r; gy <= dot_r; gy++) {
-                for (int gx = -dot_r; gx <= dot_r; gx++) {
-                    if (gx * gx + gy * gy <= dot_r * dot_r) {
-                        int px2 = dx + gx, py2 = dy + gy;
-                        if (px2 >= VIZ_X && px2 < VIZ_RIGHT &&
-                            py2 >= VIZ_Y && py2 < VIZ_BOTTOM) {
-                            spr.drawPixel(px2, py2,
-                                          lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f * alpha));
-                        }
-                    }
-                }
-            }
+            cloud_try_add_card(e.mac, e.name, e.rssi, e.proto, e.is_flock);
+            visible_count++;
+        }
+    }
 
-            if (d.depth > 0.4f) {
-                int label_x = dx + dot_r + 3;
-                int label_y = dy - 3;
-                if (label_x + 30 < VIZ_RIGHT && label_y >= VIZ_Y &&
-                    label_y + 6 < VIZ_BOTTOM) {
-                    spr.setTextColor(
-                        lerp_col16(BG_COLOR, CAUTION_COLOR, 0.6f * alpha), BG_COLOR);
-                    spr.setTextSize(TS_MICRO);
-                    spr.setCursor(label_x, label_y);
-                    char short_name[10];
-                    strncpy(short_name, d.name, 9);
-                    short_name[9] = '\0';
-                    spr.print(short_name);
-                }
-            }
-        } else if (d.depth > 0.35f) {
-            // Mid/close normal — visible dot scaling with depth.
-            int dot_r = (int)(d.depth * 1.5f);
-            if (dot_r < 1) dot_r = 1;
-            float dot_alpha = (0.15f + d.depth * 0.45f) * alpha;
-            for (int gy = -dot_r; gy <= dot_r; gy++) {
-                for (int gx = -dot_r; gx <= dot_r; gx++) {
-                    if (gx * gx + gy * gy <= dot_r * dot_r) {
-                        int px2 = dx + gx, py2 = dy + gy;
-                        if (px2 >= VIZ_X && px2 < VIZ_RIGHT &&
-                            py2 >= VIZ_Y && py2 < VIZ_BOTTOM) {
-                            spr.drawPixel(px2, py2,
-                                          lerp_col16(BG_COLOR, HEADER_COLOR, dot_alpha));
-                        }
-                    }
-                }
-            }
-            if (d.depth > 0.6f) {
-                int label_x = dx + dot_r + 2;
-                int label_y = dy - 2;
-                if (label_x + 24 < VIZ_RIGHT && label_y >= VIZ_Y &&
-                    label_y + 6 < VIZ_BOTTOM) {
-                    spr.setTextColor(
-                        lerp_col16(BG_COLOR, DIM_COLOR, 0.35f * alpha), BG_COLOR);
-                    spr.setTextSize(TS_MICRO);
-                    spr.setCursor(label_x, label_y);
-                    char short_name[8];
-                    strncpy(short_name, d.name, 7);
-                    short_name[7] = '\0';
-                    spr.print(short_name);
-                }
-            }
+    // ── Render order: top-first so lower cards visually overlap upper ──
+    int render_order[CLOUD_MAX_CARDS];
+    int render_count = 0;
+    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
+        if (cloud_cards[i].occupied &&
+            cloud_cards[i].x > -0.2f && cloud_cards[i].x < 1.2f) {
+            render_order[render_count++] = i;
+        }
+    }
+    for (int i = 1; i < render_count; i++) {
+        int key = render_order[i];
+        float ky = cloud_cards[key].y;
+        int j = i - 1;
+        while (j >= 0 && cloud_cards[render_order[j]].y > ky) {
+            render_order[j + 1] = render_order[j]; j--;
+        }
+        render_order[j + 1] = key;
+    }
+
+    for (int ri = 0; ri < render_count; ri++) {
+        CloudCard& c = cloud_cards[render_order[ri]];
+
+        int card_x = VIZ_X + (int)(c.x * (float)VIZ_W);
+        int card_y = VIZ_Y + (int)(c.y * (float)(VIZ_H - 14));
+
+        const int char_w = 7;
+        int card_w = (int)strlen(c.name) * char_w + 12;
+        int card_h = 14;
+        int card_r = 4;
+
+        if (card_x + card_w < VIZ_X || card_x > VIZ_RIGHT) continue;
+        if (card_y < VIZ_Y || card_y + card_h > VIZ_BOTTOM) continue;
+
+        // Edge fade in the 12px zone at each side of the panel.
+        float edge_alpha = 1.0f;
+        if (card_x < VIZ_X + 12) {
+            edge_alpha = (float)(card_x - VIZ_X) / 12.0f;
+            if (edge_alpha < 0.0f) edge_alpha = 0.0f;
+        }
+        if (card_x + card_w > VIZ_RIGHT - 12) {
+            edge_alpha = (float)(VIZ_RIGHT - card_x - card_w) / 12.0f;
+            if (edge_alpha < 0.0f) edge_alpha = 0.0f;
+        }
+        if (edge_alpha < 0.05f) continue;
+
+        // Birth ease — 400ms fade-in from spawn.
+        float birth_alpha = 1.0f;
+        unsigned long card_age = frame_ms - c.birth_ms;
+        if (card_age < 400) {
+            birth_alpha = ui_ease((float)card_age / 400.0f);
+        }
+
+        float alpha = edge_alpha * birth_alpha;
+
+        // Unified palette: every non-Flock card is HEADER_COLOR (ice blue);
+        // Flock is the only colour distinction (coral, with pulse).
+        uint16_t fill_col, border_col, text_col;
+        if (c.is_flock) {
+            float pulse = anim_pulse(UI_PULSE_MEDIUM);
+            float fa = alpha * (0.8f + pulse * 0.2f);
+            fill_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.25f * fa);
+            border_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f * fa);
+            text_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.90f * fa);
         } else {
-            // Far background — single pixel, with a faint companion for
-            // mid-distant devices so they don't all look identical.
-            float dot_alpha = (0.08f + d.depth * 0.15f) * alpha;
-            spr.drawPixel(dx, dy, lerp_col16(BG_COLOR, HEADER_COLOR, dot_alpha));
-            if (d.depth > 0.15f) {
-                spr.drawPixel(dx + 1, dy,
-                              lerp_col16(BG_COLOR, HEADER_COLOR, dot_alpha * 0.5f));
-            }
+            fill_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.12f * alpha);
+            border_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f * alpha);
+            text_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.75f * alpha);
         }
+
+        spr.fillRoundRect(card_x, card_y, card_w, card_h, card_r, fill_col);
+        spr.drawRoundRect(card_x, card_y, card_w, card_h, card_r, border_col);
+
+        int dot_x = card_x + 5;
+        int dot_y = card_y + card_h / 2;
+        uint16_t dot_col = c.is_flock
+            ? lerp_col16(BG_COLOR, CAUTION_COLOR, 0.9f * alpha)
+            : lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f * alpha);
+        spr.fillCircle(dot_x, dot_y, 2, dot_col);
+
+        spr.setTextColor(text_col, fill_col);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(card_x + 10, card_y + 2);
+        spr.print(c.name);
     }
 
+    int active_count = 0;
+    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
+        if (cloud_cards[i].occupied) active_count++;
+    }
     char count_str[12];
-    snprintf(count_str, sizeof(count_str), "%d dev", count);
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.3f), BG_COLOR);
+    snprintf(count_str, sizeof(count_str), "%d dev", active_count);
+    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(VIZ_X + 2, VIZ_BOTTOM - 8);
     spr.print(count_str);
