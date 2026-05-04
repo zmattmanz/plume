@@ -72,8 +72,6 @@ static void parse_wifi_event(struct WifiEvent* ev);
 static void draw_scanner_viz_radar(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_cloud(unsigned long frame_ms);
-static void cloud_try_add_card(const char* mac, const char* name,
-                               int rssi, int proto, bool is_flock);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -740,7 +738,6 @@ struct CloudCard {
 };
 
 static CloudCard cloud_cards[CLOUD_MAX_CARDS] = {};
-static bool      cloud_cards_initialized = false;
 
 // Eased x-coordinate of the spectrum scan line — slides smoothly
 // between channel positions instead of snapping when the hopper
@@ -753,6 +750,14 @@ static unsigned long     scan_line_last_frame = 0;
 static int               feed_anim_prev_head = -1;
 static unsigned long     feed_anim_shift_ms  = 0;
 static const unsigned long FEED_SHIFT_ANIM_MS = 250;
+
+// Feed snapshot — refreshed by draw_scanner_screen() once per ~500ms,
+// read directly by draw_scanner_viz_cloud() so the cloud populates
+// itself without needing a separate ingestion hook.
+static FeedEntry         scan_local_feed[FEED_SIZE];
+static int               scan_local_count = 0;
+static int               scan_local_head  = 0;
+static unsigned long     scan_feed_last_snapshot = 0;
 
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
@@ -2114,110 +2119,7 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
     feed_pending.is_flock  = is_flock;
     feed_pending.timestamp = millis();
     feed_pending_valid     = true;
-    cloud_try_add_card(mac, name, rssi, proto, is_flock);
     xSemaphoreGive(dataMutex);
-}
-
-// Cloud cards model a flowing river: each named device gets one card
-// drifting right-to-left, slower with stronger signal. Active devices
-// (refreshed within 5s) hold position; once they go quiet the card
-// resumes drifting and eventually exits the panel left edge. Flock
-// cards barely move and gently oscillate in place.
-static void cloud_try_add_card(const char* mac, const char* name,
-                               int rssi, int proto, bool is_flock) {
-    if (!mac || mac[0] == '\0') return;
-    unsigned long now = millis();
-
-    char display_name[16];
-    bool is_mac_name = (!name || name[0] == '\0' ||
-                        (strlen(name) >= 8 && name[2] == ':'));
-    if (is_mac_name) {
-        int mac_len = (int)strlen(mac);
-        const char* tail = mac + max(0, mac_len - 8);
-        strncpy(display_name, tail, 15);
-    } else {
-        strncpy(display_name, name, 15);
-    }
-    display_name[15] = '\0';
-
-    // Same name already on screen — refresh and bail.
-    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
-        if (cloud_cards[i].occupied &&
-            strncmp(cloud_cards[i].name, display_name, 15) == 0) {
-            cloud_cards[i].rssi      = (int8_t)rssi;
-            cloud_cards[i].last_seen = now;
-            cloud_cards[i].is_flock  = cloud_cards[i].is_flock || is_flock;
-            return;
-        }
-    }
-
-    // Find a free slot, recycling cards that have drifted past the left edge.
-    int slot = -1;
-    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
-        if (!cloud_cards[i].occupied) { slot = i; break; }
-        if (cloud_cards[i].x < -0.3f) {
-            cloud_cards[i].occupied = false;
-            slot = i;
-            break;
-        }
-    }
-    // Fall back to evicting the oldest non-flock card.
-    if (slot < 0) {
-        unsigned long oldest = ULONG_MAX;
-        int oldest_idx = -1;
-        for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
-            if (!cloud_cards[i].is_flock && cloud_cards[i].birth_ms < oldest) {
-                oldest = cloud_cards[i].birth_ms;
-                oldest_idx = i;
-            }
-        }
-        if (oldest_idx >= 0) slot = oldest_idx;
-        else return;
-    }
-
-    CloudCard& c = cloud_cards[slot];
-    c.occupied = true;
-    strncpy(c.name, display_name, 15); c.name[15] = '\0';
-    strncpy(c.mac,  mac, 17);          c.mac[17] = '\0';
-
-    c.x        = 1.15f;
-    c.target_x = 1.15f;
-
-    // Lane-based y assignment: pick the candidate position furthest from
-    // every existing card so new cards spread out instead of clustering.
-    float best_y = 0.15f;
-    float best_min_dist = 0.0f;
-    for (int test = 0; test < 8; test++) {
-        float candidate_y = 0.08f + (float)test / 7.0f * 0.82f;
-        float min_dist = 1.0f;
-        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-            if (!cloud_cards[ci].occupied) continue;
-            if (ci == slot) continue;
-            float dy = fabsf(cloud_cards[ci].y - candidate_y);
-            if (dy < min_dist) min_dist = dy;
-        }
-        if (min_dist > best_min_dist) {
-            best_min_dist = min_dist;
-            best_y = candidate_y;
-        }
-    }
-    c.y = best_y;
-
-    float rssi_norm = (float)(rssi - (-90)) / (float)((-30) - (-90));
-    if (rssi_norm < 0.0f) rssi_norm = 0.0f;
-    if (rssi_norm > 1.0f) rssi_norm = 1.0f;
-
-    if (is_flock) {
-        c.drift_speed = 0.025f;
-    } else {
-        c.drift_speed = 0.30f - rssi_norm * 0.22f;
-    }
-
-    c.rssi      = (int8_t)rssi;
-    c.proto     = (uint8_t)proto;
-    c.is_flock  = is_flock;
-    c.birth_ms  = now;
-    c.last_seen = now;
 }
 
 static void feed_commit_pending() {
@@ -4475,9 +4377,6 @@ void draw_scanner_screen() {
     spr.setCursor(FEED_X, FEED_LABEL_Y);
     kprint(spr, "FEED");
 
-    static FeedEntry scan_local_feed[FEED_SIZE];
-    static int scan_local_count = 0, scan_local_head = 0;
-    static unsigned long scan_feed_last_snapshot = 0;
     if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         scan_local_count = feed_count;
@@ -4867,7 +4766,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     // outer scanner clip set by draw_scanner_screen() afterwards so
     // the rest of the spectrum renders against the same bounds.
     {
-        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.30f);
+        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.50f);
         spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
         for (int d = -VIZ_H; d < VIZ_W + VIZ_H; d += 6) {
             int x0 = VIZ_X + d;
@@ -5071,24 +4970,126 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 // stand in for IMU-driven parallax — drop in real accel readings later
 // to make the field react to device tilt.
 static void draw_scanner_viz_cloud(unsigned long frame_ms) {
-    if (!cloud_cards_initialized) {
-        memset(cloud_cards, 0, sizeof(cloud_cards));
-        cloud_cards_initialized = true;
+
+    // ── STEP 1: ingest the feed snapshot directly ─────────────────────
+    // scan_local_feed / scan_local_count / scan_local_head are file-scope
+    // statics refreshed by draw_scanner_screen() once per ~500ms; we read
+    // them every frame and fold each entry into cloud_cards[].
+    for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
+        int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
+
+        if ((frame_ms - e.timestamp) > 60000UL) continue;
+
+        char display_name[16];
+        bool is_mac_name = (e.name[0] == '\0' ||
+                            (strlen(e.name) >= 8 && e.name[2] == ':'));
+        if (is_mac_name) {
+            const char* tail = e.mac + max(0, (int)strlen(e.mac) - 8);
+            strncpy(display_name, tail, 15);
+        } else {
+            strncpy(display_name, e.name, 15);
+        }
+        display_name[15] = '\0';
+
+        // Primary dedup — same MAC: refresh.
+        bool found = false;
+        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
+            if (cloud_cards[ci].occupied &&
+                strncmp(cloud_cards[ci].mac, e.mac, 17) == 0) {
+                cloud_cards[ci].rssi      = e.rssi;
+                cloud_cards[ci].last_seen = frame_ms;
+                cloud_cards[ci].is_flock  = cloud_cards[ci].is_flock || e.is_flock;
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+
+        // Secondary dedup — same display name: keep the strongest signal.
+        bool name_found = false;
+        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
+            if (cloud_cards[ci].occupied &&
+                strncmp(cloud_cards[ci].name, display_name, 15) == 0) {
+                if (e.rssi > cloud_cards[ci].rssi) {
+                    cloud_cards[ci].rssi = e.rssi;
+                    strncpy(cloud_cards[ci].mac, e.mac, 17);
+                    cloud_cards[ci].mac[17] = '\0';
+                }
+                cloud_cards[ci].last_seen = frame_ms;
+                cloud_cards[ci].is_flock  = cloud_cards[ci].is_flock || e.is_flock;
+                name_found = true;
+                break;
+            }
+        }
+        if (name_found) continue;
+
+        // Find a free slot, else evict the leftmost non-Flock card.
+        int slot = -1;
+        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
+            if (!cloud_cards[ci].occupied) { slot = ci; break; }
+        }
+        if (slot < 0) {
+            float leftmost_x = 999.0f;
+            int   leftmost_idx = 0;
+            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
+                if (cloud_cards[ci].is_flock) continue;
+                if (cloud_cards[ci].x < leftmost_x) {
+                    leftmost_x = cloud_cards[ci].x;
+                    leftmost_idx = ci;
+                }
+            }
+            slot = leftmost_idx;
+        }
+
+        CloudCard& c = cloud_cards[slot];
+        c.occupied = true;
+        strncpy(c.name, display_name, 15); c.name[15] = '\0';
+        strncpy(c.mac,  e.mac, 17);        c.mac[17] = '\0';
+
+        c.x = 1.4f;
+        c.target_x = 1.4f;
+
+        // Lane-based y assignment: pick the candidate furthest from every
+        // existing card so new cards spread instead of clustering.
+        float best_y = 0.15f;
+        float best_dist = 0.0f;
+        for (int test = 0; test < 8; test++) {
+            float candidate = 0.08f + (float)test / 7.0f * 0.82f;
+            float min_dist = 1.0f;
+            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
+                if (!cloud_cards[ci].occupied || ci == slot) continue;
+                float dy = fabsf(cloud_cards[ci].y - candidate);
+                if (dy < min_dist) min_dist = dy;
+            }
+            if (min_dist > best_dist) { best_dist = min_dist; best_y = candidate; }
+        }
+        c.y = best_y;
+
+        float rssi_norm = (float)(e.rssi - (-90)) / (float)((-30) - (-90));
+        if (rssi_norm < 0.0f) rssi_norm = 0.0f;
+        if (rssi_norm > 1.0f) rssi_norm = 1.0f;
+        c.drift_speed = e.is_flock ? 0.015f : (0.10f - rssi_norm * 0.07f);
+
+        c.rssi      = e.rssi;
+        c.proto     = e.proto;
+        c.is_flock  = e.is_flock;
+        c.birth_ms  = frame_ms;
+        c.last_seen = frame_ms;
     }
 
+    // ── STEP 2: drift positions ───────────────────────────────────────
     static unsigned long cloud_last_frame = 0;
     float dt = (cloud_last_frame == 0) ? 16.0f
              : (float)(frame_ms - cloud_last_frame);
     if (dt > 100.0f) dt = 100.0f;
     cloud_last_frame = frame_ms;
 
-    // ── Update positions: drift left, hold while active, oscillate Flock ──
     for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
         if (!cloud_cards[i].occupied) continue;
         CloudCard& c = cloud_cards[i];
 
         c.target_x -= c.drift_speed * dt / 1000.0f;
-        c.x = anim_filter(c.x, c.target_x, 200.0f, dt);
 
         bool still_active = (frame_ms - c.last_seen) < 5000;
         if (still_active && !c.is_flock) {
@@ -5099,54 +5100,20 @@ static void draw_scanner_viz_cloud(unsigned long frame_ms) {
             c.target_x = base_x + sinf((float)frame_ms * 0.0003f) * 0.05f;
         }
 
-        if (c.x < -0.5f) c.occupied = false;
-        if ((frame_ms - c.last_seen) > 120000UL) c.occupied = false;
-    }
+        c.x = anim_filter(c.x, c.target_x, 200.0f, dt);
 
-    // Always show something — if fewer than 3 cards are visible, seed
-    // from the most-recent feed entries that aren't already on screen.
-    int visible_count = 0;
-    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
-        if (cloud_cards[i].occupied &&
-            cloud_cards[i].x > -0.1f && cloud_cards[i].x < 1.1f) {
-            visible_count++;
-        }
-    }
-    if (visible_count < 3) {
-        FeedEntry feed_snap[FEED_SIZE];
-        int snap_count, snap_head;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        snap_count = feed_count;
-        snap_head  = feed_head;
-        for (int i = 0; i < FEED_SIZE; i++) feed_snap[i] = feed_entries[i];
-        xSemaphoreGive(dataMutex);
-
-        for (int fi = 0; fi < snap_count && visible_count < 3; fi++) {
-            int idx = (snap_head - fi + FEED_SIZE * 2) % FEED_SIZE;
-            FeedEntry& e = feed_snap[idx];
-            if ((frame_ms - e.timestamp) > 30000UL) continue;
-
-            bool already_shown = false;
-            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-                if (cloud_cards[ci].occupied &&
-                    strncmp(cloud_cards[ci].name, e.name, 15) == 0) {
-                    already_shown = true;
-                    break;
-                }
-            }
-            if (already_shown) continue;
-
-            cloud_try_add_card(e.mac, e.name, e.rssi, e.proto, e.is_flock);
-            visible_count++;
+        if (c.x < -0.6f) {
+            c.occupied = false;
+            continue;
         }
     }
 
-    // ── Render order: top-first so lower cards visually overlap upper ──
+    // ── STEP 3: render ────────────────────────────────────────────────
     int render_order[CLOUD_MAX_CARDS];
     int render_count = 0;
     for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
         if (cloud_cards[i].occupied &&
-            cloud_cards[i].x > -0.2f && cloud_cards[i].x < 1.2f) {
+            cloud_cards[i].x > -0.2f && cloud_cards[i].x < 1.3f) {
             render_order[render_count++] = i;
         }
     }
@@ -5163,75 +5130,59 @@ static void draw_scanner_viz_cloud(unsigned long frame_ms) {
     for (int ri = 0; ri < render_count; ri++) {
         CloudCard& c = cloud_cards[render_order[ri]];
 
+        float drift_phase = (float)(hash_mac(c.mac) % 1000) / 1000.0f;
+        float drift_y = cosf(drift_phase * 4.17f + (float)frame_ms * 0.0006f) * 2.5f * 0.3f;
+
         int card_x = VIZ_X + (int)(c.x * (float)VIZ_W);
-        int card_y = VIZ_Y + (int)(c.y * (float)(VIZ_H - 14));
+        int card_y = VIZ_Y + (int)((c.y + drift_y / (float)VIZ_H) * (float)(VIZ_H - 18));
 
         const int char_w = 7;
-        int card_w = (int)strlen(c.name) * char_w + 12;
-        int card_h = 14;
+        int card_w = (int)strlen(c.name) * char_w + 18;
+        int card_h = 16;
         int card_r = 4;
 
+        if (card_y < VIZ_Y) card_y = VIZ_Y;
+        if (card_y + card_h > VIZ_BOTTOM) card_y = VIZ_BOTTOM - card_h;
+
+        float alpha = 1.0f;
+        if (card_x < VIZ_X + 20) {
+            alpha = (float)(card_x - VIZ_X) / 20.0f;
+            if (alpha < 0.0f) alpha = 0.0f;
+        }
+        if (card_x + card_w > VIZ_RIGHT - 20) {
+            alpha = (float)(VIZ_RIGHT - card_x - card_w) / 20.0f;
+            if (alpha < 0.0f) alpha = 0.0f;
+        }
+        if (alpha < 0.05f) continue;
         if (card_x + card_w < VIZ_X || card_x > VIZ_RIGHT) continue;
-        if (card_y < VIZ_Y || card_y + card_h > VIZ_BOTTOM) continue;
 
-        // Edge fade in the 12px zone at each side of the panel.
-        float edge_alpha = 1.0f;
-        if (card_x < VIZ_X + 12) {
-            edge_alpha = (float)(card_x - VIZ_X) / 12.0f;
-            if (edge_alpha < 0.0f) edge_alpha = 0.0f;
-        }
-        if (card_x + card_w > VIZ_RIGHT - 12) {
-            edge_alpha = (float)(VIZ_RIGHT - card_x - card_w) / 12.0f;
-            if (edge_alpha < 0.0f) edge_alpha = 0.0f;
-        }
-        if (edge_alpha < 0.05f) continue;
-
-        // Birth ease — 400ms fade-in from spawn.
-        float birth_alpha = 1.0f;
-        unsigned long card_age = frame_ms - c.birth_ms;
-        if (card_age < 400) {
-            birth_alpha = ui_ease((float)card_age / 400.0f);
-        }
-
-        float alpha = edge_alpha * birth_alpha;
-
-        // Unified palette: every non-Flock card is HEADER_COLOR (ice blue);
-        // Flock is the only colour distinction (coral, with pulse).
-        uint16_t fill_col, border_col, text_col;
+        uint16_t fill_col, border_col, text_col, dot_col;
         if (c.is_flock) {
             float pulse = anim_pulse(UI_PULSE_MEDIUM);
             float fa = alpha * (0.8f + pulse * 0.2f);
             fill_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.25f * fa);
             border_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f * fa);
             text_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.90f * fa);
+            dot_col    = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.9f  * fa);
         } else {
             fill_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.12f * alpha);
             border_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f * alpha);
             text_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.75f * alpha);
+            dot_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f  * alpha);
         }
 
         spr.fillRoundRect(card_x, card_y, card_w, card_h, card_r, fill_col);
         spr.drawRoundRect(card_x, card_y, card_w, card_h, card_r, border_col);
-
-        int dot_x = card_x + 5;
-        int dot_y = card_y + card_h / 2;
-        uint16_t dot_col = c.is_flock
-            ? lerp_col16(BG_COLOR, CAUTION_COLOR, 0.9f * alpha)
-            : lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f * alpha);
-        spr.fillCircle(dot_x, dot_y, 2, dot_col);
+        spr.fillCircle(card_x + 6, card_y + card_h / 2, 2, dot_col);
 
         spr.setTextColor(text_col, fill_col);
         spr.setTextSize(TS_BODY);
-        spr.setCursor(card_x + 10, card_y + 2);
+        spr.setCursor(card_x + 12, card_y + 3);
         spr.print(c.name);
     }
 
-    int active_count = 0;
-    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
-        if (cloud_cards[i].occupied) active_count++;
-    }
     char count_str[12];
-    snprintf(count_str, sizeof(count_str), "%d dev", active_count);
+    snprintf(count_str, sizeof(count_str), "%d dev", render_count);
     spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.5f), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(VIZ_X + 2, VIZ_BOTTOM - 8);
