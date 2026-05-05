@@ -73,6 +73,8 @@ static void draw_scanner_viz_radar(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_cloud(unsigned long frame_ms);
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms);
+static void draw_scanner_viz_waveform(unsigned long frame_ms);
+static void draw_scanner_viz_sonar(unsigned long frame_ms);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -686,8 +688,8 @@ static uint16_t      scanner_flash_color = 0;
 
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
-static int       scanner_viz_mode  = 0;   // 0 = RADAR, 1 = SPECTRUM, 2 = CLOUD, 3 = SIGNAL BARS
-static const int SCANNER_VIZ_COUNT = 4;
+static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=CLOUD 3=SIGNAL BARS 4=WAVEFORM 5=SONAR
+static const int SCANNER_VIZ_COUNT = 6;
 static unsigned long viz_indicator_show_ms = 0;
 static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
 
@@ -745,6 +747,43 @@ static CloudCard cloud_cards[CLOUD_MAX_CARDS] = {};
 // advances. Initialised on first render so it doesn't fly in from x=0.
 static float             scan_line_x_f = 0.0f;
 static unsigned long     scan_line_last_frame = 0;
+
+// Signal bars animation state — eased y positions and bar widths per slot.
+#define SIGBAR_MAX 4
+struct SigBarState {
+    char  name[20];
+    float y_f;
+    float width_f;
+    bool  occupied;
+};
+static SigBarState       sigbar_state[SIGBAR_MAX] = {};
+static unsigned long     sigbar_last_frame = 0;
+static unsigned long     sigbar_sort_last_ms = 0;
+static int               sigbar_sorted_cache[FEED_SIZE];
+static int               sigbar_sorted_count = 0;
+
+// Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
+#define WAVEFORM_SAMPLES 134
+static float             waveform_amp[WAVEFORM_SAMPLES]   = {0};
+static float             waveform_ratio[WAVEFORM_SAMPLES] = {0};
+static int               waveform_head = 0;
+static uint32_t          waveform_prev_pkt_count = 0;
+static unsigned long     waveform_last_sample_ms = 0;
+static float             waveform_peak = 1.0f;
+
+// Sonar ping state.
+static unsigned long     sonar_last_ping_ms = 0;
+static const unsigned long SONAR_PING_INTERVAL = 2500;
+#define SONAR_MAX_DOTS 8
+struct SonarDot {
+    float    x;
+    float    y;
+    uint16_t col;
+    float    alpha;
+    bool     occupied;
+};
+static SonarDot          sonar_dots[SONAR_MAX_DOTS] = {};
+static unsigned long     sonar_last_dot_refresh = 0;
 
 // Feed slide-in animation — when scan_local_head changes, all rows
 // shift down together over FEED_SHIFT_ANIM_MS with an ease-out curve.
@@ -4313,23 +4352,18 @@ void draw_scanner_screen() {
     spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
 
     // Step 3: viz panel — TOP LEFT, directly below the header.
-    if (scanner_viz_mode == 0) {
-        // Radar renders as a full-left-panel background element — extends
-        // behind the scorecard. Clip to [header bottom → screen bottom,
-        // left edge → divider] so it never bleeds into the header or feed.
-        spr.setClipRect(0, 19, DIVIDER_X, DISP_H - 19);
-        draw_scanner_viz_radar(frame_ms);
-        spr.clearClipRect();
-    } else {
-        // Spectrum and cloud stay confined to the viz panel
-        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
-        switch (scanner_viz_mode) {
-            case 1: draw_scanner_viz_spectrum(frame_ms);    break;
-            case 2: draw_scanner_viz_cloud(frame_ms);       break;
-            case 3: draw_scanner_viz_signal_bars(frame_ms); break;
-        }
-        spr.clearClipRect();
+    // All modes use the same tight clip rect — radar is cropped at the
+    // panel boundary, giving a "viewport into a larger instrument" look.
+    spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+    switch (scanner_viz_mode) {
+        case 0: draw_scanner_viz_radar(frame_ms);        break;
+        case 1: draw_scanner_viz_spectrum(frame_ms);     break;
+        case 2: draw_scanner_viz_cloud(frame_ms);        break;
+        case 3: draw_scanner_viz_signal_bars(frame_ms);  break;
+        case 4: draw_scanner_viz_waveform(frame_ms);     break;
+        case 5: draw_scanner_viz_sonar(frame_ms);        break;
     }
+    spr.clearClipRect();
 
     // Step 4: scorecard — scanning status, then WIFI/BLE labels + numbers.
     // Vertical rhythm uses named spacing tokens (UI_PAD_SM, UI_PAD_XS).
@@ -4687,11 +4721,11 @@ static void draw_radar_common(unsigned long frame_ms,
 // the bottom half is naturally invisible.
 static void draw_scanner_viz_radar(unsigned long frame_ms) {
     const int   R_CX    = VIZ_X + VIZ_W / 2;
-    const int   R_CY    = VIZ_Y + (int)(VIZ_H * 0.6f);
-    const int   R_R     = 38;
-    const int   R_IR    = 13;
+    const int   R_CY    = VIZ_Y + (int)(VIZ_H * 0.45f);
+    const int   R_R     = 45;
+    const int   R_IR    = 15;
     const float R_TILT  = 0.55f;
-    const int   R_THICK = 5;
+    const int   R_THICK = 6;
 
     update_radar_data(frame_ms);
     draw_radar_common(frame_ms, R_CX, R_CY, R_R, R_IR, R_TILT, R_THICK);
@@ -5186,46 +5220,67 @@ static void draw_scanner_viz_cloud(unsigned long frame_ms) {
     }
 }
 
+static inline float rssi_pct_for(int rssi) {
+    float pct = (float)(rssi - (-90)) / (float)((-30) - (-90));
+    if (pct < 0.05f) pct = 0.05f;
+    if (pct > 1.0f)  pct = 1.0f;
+    return pct;
+}
+
 // ── Viz mode 3: SIGNAL BARS ───────────────────────────────────────────────
-// Horizontal bar chart of the strongest currently-visible devices,
-// sorted by RSSI. Protocol color: coral = WiFi, ice blue = BLE.
+// Horizontal pill bar chart sorted by RSSI. Coral = WiFi, ice blue = BLE.
+// Sort throttled to 800ms; bars animate smoothly with live edge jitter.
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
 
-    // Collect feed entries seen in the last 30 seconds
-    int sorted_idx[FEED_SIZE];
-    int valid_count = 0;
-
-    for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
-        int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-        FeedEntry& e = scan_local_feed[idx];
-        if (e.mac[0] == '\0') continue;
-        if ((frame_ms - e.timestamp) > 30000UL) continue;
-        sorted_idx[valid_count++] = idx;
-    }
-
-    // Insertion sort by RSSI descending (strongest first)
-    for (int i = 1; i < valid_count; i++) {
-        int key = sorted_idx[i];
-        int8_t key_rssi = scan_local_feed[key].rssi;
-        int j = i - 1;
-        while (j >= 0 && scan_local_feed[sorted_idx[j]].rssi < key_rssi) {
-            sorted_idx[j + 1] = sorted_idx[j];
-            j--;
-        }
-        sorted_idx[j + 1] = key;
-    }
-
     const int MAX_BARS  = 4;
-    const int BAR_H     = 10;
-    const int BAR_GAP   = 3;
+    const int BAR_H     = 11;
+    const int BAR_GAP   = 2;
     const int NAME_W    = 48;
     const int BAR_X     = VIZ_X + NAME_W;
     const int BAR_MAX_W = VIZ_W - NAME_W - 4;
     const int START_Y   = VIZ_Y + 2;
-    const int RSSI_MIN  = -90;
-    const int RSSI_MAX  = -30;
 
-    int bars_to_show = (valid_count < MAX_BARS) ? valid_count : MAX_BARS;
+    // ── Sort + dedup (throttled to every 800ms) ──
+    if (frame_ms - sigbar_sort_last_ms >= 800 || sigbar_sort_last_ms == 0) {
+        int sorted_idx[FEED_SIZE];
+        int valid_count = 0;
+
+        for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
+            int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+            FeedEntry& e = scan_local_feed[idx];
+            if (e.mac[0] == '\0') continue;
+            if ((frame_ms - e.timestamp) > 30000UL) continue;
+            sorted_idx[valid_count++] = idx;
+        }
+
+        for (int i = 1; i < valid_count; i++) {
+            int key = sorted_idx[i];
+            int8_t key_rssi = scan_local_feed[key].rssi;
+            int j = i - 1;
+            while (j >= 0 && scan_local_feed[sorted_idx[j]].rssi < key_rssi) {
+                sorted_idx[j + 1] = sorted_idx[j];
+                j--;
+            }
+            sorted_idx[j + 1] = key;
+        }
+
+        sigbar_sorted_count = 0;
+        for (int i = 0; i < valid_count; i++) {
+            FeedEntry& e = scan_local_feed[sorted_idx[i]];
+            bool dup = false;
+            for (int j = 0; j < sigbar_sorted_count; j++) {
+                if (strncmp(e.name, scan_local_feed[sigbar_sorted_cache[j]].name,
+                            sizeof(e.name)) == 0) {
+                    dup = true; break;
+                }
+            }
+            if (!dup) sigbar_sorted_cache[sigbar_sorted_count++] = sorted_idx[i];
+        }
+        sigbar_sort_last_ms = frame_ms;
+    }
+
+    int bars_to_show = (sigbar_sorted_count < MAX_BARS)
+                     ? sigbar_sorted_count : MAX_BARS;
 
     if (bars_to_show == 0) {
         spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
@@ -5235,35 +5290,102 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         return;
     }
 
-    for (int bi = 0; bi < bars_to_show; bi++) {
-        FeedEntry& e = scan_local_feed[sorted_idx[bi]];
-        int y = START_Y + bi * (BAR_H + BAR_GAP);
+    // ── Animation dt ──
+    float sdt = (sigbar_last_frame == 0) ? 16.0f
+              : (float)(frame_ms - sigbar_last_frame);
+    if (sdt > 100.0f) sdt = 100.0f;
+    sigbar_last_frame = frame_ms;
 
-        float rssi_pct = (float)(e.rssi - RSSI_MIN) / (float)(RSSI_MAX - RSSI_MIN);
-        if (rssi_pct < 0.05f) rssi_pct = 0.05f;
-        if (rssi_pct > 1.0f)  rssi_pct = 1.0f;
-        int bar_w = (int)(rssi_pct * (float)BAR_MAX_W);
+    // ── Match devices to animation slots ──
+    bool slot_matched[SIGBAR_MAX] = {false};
+    for (int bi = 0; bi < bars_to_show; bi++) {
+        FeedEntry& e = scan_local_feed[sigbar_sorted_cache[bi]];
+        int   target_y = START_Y + bi * (BAR_H + BAR_GAP);
+        float target_w = rssi_pct_for(e.rssi) * (float)BAR_MAX_W;
+
+        int slot = -1;
+        for (int si = 0; si < SIGBAR_MAX; si++) {
+            if (sigbar_state[si].occupied &&
+                strncmp(sigbar_state[si].name, e.name, 19) == 0) {
+                slot = si; slot_matched[si] = true; break;
+            }
+        }
+        if (slot < 0) {
+            for (int si = 0; si < SIGBAR_MAX; si++) {
+                if (!sigbar_state[si].occupied) { slot = si; break; }
+            }
+            if (slot < 0) {
+                for (int si = 0; si < SIGBAR_MAX; si++) {
+                    if (!slot_matched[si]) { slot = si; break; }
+                }
+            }
+            if (slot < 0) slot = 0;
+            sigbar_state[slot].y_f      = (float)target_y;
+            sigbar_state[slot].width_f  = target_w;
+            sigbar_state[slot].occupied = true;
+            strncpy(sigbar_state[slot].name, e.name, 19);
+            sigbar_state[slot].name[19] = '\0';
+            slot_matched[slot] = true;
+        }
+        sigbar_state[slot].y_f     = anim_filter(sigbar_state[slot].y_f,     (float)target_y, 300.0f, sdt);
+        sigbar_state[slot].width_f = anim_filter(sigbar_state[slot].width_f, target_w,        500.0f, sdt);
+    }
+    for (int si = 0; si < SIGBAR_MAX; si++) {
+        if (!slot_matched[si]) sigbar_state[si].occupied = false;
+    }
+
+    // ── Render each bar ──
+    for (int bi = 0; bi < bars_to_show; bi++) {
+        FeedEntry& e = scan_local_feed[sigbar_sorted_cache[bi]];
+
+        int slot = -1;
+        for (int si = 0; si < SIGBAR_MAX; si++) {
+            if (sigbar_state[si].occupied &&
+                strncmp(sigbar_state[si].name, e.name, 19) == 0) {
+                slot = si; break;
+            }
+        }
+        if (slot < 0) continue;
+
+        int y     = (int)(sigbar_state[slot].y_f + 0.5f);
+        int bar_w = (int)(sigbar_state[slot].width_f + 0.5f);
+
+        // Live edge — two overlapping sines with per-device phase offset
+        {
+            uint32_t name_hash = 0;
+            for (const char* p = e.name; *p; p++) name_hash = name_hash * 31 + (uint8_t)*p;
+            float phase = (float)(name_hash % 1000) / 1000.0f * 6.28f;
+            float wave1 = sinf((float)frame_ms * 0.003f  + phase) * 2.0f;
+            float wave2 = sinf((float)frame_ms * 0.0017f + phase * 1.7f) * 1.5f;
+            bar_w += (int)(wave1 + wave2);
+        }
+        if (bar_w < 3)         bar_w = 3;
+        if (bar_w > BAR_MAX_W) bar_w = BAR_MAX_W;
 
         uint16_t bar_col, name_col, sym_col;
         if (e.is_flock) {
-            bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.70f);
+            bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
             name_col = CAUTION_COLOR;
             sym_col  = CAUTION_COLOR;
         } else if (e.proto == 0) {
-            bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.35f);
-            name_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.70f);
-            sym_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.70f);
+            bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f);
+            name_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
+            sym_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
         } else {
-            bar_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f);
-            name_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.70f);
-            sym_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.70f);
+            bar_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f);
+            name_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
+            sym_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
         }
 
-        // Bar track + fill
-        spr.fillRect(BAR_X, y, BAR_MAX_W, BAR_H,
-                     lerp_col16(BG_COLOR, CARD_BORDER, 0.15f));
-        if (bar_w > 2) spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, 2, bar_col);
-        else           spr.fillRect(BAR_X, y, bar_w, BAR_H, bar_col);
+        // Pill track + fill
+        int pill_r = BAR_H / 2;
+        spr.fillRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.18f));
+        if (bar_w > pill_r * 2) {
+            spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, bar_col);
+        } else if (bar_w > 0) {
+            spr.fillCircle(BAR_X + pill_r, y + pill_r, pill_r, bar_col);
+        }
 
         // Protocol symbol
         int sym_x  = VIZ_X + 1;
@@ -5301,20 +5423,244 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         spr.setTextSize(TS_MICRO);
         spr.setCursor(name_x, y + 1);
         spr.print(nd);
+    }
+}
 
-        // RSSI label — after bar, or inside if bar fills the panel
-        char rssi_str[6];
-        snprintf(rssi_str, sizeof(rssi_str), "%d", e.rssi);
-        int rssi_x = BAR_X + bar_w + 3;
-        if (rssi_x + 18 > VIZ_X + VIZ_W) {
-            rssi_x = BAR_X + bar_w - 20;
-            spr.setTextColor(BG_COLOR);
+// ── Viz mode 4: WAVEFORM ──────────────────────────────────────────────────
+// Scrolling oscilloscope of RF packet rate. Amplitude = packets per
+// sample interval. Color shifts blue→coral based on WiFi/BLE ratio.
+static void draw_scanner_viz_waveform(unsigned long frame_ms) {
+
+    // Sample packet rate every ~50ms
+    if (frame_ms - waveform_last_sample_ms >= 50 || waveform_last_sample_ms == 0) {
+        uint32_t cur   = ambient_packet_count;
+        uint32_t delta = cur - waveform_prev_pkt_count;
+        waveform_prev_pkt_count = cur;
+
+        float raw = (float)delta;
+        if (raw > waveform_peak) {
+            waveform_peak = raw;
         } else {
-            spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
+            waveform_peak *= 0.995f;
+            if (waveform_peak < 1.0f) waveform_peak = 1.0f;
         }
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(rssi_x, y + 1);
-        spr.print(rssi_str);
+        float norm = raw / waveform_peak;
+        if (norm > 1.0f) norm = 1.0f;
+
+        uint32_t wifi_ch = 0;
+        uint8_t ch = current_channel;
+        if (ch >= 1 && ch <= NUM_WIFI_CHANNELS) wifi_ch = channel_pkt_counts[ch - 1];
+        float ratio = (delta > 0) ? min(1.0f, (float)wifi_ch / (float)(delta + 1)) : 0.5f;
+
+        waveform_amp[waveform_head]   = norm;
+        waveform_ratio[waveform_head] = ratio;
+        waveform_head = (waveform_head + 1) % WAVEFORM_SAMPLES;
+        waveform_last_sample_ms = frame_ms;
+    }
+
+    const int plot_x  = VIZ_X;
+    const int plot_w  = VIZ_W;
+    const int mid_y   = VIZ_Y + VIZ_H / 2;
+    const int max_amp = VIZ_H / 2 - 2;
+
+    // Center reference line
+    spr.drawFastHLine(plot_x, mid_y, plot_w,
+                      lerp_col16(BG_COLOR, CARD_BORDER, 0.25f));
+
+    // Fill pass — faint body between trace and centerline
+    for (int px = 0; px < plot_w; px++) {
+        int age     = plot_w - 1 - px;
+        int buf_idx = (waveform_head - 1 - age + WAVEFORM_SAMPLES * 2) % WAVEFORM_SAMPLES;
+        float amp   = waveform_amp[buf_idx];
+        int deflection = (int)(amp * (float)max_amp);
+        int y_top = mid_y - deflection;
+        int y_bot = mid_y + deflection;
+        int draw_x = plot_x + px;
+        float ratio    = waveform_ratio[buf_idx];
+        uint16_t fill_col = lerp_col16(HEADER_COLOR, CAUTION_COLOR, ratio);
+        for (int fy = y_top; fy <= y_bot; fy++) {
+            float dist = (float)abs(fy - mid_y) / (float)max(1, deflection);
+            float fa = (1.0f - dist) * 0.08f;
+            if (fa > 0.01f) spr.drawPixel(draw_x, fy, lerp_col16(BG_COLOR, fill_col, fa));
+        }
+    }
+
+    // Line pass — oscilloscope trace with sinf-modulated phase for organic look
+    int prev_x = -1, prev_y = -1;
+    for (int px = 0; px < plot_w; px++) {
+        int age     = plot_w - 1 - px;
+        int buf_idx = (waveform_head - 1 - age + WAVEFORM_SAMPLES * 2) % WAVEFORM_SAMPLES;
+        float amp   = waveform_amp[buf_idx];
+        float ratio = waveform_ratio[buf_idx];
+
+        float phase      = (float)px * 0.35f + (float)frame_ms * 0.005f;
+        int   deflection = (int)(amp * (float)max_amp * sinf(phase));
+        int   cy         = mid_y - deflection;
+        int   draw_x     = plot_x + px;
+
+        uint16_t line_col = lerp_col16(HEADER_COLOR, CAUTION_COLOR, ratio);
+        float age_fade    = 0.4f + 0.6f * (float)px / (float)plot_w;
+        line_col = lerp_col16(BG_COLOR, line_col, age_fade);
+
+        if (prev_x >= 0) spr.drawLine(prev_x, prev_y, draw_x, cy, line_col);
+        prev_x = draw_x;
+        prev_y = cy;
+    }
+
+    // Detection flash — bright vertical bar at right edge
+    if (scanner_flash_ms > 0 && (frame_ms - scanner_flash_ms) < 2000) {
+        float flash_t     = (float)(frame_ms - scanner_flash_ms) / 2000.0f;
+        float flash_alpha = (1.0f - flash_t) * 0.15f;
+        if (flash_alpha > 0.01f) {
+            int flash_w = 8 + (int)((1.0f - flash_t) * 20.0f);
+            for (int fx = plot_x + plot_w - flash_w; fx < plot_x + plot_w; fx++) {
+                if (fx < plot_x) continue;
+                spr.drawFastVLine(fx, VIZ_Y, VIZ_H,
+                    lerp_col16(BG_COLOR, scanner_flash_color, flash_alpha));
+            }
+        }
+    }
+}
+
+// ── Viz mode 5: SONAR PING ────────────────────────────────────────────────
+// Expanding arcs from the left edge. Device dots appear at RSSI-mapped
+// distances when the ping wave passes them. Dots linger and fade.
+static void draw_scanner_viz_sonar(unsigned long frame_ms) {
+
+    // Ping timing
+    if (sonar_last_ping_ms == 0) sonar_last_ping_ms = frame_ms;
+    float ping_age = (float)(frame_ms - sonar_last_ping_ms);
+    float ping_t   = ping_age / (float)SONAR_PING_INTERVAL;
+    if (ping_t > 1.0f) ping_t = 1.0f;
+    if (ping_age >= SONAR_PING_INTERVAL) {
+        sonar_last_ping_ms = frame_ms;
+        ping_t = 0.0f;
+    }
+
+    // Refresh device dots every 500ms
+    if (frame_ms - sonar_last_dot_refresh >= 500 || sonar_last_dot_refresh == 0) {
+        for (int i = 0; i < SONAR_MAX_DOTS; i++) {
+            if (!sonar_dots[i].occupied) continue;
+            sonar_dots[i].alpha -= 0.15f;
+            if (sonar_dots[i].alpha <= 0.0f) sonar_dots[i].occupied = false;
+        }
+
+        for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
+            int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
+            FeedEntry& e = scan_local_feed[idx];
+            if (e.mac[0] == '\0') continue;
+            if ((frame_ms - e.timestamp) > 30000UL) continue;
+
+            float rssi_norm = (float)(e.rssi - (-90)) / (float)((-30) - (-90));
+            if (rssi_norm < 0.0f) rssi_norm = 0.0f;
+            if (rssi_norm > 1.0f) rssi_norm = 1.0f;
+            float dist = (1.0f - rssi_norm) * (float)(VIZ_W - 10);
+
+            uint32_t mh = 0;
+            for (const char* p = e.mac; *p; p++) mh = mh * 31 + (uint8_t)*p;
+            float angle = ((float)(mh % 1000) / 1000.0f - 0.5f) * 1.4f;
+            float dx = dist * cosf(angle);
+            float dy = dist * sinf(angle);
+
+            int slot = -1;
+            for (int si = 0; si < SONAR_MAX_DOTS; si++) {
+                if (sonar_dots[si].occupied) {
+                    float sx = sonar_dots[si].x - dx;
+                    float sy = sonar_dots[si].y - dy;
+                    if (sx * sx + sy * sy < 100.0f) { slot = si; break; }
+                }
+            }
+            if (slot < 0) {
+                for (int si = 0; si < SONAR_MAX_DOTS; si++) {
+                    if (!sonar_dots[si].occupied) { slot = si; break; }
+                }
+            }
+            if (slot < 0) continue;
+
+            uint16_t dot_col = (e.proto == 0 || e.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
+            sonar_dots[slot].x        = dx;
+            sonar_dots[slot].y        = dy;
+            sonar_dots[slot].col      = dot_col;
+            sonar_dots[slot].alpha    = 0.85f;
+            sonar_dots[slot].occupied = true;
+        }
+        sonar_last_dot_refresh = frame_ms;
+    }
+
+    int ox = VIZ_X + 8;
+    int oy = VIZ_Y + VIZ_H / 2;
+
+    // Origin dot
+    spr.fillCircle(ox, oy, 2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f));
+
+    // Static range rings
+    const int ring_distances[3] = {30, 60, 90};
+    for (int ri = 0; ri < 3; ri++) {
+        int rr = ring_distances[ri];
+        if (rr > VIZ_W) continue;
+        uint16_t ring_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.18f);
+        int steps = rr; if (steps > 80) steps = 80;
+        for (int s = 0; s <= steps; s++) {
+            float a  = -0.8f + (float)s / (float)steps * 1.6f;
+            int   px = ox + (int)((float)rr * cosf(a));
+            int   py = oy + (int)((float)rr * sinf(a));
+            spr.drawPixel(px, py, ring_col);
+        }
+    }
+
+    // Expanding ping arc (ease-out)
+    float eased_t    = 1.0f - (1.0f - ping_t) * (1.0f - ping_t);
+    int   ping_radius = (int)(eased_t * (float)(VIZ_W + 10));
+
+    if (ping_radius > 2) {
+        float arc_alpha = (1.0f - eased_t) * 0.5f;
+        if (arc_alpha > 0.02f) {
+            uint16_t arc_col = lerp_col16(BG_COLOR, HEADER_COLOR, arc_alpha);
+            int steps = ping_radius * 2; if (steps > 120) steps = 120;
+            for (int s = 0; s <= steps; s++) {
+                float a  = -0.8f + (float)s / (float)steps * 1.6f;
+                int   px = ox + (int)((float)ping_radius * cosf(a));
+                int   py = oy + (int)((float)ping_radius * sinf(a));
+                spr.drawPixel(px, py, arc_col);
+            }
+        }
+        int trail_r = ping_radius - 6;
+        if (trail_r > 2) {
+            float trail_alpha = (1.0f - eased_t) * 0.2f;
+            if (trail_alpha > 0.01f) {
+                uint16_t trail_col = lerp_col16(BG_COLOR, HEADER_COLOR, trail_alpha);
+                int steps = trail_r * 2; if (steps > 100) steps = 100;
+                for (int s = 0; s <= steps; s++) {
+                    float a  = -0.8f + (float)s / (float)steps * 1.6f;
+                    int   px = ox + (int)((float)trail_r * cosf(a));
+                    int   py = oy + (int)((float)trail_r * sinf(a));
+                    spr.drawPixel(px, py, trail_col);
+                }
+            }
+        }
+    }
+
+    // Device dots
+    for (int i = 0; i < SONAR_MAX_DOTS; i++) {
+        if (!sonar_dots[i].occupied) continue;
+        SonarDot& d = sonar_dots[i];
+
+        float dot_dist = sqrtf(d.x * d.x + d.y * d.y);
+        int   dpx = ox + (int)d.x;
+        int   dpy = oy + (int)d.y;
+
+        float dist_to_ping = fabsf(dot_dist - (float)ping_radius);
+        float ping_boost   = (dist_to_ping < 12.0f) ? (1.0f - dist_to_ping / 12.0f) * 0.5f : 0.0f;
+
+        float draw_alpha = d.alpha + ping_boost;
+        if (draw_alpha > 1.0f) draw_alpha = 1.0f;
+        if (draw_alpha < 0.05f) continue;
+
+        float dist_norm = dot_dist / (float)VIZ_W;
+        int   dot_r     = (dist_norm < 0.3f) ? 3 : (dist_norm < 0.6f) ? 2 : 1;
+
+        spr.fillCircle(dpx, dpy, dot_r + 2, lerp_col16(BG_COLOR, d.col, draw_alpha * 0.2f));
+        spr.fillCircle(dpx, dpy, dot_r,     lerp_col16(BG_COLOR, d.col, draw_alpha));
     }
 }
 
