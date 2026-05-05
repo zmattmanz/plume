@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // FLOCK DETECTOR v9.0-ADV — Tactical Edition (Build 2)
 // ============================================================================
 
@@ -730,6 +730,7 @@ static unsigned long     scan_line_last_frame = 0;
 struct SigBarState {
     char  name[20];
     float y_f;
+    float y_target;
     float width_f;
     bool  occupied;
 };
@@ -746,12 +747,15 @@ static unsigned long     pulse_device_refresh_ms = 0;
 
 #define PULSE_MAX_DEVICES 8
 struct PulseDevice {
-    float    angle;
-    float    dist;
-    uint8_t  proto;
-    bool     is_flock;
-    float    alpha;
-    bool     occupied;
+    float         angle;
+    float         dist;
+    uint8_t       proto;
+    bool          is_flock;
+    float         alpha;
+    bool          occupied;
+    bool          dying;
+    float         death_alpha;
+    unsigned long death_start_ms;
 };
 static PulseDevice pulse_devices[PULSE_MAX_DEVICES] = {};
 
@@ -5057,9 +5061,8 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         }
     }
 
-    // ── Structural update: RSSI sort with hysteresis ──
+    // ── Remove dead + fill empty — every frame ──
     {
-        // Remove dead slots
         for (int si = 0; si < SIGBAR_MAX; si++) {
             if (!sigbar_state[si].occupied) continue;
             bool still_here = false;
@@ -5071,7 +5074,6 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             if (!still_here) sigbar_state[si].occupied = false;
         }
 
-        // Fill empty slots — new bar starts at bottom of stack, others ease down
         for (int vi = 0; vi < visible_count; vi++) {
             bool already = false;
             for (int si = 0; si < SIGBAR_MAX; si++) {
@@ -5096,10 +5098,17 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             for (int si2 = 0; si2 < SIGBAR_MAX; si2++) {
                 if (sigbar_state[si2].occupied && si2 != free_slot) occ++;
             }
-            sigbar_state[free_slot].y_f = (float)(START_Y + occ * (BAR_H + BAR_GAP));
+            float init_y = (float)(START_Y + occ * (BAR_H + BAR_GAP));
+            sigbar_state[free_slot].y_f      = init_y;
+            sigbar_state[free_slot].y_target = init_y;
         }
+    }
 
-        // Build occupied-slot index and look up current RSSI
+    // ── Sort — throttled to 3s, 10 dBm hysteresis ──
+    static unsigned long sigbar_sort_ms = 0;
+    if (frame_ms - sigbar_sort_ms >= 3000 || sigbar_sort_ms == 0) {
+        sigbar_sort_ms = frame_ms;
+
         int order[SIGBAR_MAX];
         int order_count = 0;
         for (int si = 0; si < SIGBAR_MAX; si++) {
@@ -5119,24 +5128,27 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             }
         }
 
-        // Insertion sort: strongest first, 5 dBm hysteresis prevents micro-swaps
         for (int i = 1; i < order_count; i++) {
             int key = order[i];
             int j   = i - 1;
-            while (j >= 0 && slot_rssi[order[j]] < slot_rssi[key] - 5) {
+            while (j >= 0 && slot_rssi[order[j]] < slot_rssi[key] - 10) {
                 order[j + 1] = order[j];
                 j--;
             }
             order[j + 1] = key;
         }
 
-        // Ease y positions to sorted order
         for (int oi = 0; oi < order_count; oi++) {
-            int si       = order[oi];
-            int target_y = START_Y + oi * (BAR_H + BAR_GAP);
-            sigbar_state[si].y_f = anim_filter(
-                sigbar_state[si].y_f, (float)target_y, 200.0f, sdt);
+            sigbar_state[order[oi]].y_target =
+                (float)(START_Y + oi * (BAR_H + BAR_GAP));
         }
+    }
+
+    // ── Ease y positions toward targets — every frame, 400ms TC ──
+    for (int si = 0; si < SIGBAR_MAX; si++) {
+        if (!sigbar_state[si].occupied) continue;
+        sigbar_state[si].y_f = anim_filter(
+            sigbar_state[si].y_f, sigbar_state[si].y_target, 400.0f, sdt);
     }
 
     // ── dBm scale along the bottom ──
@@ -5424,27 +5436,27 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
         pulse_prev_pkt_ms = frame_ms;
     }
 
-    // ── Continuous sinusoidal pulse — C7: 0.4-1.0 Hz ──
+    // ── B5: Sinusoidal pulse — 0.25-0.6 Hz ──
     float pps_norm   = (pulse_rate_smooth - 1.0f) / 7.0f;
-    float pulse_freq = 0.4f + pps_norm * 0.6f;
+    float pulse_freq = 0.25f + pps_norm * 0.35f;
 
     static float pulse_phase = 0.0f;
     pulse_phase += anim_dt * 0.001f * pulse_freq * 2.0f * (float)M_PI;
     if (pulse_phase > 2.0f * (float)M_PI) pulse_phase -= 2.0f * (float)M_PI;
 
-    // wave_t 0..1 (0=collapsed, 1=fully expanded); flash_intensity peaks at max
-    float wave_t          = (sinf(pulse_phase) + 1.0f) * 0.5f;
+    // B5: ease-out quadratic wave_t
+    float raw_t          = (sinf(pulse_phase) + 1.0f) * 0.5f;
+    float wave_t         = 1.0f - (1.0f - raw_t) * (1.0f - raw_t);
     float flash_intensity = wave_t;
 
-    // ── Layout — C2: origin at left side ──
-    const int   CX         = VIZ_X + 18;
-    const int   CY         = VIZ_Y + VIZ_H / 2;
-    const float ASPECT     = 0.55f;
-    const int   max_radius = VIZ_W - (CX - VIZ_X) - 4;
+    // ── B1: Layout — perfect circles, origin at left side ──
+    const int CX         = VIZ_X + 18;
+    const int CY         = VIZ_Y + VIZ_H / 2;
+    const int max_radius = VIZ_W - (CX - VIZ_X) - 4;
 
     float wave_r = wave_t * (float)max_radius;
 
-    // ── 10 concentric rings, quadratic spacing, pulse-brightened — C3 ──
+    // ── 10 concentric rings, quadratic spacing, pulse-brightened — B1: drawCircle ──
     {
         const int NUM_RINGS = 10;
         for (int i = 1; i <= NUM_RINGS; i++) {
@@ -5452,7 +5464,6 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
             float curved = t * t;
             int ring_r   = 8 + (int)(curved * 60.0f);
             int ring_cx  = CX + (int)(curved * 10.0f);
-            int ring_ry  = (int)((float)ring_r * ASPECT);
 
             float ring_alpha = 0.25f + (1.0f - curved) * 0.15f;
             float ring_dist  = fabsf((float)ring_r - wave_r);
@@ -5461,31 +5472,30 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
             }
 
             uint16_t ring_col = lerp_col16(BG_COLOR, CARD_BORDER, ring_alpha);
-            spr.drawEllipse(ring_cx, CY, ring_r, ring_ry, ring_col);
+            spr.drawCircle(ring_cx, CY, ring_r, ring_col);
             if (i <= 3) {
-                spr.drawEllipse(ring_cx, CY + 1, ring_r, ring_ry, ring_col);
+                spr.drawCircle(ring_cx, CY + 1, ring_r, ring_col);
             }
         }
     }
 
-    // ── 4 trailing wave rings at 6px spacing — C7 ──
+    // ── B5: 6 trailing wave rings at 4px spacing, 15% fade per trail ──
     {
-        const int   NUM_TRAILS    = 4;
-        const float TRAIL_SPACING = 6.0f;
+        const int   NUM_TRAILS    = 6;
+        const float TRAIL_SPACING = 4.0f;
         for (int ti = 0; ti < NUM_TRAILS; ti++) {
             float trail_r = wave_r - (float)ti * TRAIL_SPACING;
             if (trail_r < 5.0f) continue;
-            int wr  = (int)(trail_r + 0.5f);
-            int wry = (int)(trail_r * ASPECT + 0.5f);
+            int wr = (int)(trail_r + 0.5f);
             if (wr > VIZ_W) continue;
-            float trail_fade = (1.0f - wave_t) * (1.0f - (float)ti * 0.25f);
+            float trail_fade = (1.0f - wave_t) * (1.0f - (float)ti * 0.15f);
             if (trail_fade < 0.02f) continue;
-            spr.drawEllipse(CX, CY, wr, wry,
-                            lerp_col16(BG_COLOR, HEADER_COLOR, trail_fade * 0.30f));
+            spr.drawCircle(CX, CY, wr,
+                           lerp_col16(BG_COLOR, HEADER_COLOR, trail_fade * 0.30f));
         }
     }
 
-    // ── Rotating 3D wireframe hexagon — C8 ──
+    // ── Rotating 3D wireframe hexagon ──
     {
         static float hex_rot = 0.0f;
         hex_rot += anim_dt * 0.001f;
@@ -5522,13 +5532,9 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
         spr.fillCircle(CX, CY, 1, lerp_col16(BG_COLOR, HEADER_COLOR, hex_bright));
     }
 
-    // ── Refresh device symbols every 500ms ──
+    // ── B4: Refresh device symbols every 500ms ──
     if (frame_ms - pulse_device_refresh_ms >= 500 || pulse_device_refresh_ms == 0) {
-        for (int i = 0; i < PULSE_MAX_DEVICES; i++) {
-            if (!pulse_devices[i].occupied) continue;
-            pulse_devices[i].alpha -= 0.12f;
-            if (pulse_devices[i].alpha <= 0.0f) pulse_devices[i].occupied = false;
-        }
+        bool matched[PULSE_MAX_DEVICES] = {};
 
         for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
             int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
@@ -5547,77 +5553,115 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
 
             int slot = -1;
             for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
-                if (pulse_devices[si].occupied &&
+                if (pulse_devices[si].occupied && !pulse_devices[si].dying &&
                     fabsf(pulse_devices[si].angle - angle) < 0.3f) {
                     slot = si; break;
                 }
             }
             if (slot < 0) {
                 for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
-                    if (!pulse_devices[si].occupied) { slot = si; break; }
+                    if (!pulse_devices[si].occupied || pulse_devices[si].dying) {
+                        slot = si; break;
+                    }
                 }
             }
             if (slot < 0) continue;
 
-            pulse_devices[slot].angle    = angle;
-            pulse_devices[slot].dist     = anim_filter(
+            pulse_devices[slot].angle          = angle;
+            pulse_devices[slot].dist           = anim_filter(
                 pulse_devices[slot].dist, target_dist, 500.0f, 500.0f);
-            pulse_devices[slot].proto    = e.proto;
-            pulse_devices[slot].is_flock = e.is_flock;
-            pulse_devices[slot].alpha    = 0.6f;
-            pulse_devices[slot].occupied = true;
+            pulse_devices[slot].proto          = e.proto;
+            pulse_devices[slot].is_flock       = e.is_flock;
+            pulse_devices[slot].alpha          = 0.6f;
+            pulse_devices[slot].occupied       = true;
+            pulse_devices[slot].dying          = false;
+            matched[slot]                      = true;
+        }
+
+        // Unmatched live slots trigger death animation
+        for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
+            if (!pulse_devices[si].occupied || pulse_devices[si].dying) continue;
+            if (!matched[si]) {
+                pulse_devices[si].dying          = true;
+                pulse_devices[si].death_alpha    = pulse_devices[si].alpha;
+                pulse_devices[si].death_start_ms = frame_ms;
+            }
         }
 
         pulse_device_refresh_ms = frame_ms;
     }
 
-    // ── Render device symbols — C1: SYM_R=4, C6: MARGIN=SYM_R+7 ──
-    const int SYM_R  = 4;
-    const int MARGIN = SYM_R + 7;
+    // ── B2: Render device symbols — SYM_R=6, MARGIN=14 ──
+    const int SYM_R  = 6;
+    const int MARGIN = SYM_R + 8;
 
     for (int i = 0; i < PULSE_MAX_DEVICES; i++) {
         if (!pulse_devices[i].occupied) continue;
         PulseDevice& d = pulse_devices[i];
 
+        // B4: Death animation
+        float draw_alpha;
+        if (d.dying) {
+            float death_t = (float)(frame_ms - d.death_start_ms) / 500.0f;
+            if (death_t >= 1.0f) { d.occupied = false; continue; }
+            draw_alpha = d.death_alpha * (1.0f - ui_ease(death_t));
+            d.dist += anim_dt * 0.0003f;
+        } else {
+            draw_alpha = d.alpha;
+        }
+        if (draw_alpha < 0.05f) continue;
+
+        // B1: No ASPECT — perfect circles, y uses sinf directly
         int dev_r = 6 + (int)(d.dist * (float)(max_radius - 8));
         int px    = CX + (int)((float)dev_r * cosf(d.angle));
-        int py    = CY + (int)((float)dev_r * ASPECT * sinf(d.angle));
+        int py    = CY + (int)((float)dev_r * sinf(d.angle));
+
+        // B3: Two-sine drift with per-device phase
+        float fp      = fabsf(sinf(d.angle * 7.3f)) * 6.28f;
+        float drift_x = sinf((float)frame_ms * 0.0008f + fp)        * 3.0f
+                      + sinf((float)frame_ms * 0.0013f + fp * 1.7f) * 2.0f;
+        float drift_y = sinf((float)frame_ms * 0.0011f + fp * 0.6f) * 2.5f
+                      + cosf((float)frame_ms * 0.0007f + fp * 2.1f) * 1.5f;
+        px += (int)drift_x;
+        py += (int)drift_y;
 
         if (px < VIZ_X + MARGIN || px > VIZ_X + VIZ_W - MARGIN) continue;
         if (py < VIZ_Y + MARGIN || py > VIZ_Y + VIZ_H - MARGIN) continue;
 
         float dist_to_pulse = fabsf((float)dev_r - wave_r);
-        float pulse_boost   = (dist_to_pulse < 10.0f)
+        float pulse_boost   = (!d.dying && dist_to_pulse < 10.0f)
                             ? (1.0f - dist_to_pulse / 10.0f) * 0.4f : 0.0f;
 
-        float draw_alpha = d.alpha + pulse_boost;
-        if (draw_alpha > 1.0f) draw_alpha = 1.0f;
-        if (draw_alpha < 0.08f) continue;
+        float total_alpha = draw_alpha + pulse_boost;
+        if (total_alpha > 1.0f) total_alpha = 1.0f;
 
         uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
-        uint16_t sym_col  = lerp_col16(BG_COLOR, base_col, draw_alpha);
+        uint16_t sym_col  = lerp_col16(BG_COLOR, base_col, total_alpha);
 
         if (pulse_boost > 0.1f) {
             spr.fillCircle(px, py, SYM_R + 2,
                            lerp_col16(BG_COLOR, base_col, pulse_boost * 0.3f));
         }
 
+        // B2: apex-up triangle for BLE; diamond for WiFi
         if (d.proto == 0) {
-            spr.drawTriangle(px,             py + SYM_R,
-                             px + SYM_R,     py + SYM_R,
-                             px + SYM_R / 2, py - SYM_R + 1,
-                             sym_col);
             if (pulse_boost > 0.15f) {
-                spr.drawPixel(px + SYM_R / 2, py + SYM_R - 2,
-                              lerp_col16(BG_COLOR, base_col, draw_alpha * 0.4f));
+                spr.fillTriangle(px,         py - SYM_R,
+                                 px - SYM_R, py + SYM_R - 1,
+                                 px + SYM_R, py + SYM_R - 1,
+                                 lerp_col16(BG_COLOR, base_col, pulse_boost * 0.25f));
             }
+            spr.drawTriangle(px,         py - SYM_R,
+                             px - SYM_R, py + SYM_R - 1,
+                             px + SYM_R, py + SYM_R - 1,
+                             sym_col);
         } else {
             spr.drawLine(px,         py - SYM_R, px + SYM_R, py,         sym_col);
             spr.drawLine(px + SYM_R, py,         px,         py + SYM_R, sym_col);
             spr.drawLine(px,         py + SYM_R, px - SYM_R, py,         sym_col);
             spr.drawLine(px - SYM_R, py,         px,         py - SYM_R, sym_col);
             if (pulse_boost > 0.15f) {
-                spr.drawPixel(px, py, lerp_col16(BG_COLOR, base_col, draw_alpha * 0.4f));
+                spr.drawPixel(px, py, lerp_col16(BG_COLOR, base_col, total_alpha * 0.4f));
             }
         }
     }
