@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // FLOCK DETECTOR v9.0-ADV — Tactical Edition (Build 2)
 // ============================================================================
 
@@ -71,7 +71,6 @@ struct WifiEvent;
 static void parse_wifi_event(struct WifiEvent* ev);
 static void draw_scanner_viz_radar(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
-static void draw_scanner_viz_cloud(unsigned long frame_ms);
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms);
 static void draw_scanner_viz_waveform(unsigned long frame_ms);
 static void draw_scanner_viz_sonar(unsigned long frame_ms);
@@ -688,8 +687,8 @@ static uint16_t      scanner_flash_color = 0;
 
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
-static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=CLOUD 3=SIGNAL BARS 4=WAVEFORM 5=SONAR
-static const int SCANNER_VIZ_COUNT = 6;
+static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=SIGNAL BARS 3=WAVEFORM 4=SONAR
+static const int SCANNER_VIZ_COUNT = 5;
 static unsigned long viz_indicator_show_ms = 0;
 static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
 
@@ -719,28 +718,6 @@ static int               spectrum_ghost_head = 0;
 static bool              spectrum_ghost_filled = false;
 static unsigned long     spectrum_ghost_last_ms = 0;
 
-// Device cloud — spatial map of recently-seen devices, separate from the
-// scrolling feed. Each device gets a deterministic position from its MAC
-// hash so it always appears in the same spot, plus a depth derived from
-// RSSI so close devices render bigger and brighter.
-#define CLOUD_MAX_CARDS  8
-
-struct CloudCard {
-    char          name[16];
-    char          mac[18];
-    float         x;            // 0=left edge, 1=right edge
-    float         y;            // 0=top, 1=bottom
-    float         drift_speed;  // panel-widths per second drifting left
-    float         target_x;     // eased toward by anim_filter
-    int8_t        rssi;
-    uint8_t       proto;        // 0=WiFi, 1=BLE
-    bool          is_flock;
-    bool          occupied;
-    unsigned long birth_ms;
-    unsigned long last_seen;
-};
-
-static CloudCard cloud_cards[CLOUD_MAX_CARDS] = {};
 
 // Eased x-coordinate of the spectrum scan line — slides smoothly
 // between channel positions instead of snapping when the hopper
@@ -754,6 +731,7 @@ struct SigBarState {
     char  name[20];
     float y_f;
     float width_f;
+    float peak_w;
     bool  occupied;
 };
 static SigBarState       sigbar_state[SIGBAR_MAX] = {};
@@ -792,8 +770,7 @@ static unsigned long     feed_anim_shift_ms  = 0;
 static const unsigned long FEED_SHIFT_ANIM_MS = 250;
 
 // Feed snapshot — refreshed by draw_scanner_screen() once per ~500ms,
-// read directly by draw_scanner_viz_cloud() so the cloud populates
-// itself without needing a separate ingestion hook.
+// read directly by the viz functions so they don't need a separate mutex.
 static FeedEntry         scan_local_feed[FEED_SIZE];
 static int               scan_local_count = 0;
 static int               scan_local_head  = 0;
@@ -4358,10 +4335,9 @@ void draw_scanner_screen() {
     switch (scanner_viz_mode) {
         case 0: draw_scanner_viz_radar(frame_ms);        break;
         case 1: draw_scanner_viz_spectrum(frame_ms);     break;
-        case 2: draw_scanner_viz_cloud(frame_ms);        break;
-        case 3: draw_scanner_viz_signal_bars(frame_ms);  break;
-        case 4: draw_scanner_viz_waveform(frame_ms);     break;
-        case 5: draw_scanner_viz_sonar(frame_ms);        break;
+        case 2: draw_scanner_viz_signal_bars(frame_ms);  break;
+        case 3: draw_scanner_viz_waveform(frame_ms);     break;
+        case 4: draw_scanner_viz_sonar(frame_ms);        break;
     }
     spr.clearClipRect();
 
@@ -4523,18 +4499,19 @@ void draw_scanner_screen() {
                 char ind_str[6];
                 snprintf(ind_str, sizeof(ind_str), "%d/%d",
                          scanner_viz_mode + 1, SCANNER_VIZ_COUNT);
-                int ind_w  = (int)strlen(ind_str) * 6 + 4;
-                int ind_h  = 9;
+                int ind_h  = 13;
+                int ind_w  = (int)strlen(ind_str) * 6 + 12;
                 int ind_x  = VIZ_X + 3;
-                int ind_y  = VIZ_BOTTOM - ind_h - 1;
-                uint16_t pill_bg     = lerp_col16(BG_COLOR, CARD_COLOR,   0.7f * ind_alpha);
-                uint16_t pill_border = lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f * ind_alpha);
-                uint16_t text_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.8f * ind_alpha);
-                spr.fillRoundRect(ind_x, ind_y, ind_w, ind_h, 2, pill_bg);
-                spr.drawRoundRect(ind_x, ind_y, ind_w, ind_h, 2, pill_border);
+                int ind_y  = VIZ_Y + 3;
+                int ind_r  = ind_h / 2;
+                uint16_t pill_bg     = lerp_col16(BG_COLOR, CARD_COLOR,   0.8f * ind_alpha);
+                uint16_t pill_border = lerp_col16(BG_COLOR, HEADER_COLOR, 0.4f * ind_alpha);
+                uint16_t text_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.9f * ind_alpha);
+                spr.fillRoundRect(ind_x, ind_y, ind_w, ind_h, ind_r, pill_bg);
+                spr.drawRoundRect(ind_x, ind_y, ind_w, ind_h, ind_r, pill_border);
                 spr.setTextColor(text_col, pill_bg);
                 spr.setTextSize(TS_MICRO);
-                spr.setCursor(ind_x + 2, ind_y + 1);
+                spr.setCursor(ind_x + 6, ind_y + (ind_h - 8) / 2);
                 spr.print(ind_str);
             }
         }
@@ -5007,219 +4984,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     spr.print(ch_str);
 }
 
-// ── Viz mode 2: DEVICE CLOUD ───────────────────────────────────────────────
-// Simple badge stream: each device gets one rounded rect drifting
-// right-to-left in one of 4 fixed lanes. Active devices freeze in
-// place; Flock entries oscillate gently around x≈0.35 with a coral
-// pulse. No parallax, no depth tiers, no glow — color carries the
-// signal that matters and the lane prevents overlap.
-static void draw_scanner_viz_cloud(unsigned long frame_ms) {
-
-    // First-render flag: the initial batch of cards is staggered across
-    // the panel so the viz isn't empty for the first 3 seconds. After
-    // that, new cards always enter from the right edge.
-    static bool cloud_first_render = true;
-
-    // ── Perspective grid — vertical lines converging toward the right ──
-    // Quadratic spacing bunches lines rightward, like a corridor vanishing point.
-    {
-        const int NUM_LINES = 8;
-        uint16_t line_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.30f);
-        for (int i = 1; i <= NUM_LINES; i++) {
-            float t = (float)i / (float)(NUM_LINES + 1);
-            float curved = t * t;
-            int lx = VIZ_X + (int)(curved * (float)VIZ_W);
-            spr.drawFastVLine(lx, VIZ_Y, VIZ_H, line_col);
-        }
-    }
-
-    // ── Ingest new devices — read from scan_local_feed which draw_scanner_screen()
-    //    refreshes every 500ms under mutex before dispatching here. No separate
-    //    snapshot needed; saves ~384 bytes of static storage.
-    for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
-        int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
-        FeedEntry& e = scan_local_feed[idx];
-        if (e.mac[0] == '\0') continue;
-        if ((frame_ms - e.timestamp) > 60000UL) continue;
-
-        char dname[16];
-        if (e.name[0] == '\0' || (strlen(e.name) >= 8 && e.name[2] == ':')) {
-            const char* tail = e.mac + max(0, (int)strlen(e.mac) - 8);
-            strncpy(dname, tail, 15);
-        } else {
-            strncpy(dname, e.name, 15);
-        }
-        dname[15] = '\0';
-
-        // MAC dedup — refresh existing card.
-        bool found = false;
-        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-            if (cloud_cards[ci].occupied &&
-                strncmp(cloud_cards[ci].mac, e.mac, 17) == 0) {
-                cloud_cards[ci].last_seen = frame_ms;
-                cloud_cards[ci].is_flock  = cloud_cards[ci].is_flock || e.is_flock;
-                found = true;
-                break;
-            }
-        }
-        if (found) continue;
-
-        // Name dedup — don't show two cards with the same display name.
-        bool name_dup = false;
-        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-            if (cloud_cards[ci].occupied &&
-                strncmp(cloud_cards[ci].name, dname, 15) == 0) {
-                cloud_cards[ci].last_seen = frame_ms;
-                name_dup = true;
-                break;
-            }
-        }
-        if (name_dup) continue;
-
-        // Find a free slot; if none, skip this entry.
-        int slot = -1;
-        for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-            if (!cloud_cards[ci].occupied) { slot = ci; break; }
-        }
-        if (slot < 0) continue;
-
-        // 3 evenly-spaced lanes — guarantees ~19px between centres in a
-        // 53px panel, well above the 12px card height so cards in
-        // different lanes can never overlap vertically.
-        const int NUM_LANES    = 3;
-        const int card_h_check = 17;
-        int lane_positions[NUM_LANES];
-        for (int li = 0; li < NUM_LANES; li++) {
-            lane_positions[li] = VIZ_Y + 1 +
-                                 li * ((VIZ_H - card_h_check) / (NUM_LANES - 1));
-        }
-
-        // Pick the lane whose nearest same-lane card sits furthest in x.
-        int   best_lane  = 0;
-        float best_x_gap = -1.0f;
-        for (int li = 0; li < NUM_LANES; li++) {
-            float nearest_x_dist = 999.0f;
-            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-                if (!cloud_cards[ci].occupied || ci == slot) continue;
-                if (abs((int)cloud_cards[ci].y - lane_positions[li]) < card_h_check) {
-                    float x_dist = fabsf(cloud_cards[ci].x - 1.05f);
-                    if (x_dist < nearest_x_dist) nearest_x_dist = x_dist;
-                }
-            }
-            if (nearest_x_dist > best_x_gap) {
-                best_x_gap = nearest_x_dist;
-                best_lane  = li;
-            }
-        }
-
-        CloudCard& c = cloud_cards[slot];
-        c.occupied = true;
-        strncpy(c.name, dname, 15); c.name[15] = '\0';
-        strncpy(c.mac,  e.mac, 17); c.mac[17]  = '\0';
-        c.x        = 1.05f;
-        c.target_x = 1.05f;
-        if (cloud_first_render) {
-            int occupied_count = 0;
-            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-                if (cloud_cards[ci].occupied) occupied_count++;
-            }
-            c.x        = 0.1f + (float)(occupied_count - 1) * 0.25f;
-            c.target_x = c.x;
-        }
-        c.y          = (float)lane_positions[best_lane];   // pixel y
-        c.drift_speed = e.is_flock ? 0.012f : 0.06f;
-        c.rssi       = e.rssi;
-        c.proto      = e.proto;
-        c.is_flock   = e.is_flock;
-        c.birth_ms   = frame_ms;
-        c.last_seen  = frame_ms;
-    }
-    if (cloud_first_render) cloud_first_render = false;
-
-    // ── Drift left at constant speed ──
-    static unsigned long cloud_last_frame = 0;
-    float dt = (cloud_last_frame == 0) ? 16.0f
-             : (float)(frame_ms - cloud_last_frame);
-    if (dt > 100.0f) dt = 100.0f;
-    cloud_last_frame = frame_ms;
-
-    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
-        if (!cloud_cards[i].occupied) continue;
-        CloudCard& c = cloud_cards[i];
-
-        // Recently-seen devices drift slower but never freeze
-        bool recently_seen = (frame_ms - c.last_seen) < 5000;
-        float speed_mult = (recently_seen && !c.is_flock) ? 0.3f : 1.0f;
-        c.target_x -= c.drift_speed * speed_mult * dt / 1000.0f;
-
-        if (c.is_flock) {
-            c.target_x = 0.35f + sinf((float)frame_ms * 0.0003f) * 0.03f;
-        }
-
-        c.x = anim_filter(c.x, c.target_x, 150.0f, dt);
-
-        if (c.x < -0.3f) c.occupied = false;
-    }
-
-    // ── Render badges ──
-    for (int i = 0; i < CLOUD_MAX_CARDS; i++) {
-        if (!cloud_cards[i].occupied) continue;
-        CloudCard& c = cloud_cards[i];
-
-        int card_x = VIZ_X + (int)(c.x * (float)VIZ_W);
-        int card_y = (int)c.y;
-
-        int name_len = (int)strlen(c.name);
-        int card_w = name_len * 6 + 24;
-        int card_h = 15;
-        int card_r = 4;
-
-        if (card_x + card_w < VIZ_X || card_x > VIZ_X + VIZ_W) continue;
-        if (card_y + card_h < VIZ_Y || card_y > VIZ_Y + VIZ_H) continue;
-        float alpha = 1.0f;
-
-        uint16_t fill_col, border_col, text_col, sym_col;
-        if (c.is_flock) {
-            float pulse = anim_pulse(UI_PULSE_MEDIUM);
-            float fa = alpha * (0.8f + pulse * 0.2f);
-            fill_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.12f * fa);
-            border_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.45f * fa);
-            text_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 1.0f  * fa);
-            sym_col    = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.70f * fa);
-        } else {
-            uint16_t card_accent = (c.proto == 0) ? CAUTION_COLOR : HEADER_COLOR;
-            fill_col   = lerp_col16(BG_COLOR, card_accent, 0.08f * alpha);
-            border_col = lerp_col16(BG_COLOR, card_accent, 0.35f * alpha);
-            text_col   = lerp_col16(BG_COLOR, card_accent, 0.90f * alpha);
-            sym_col    = lerp_col16(BG_COLOR, card_accent, 0.70f * alpha);
-        }
-
-        spr.fillRoundRect(card_x, card_y, card_w, card_h, card_r, fill_col);
-        spr.drawRoundRect(card_x, card_y, card_w, card_h, card_r, border_col);
-
-        // Protocol symbol — outline triangle (WiFi) or diamond (BLE) at left.
-        int sym_x  = card_x + 4;
-        int sym_cy = card_y + card_h / 2;
-        if (c.proto == 0) {
-            spr.drawTriangle(sym_x + 3, sym_cy - 3,
-                             sym_x,     sym_cy + 3,
-                             sym_x + 6, sym_cy + 3,
-                             sym_col);
-        } else {
-            int dhr = 3;
-            spr.drawLine(sym_x + 3,       sym_cy - dhr, sym_x + 3 + dhr, sym_cy,       sym_col);
-            spr.drawLine(sym_x + 3 + dhr, sym_cy,       sym_x + 3,       sym_cy + dhr, sym_col);
-            spr.drawLine(sym_x + 3,       sym_cy + dhr, sym_x + 3 - dhr, sym_cy,       sym_col);
-            spr.drawLine(sym_x + 3 - dhr, sym_cy,       sym_x + 3,       sym_cy - dhr, sym_col);
-        }
-
-        spr.setTextColor(text_col, fill_col);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(card_x + 14, card_y + 4);
-        spr.print(c.name);
-    }
-}
-
+// (cloud viz removed)
 static inline float rssi_pct_for(int rssi) {
     float pct = (float)(rssi - (-90)) / (float)((-30) - (-90));
     if (pct < 0.05f) pct = 0.05f;
@@ -5241,7 +5006,7 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
     const int START_Y   = VIZ_Y + 2;
 
     // ── Sort + dedup (throttled to every 800ms) ──
-    if (frame_ms - sigbar_sort_last_ms >= 800 || sigbar_sort_last_ms == 0) {
+    if (frame_ms - sigbar_sort_last_ms >= 5000 || sigbar_sort_last_ms == 0) {
         int sorted_idx[FEED_SIZE];
         int valid_count = 0;
 
@@ -5322,16 +5087,33 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             if (slot < 0) slot = 0;
             sigbar_state[slot].y_f      = (float)target_y;
             sigbar_state[slot].width_f  = target_w;
+            sigbar_state[slot].peak_w   = target_w;
             sigbar_state[slot].occupied = true;
             strncpy(sigbar_state[slot].name, e.name, 19);
             sigbar_state[slot].name[19] = '\0';
             slot_matched[slot] = true;
         }
-        sigbar_state[slot].y_f     = anim_filter(sigbar_state[slot].y_f,     (float)target_y, 300.0f, sdt);
+        sigbar_state[slot].y_f     = anim_filter(sigbar_state[slot].y_f,     (float)target_y, 800.0f, sdt);
         sigbar_state[slot].width_f = anim_filter(sigbar_state[slot].width_f, target_w,        500.0f, sdt);
+        // Peak hold: rise instantly, decay toward 0 over ~10s
+        if (target_w >= sigbar_state[slot].peak_w) {
+            sigbar_state[slot].peak_w = target_w;
+        } else {
+            sigbar_state[slot].peak_w = anim_filter(sigbar_state[slot].peak_w, 0.0f, 10000.0f, sdt);
+        }
     }
     for (int si = 0; si < SIGBAR_MAX; si++) {
         if (!slot_matched[si]) sigbar_state[si].occupied = false;
+    }
+
+    // Scale reference ticks at 0%, 50%, 100% of bar span
+    {
+        int tick_y1  = VIZ_Y + 1;
+        int tick_len = VIZ_H - 2;
+        uint16_t tick_col = lerp_col16(BG_COLOR, DIM_COLOR, 0.22f);
+        spr.drawFastVLine(BAR_X,                 tick_y1, tick_len, tick_col);
+        spr.drawFastVLine(BAR_X + BAR_MAX_W / 2, tick_y1, tick_len, tick_col);
+        spr.drawFastVLine(BAR_X + BAR_MAX_W - 1, tick_y1, tick_len, tick_col);
     }
 
     // ── Render each bar ──
@@ -5350,13 +5132,15 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         int y     = (int)(sigbar_state[slot].y_f + 0.5f);
         int bar_w = (int)(sigbar_state[slot].width_f + 0.5f);
 
-        // Live edge — two overlapping sines with per-device phase offset
+        // Per-device phase for live edge and tip glow
+        uint32_t name_hash = 0;
+        for (const char* p = e.name; *p; p++) name_hash = name_hash * 31 + (uint8_t)*p;
+        float dev_phase = (float)(name_hash % 1000) / 1000.0f * 6.28f;
+
+        // Live edge — two overlapping sines
         {
-            uint32_t name_hash = 0;
-            for (const char* p = e.name; *p; p++) name_hash = name_hash * 31 + (uint8_t)*p;
-            float phase = (float)(name_hash % 1000) / 1000.0f * 6.28f;
-            float wave1 = sinf((float)frame_ms * 0.003f  + phase) * 2.0f;
-            float wave2 = sinf((float)frame_ms * 0.0017f + phase * 1.7f) * 1.5f;
+            float wave1 = sinf((float)frame_ms * 0.003f  + dev_phase) * 2.0f;
+            float wave2 = sinf((float)frame_ms * 0.0017f + dev_phase * 1.7f) * 1.5f;
             bar_w += (int)(wave1 + wave2);
         }
         if (bar_w < 3)         bar_w = 3;
@@ -5385,6 +5169,28 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, bar_col);
         } else if (bar_w > 0) {
             spr.fillCircle(BAR_X + pill_r, y + pill_r, pill_r, bar_col);
+        }
+
+        // Peak hold marker — double-pixel vertical tick at peak position
+        {
+            int pk_x = BAR_X + (int)(sigbar_state[slot].peak_w + 0.5f);
+            if (pk_x > BAR_X + pill_r && pk_x < BAR_X + BAR_MAX_W - 1) {
+                uint16_t pk_col = lerp_col16(BG_COLOR, bar_col, 0.7f);
+                spr.drawFastVLine(pk_x,     y + 1, BAR_H - 2, pk_col);
+                spr.drawFastVLine(pk_x + 1, y + 1, BAR_H - 2, pk_col);
+            }
+        }
+
+        // Tip glow — soft pulsing halo + bright dot at bar leading edge
+        {
+            float glow_t  = (sinf((float)frame_ms * 0.002f + dev_phase) + 1.0f) * 0.5f;
+            int   tip_x   = BAR_X + bar_w;
+            int   tip_y   = y + BAR_H / 2;
+            uint16_t glow_base = e.is_flock ? CAUTION_COLOR : HEADER_COLOR;
+            spr.fillCircle(tip_x, tip_y, 3,
+                           lerp_col16(BG_COLOR, glow_base, 0.25f + 0.2f * glow_t));
+            spr.drawPixel(tip_x, tip_y,
+                          lerp_col16(BG_COLOR, glow_base, 0.85f + 0.15f * glow_t));
         }
 
         // Protocol symbol
@@ -7850,71 +7656,6 @@ void setup() {
         feed_commit_pending();
         // Reset so a later boot-screen draw (shouldn't happen) would repaint cleanly
         boot_prev_fill_w = 0;
-    }
-
-    // Pre-seed cloud cards from the feed snapshot so the cloud viz isn't
-    // empty on first view. Mirrors draw_scanner_viz_cloud()'s ingest loop
-    // but runs once at boot, with staggered x and cycled lanes.
-    {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        int boot_fc = feed_count;
-        int boot_fh = feed_head;
-        FeedEntry boot_snap[FEED_SIZE];
-        for (int i = 0; i < FEED_SIZE; i++) boot_snap[i] = feed_entries[i];
-        xSemaphoreGive(dataMutex);
-
-        unsigned long now_boot = millis();
-        int cloud_slot_count = 0;
-        const int lane_positions[3] = {
-            VIZ_Y + 2,
-            VIZ_Y + 2 + (VIZ_H - 16) / 2,
-            VIZ_Y + VIZ_H - 14
-        };
-
-        for (int fi = 0; fi < boot_fc && fi < FEED_SIZE; fi++) {
-            int idx = (boot_fh - fi + FEED_SIZE * 2) % FEED_SIZE;
-            FeedEntry& e = boot_snap[idx];
-            if (e.mac[0] == '\0') continue;
-
-            char dname[16];
-            if (e.name[0] == '\0' || (strlen(e.name) >= 8 && e.name[2] == ':')) {
-                const char* tail = e.mac + max(0, (int)strlen(e.mac) - 8);
-                strncpy(dname, tail, 15);
-            } else {
-                strncpy(dname, e.name, 15);
-            }
-            dname[15] = '\0';
-
-            bool dup = false;
-            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-                if (cloud_cards[ci].occupied &&
-                    strncmp(cloud_cards[ci].name, dname, 15) == 0) {
-                    dup = true; break;
-                }
-            }
-            if (dup) continue;
-
-            int slot = -1;
-            for (int ci = 0; ci < CLOUD_MAX_CARDS; ci++) {
-                if (!cloud_cards[ci].occupied) { slot = ci; break; }
-            }
-            if (slot < 0) break;
-
-            CloudCard& c = cloud_cards[slot];
-            c.occupied = true;
-            strncpy(c.name, dname, 15); c.name[15] = '\0';
-            strncpy(c.mac,  e.mac, 17); c.mac[17]  = '\0';
-            c.x          = 0.1f + (float)cloud_slot_count * 0.25f;
-            c.target_x   = c.x;
-            c.y          = (float)lane_positions[cloud_slot_count % 3];
-            c.drift_speed = e.is_flock ? 0.012f : 0.06f;
-            c.rssi       = e.rssi;
-            c.proto      = e.proto;
-            c.is_flock   = e.is_flock;
-            c.birth_ms   = now_boot;
-            c.last_seen  = now_boot;
-            cloud_slot_count++;
-        }
     }
 
     // Pre-populate the scanner feed snapshot so the first frame of
