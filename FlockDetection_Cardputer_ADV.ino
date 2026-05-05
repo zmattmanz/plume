@@ -5037,12 +5037,18 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
     if (sdt > 100.0f) sdt = 100.0f;
     sigbar_last_frame = frame_ms;
 
-    // ── Structural update (one change per 5s tick) ──
-    // Devices keep their slot. One slot is removed OR one new device is added per tick.
+    // First frame: force structural update so panel populates immediately
+    static bool sigbar_first_run = true;
+    if (sigbar_first_run) {
+        sigbar_sort_last_ms = 0;
+        sigbar_first_run = false;
+    }
+
+    // ── Structural update (every 5s): remove ALL dead slots, fill ALL empty slots ──
     if (frame_ms - sigbar_sort_last_ms >= 5000 || sigbar_sort_last_ms == 0) {
         sigbar_sort_last_ms = frame_ms;
 
-        bool did_remove = false;
+        // Remove dead slots
         for (int si = 0; si < SIGBAR_MAX; si++) {
             if (!sigbar_state[si].occupied) continue;
             bool still_here = false;
@@ -5051,38 +5057,32 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
                     still_here = true; break;
                 }
             }
-            if (!still_here) {
-                sigbar_state[si].occupied = false;
-                did_remove = true;
-                break;
-            }
+            if (!still_here) sigbar_state[si].occupied = false;
         }
 
-        if (!did_remove) {
-            for (int vi = 0; vi < visible_count; vi++) {
-                bool already_slotted = false;
-                for (int si = 0; si < SIGBAR_MAX; si++) {
-                    if (sigbar_state[si].occupied &&
-                        strncmp(sigbar_state[si].name, visible[vi].name, 19) == 0) {
-                        already_slotted = true; break;
-                    }
+        // Fill all empty slots with new devices
+        for (int vi = 0; vi < visible_count; vi++) {
+            bool already_slotted = false;
+            for (int si = 0; si < SIGBAR_MAX; si++) {
+                if (sigbar_state[si].occupied &&
+                    strncmp(sigbar_state[si].name, visible[vi].name, 19) == 0) {
+                    already_slotted = true; break;
                 }
-                if (already_slotted) continue;
-
-                int free_slot = -1;
-                for (int si = 0; si < SIGBAR_MAX; si++) {
-                    if (!sigbar_state[si].occupied) { free_slot = si; break; }
-                }
-                if (free_slot < 0) break;
-
-                sigbar_state[free_slot].occupied = true;
-                strncpy(sigbar_state[free_slot].name, visible[vi].name, 19);
-                sigbar_state[free_slot].name[19] = '\0';
-                sigbar_state[free_slot].width_f = 0.0f;
-                sigbar_state[free_slot].peak_w  = 0.0f;
-                sigbar_state[free_slot].y_f     = (float)(VIZ_Y - BAR_H - 4);
-                break;
             }
+            if (already_slotted) continue;
+
+            int free_slot = -1;
+            for (int si = 0; si < SIGBAR_MAX; si++) {
+                if (!sigbar_state[si].occupied) { free_slot = si; break; }
+            }
+            if (free_slot < 0) break;
+
+            sigbar_state[free_slot].occupied = true;
+            strncpy(sigbar_state[free_slot].name, visible[vi].name, 19);
+            sigbar_state[free_slot].name[19] = '\0';
+            sigbar_state[free_slot].width_f = 0.0f;
+            sigbar_state[free_slot].peak_w  = 0.0f;
+            sigbar_state[free_slot].y_f     = (float)(VIZ_Y - BAR_H - 4);
         }
     }
 
@@ -5166,15 +5166,18 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         if (bar_w < 3)         bar_w = 3;
         if (bar_w > BAR_MAX_W) bar_w = BAR_MAX_W;
 
-        // Colors — name always white, bar color encodes protocol
-        uint16_t bar_col;
+        // Colors — bar encodes protocol, name always white
+        uint16_t bar_col, sym_col;
         uint16_t name_col = TEXT_COLOR;
         if (e.is_flock) {
             bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
+            sym_col = CAUTION_COLOR;
         } else if (e.proto == 0) {
-            bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f);
+            bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.65f);
+            sym_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
         } else {
-            bar_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f);
+            bar_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.65f);
+            sym_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
         }
 
         // Pill track background
@@ -5205,31 +5208,25 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
                            lerp_col16(bar_col, TEXT_COLOR, 0.25f));
         }
 
-        // Peak hold marker — double-pixel vertical tick
-        {
-            int pk_x = BAR_X + (int)(sigbar_state[si].peak_w + 0.5f);
-            if (pk_x > BAR_X + pill_r && pk_x < BAR_X + BAR_MAX_W - 1) {
-                uint16_t pk_col = lerp_col16(BG_COLOR, bar_col, 0.7f);
-                spr.drawFastVLine(pk_x,     y + 1, BAR_H - 2, pk_col);
-                spr.drawFastVLine(pk_x + 1, y + 1, BAR_H - 2, pk_col);
-            }
+        // Protocol symbol
+        int sym_x  = VIZ_X + 1;
+        int sym_cy = y + BAR_H / 2;
+        if (e.proto == 0) {
+            spr.drawTriangle(sym_x + 3, sym_cy - 3,
+                             sym_x,     sym_cy + 3,
+                             sym_x + 6, sym_cy + 3,
+                             sym_col);
+        } else {
+            int dhr = 3;
+            spr.drawLine(sym_x + 3,       sym_cy - dhr, sym_x + 3 + dhr, sym_cy,       sym_col);
+            spr.drawLine(sym_x + 3 + dhr, sym_cy,       sym_x + 3,       sym_cy + dhr, sym_col);
+            spr.drawLine(sym_x + 3,       sym_cy + dhr, sym_x + 3 - dhr, sym_cy,       sym_col);
+            spr.drawLine(sym_x + 3 - dhr, sym_cy,       sym_x + 3,       sym_cy - dhr, sym_col);
         }
 
-        // Tip glow — soft pulsing halo + bright dot at bar leading edge
-        {
-            float glow_t  = (sinf((float)frame_ms * 0.002f + dev_phase) + 1.0f) * 0.5f;
-            int   tip_x   = BAR_X + bar_w;
-            int   tip_y   = y + BAR_H / 2;
-            uint16_t glow_base = e.is_flock ? CAUTION_COLOR : HEADER_COLOR;
-            spr.fillCircle(tip_x, tip_y, 3,
-                           lerp_col16(BG_COLOR, glow_base, 0.25f + 0.2f * glow_t));
-            spr.drawPixel(tip_x, tip_y,
-                          lerp_col16(BG_COLOR, glow_base, 0.85f + 0.15f * glow_t));
-        }
-
-        // Device name — full width of name column, white
-        int name_x    = VIZ_X + 3;
-        int max_chars = (NAME_W - 3) / 6;
+        // Device name — after symbol
+        int name_x    = VIZ_X + 10;
+        int max_chars = (NAME_W - 10) / 6;
         if (max_chars < 3) max_chars = 3;
         if (max_chars > 9) max_chars = 9;
         char nd[10];
