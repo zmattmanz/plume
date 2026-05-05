@@ -74,6 +74,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms);
 static void draw_scanner_viz_waveform(unsigned long frame_ms);
 static void draw_scanner_viz_sonar(unsigned long frame_ms);
+static void draw_scanner_viz_pulse(unsigned long frame_ms);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -688,7 +689,7 @@ static uint16_t      scanner_flash_color = 0;
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
 static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=SIGNAL BARS 3=WAVEFORM 4=SONAR
-static const int SCANNER_VIZ_COUNT = 5;
+static const int SCANNER_VIZ_COUNT = 6;
 static unsigned long viz_indicator_show_ms = 0;
 static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
 
@@ -736,7 +737,24 @@ struct SigBarState {
 static SigBarState       sigbar_state[SIGBAR_MAX] = {};
 static unsigned long     sigbar_last_frame = 0;
 static unsigned long     sigbar_sort_last_ms = 0;
-static bool              sigbar_first_run    = true;
+
+// Pulse ring state
+static unsigned long     pulse_last_ping_ms   = 0;
+static float             pulse_rate_smooth    = 1.0f;
+static uint32_t          pulse_prev_pkt_count = 0;
+static unsigned long     pulse_prev_pkt_ms    = 0;
+static unsigned long     pulse_device_refresh_ms = 0;
+
+#define PULSE_MAX_DEVICES 8
+struct PulseDevice {
+    float    angle;
+    float    dist;
+    uint8_t  proto;
+    bool     is_flock;
+    float    alpha;
+    bool     occupied;
+};
+static PulseDevice pulse_devices[PULSE_MAX_DEVICES] = {};
 
 // Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
 #define WAVEFORM_SAMPLES 134
@@ -4336,6 +4354,7 @@ void draw_scanner_screen() {
         case 2: draw_scanner_viz_signal_bars(frame_ms);  break;
         case 3: draw_scanner_viz_waveform(frame_ms);     break;
         case 4: draw_scanner_viz_sonar(frame_ms);        break;
+        case 5: draw_scanner_viz_pulse(frame_ms);        break;
     }
     spr.clearClipRect();
 
@@ -4999,7 +5018,7 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
     const int MAX_BARS    = 4;
     const int BAR_H       = 10;
     const int BAR_GAP     = 2;
-    const int NAME_W      = 42;
+    const int NAME_W      = 54;
     const int BAR_X       = VIZ_X + NAME_W;
     const int BAR_MAX_W   = VIZ_W - NAME_W - 4;
     const int START_Y     = VIZ_Y + 1;
@@ -5040,15 +5059,22 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         visible_count++;
     }
 
-    // ── Structural update (every 5s, or first frame) ──
-    if (sigbar_first_run) {
-        sigbar_sort_last_ms = 0;
-        sigbar_first_run = false;
+    // If feed snapshot hasn't populated yet, scan directly
+    if (visible_count == 0 && scan_local_count > 0) {
+        for (int i = 0; i < scan_local_count && i < FEED_SIZE && visible_count < FEED_SIZE; i++) {
+            int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+            FeedEntry& e = scan_local_feed[idx];
+            if (e.mac[0] == '\0') continue;
+            strncpy(visible[visible_count].name, e.name, 19);
+            visible[visible_count].name[19] = '\0';
+            visible[visible_count].feed_idx = idx;
+            visible[visible_count].rssi_pct = rssi_pct_for(e.rssi);
+            visible_count++;
+        }
     }
 
-    if (frame_ms - sigbar_sort_last_ms >= 5000 || sigbar_sort_last_ms == 0) {
-        sigbar_sort_last_ms = frame_ms;
-
+    // ── Structural update — runs every frame ──
+    {
         // Remove dead slots
         for (int si = 0; si < SIGBAR_MAX; si++) {
             if (!sigbar_state[si].occupied) continue;
@@ -5088,7 +5114,7 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
 
     // ── dBm scale along the bottom ──
     spr.drawFastHLine(BAR_X, SCALE_Y, BAR_MAX_W,
-                      lerp_col16(BG_COLOR, CARD_BORDER, 0.35f));
+                      lerp_col16(BG_COLOR, CARD_BORDER, 0.50f));
 
     struct ScaleTick { float pct; const char* label; };
     const ScaleTick ticks[4] = {
@@ -5101,29 +5127,15 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         int tx = BAR_X + (int)(ticks[t].pct * (float)BAR_MAX_W);
 
         spr.drawFastVLine(tx, START_Y, SCALE_Y - START_Y,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.15f));
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.35f));
         spr.drawFastVLine(tx, SCALE_Y, 3,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.40f));
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.55f));
 
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.8f), BG_COLOR);
         spr.setTextSize(TS_MICRO);
         int label_w = (int)strlen(ticks[t].label) * 6;
         spr.setCursor(tx - label_w / 2, SCALE_Y + 4);
         spr.print(ticks[t].label);
-    }
-
-    // ── Empty state ──
-    int occupied_count = 0;
-    for (int si = 0; si < SIGBAR_MAX; si++) {
-        if (sigbar_state[si].occupied) occupied_count++;
-    }
-
-    if (occupied_count == 0 && visible_count == 0) {
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(VIZ_X + VIZ_W / 2 - 20, VIZ_Y + VIZ_H / 2 - 8);
-        spr.print("listening");
-        return;
     }
 
     // ── Draw ALL 4 tracks (always visible, even if empty) ──
@@ -5131,12 +5143,12 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         int y = START_Y + row * (BAR_H + BAR_GAP);
 
         spr.fillRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.25f));
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.35f));
         spr.drawRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.40f));
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.55f));
 
         spr.setClipRect(BAR_X, y, BAR_MAX_W, BAR_H);
-        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.15f);
+        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.40f);
         for (int d = -BAR_H; d < BAR_MAX_W + BAR_H; d += 5) {
             spr.drawLine(BAR_X + d, y, BAR_X + d + BAR_H, y + BAR_H, hatch_col);
         }
@@ -5207,14 +5219,16 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             sym_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
         }
 
-        // Bar fill — solid base + leading-edge horizontal glow on right 1/3
+        uint16_t outline_col = (e.is_flock || e.proto == 0) ? CAUTION_COLOR : HEADER_COLOR;
+
+        // Bar fill — solid base + leading-edge horizontal glow on right 1/2
         if (bar_w > pill_r * 2) {
             spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, bar_col);
 
-            int glow_start = bar_w * 2 / 3;
+            int glow_start = bar_w / 2;
             int glow_len   = bar_w - glow_start;
             if (glow_len > 4) {
-                uint16_t bright_col = lerp_col16(bar_col, TEXT_COLOR, 0.15f);
+                uint16_t bright_col = lerp_col16(bar_col, TEXT_COLOR, 0.30f);
                 spr.setClipRect(BAR_X, y, bar_w, BAR_H);
                 for (int gx = 0; gx < glow_len; gx++) {
                     float t      = (float)gx / (float)(glow_len - 1);
@@ -5226,12 +5240,10 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
                 spr.clearClipRect();
             }
 
-            spr.drawRoundRect(BAR_X, y, bar_w, BAR_H, pill_r,
-                              lerp_col16(bar_col, TEXT_COLOR, 0.30f));
+            spr.drawRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, outline_col);
         } else if (bar_w > 0) {
             spr.fillCircle(BAR_X + pill_r, y + pill_r, pill_r, bar_col);
-            spr.drawCircle(BAR_X + pill_r, y + pill_r, pill_r,
-                           lerp_col16(bar_col, TEXT_COLOR, 0.30f));
+            spr.drawCircle(BAR_X + pill_r, y + pill_r, pill_r, outline_col);
         }
 
         // Protocol symbol
@@ -5257,9 +5269,9 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         // Device name — white, truncated
         int name_x    = VIZ_X + 10;
         int max_chars = (NAME_W - 10) / 6;
-        if (max_chars > 7) max_chars = 7;
+        if (max_chars > 8) max_chars = 8;
         if (max_chars < 2) max_chars = 2;
-        char nd[8];
+        char nd[9];
         strncpy(nd, e.name, max_chars);
         nd[max_chars] = '\0';
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
@@ -5503,6 +5515,216 @@ static void draw_scanner_viz_sonar(unsigned long frame_ms) {
 
         spr.fillCircle(dpx, dpy, dot_r + 2, lerp_col16(BG_COLOR, d.col, draw_alpha * 0.2f));
         spr.fillCircle(dpx, dpy, dot_r,     lerp_col16(BG_COLOR, d.col, draw_alpha));
+    }
+}
+
+// ── Viz mode 5: PULSE RING ────────────────────────────────────────────────
+// Expanding pulse wave driven by packet rate. Protocol symbols at
+// RSSI-mapped distances; symbols brighten as the pulse washes over them.
+static void draw_scanner_viz_pulse(unsigned long frame_ms) {
+
+    // ── Measure packet rate every 200ms ──
+    if (frame_ms - pulse_prev_pkt_ms >= 200 || pulse_prev_pkt_ms == 0) {
+        uint32_t cur   = ambient_packet_count;
+        uint32_t delta = cur - pulse_prev_pkt_count;
+        pulse_prev_pkt_count = cur;
+
+        float raw_rate = (float)delta * 5.0f;
+        float dt_ms    = (pulse_prev_pkt_ms == 0) ? 200.0f
+                       : (float)(frame_ms - pulse_prev_pkt_ms);
+        pulse_rate_smooth = anim_filter(pulse_rate_smooth, raw_rate, 2000.0f, dt_ms);
+        if (pulse_rate_smooth < 1.0f) pulse_rate_smooth = 1.0f;
+        if (pulse_rate_smooth > 8.0f) pulse_rate_smooth = 8.0f;
+
+        pulse_prev_pkt_ms = frame_ms;
+    }
+
+    // ── Pulse timing ──
+    float ping_interval_ms = 2500.0f / pulse_rate_smooth;
+    if (ping_interval_ms < 600.0f)  ping_interval_ms = 600.0f;
+    if (ping_interval_ms > 2500.0f) ping_interval_ms = 2500.0f;
+
+    if (pulse_last_ping_ms == 0) pulse_last_ping_ms = frame_ms;
+    float ping_age = (float)(frame_ms - pulse_last_ping_ms);
+    float ping_t   = ping_age / ping_interval_ms;
+    if (ping_t > 1.0f) ping_t = 1.0f;
+
+    if (ping_age >= (unsigned long)ping_interval_ms) {
+        pulse_last_ping_ms = frame_ms;
+        ping_t = 0.0f;
+    }
+
+    float eased_t = 1.0f - (1.0f - ping_t) * (1.0f - ping_t);
+
+    // ── Layout ──
+    int cx         = VIZ_X + VIZ_W / 3;
+    int cy         = VIZ_Y + VIZ_H / 2;
+    int max_radius = VIZ_W - (cx - VIZ_X) - 4;
+
+    // ── Concentric perspective rings ──
+    {
+        const int NUM_RINGS    = 7;
+        const float ARC_SPAN   = 1.3f;
+        uint16_t ring_col      = lerp_col16(BG_COLOR, CARD_BORDER, 0.30f);
+        for (int i = 1; i <= NUM_RINGS; i++) {
+            float t      = (float)i / (float)(NUM_RINGS + 1);
+            float curved = t * t;
+            int ring_r   = (int)(curved * (float)max_radius);
+            if (ring_r < 4) continue;
+
+            int steps = ring_r * 2;
+            if (steps > 100) steps = 100;
+            for (int s = 0; s <= steps; s++) {
+                float a  = -ARC_SPAN + (float)s / (float)steps * ARC_SPAN * 2.0f;
+                int   px = cx + (int)((float)ring_r * cosf(a));
+                int   py = cy + (int)((float)ring_r * sinf(a));
+                spr.drawPixel(px, py, ring_col);
+            }
+        }
+    }
+
+    // ── Origin dot ──
+    spr.fillCircle(cx, cy, 2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f));
+
+    // ── Expanding pulse wave ──
+    int pulse_radius = (int)(eased_t * (float)max_radius);
+
+    if (pulse_radius > 3) {
+        const float ARC_SPAN = 1.3f;
+        float arc_alpha = (1.0f - eased_t) * 0.7f;
+        if (arc_alpha > 0.03f) {
+            uint16_t arc_col = lerp_col16(BG_COLOR, HEADER_COLOR, arc_alpha);
+            int steps = pulse_radius * 2;
+            if (steps > 120) steps = 120;
+            for (int offset = -1; offset <= 1; offset++) {
+                int r = pulse_radius + offset;
+                if (r < 2) continue;
+                for (int s = 0; s <= steps; s++) {
+                    float a  = -ARC_SPAN + (float)s / (float)steps * ARC_SPAN * 2.0f;
+                    int   px = cx + (int)((float)r * cosf(a));
+                    int   py = cy + (int)((float)r * sinf(a));
+                    spr.drawPixel(px, py, arc_col);
+                }
+            }
+        }
+
+        int trail_r = pulse_radius - 5;
+        if (trail_r > 3) {
+            float trail_alpha = (1.0f - eased_t) * 0.25f;
+            if (trail_alpha > 0.02f) {
+                uint16_t trail_col = lerp_col16(BG_COLOR, HEADER_COLOR, trail_alpha);
+                int steps = trail_r * 2;
+                if (steps > 100) steps = 100;
+                for (int s = 0; s <= steps; s++) {
+                    float a  = -ARC_SPAN + (float)s / (float)steps * ARC_SPAN * 2.0f;
+                    int   px = cx + (int)((float)trail_r * cosf(a));
+                    int   py = cy + (int)((float)trail_r * sinf(a));
+                    spr.drawPixel(px, py, trail_col);
+                }
+            }
+        }
+    }
+
+    // ── Refresh device symbols every 500ms ──
+    if (frame_ms - pulse_device_refresh_ms >= 500 || pulse_device_refresh_ms == 0) {
+        for (int i = 0; i < PULSE_MAX_DEVICES; i++) {
+            if (!pulse_devices[i].occupied) continue;
+            pulse_devices[i].alpha -= 0.12f;
+            if (pulse_devices[i].alpha <= 0.0f) pulse_devices[i].occupied = false;
+        }
+
+        for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
+            int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
+            FeedEntry& e = scan_local_feed[idx];
+            if (e.mac[0] == '\0') continue;
+            if ((frame_ms - e.timestamp) > 30000UL) continue;
+
+            float rssi_norm = (float)(e.rssi - (-90)) / (float)((-30) - (-90));
+            if (rssi_norm < 0.0f) rssi_norm = 0.0f;
+            if (rssi_norm > 1.0f) rssi_norm = 1.0f;
+            float dist = 1.0f - rssi_norm;
+
+            uint32_t mh = 0;
+            for (const char* p = e.mac; *p; p++) mh = mh * 31 + (uint8_t)*p;
+            float angle = ((float)(mh % 1000) / 1000.0f - 0.5f) * 2.2f;
+
+            int slot = -1;
+            for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
+                if (pulse_devices[si].occupied) {
+                    if (fabsf(pulse_devices[si].angle - angle) < 0.3f &&
+                        fabsf(pulse_devices[si].dist  - dist)  < 0.2f) {
+                        slot = si; break;
+                    }
+                }
+            }
+            if (slot < 0) {
+                for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
+                    if (!pulse_devices[si].occupied) { slot = si; break; }
+                }
+            }
+            if (slot < 0) continue;
+
+            pulse_devices[slot].angle    = angle;
+            pulse_devices[slot].dist     = dist;
+            pulse_devices[slot].proto    = e.proto;
+            pulse_devices[slot].is_flock = e.is_flock;
+            pulse_devices[slot].alpha    = 0.6f;
+            pulse_devices[slot].occupied = true;
+        }
+
+        pulse_device_refresh_ms = frame_ms;
+    }
+
+    // ── Render device symbols ──
+    for (int i = 0; i < PULSE_MAX_DEVICES; i++) {
+        if (!pulse_devices[i].occupied) continue;
+        PulseDevice& d = pulse_devices[i];
+
+        int dev_r = 6 + (int)(d.dist * (float)(max_radius - 8));
+        int dx    = cx + (int)((float)dev_r * cosf(d.angle));
+        int dy    = cy + (int)((float)dev_r * sinf(d.angle));
+
+        float dist_to_pulse = fabsf((float)dev_r - (float)pulse_radius);
+        float pulse_boost   = (dist_to_pulse < 10.0f)
+                            ? (1.0f - dist_to_pulse / 10.0f) * 0.4f : 0.0f;
+
+        float draw_alpha = d.alpha + pulse_boost;
+        if (draw_alpha > 1.0f) draw_alpha = 1.0f;
+        if (draw_alpha < 0.08f) continue;
+
+        uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
+        uint16_t sym_col  = lerp_col16(BG_COLOR, base_col, draw_alpha);
+
+        int sym_size = (d.dist < 0.3f) ? 4 : 3;
+
+        // Glow halo when pulse-boosted (drawn first, behind symbol)
+        if (pulse_boost > 0.1f) {
+            uint16_t glow = lerp_col16(BG_COLOR, base_col, pulse_boost * 0.3f);
+            int hx = dx + (d.proto == 0 ? sym_size / 2 : 0);
+            int hy = dy + (d.proto == 0 ? 1 : 0);
+            spr.fillCircle(hx, hy, sym_size + 2, glow);
+        }
+
+        if (d.proto == 0) {
+            spr.drawTriangle(dx,                dy + sym_size,
+                             dx + sym_size,     dy + sym_size,
+                             dx + sym_size / 2, dy - sym_size + 1,
+                             sym_col);
+            if (pulse_boost > 0.15f) {
+                uint16_t fill = lerp_col16(BG_COLOR, base_col, draw_alpha * 0.4f);
+                spr.drawPixel(dx + sym_size / 2, dy + sym_size - 2, fill);
+            }
+        } else {
+            int dhr = sym_size;
+            spr.drawLine(dx,       dy - dhr, dx + dhr, dy,       sym_col);
+            spr.drawLine(dx + dhr, dy,       dx,       dy + dhr, sym_col);
+            spr.drawLine(dx,       dy + dhr, dx - dhr, dy,       sym_col);
+            spr.drawLine(dx - dhr, dy,       dx,       dy - dhr, sym_col);
+            if (pulse_boost > 0.15f) {
+                uint16_t fill = lerp_col16(BG_COLOR, base_col, draw_alpha * 0.4f);
+                spr.drawPixel(dx, dy, fill);
+            }
+        }
     }
 }
 
