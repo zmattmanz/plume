@@ -73,7 +73,7 @@ static void draw_scanner_viz_radar(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms);
 static void draw_scanner_viz_waveform(unsigned long frame_ms);
-static void draw_scanner_viz_pulse(unsigned long frame_ms);
+static void draw_scanner_viz_flatradar(unsigned long frame_ms);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -687,7 +687,7 @@ static uint16_t      scanner_flash_color = 0;
 
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
-static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=SIGNAL BARS 3=WAVEFORM 4=PULSE
+static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=SIGNAL BARS 3=WAVEFORM 4=FLATRADAR
 static const int SCANNER_VIZ_COUNT = 5;
 static unsigned long viz_indicator_show_ms = 0;
 static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
@@ -738,20 +738,16 @@ static SigBarState       sigbar_state[SIGBAR_MAX] = {};
 static unsigned long     sigbar_last_frame = 0;
 static unsigned long     sigbar_sort_last_ms = 0;
 
-// Pulse viz state
-static float         pulse_pps_f          = 0.0f;
-static uint32_t      pulse_prev_pkt       = 0;
-static unsigned long pulse_last_sample_ms = 0;
-static float         pulse_hex_rot        = 0.0f;
+// Flat radar state
+static float         flatradar_angle           = 0.0f;
+static unsigned long flatradar_last_ms         = 0;
 
-// Per-device state — position-based with soft collision
-#define PULSE_MAX_DEVICES 8
-struct PulseDevice {
+// Per-device state with position physics
+#define FLATRADAR_MAX_DEVICES 6
+struct FlatRadarDevice {
     char          name[20];
     float         x;
     float         y;
-    float         target_x;
-    float         target_y;
     float         vx;
     float         vy;
     float         orbit_r;
@@ -759,15 +755,11 @@ struct PulseDevice {
     float         orbit_speed;
     uint8_t       proto;
     bool          is_flock;
-    float         brightness;
-    float         death_alpha;
-    bool          dying;
-    unsigned long death_start_ms;
+    float         sweep_bright;
     bool          occupied;
 };
-static PulseDevice   pulse_devs[PULSE_MAX_DEVICES] = {};
-static unsigned long pulse_dev_refresh_ms = 0;
-static unsigned long pulse_last_anim_ms   = 0;
+static FlatRadarDevice flatradar_devs[FLATRADAR_MAX_DEVICES] = {};
+static unsigned long   flatradar_dev_refresh_ms = 0;
 
 // Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
 #define WAVEFORM_SAMPLES 134
@@ -4352,7 +4344,7 @@ void draw_scanner_screen() {
         case 1: draw_scanner_viz_spectrum(frame_ms);     break;
         case 2: draw_scanner_viz_signal_bars(frame_ms);  break;
         case 3: draw_scanner_viz_waveform(frame_ms);     break;
-        case 4: draw_scanner_viz_pulse(frame_ms);        break;
+        case 4: draw_scanner_viz_flatradar(frame_ms);    break;
     }
     spr.clearClipRect();
 
@@ -5420,121 +5412,92 @@ static void draw_scanner_viz_waveform(unsigned long frame_ms) {
     }
 }
 
-// ── Viz mode 4: PULSE RING ────────────────────────────────────────────────
-// Hexagon emitter on left, 4 guide rings, expanding pulse wave with
-// trailing rings. Devices orbit and softly repel each other.
-static void draw_scanner_viz_pulse(unsigned long frame_ms) {
+// ── Viz mode 4: FLAT RADAR — phosphor decay ──────────────────────────────
+// Rotating sweep paints the display; recently-swept areas glow then fade.
+// Devices orbit the center at RSSI-mapped radii and softly repel each other.
+static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
 
-    // ── Origin — hexagon sits on the left ──
-    const int HX     = VIZ_X + 10;
-    const int HY     = VIZ_Y + VIZ_H / 2;
-    const int SYM_R  = 6;
-    const int MARGIN = SYM_R + 4;
+    const int   CX   = VIZ_X + VIZ_W / 2;
+    const int   CY   = VIZ_Y + VIZ_H / 2;
+    const int   R    = (VIZ_H / 2) - 2;
+    const float PI2f = 2.0f * (float)M_PI;
+
+    // Ring radii as fractions of R — used in both rings and sweep-line sections
+    const float ring_pcts[3] = {0.33f, 0.66f, 1.0f};
 
     // ── Animation dt ──
-    float dt = (pulse_last_anim_ms == 0) ? 16.0f
-             : (float)(frame_ms - pulse_last_anim_ms);
+    float dt = (flatradar_last_ms == 0) ? 16.0f
+             : (float)(frame_ms - flatradar_last_ms);
     if (dt > 100.0f) dt = 100.0f;
-    pulse_last_anim_ms = frame_ms;
+    flatradar_last_ms = frame_ms;
 
-    // ── Sample packet rate every 200ms ──
-    if (frame_ms - pulse_last_sample_ms >= 200 || pulse_last_sample_ms == 0) {
-        uint32_t cur = ambient_packet_count;
-        uint32_t delta = cur - pulse_prev_pkt;
-        pulse_prev_pkt = cur;
-        float pps = (float)delta * 5.0f;
-        float sample_dt = (pulse_last_sample_ms == 0) ? 200.0f
-                        : (float)(frame_ms - pulse_last_sample_ms);
-        pulse_pps_f = anim_filter(pulse_pps_f, pps, 800.0f, sample_dt);
-        pulse_last_sample_ms = frame_ms;
-    }
+    // ── Advance sweep — one revolution per ~6 seconds ──
+    flatradar_angle += dt * 0.001f * (PI2f / 6.0f);
+    if (flatradar_angle > PI2f) flatradar_angle -= PI2f;
 
-    // ── Pulse parameters ──
-    float pps_norm = pulse_pps_f / 150.0f;
-    if (pps_norm > 1.5f) pps_norm = 1.5f;
-
-    float pulse_freq = 0.25f + pps_norm * 0.25f;
-    float pulse_phase = (float)frame_ms * 0.001f * pulse_freq * 2.0f * (float)M_PI;
-
-    float raw_t  = (sinf(pulse_phase) + 1.0f) * 0.5f;
-    float wave_t = 1.0f - (1.0f - raw_t) * (1.0f - raw_t);
-    float wave_r = 10.0f + wave_t * (float)(VIZ_W + 20);
-
-    float flash_intensity = (1.0f - raw_t) * (1.0f - raw_t);
-
-    // ── 4 guide rings — clean, evenly spaced ──
+    // ── Draw phosphor decay — 90 filled wedge slices covering 300° behind sweep ──
     {
-        int ring_radii[4] = {30, 55, 85, 115};
-        for (int ri = 0; ri < 4; ri++) {
-            int rr = ring_radii[ri];
-            float ring_alpha = 0.18f;
-            float ring_dist = fabsf((float)rr - wave_r);
-            if (ring_dist < 8.0f) {
-                ring_alpha += (1.0f - ring_dist / 8.0f) * 0.15f;
+        const int   NUM_SLICES = 90;
+        const float DECAY_ARC  = PI2f * 0.83f;
+
+        for (int si = 0; si < NUM_SLICES; si++) {
+            float t0 = (float)si / (float)NUM_SLICES;
+            float t1 = (float)(si + 1) / (float)NUM_SLICES;
+
+            float a0 = flatradar_angle - t0 * DECAY_ARC;
+            float a1 = flatradar_angle - t1 * DECAY_ARC;
+
+            float brightness;
+            if (t0 < 0.04f) {
+                brightness = 0.55f;
+            } else {
+                float fade = (t0 - 0.04f) / 0.96f;
+                brightness = 0.45f * (1.0f - fade) * (1.0f - fade) * (1.0f - fade);
             }
-            spr.drawCircle(HX, HY, rr,
-                           lerp_col16(BG_COLOR, CARD_BORDER, ring_alpha));
+            if (brightness < 0.01f) continue;
+
+            uint16_t col = lerp_col16(BG_COLOR, HEADER_COLOR, brightness);
+
+            int x0 = CX + (int)((float)(R + 1) * cosf(a0));
+            int y0 = CY + (int)((float)(R + 1) * sinf(a0));
+            int x1 = CX + (int)((float)(R + 1) * cosf(a1));
+            int y1 = CY + (int)((float)(R + 1) * sinf(a1));
+
+            spr.fillTriangle(CX, CY, x0, y0, x1, y1, col);
         }
     }
 
-    // ── Expanding pulse wave with trailing rings ──
+    // ── 3 guide rings — drawn on top of phosphor at 25% HEADER ──
     {
-        const int   NUM_TRAILS    = 5;
-        const float TRAIL_SPACING = 5.0f;
-        for (int ti = 0; ti < NUM_TRAILS; ti++) {
-            float trail_r = wave_r - (float)ti * TRAIL_SPACING;
-            if (trail_r < 5.0f || trail_r > (float)(VIZ_W + 10)) continue;
-            int wr = (int)(trail_r + 0.5f);
-            float trail_fade = (1.0f - wave_t) * (1.0f - (float)ti * 0.18f);
-            if (trail_fade < 0.02f) continue;
-            float alpha = trail_fade * (ti == 0 ? 0.40f : 0.25f);
-            spr.drawCircle(HX, HY, wr,
-                           lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
+        for (int ri = 0; ri < 3; ri++) {
+            int rr = (int)(ring_pcts[ri] * (float)R);
+            spr.drawCircle(CX, CY, rr,
+                           lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
         }
     }
 
-    // ── Rotating 3D hexagon at the origin ──
+    // ── Sweep line — bright leading edge ──
     {
-        pulse_hex_rot += dt * 0.001f;
-        if (pulse_hex_rot > 2.0f * (float)M_PI)
-            pulse_hex_rot -= 2.0f * (float)M_PI;
+        int ex = CX + (int)((float)R * cosf(flatradar_angle));
+        int ey = CY + (int)((float)R * sinf(flatradar_angle));
 
-        const float HEX_R = 7.0f;
-        const float TILT  = 0.35f;
-        const float DEPTH = 3.0f;
+        spr.drawLine(CX, CY, ex, ey,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
+        uint16_t bright = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
+        spr.drawLine(CX, CY, ex, ey, bright);
 
-        float hex_bright = 0.45f + flash_intensity * 0.55f;
-        uint16_t hex_col = lerp_col16(BG_COLOR, HEADER_COLOR, hex_bright);
-        uint16_t hex_dim = lerp_col16(BG_COLOR, HEADER_COLOR, hex_bright * 0.35f);
-
-        int fx[6], fy[6], bx[6], by[6];
-        for (int v = 0; v < 6; v++) {
-            float a = pulse_hex_rot + (float)v * (2.0f * (float)M_PI / 6.0f);
-            fx[v] = HX + (int)(HEX_R * cosf(a));
-            fy[v] = HY + (int)(HEX_R * sinf(a) * TILT);
-            bx[v] = HX + (int)(HEX_R * 0.7f * cosf(a) + DEPTH * 0.4f);
-            by[v] = HY + (int)(HEX_R * 0.7f * sinf(a) * TILT + DEPTH * 0.6f);
-        }
-        for (int v = 0; v < 6; v++) {
-            int nv = (v + 1) % 6;
-            spr.drawLine(bx[v], by[v], bx[nv], by[nv], hex_dim);
-        }
-        for (int v = 0; v < 6; v++) {
-            spr.drawLine(bx[v], by[v], fx[v], fy[v], hex_dim);
-        }
-        for (int v = 0; v < 6; v++) {
-            int nv = (v + 1) % 6;
-            spr.drawLine(fx[v], fy[v], fx[nv], fy[nv], hex_col);
-        }
-        if (flash_intensity > 0.3f) {
-            spr.fillCircle(HX, HY, 2,
-                           lerp_col16(BG_COLOR, HEADER_COLOR, flash_intensity * 0.6f));
+        // Ring intersection highlights
+        for (int ri = 0; ri < 3; ri++) {
+            float rr = ring_pcts[ri] * (float)R;
+            int ix = CX + (int)(rr * cosf(flatradar_angle));
+            int iy = CY + (int)(rr * sinf(flatradar_angle));
+            spr.fillCircle(ix, iy, 2, bright);
         }
     }
 
     // ── Refresh device list every 500ms ──
-    if (frame_ms - pulse_dev_refresh_ms >= 500 || pulse_dev_refresh_ms == 0) {
-        bool matched[PULSE_MAX_DEVICES] = {false};
+    if (frame_ms - flatradar_dev_refresh_ms >= 500 || flatradar_dev_refresh_ms == 0) {
+        bool matched[FLATRADAR_MAX_DEVICES] = {false};
 
         for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
             int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
@@ -5544,10 +5507,9 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
 
             // Dedup by name
             bool dup = false;
-            for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
-                if (pulse_devs[pi].occupied && !pulse_devs[pi].dying &&
-                    matched[pi] &&
-                    strncmp(pulse_devs[pi].name, e.name, 19) == 0) {
+            for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
+                if (flatradar_devs[pi].occupied && matched[pi] &&
+                    strncmp(flatradar_devs[pi].name, e.name, 19) == 0) {
                     dup = true; break;
                 }
             }
@@ -5555,200 +5517,187 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
 
             // Match existing slot by name
             int slot = -1;
-            for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
-                if (pulse_devs[pi].occupied && !pulse_devs[pi].dying &&
-                    strncmp(pulse_devs[pi].name, e.name, 19) == 0) {
+            for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
+                if (flatradar_devs[pi].occupied &&
+                    strncmp(flatradar_devs[pi].name, e.name, 19) == 0) {
                     slot = pi; matched[pi] = true; break;
                 }
             }
 
             float rssi_norm = rssi_pct_for(e.rssi);
+            float target_r  = (1.0f - rssi_norm) * (float)(R - 8) + 6.0f;
 
             if (slot >= 0) {
-                float target_r = 20.0f + (1.0f - rssi_norm) * 40.0f;
-                pulse_devs[slot].orbit_r = anim_filter(
-                    pulse_devs[slot].orbit_r, target_r, 500.0f, 500.0f);
-                pulse_devs[slot].proto    = e.proto;
-                pulse_devs[slot].is_flock = e.is_flock;
+                flatradar_devs[slot].orbit_r = anim_filter(
+                    flatradar_devs[slot].orbit_r, target_r, 600.0f, 500.0f);
+                flatradar_devs[slot].proto    = e.proto;
+                flatradar_devs[slot].is_flock = e.is_flock;
             } else {
-                // Find free slot
-                for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
-                    if (!pulse_devs[pi].occupied) { slot = pi; break; }
+                for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
+                    if (!flatradar_devs[pi].occupied) { slot = pi; break; }
                 }
                 if (slot < 0) continue;
 
-                float target_r = 20.0f + (1.0f - rssi_norm) * 40.0f;
-
                 uint32_t nh = 0;
                 for (const char* p = e.name; *p; p++) nh = nh * 31 + (uint8_t)*p;
-                float start_angle = (float)(nh % 628) / 100.0f;
 
-                pulse_devs[slot].occupied    = true;
-                pulse_devs[slot].dying       = false;
-                pulse_devs[slot].death_alpha = 1.0f;
-                strncpy(pulse_devs[slot].name, e.name, 19);
-                pulse_devs[slot].name[19]    = '\0';
-                pulse_devs[slot].proto       = e.proto;
-                pulse_devs[slot].is_flock    = e.is_flock;
-                pulse_devs[slot].brightness  = 0.55f;
-                pulse_devs[slot].orbit_r     = target_r;
-                pulse_devs[slot].orbit_angle = start_angle;
-                pulse_devs[slot].orbit_speed = 0.2f + rssi_norm * 0.5f;
-                pulse_devs[slot].vx          = 0.0f;
-                pulse_devs[slot].vy          = 0.0f;
-                pulse_devs[slot].x  = (float)HX + target_r * cosf(start_angle);
-                pulse_devs[slot].y  = (float)HY + target_r * sinf(start_angle);
-                pulse_devs[slot].target_x = pulse_devs[slot].x;
-                pulse_devs[slot].target_y = pulse_devs[slot].y;
+                flatradar_devs[slot].occupied     = true;
+                strncpy(flatradar_devs[slot].name, e.name, 19);
+                flatradar_devs[slot].name[19]     = '\0';
+                flatradar_devs[slot].proto        = e.proto;
+                flatradar_devs[slot].is_flock     = e.is_flock;
+                flatradar_devs[slot].orbit_r      = target_r;
+                flatradar_devs[slot].orbit_angle  = (float)(nh % 628) / 100.0f;
+                flatradar_devs[slot].orbit_speed  = 0.08f + rssi_norm * 0.12f;
+                flatradar_devs[slot].sweep_bright = 0.0f;
+                flatradar_devs[slot].vx           = 0.0f;
+                flatradar_devs[slot].vy           = 0.0f;
+                flatradar_devs[slot].x = target_r * cosf(flatradar_devs[slot].orbit_angle);
+                flatradar_devs[slot].y = target_r * sinf(flatradar_devs[slot].orbit_angle);
                 matched[slot] = true;
             }
         }
 
-        // Start death animation on unmatched live slots
-        for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
-            if (pulse_devs[pi].occupied && !matched[pi] && !pulse_devs[pi].dying) {
-                pulse_devs[pi].dying          = true;
-                pulse_devs[pi].death_start_ms = frame_ms;
-            }
+        // Remove unmatched
+        for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
+            if (flatradar_devs[pi].occupied && !matched[pi])
+                flatradar_devs[pi].occupied = false;
         }
 
-        pulse_dev_refresh_ms = frame_ms;
+        flatradar_dev_refresh_ms = frame_ms;
     }
 
     // ── Update device positions ──
-    for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
-        if (!pulse_devs[pi].occupied) continue;
-        PulseDevice& d = pulse_devs[pi];
-
-        if (d.dying) {
-            float death_t = (float)(frame_ms - d.death_start_ms) / 600.0f;
-            if (death_t >= 1.0f) { d.occupied = false; continue; }
-            d.death_alpha = 1.0f - ui_ease(death_t);
-            d.orbit_r += dt * 0.02f;
-        }
+    for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
+        if (!flatradar_devs[pi].occupied) continue;
+        FlatRadarDevice& d = flatradar_devs[pi];
 
         d.orbit_angle += d.orbit_speed * dt / 1000.0f;
-        if (d.orbit_angle > 2.0f * (float)M_PI)
-            d.orbit_angle -= 2.0f * (float)M_PI;
+        if (d.orbit_angle > PI2f) d.orbit_angle -= PI2f;
 
-        d.target_x = (float)HX + d.orbit_r * cosf(d.orbit_angle);
-        d.target_y = (float)HY + d.orbit_r * sinf(d.orbit_angle);
+        float tx = d.orbit_r * cosf(d.orbit_angle);
+        float ty = d.orbit_r * sinf(d.orbit_angle);
 
         // Gentle float drift — two sine waves per axis, per-device phase
         uint32_t fh = 0;
         for (const char* p = d.name; *p; p++) fh = fh * 31 + (uint8_t)*p;
         float fp = (float)(fh % 1000) / 1000.0f * 6.28f;
-        d.target_x += sinf((float)frame_ms * 0.0006f + fp)        * 4.0f
-                    + sinf((float)frame_ms * 0.001f  + fp * 1.7f) * 2.5f;
-        d.target_y += sinf((float)frame_ms * 0.0008f + fp * 0.6f) * 3.0f
-                    + cosf((float)frame_ms * 0.0005f + fp * 2.1f) * 2.0f;
+        tx += sinf((float)frame_ms * 0.0005f + fp)        * 3.0f;
+        ty += sinf((float)frame_ms * 0.0007f + fp * 0.6f) * 2.0f;
 
-        d.x = anim_filter(d.x, d.target_x + d.vx, 200.0f, dt);
-        d.y = anim_filter(d.y, d.target_y + d.vy, 200.0f, dt);
+        d.x = anim_filter(d.x, tx + d.vx, 250.0f, dt);
+        d.y = anim_filter(d.y, ty + d.vy, 250.0f, dt);
 
-        d.vx *= 0.95f;
-        d.vy *= 0.95f;
+        d.vx *= 0.94f;
+        d.vy *= 0.94f;
 
-        float min_x = (float)(VIZ_X + MARGIN);
-        float max_x = (float)(VIZ_X + VIZ_W - MARGIN);
-        float min_y = (float)(VIZ_Y + MARGIN);
-        float max_y = (float)(VIZ_Y + VIZ_H - MARGIN);
-        if (d.x < min_x) { d.x = min_x; d.vx =  fabsf(d.vx); }
-        if (d.x > max_x) { d.x = max_x; d.vx = -fabsf(d.vx); }
-        if (d.y < min_y) { d.y = min_y; d.vy =  fabsf(d.vy); }
-        if (d.y > max_y) { d.y = max_y; d.vy = -fabsf(d.vy); }
+        // Clamp to circle with inward bounce
+        float dist = sqrtf(d.x * d.x + d.y * d.y);
+        if (dist > (float)(R - 6)) {
+            float scale = (float)(R - 6) / dist;
+            d.x *= scale;
+            d.y *= scale;
+            float nx = d.x / dist, ny = d.y / dist;
+            float dot = d.vx * nx + d.vy * ny;
+            if (dot > 0) { d.vx -= 2.0f * dot * nx; d.vy -= 2.0f * dot * ny; }
+        }
+
+        // ── Sweep brightness — how recently did the sweep pass? ──
+        float dev_angle = atan2f(d.y, d.x);
+        float behind = flatradar_angle - dev_angle;
+        while (behind < 0)    behind += PI2f;
+        while (behind > PI2f) behind -= PI2f;
+
+        float sweep_zone = PI2f * 0.33f;  // 120° — 2 seconds of persistence
+        if (behind < sweep_zone) {
+            float t = behind / sweep_zone;
+            float target_sb = (1.0f - t) * (1.0f - t);
+            if (target_sb > d.sweep_bright) {
+                d.sweep_bright = target_sb;           // snap up immediately
+            } else {
+                d.sweep_bright = anim_filter(d.sweep_bright, target_sb, 400.0f, dt);
+            }
+        } else {
+            d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 800.0f, dt);
+        }
     }
 
-    // ── Soft collision — devices repel each other ──
+    // ── Soft collision — devices bump off each other ──
     {
-        const float REPEL_DIST  = 16.0f;
-        const float REPEL_FORCE = 0.8f;
-        for (int a = 0; a < PULSE_MAX_DEVICES; a++) {
-            if (!pulse_devs[a].occupied) continue;
-            for (int b = a + 1; b < PULSE_MAX_DEVICES; b++) {
-                if (!pulse_devs[b].occupied) continue;
-                float dx = pulse_devs[a].x - pulse_devs[b].x;
-                float dy = pulse_devs[a].y - pulse_devs[b].y;
+        const float REPEL_DIST  = 14.0f;
+        const float REPEL_FORCE = 0.6f;
+
+        for (int a = 0; a < FLATRADAR_MAX_DEVICES; a++) {
+            if (!flatradar_devs[a].occupied) continue;
+            for (int b = a + 1; b < FLATRADAR_MAX_DEVICES; b++) {
+                if (!flatradar_devs[b].occupied) continue;
+
+                float dx      = flatradar_devs[a].x - flatradar_devs[b].x;
+                float dy      = flatradar_devs[a].y - flatradar_devs[b].y;
                 float dist_sq = dx * dx + dy * dy;
+
                 if (dist_sq < REPEL_DIST * REPEL_DIST && dist_sq > 0.1f) {
                     float dist    = sqrtf(dist_sq);
                     float overlap = REPEL_DIST - dist;
-                    float nx = dx / dist;
-                    float ny = dy / dist;
+                    float nx = dx / dist, ny = dy / dist;
                     float impulse = overlap * REPEL_FORCE * 0.5f;
-                    pulse_devs[a].vx += nx * impulse;
-                    pulse_devs[a].vy += ny * impulse;
-                    pulse_devs[b].vx -= nx * impulse;
-                    pulse_devs[b].vy -= ny * impulse;
+                    flatradar_devs[a].vx += nx * impulse;
+                    flatradar_devs[a].vy += ny * impulse;
+                    flatradar_devs[b].vx -= nx * impulse;
+                    flatradar_devs[b].vy -= ny * impulse;
                 }
             }
         }
     }
 
-    // ── Render device symbols ──
-    for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
-        if (!pulse_devs[pi].occupied) continue;
-        PulseDevice& d = pulse_devs[pi];
+    // ── Render devices — drawn after phosphor+rings so they sit on top ──
+    for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
+        if (!flatradar_devs[pi].occupied) continue;
+        FlatRadarDevice& d = flatradar_devs[pi];
 
-        int px = (int)(d.x + 0.5f);
-        int py = (int)(d.y + 0.5f);
+        int px = CX + (int)(d.x + 0.5f);
+        int py = CY + (int)(d.y + 0.5f);
 
         if (px < VIZ_X + 2 || px > VIZ_X + VIZ_W - 2) continue;
         if (py < VIZ_Y + 2 || py > VIZ_Y + VIZ_H - 2) continue;
 
-        // Pulse wash brightness
-        float dev_dist = sqrtf((d.x - (float)HX) * (d.x - (float)HX) +
-                               (d.y - (float)HY) * (d.y - (float)HY));
-        float dist_to_wave = fabsf(dev_dist - wave_r);
-        float wash_boost = (dist_to_wave < 10.0f)
-                         ? (1.0f - dist_to_wave / 10.0f) * 0.5f : 0.0f;
-
-        float target_bright = 0.55f + wash_boost;
-        if (target_bright > 1.0f) target_bright = 1.0f;
-        d.brightness = anim_filter(d.brightness, target_bright, 120.0f, dt);
-
-        float eff_bright = d.brightness * d.death_alpha;
-        if (eff_bright < 0.05f) continue;
-
         uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
-        uint16_t sym_col  = lerp_col16(BG_COLOR, base_col, eff_bright);
+        const int SZ = 5;
 
-        if (eff_bright > 0.6f) {
-            float glow_a = (eff_bright - 0.6f) * 0.3f;
-            spr.fillCircle(px, py, SYM_R + 3,
-                           lerp_col16(BG_COLOR, base_col, glow_a));
+        // Glow halo — double-layered, scales with sweep_bright only
+        if (d.sweep_bright > 0.1f) {
+            spr.fillCircle(px, py, SZ + 4,
+                           lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.25f));
+            spr.fillCircle(px, py, SZ + 2,
+                           lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.35f));
         }
 
-        bool lit = (wash_boost > 0.2f);
-
+        // Symbol — icon color is ALWAYS full brightness regardless of sweep_bright
         if (d.proto == 0) {
-            // BLE — triangle (apex up)
-            if (lit) {
-                spr.fillTriangle(px,             py - SYM_R + 1,
-                                 px - SYM_R + 1, py + SYM_R - 1,
-                                 px + SYM_R - 1, py + SYM_R - 1,
-                                 lerp_col16(BG_COLOR, base_col, eff_bright * 0.4f));
-            }
-            spr.drawTriangle(px,         py - SYM_R,
-                             px - SYM_R, py + SYM_R,
-                             px + SYM_R, py + SYM_R,
-                             sym_col);
+            // WiFi — filled apex-up triangle, full CAUTION_COLOR
+            spr.fillTriangle(px,      py - SZ,
+                             px - SZ, py + SZ,
+                             px + SZ, py + SZ,
+                             lerp_col16(BG_COLOR, base_col, 0.55f));
+            spr.drawTriangle(px,      py - SZ,
+                             px - SZ, py + SZ,
+                             px + SZ, py + SZ,
+                             base_col);
         } else {
-            // WiFi — diamond
-            if (lit) {
-                spr.fillTriangle(px, py - SYM_R + 1, px + SYM_R - 1, py,
-                                 px, py + SYM_R - 1,
-                                 lerp_col16(BG_COLOR, base_col, eff_bright * 0.4f));
-                spr.fillTriangle(px, py - SYM_R + 1, px - SYM_R + 1, py,
-                                 px, py + SYM_R - 1,
-                                 lerp_col16(BG_COLOR, base_col, eff_bright * 0.4f));
-            }
-            spr.drawLine(px,         py - SYM_R, px + SYM_R, py,         sym_col);
-            spr.drawLine(px + SYM_R, py,         px,         py + SYM_R, sym_col);
-            spr.drawLine(px,         py + SYM_R, px - SYM_R, py,         sym_col);
-            spr.drawLine(px - SYM_R, py,         px,         py - SYM_R, sym_col);
+            // BLE — filled diamond, full HEADER_COLOR
+            spr.fillTriangle(px, py - SZ, px + SZ, py, px, py + SZ,
+                             lerp_col16(BG_COLOR, base_col, 0.55f));
+            spr.fillTriangle(px, py - SZ, px - SZ, py, px, py + SZ,
+                             lerp_col16(BG_COLOR, base_col, 0.55f));
+            spr.drawLine(px,      py - SZ, px + SZ, py,      base_col);
+            spr.drawLine(px + SZ, py,      px,      py + SZ, base_col);
+            spr.drawLine(px,      py + SZ, px - SZ, py,      base_col);
+            spr.drawLine(px - SZ, py,      px,      py - SZ, base_col);
         }
     }
+
+    // ── Center dot ──
+    spr.fillCircle(CX, CY, 2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.45f));
 }
 
 void draw_locator_screen() {
