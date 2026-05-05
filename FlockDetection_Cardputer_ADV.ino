@@ -5207,16 +5207,25 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             sym_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
         }
 
-        // Gradient fill — quadratic falloff top→bottom, clipped to pill
+        // Bar fill — solid base + leading-edge horizontal glow on right 1/3
         if (bar_w > pill_r * 2) {
-            spr.setClipRect(BAR_X, y, bar_w, BAR_H);
-            for (int fy = 0; fy < BAR_H; fy++) {
-                float t = (float)fy / (float)(BAR_H - 1);
-                float fill_alpha = 0.35f + (1.0f - t * t) * 0.50f;
-                spr.drawFastHLine(BAR_X, y + fy, bar_w,
-                                  lerp_col16(BG_COLOR, bar_col, fill_alpha));
+            spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, bar_col);
+
+            int glow_start = bar_w * 2 / 3;
+            int glow_len   = bar_w - glow_start;
+            if (glow_len > 4) {
+                uint16_t bright_col = lerp_col16(bar_col, TEXT_COLOR, 0.15f);
+                spr.setClipRect(BAR_X, y, bar_w, BAR_H);
+                for (int gx = 0; gx < glow_len; gx++) {
+                    float t      = (float)gx / (float)(glow_len - 1);
+                    float glow_t = t * t;
+                    int   draw_x = BAR_X + glow_start + gx;
+                    spr.drawFastVLine(draw_x, y, BAR_H,
+                                      lerp_col16(bar_col, bright_col, glow_t));
+                }
+                spr.clearClipRect();
             }
-            spr.clearClipRect();
+
             spr.drawRoundRect(BAR_X, y, bar_w, BAR_H, pill_r,
                               lerp_col16(bar_col, TEXT_COLOR, 0.30f));
         } else if (bar_w > 0) {
