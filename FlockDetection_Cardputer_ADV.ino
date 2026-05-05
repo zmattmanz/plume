@@ -738,26 +738,36 @@ static SigBarState       sigbar_state[SIGBAR_MAX] = {};
 static unsigned long     sigbar_last_frame = 0;
 static unsigned long     sigbar_sort_last_ms = 0;
 
-// Pulse ring state
-static unsigned long     pulse_last_ping_ms   = 0;
-static float             pulse_rate_smooth    = 1.0f;
-static uint32_t          pulse_prev_pkt_count = 0;
-static unsigned long     pulse_prev_pkt_ms    = 0;
-static unsigned long     pulse_device_refresh_ms = 0;
+// Pulse viz state
+static float         pulse_pps_f          = 0.0f;
+static uint32_t      pulse_prev_pkt       = 0;
+static unsigned long pulse_last_sample_ms = 0;
+static float         pulse_hex_rot        = 0.0f;
 
+// Per-device state — position-based with soft collision
 #define PULSE_MAX_DEVICES 8
 struct PulseDevice {
-    float         angle;
-    float         dist;
+    char          name[20];
+    float         x;
+    float         y;
+    float         target_x;
+    float         target_y;
+    float         vx;
+    float         vy;
+    float         orbit_r;
+    float         orbit_angle;
+    float         orbit_speed;
     uint8_t       proto;
     bool          is_flock;
-    float         alpha;
-    bool          occupied;
-    bool          dying;
+    float         brightness;
     float         death_alpha;
+    bool          dying;
     unsigned long death_start_ms;
+    bool          occupied;
 };
-static PulseDevice pulse_devices[PULSE_MAX_DEVICES] = {};
+static PulseDevice   pulse_devs[PULSE_MAX_DEVICES] = {};
+static unsigned long pulse_dev_refresh_ms = 0;
+static unsigned long pulse_last_anim_ms   = 0;
 
 // Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
 #define WAVEFORM_SAMPLES 134
@@ -5411,112 +5421,99 @@ static void draw_scanner_viz_waveform(unsigned long frame_ms) {
 }
 
 // ── Viz mode 4: PULSE RING ────────────────────────────────────────────────
-// Expanding pulse wave driven by packet rate. Protocol symbols at
-// RSSI-mapped distances; symbols brighten as the pulse washes over them.
+// Hexagon emitter on left, 4 guide rings, expanding pulse wave with
+// trailing rings. Devices orbit and softly repel each other.
 static void draw_scanner_viz_pulse(unsigned long frame_ms) {
 
-    // ── Animation dt ──
-    static unsigned long pulse_last_frame_ms = 0;
-    float anim_dt = (pulse_last_frame_ms == 0) ? 16.0f
-                  : (float)(frame_ms - pulse_last_frame_ms);
-    if (anim_dt > 100.0f) anim_dt = 100.0f;
-    pulse_last_frame_ms = frame_ms;
+    // ── Origin — hexagon sits on the left ──
+    const int HX     = VIZ_X + 10;
+    const int HY     = VIZ_Y + VIZ_H / 2;
+    const int SYM_R  = 6;
+    const int MARGIN = SYM_R + 4;
 
-    // ── Packet rate (sampled every 200ms) ──
-    if (frame_ms - pulse_prev_pkt_ms >= 200 || pulse_prev_pkt_ms == 0) {
-        uint32_t cur   = ambient_packet_count;
-        uint32_t delta = cur - pulse_prev_pkt_count;
-        pulse_prev_pkt_count = cur;
-        float raw_rate = (float)delta * 5.0f;
-        float dt_ms    = (pulse_prev_pkt_ms == 0) ? 200.0f
-                       : (float)(frame_ms - pulse_prev_pkt_ms);
-        pulse_rate_smooth = anim_filter(pulse_rate_smooth, raw_rate, 2000.0f, dt_ms);
-        if (pulse_rate_smooth < 1.0f) pulse_rate_smooth = 1.0f;
-        if (pulse_rate_smooth > 8.0f) pulse_rate_smooth = 8.0f;
-        pulse_prev_pkt_ms = frame_ms;
+    // ── Animation dt ──
+    float dt = (pulse_last_anim_ms == 0) ? 16.0f
+             : (float)(frame_ms - pulse_last_anim_ms);
+    if (dt > 100.0f) dt = 100.0f;
+    pulse_last_anim_ms = frame_ms;
+
+    // ── Sample packet rate every 200ms ──
+    if (frame_ms - pulse_last_sample_ms >= 200 || pulse_last_sample_ms == 0) {
+        uint32_t cur = ambient_packet_count;
+        uint32_t delta = cur - pulse_prev_pkt;
+        pulse_prev_pkt = cur;
+        float pps = (float)delta * 5.0f;
+        float sample_dt = (pulse_last_sample_ms == 0) ? 200.0f
+                        : (float)(frame_ms - pulse_last_sample_ms);
+        pulse_pps_f = anim_filter(pulse_pps_f, pps, 800.0f, sample_dt);
+        pulse_last_sample_ms = frame_ms;
     }
 
-    // ── B5: Sinusoidal pulse — 0.25-0.6 Hz ──
-    float pps_norm   = (pulse_rate_smooth - 1.0f) / 7.0f;
-    float pulse_freq = 0.25f + pps_norm * 0.35f;
+    // ── Pulse parameters ──
+    float pps_norm = pulse_pps_f / 150.0f;
+    if (pps_norm > 1.5f) pps_norm = 1.5f;
 
-    static float pulse_phase = 0.0f;
-    pulse_phase += anim_dt * 0.001f * pulse_freq * 2.0f * (float)M_PI;
-    if (pulse_phase > 2.0f * (float)M_PI) pulse_phase -= 2.0f * (float)M_PI;
+    float pulse_freq = 0.25f + pps_norm * 0.25f;
+    float pulse_phase = (float)frame_ms * 0.001f * pulse_freq * 2.0f * (float)M_PI;
 
-    // B5: ease-out quadratic wave_t
-    float raw_t          = (sinf(pulse_phase) + 1.0f) * 0.5f;
-    float wave_t         = 1.0f - (1.0f - raw_t) * (1.0f - raw_t);
-    float flash_intensity = wave_t;
+    float raw_t  = (sinf(pulse_phase) + 1.0f) * 0.5f;
+    float wave_t = 1.0f - (1.0f - raw_t) * (1.0f - raw_t);
+    float wave_r = 10.0f + wave_t * (float)(VIZ_W + 20);
 
-    // ── B1: Layout — perfect circles, origin at left side ──
-    const int CX         = VIZ_X + 18;
-    const int CY         = VIZ_Y + VIZ_H / 2;
-    const int max_radius = VIZ_W - (CX - VIZ_X) - 4;
+    float flash_intensity = (1.0f - raw_t) * (1.0f - raw_t);
 
-    float wave_r = wave_t * (float)max_radius;
-
-    // ── 10 concentric rings, quadratic spacing, pulse-brightened — B1: drawCircle ──
+    // ── 4 guide rings — clean, evenly spaced ──
     {
-        const int NUM_RINGS = 10;
-        for (int i = 1; i <= NUM_RINGS; i++) {
-            float t      = (float)i / (float)(NUM_RINGS + 1);
-            float curved = t * t;
-            int ring_r   = 8 + (int)(curved * 60.0f);
-            int ring_cx  = CX + (int)(curved * 10.0f);
-
-            float ring_alpha = 0.25f + (1.0f - curved) * 0.15f;
-            float ring_dist  = fabsf((float)ring_r - wave_r);
-            if (ring_dist < 12.0f) {
-                ring_alpha += (1.0f - ring_dist / 12.0f) * 0.25f;
+        int ring_radii[4] = {30, 55, 85, 115};
+        for (int ri = 0; ri < 4; ri++) {
+            int rr = ring_radii[ri];
+            float ring_alpha = 0.18f;
+            float ring_dist = fabsf((float)rr - wave_r);
+            if (ring_dist < 8.0f) {
+                ring_alpha += (1.0f - ring_dist / 8.0f) * 0.15f;
             }
-
-            uint16_t ring_col = lerp_col16(BG_COLOR, CARD_BORDER, ring_alpha);
-            spr.drawCircle(ring_cx, CY, ring_r, ring_col);
-            if (i <= 3) {
-                spr.drawCircle(ring_cx, CY + 1, ring_r, ring_col);
-            }
+            spr.drawCircle(HX, HY, rr,
+                           lerp_col16(BG_COLOR, CARD_BORDER, ring_alpha));
         }
     }
 
-    // ── B5: 6 trailing wave rings at 4px spacing, 15% fade per trail ──
+    // ── Expanding pulse wave with trailing rings ──
     {
-        const int   NUM_TRAILS    = 6;
-        const float TRAIL_SPACING = 4.0f;
+        const int   NUM_TRAILS    = 5;
+        const float TRAIL_SPACING = 5.0f;
         for (int ti = 0; ti < NUM_TRAILS; ti++) {
             float trail_r = wave_r - (float)ti * TRAIL_SPACING;
-            if (trail_r < 5.0f) continue;
+            if (trail_r < 5.0f || trail_r > (float)(VIZ_W + 10)) continue;
             int wr = (int)(trail_r + 0.5f);
-            if (wr > VIZ_W) continue;
-            float trail_fade = (1.0f - wave_t) * (1.0f - (float)ti * 0.15f);
+            float trail_fade = (1.0f - wave_t) * (1.0f - (float)ti * 0.18f);
             if (trail_fade < 0.02f) continue;
-            spr.drawCircle(CX, CY, wr,
-                           lerp_col16(BG_COLOR, HEADER_COLOR, trail_fade * 0.30f));
+            float alpha = trail_fade * (ti == 0 ? 0.40f : 0.25f);
+            spr.drawCircle(HX, HY, wr,
+                           lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
         }
     }
 
-    // ── Rotating 3D wireframe hexagon ──
+    // ── Rotating 3D hexagon at the origin ──
     {
-        static float hex_rot = 0.0f;
-        hex_rot += anim_dt * 0.001f;
-        if (hex_rot > 2.0f * (float)M_PI) hex_rot -= 2.0f * (float)M_PI;
+        pulse_hex_rot += dt * 0.001f;
+        if (pulse_hex_rot > 2.0f * (float)M_PI)
+            pulse_hex_rot -= 2.0f * (float)M_PI;
 
-        const float HEX_R      = 6.0f;
-        const float TILT       = 0.35f;
-        const float DEPTH      = 3.0f;
-        const float back_scale = 0.75f;
+        const float HEX_R = 7.0f;
+        const float TILT  = 0.35f;
+        const float DEPTH = 3.0f;
 
-        float hex_bright = 0.4f + flash_intensity * 0.6f;
+        float hex_bright = 0.45f + flash_intensity * 0.55f;
         uint16_t hex_col = lerp_col16(BG_COLOR, HEADER_COLOR, hex_bright);
-        uint16_t hex_dim = lerp_col16(BG_COLOR, HEADER_COLOR, hex_bright * 0.4f);
+        uint16_t hex_dim = lerp_col16(BG_COLOR, HEADER_COLOR, hex_bright * 0.35f);
 
         int fx[6], fy[6], bx[6], by[6];
         for (int v = 0; v < 6; v++) {
-            float a = hex_rot + (float)v * (2.0f * (float)M_PI / 6.0f);
-            fx[v] = CX + (int)(HEX_R * cosf(a));
-            fy[v] = CY + (int)(HEX_R * sinf(a) * TILT);
-            bx[v] = CX + (int)(HEX_R * back_scale * cosf(a)) + (int)(DEPTH * 0.5f);
-            by[v] = CY + (int)(HEX_R * back_scale * sinf(a) * TILT) + (int)(DEPTH * 0.7f);
+            float a = pulse_hex_rot + (float)v * (2.0f * (float)M_PI / 6.0f);
+            fx[v] = HX + (int)(HEX_R * cosf(a));
+            fy[v] = HY + (int)(HEX_R * sinf(a) * TILT);
+            bx[v] = HX + (int)(HEX_R * 0.7f * cosf(a) + DEPTH * 0.4f);
+            by[v] = HY + (int)(HEX_R * 0.7f * sinf(a) * TILT + DEPTH * 0.6f);
         }
         for (int v = 0; v < 6; v++) {
             int nv = (v + 1) % 6;
@@ -5529,140 +5526,227 @@ static void draw_scanner_viz_pulse(unsigned long frame_ms) {
             int nv = (v + 1) % 6;
             spr.drawLine(fx[v], fy[v], fx[nv], fy[nv], hex_col);
         }
-        spr.fillCircle(CX, CY, 1, lerp_col16(BG_COLOR, HEADER_COLOR, hex_bright));
+        if (flash_intensity > 0.3f) {
+            spr.fillCircle(HX, HY, 2,
+                           lerp_col16(BG_COLOR, HEADER_COLOR, flash_intensity * 0.6f));
+        }
     }
 
-    // ── B4: Refresh device symbols every 500ms ──
-    if (frame_ms - pulse_device_refresh_ms >= 500 || pulse_device_refresh_ms == 0) {
-        bool matched[PULSE_MAX_DEVICES] = {};
+    // ── Refresh device list every 500ms ──
+    if (frame_ms - pulse_dev_refresh_ms >= 500 || pulse_dev_refresh_ms == 0) {
+        bool matched[PULSE_MAX_DEVICES] = {false};
 
         for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
             int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
             FeedEntry& e = scan_local_feed[idx];
             if (e.mac[0] == '\0') continue;
-            if ((frame_ms - e.timestamp) > 30000UL) continue;
+            if ((frame_ms - e.timestamp) > 60000UL) continue;
 
-            float rssi_norm = (float)(e.rssi - (-90)) / (float)((-30) - (-90));
-            if (rssi_norm < 0.0f) rssi_norm = 0.0f;
-            if (rssi_norm > 1.0f) rssi_norm = 1.0f;
-            float target_dist = 1.0f - rssi_norm;
+            // Dedup by name
+            bool dup = false;
+            for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
+                if (pulse_devs[pi].occupied && !pulse_devs[pi].dying &&
+                    matched[pi] &&
+                    strncmp(pulse_devs[pi].name, e.name, 19) == 0) {
+                    dup = true; break;
+                }
+            }
+            if (dup) continue;
 
-            uint32_t mh = 0;
-            for (const char* p = e.mac; *p; p++) mh = mh * 31 + (uint8_t)*p;
-            float angle = ((float)(mh % 1000) / 1000.0f - 0.5f) * 2.2f;
-
+            // Match existing slot by name
             int slot = -1;
-            for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
-                if (pulse_devices[si].occupied && !pulse_devices[si].dying &&
-                    fabsf(pulse_devices[si].angle - angle) < 0.3f) {
-                    slot = si; break;
+            for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
+                if (pulse_devs[pi].occupied && !pulse_devs[pi].dying &&
+                    strncmp(pulse_devs[pi].name, e.name, 19) == 0) {
+                    slot = pi; matched[pi] = true; break;
                 }
             }
-            if (slot < 0) {
-                for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
-                    if (!pulse_devices[si].occupied || pulse_devices[si].dying) {
-                        slot = si; break;
-                    }
+
+            float rssi_norm = rssi_pct_for(e.rssi);
+
+            if (slot >= 0) {
+                float target_r = 20.0f + (1.0f - rssi_norm) * 40.0f;
+                pulse_devs[slot].orbit_r = anim_filter(
+                    pulse_devs[slot].orbit_r, target_r, 500.0f, 500.0f);
+                pulse_devs[slot].proto    = e.proto;
+                pulse_devs[slot].is_flock = e.is_flock;
+            } else {
+                // Find free slot
+                for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
+                    if (!pulse_devs[pi].occupied) { slot = pi; break; }
                 }
-            }
-            if (slot < 0) continue;
+                if (slot < 0) continue;
 
-            pulse_devices[slot].angle          = angle;
-            pulse_devices[slot].dist           = anim_filter(
-                pulse_devices[slot].dist, target_dist, 500.0f, 500.0f);
-            pulse_devices[slot].proto          = e.proto;
-            pulse_devices[slot].is_flock       = e.is_flock;
-            pulse_devices[slot].alpha          = 0.6f;
-            pulse_devices[slot].occupied       = true;
-            pulse_devices[slot].dying          = false;
-            matched[slot]                      = true;
+                float target_r = 20.0f + (1.0f - rssi_norm) * 40.0f;
+
+                uint32_t nh = 0;
+                for (const char* p = e.name; *p; p++) nh = nh * 31 + (uint8_t)*p;
+                float start_angle = (float)(nh % 628) / 100.0f;
+
+                pulse_devs[slot].occupied    = true;
+                pulse_devs[slot].dying       = false;
+                pulse_devs[slot].death_alpha = 1.0f;
+                strncpy(pulse_devs[slot].name, e.name, 19);
+                pulse_devs[slot].name[19]    = '\0';
+                pulse_devs[slot].proto       = e.proto;
+                pulse_devs[slot].is_flock    = e.is_flock;
+                pulse_devs[slot].brightness  = 0.55f;
+                pulse_devs[slot].orbit_r     = target_r;
+                pulse_devs[slot].orbit_angle = start_angle;
+                pulse_devs[slot].orbit_speed = 0.2f + rssi_norm * 0.5f;
+                pulse_devs[slot].vx          = 0.0f;
+                pulse_devs[slot].vy          = 0.0f;
+                pulse_devs[slot].x  = (float)HX + target_r * cosf(start_angle);
+                pulse_devs[slot].y  = (float)HY + target_r * sinf(start_angle);
+                pulse_devs[slot].target_x = pulse_devs[slot].x;
+                pulse_devs[slot].target_y = pulse_devs[slot].y;
+                matched[slot] = true;
+            }
         }
 
-        // Unmatched live slots trigger death animation
-        for (int si = 0; si < PULSE_MAX_DEVICES; si++) {
-            if (!pulse_devices[si].occupied || pulse_devices[si].dying) continue;
-            if (!matched[si]) {
-                pulse_devices[si].dying          = true;
-                pulse_devices[si].death_alpha    = pulse_devices[si].alpha;
-                pulse_devices[si].death_start_ms = frame_ms;
+        // Start death animation on unmatched live slots
+        for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
+            if (pulse_devs[pi].occupied && !matched[pi] && !pulse_devs[pi].dying) {
+                pulse_devs[pi].dying          = true;
+                pulse_devs[pi].death_start_ms = frame_ms;
             }
         }
 
-        pulse_device_refresh_ms = frame_ms;
+        pulse_dev_refresh_ms = frame_ms;
     }
 
-    // ── B2: Render device symbols — SYM_R=6, MARGIN=14 ──
-    const int SYM_R  = 6;
-    const int MARGIN = SYM_R + 8;
+    // ── Update device positions ──
+    for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
+        if (!pulse_devs[pi].occupied) continue;
+        PulseDevice& d = pulse_devs[pi];
 
-    for (int i = 0; i < PULSE_MAX_DEVICES; i++) {
-        if (!pulse_devices[i].occupied) continue;
-        PulseDevice& d = pulse_devices[i];
-
-        // B4: Death animation
-        float draw_alpha;
         if (d.dying) {
-            float death_t = (float)(frame_ms - d.death_start_ms) / 500.0f;
+            float death_t = (float)(frame_ms - d.death_start_ms) / 600.0f;
             if (death_t >= 1.0f) { d.occupied = false; continue; }
-            draw_alpha = d.death_alpha * (1.0f - ui_ease(death_t));
-            d.dist += anim_dt * 0.0003f;
-        } else {
-            draw_alpha = d.alpha;
+            d.death_alpha = 1.0f - ui_ease(death_t);
+            d.orbit_r += dt * 0.02f;
         }
-        if (draw_alpha < 0.05f) continue;
 
-        // B1: No ASPECT — perfect circles, y uses sinf directly
-        int dev_r = 6 + (int)(d.dist * (float)(max_radius - 8));
-        int px    = CX + (int)((float)dev_r * cosf(d.angle));
-        int py    = CY + (int)((float)dev_r * sinf(d.angle));
+        d.orbit_angle += d.orbit_speed * dt / 1000.0f;
+        if (d.orbit_angle > 2.0f * (float)M_PI)
+            d.orbit_angle -= 2.0f * (float)M_PI;
 
-        // B3: Two-sine drift with per-device phase
-        float fp      = fabsf(sinf(d.angle * 7.3f)) * 6.28f;
-        float drift_x = sinf((float)frame_ms * 0.0008f + fp)        * 3.0f
-                      + sinf((float)frame_ms * 0.0013f + fp * 1.7f) * 2.0f;
-        float drift_y = sinf((float)frame_ms * 0.0011f + fp * 0.6f) * 2.5f
-                      + cosf((float)frame_ms * 0.0007f + fp * 2.1f) * 1.5f;
-        px += (int)drift_x;
-        py += (int)drift_y;
+        d.target_x = (float)HX + d.orbit_r * cosf(d.orbit_angle);
+        d.target_y = (float)HY + d.orbit_r * sinf(d.orbit_angle);
 
-        if (px < VIZ_X + MARGIN || px > VIZ_X + VIZ_W - MARGIN) continue;
-        if (py < VIZ_Y + MARGIN || py > VIZ_Y + VIZ_H - MARGIN) continue;
+        // Gentle float drift — two sine waves per axis, per-device phase
+        uint32_t fh = 0;
+        for (const char* p = d.name; *p; p++) fh = fh * 31 + (uint8_t)*p;
+        float fp = (float)(fh % 1000) / 1000.0f * 6.28f;
+        d.target_x += sinf((float)frame_ms * 0.0006f + fp)        * 4.0f
+                    + sinf((float)frame_ms * 0.001f  + fp * 1.7f) * 2.5f;
+        d.target_y += sinf((float)frame_ms * 0.0008f + fp * 0.6f) * 3.0f
+                    + cosf((float)frame_ms * 0.0005f + fp * 2.1f) * 2.0f;
 
-        float dist_to_pulse = fabsf((float)dev_r - wave_r);
-        float pulse_boost   = (!d.dying && dist_to_pulse < 10.0f)
-                            ? (1.0f - dist_to_pulse / 10.0f) * 0.4f : 0.0f;
+        d.x = anim_filter(d.x, d.target_x + d.vx, 200.0f, dt);
+        d.y = anim_filter(d.y, d.target_y + d.vy, 200.0f, dt);
 
-        float total_alpha = draw_alpha + pulse_boost;
-        if (total_alpha > 1.0f) total_alpha = 1.0f;
+        d.vx *= 0.95f;
+        d.vy *= 0.95f;
+
+        float min_x = (float)(VIZ_X + MARGIN);
+        float max_x = (float)(VIZ_X + VIZ_W - MARGIN);
+        float min_y = (float)(VIZ_Y + MARGIN);
+        float max_y = (float)(VIZ_Y + VIZ_H - MARGIN);
+        if (d.x < min_x) { d.x = min_x; d.vx =  fabsf(d.vx); }
+        if (d.x > max_x) { d.x = max_x; d.vx = -fabsf(d.vx); }
+        if (d.y < min_y) { d.y = min_y; d.vy =  fabsf(d.vy); }
+        if (d.y > max_y) { d.y = max_y; d.vy = -fabsf(d.vy); }
+    }
+
+    // ── Soft collision — devices repel each other ──
+    {
+        const float REPEL_DIST  = 16.0f;
+        const float REPEL_FORCE = 0.8f;
+        for (int a = 0; a < PULSE_MAX_DEVICES; a++) {
+            if (!pulse_devs[a].occupied) continue;
+            for (int b = a + 1; b < PULSE_MAX_DEVICES; b++) {
+                if (!pulse_devs[b].occupied) continue;
+                float dx = pulse_devs[a].x - pulse_devs[b].x;
+                float dy = pulse_devs[a].y - pulse_devs[b].y;
+                float dist_sq = dx * dx + dy * dy;
+                if (dist_sq < REPEL_DIST * REPEL_DIST && dist_sq > 0.1f) {
+                    float dist    = sqrtf(dist_sq);
+                    float overlap = REPEL_DIST - dist;
+                    float nx = dx / dist;
+                    float ny = dy / dist;
+                    float impulse = overlap * REPEL_FORCE * 0.5f;
+                    pulse_devs[a].vx += nx * impulse;
+                    pulse_devs[a].vy += ny * impulse;
+                    pulse_devs[b].vx -= nx * impulse;
+                    pulse_devs[b].vy -= ny * impulse;
+                }
+            }
+        }
+    }
+
+    // ── Render device symbols ──
+    for (int pi = 0; pi < PULSE_MAX_DEVICES; pi++) {
+        if (!pulse_devs[pi].occupied) continue;
+        PulseDevice& d = pulse_devs[pi];
+
+        int px = (int)(d.x + 0.5f);
+        int py = (int)(d.y + 0.5f);
+
+        if (px < VIZ_X + 2 || px > VIZ_X + VIZ_W - 2) continue;
+        if (py < VIZ_Y + 2 || py > VIZ_Y + VIZ_H - 2) continue;
+
+        // Pulse wash brightness
+        float dev_dist = sqrtf((d.x - (float)HX) * (d.x - (float)HX) +
+                               (d.y - (float)HY) * (d.y - (float)HY));
+        float dist_to_wave = fabsf(dev_dist - wave_r);
+        float wash_boost = (dist_to_wave < 10.0f)
+                         ? (1.0f - dist_to_wave / 10.0f) * 0.5f : 0.0f;
+
+        float target_bright = 0.55f + wash_boost;
+        if (target_bright > 1.0f) target_bright = 1.0f;
+        d.brightness = anim_filter(d.brightness, target_bright, 120.0f, dt);
+
+        float eff_bright = d.brightness * d.death_alpha;
+        if (eff_bright < 0.05f) continue;
 
         uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
-        uint16_t sym_col  = lerp_col16(BG_COLOR, base_col, total_alpha);
+        uint16_t sym_col  = lerp_col16(BG_COLOR, base_col, eff_bright);
 
-        if (pulse_boost > 0.1f) {
-            spr.fillCircle(px, py, SYM_R + 2,
-                           lerp_col16(BG_COLOR, base_col, pulse_boost * 0.3f));
+        if (eff_bright > 0.6f) {
+            float glow_a = (eff_bright - 0.6f) * 0.3f;
+            spr.fillCircle(px, py, SYM_R + 3,
+                           lerp_col16(BG_COLOR, base_col, glow_a));
         }
 
-        // B2: apex-up triangle for BLE; diamond for WiFi
+        bool lit = (wash_boost > 0.2f);
+
         if (d.proto == 0) {
-            if (pulse_boost > 0.15f) {
-                spr.fillTriangle(px,         py - SYM_R,
-                                 px - SYM_R, py + SYM_R - 1,
-                                 px + SYM_R, py + SYM_R - 1,
-                                 lerp_col16(BG_COLOR, base_col, pulse_boost * 0.25f));
+            // BLE — triangle (apex up)
+            if (lit) {
+                spr.fillTriangle(px,             py - SYM_R + 1,
+                                 px - SYM_R + 1, py + SYM_R - 1,
+                                 px + SYM_R - 1, py + SYM_R - 1,
+                                 lerp_col16(BG_COLOR, base_col, eff_bright * 0.4f));
             }
             spr.drawTriangle(px,         py - SYM_R,
-                             px - SYM_R, py + SYM_R - 1,
-                             px + SYM_R, py + SYM_R - 1,
+                             px - SYM_R, py + SYM_R,
+                             px + SYM_R, py + SYM_R,
                              sym_col);
         } else {
+            // WiFi — diamond
+            if (lit) {
+                spr.fillTriangle(px, py - SYM_R + 1, px + SYM_R - 1, py,
+                                 px, py + SYM_R - 1,
+                                 lerp_col16(BG_COLOR, base_col, eff_bright * 0.4f));
+                spr.fillTriangle(px, py - SYM_R + 1, px - SYM_R + 1, py,
+                                 px, py + SYM_R - 1,
+                                 lerp_col16(BG_COLOR, base_col, eff_bright * 0.4f));
+            }
             spr.drawLine(px,         py - SYM_R, px + SYM_R, py,         sym_col);
             spr.drawLine(px + SYM_R, py,         px,         py + SYM_R, sym_col);
             spr.drawLine(px,         py + SYM_R, px - SYM_R, py,         sym_col);
             spr.drawLine(px - SYM_R, py,         px,         py - SYM_R, sym_col);
-            if (pulse_boost > 0.15f) {
-                spr.drawPixel(px, py, lerp_col16(BG_COLOR, base_col, total_alpha * 0.4f));
-            }
         }
     }
 }
