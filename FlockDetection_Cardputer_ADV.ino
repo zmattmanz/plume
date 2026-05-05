@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // FLOCK DETECTOR v9.0-ADV — Tactical Edition (Build 2)
 // ============================================================================
 
@@ -731,12 +731,12 @@ struct SigBarState {
     char  name[20];
     float y_f;
     float width_f;
-    float peak_w;
     bool  occupied;
 };
 static SigBarState       sigbar_state[SIGBAR_MAX] = {};
 static unsigned long     sigbar_last_frame = 0;
 static unsigned long     sigbar_sort_last_ms = 0;
+static bool              sigbar_first_run    = true;
 
 // Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
 #define WAVEFORM_SAMPLES 134
@@ -4995,15 +4995,24 @@ static inline float rssi_pct_for(int rssi) {
 // Sort throttled to 800ms; bars animate smoothly with live edge jitter.
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
 
-    const int MAX_BARS  = 4;
-    const int BAR_H     = 11;
-    const int BAR_GAP   = 2;
-    const int NAME_W    = 58;
-    const int BAR_X     = VIZ_X + NAME_W;
-    const int BAR_MAX_W = VIZ_W - NAME_W - 4;
-    const int START_Y   = VIZ_Y + 2;
+    // ── Layout constants ──
+    const int MAX_BARS    = 4;
+    const int BAR_H       = 10;
+    const int BAR_GAP     = 2;
+    const int NAME_W      = 42;
+    const int BAR_X       = VIZ_X + NAME_W;
+    const int BAR_MAX_W   = VIZ_W - NAME_W - 4;
+    const int START_Y     = VIZ_Y + 1;
+    const int SCALE_Y     = START_Y + MAX_BARS * (BAR_H + BAR_GAP) + 1;
+    const int pill_r      = BAR_H / 2;
 
-    // ── Build visible device list (deduped, 60s timeout) ──
+    // ── Animation dt ──
+    float sdt = (sigbar_last_frame == 0) ? 16.0f
+              : (float)(frame_ms - sigbar_last_frame);
+    if (sdt > 100.0f) sdt = 100.0f;
+    sigbar_last_frame = frame_ms;
+
+    // ── Build visible device list from feed ──
     struct VisibleDevice {
         int   feed_idx;
         char  name[20];
@@ -5031,20 +5040,12 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         visible_count++;
     }
 
-    // ── Animation dt ──
-    float sdt = (sigbar_last_frame == 0) ? 16.0f
-              : (float)(frame_ms - sigbar_last_frame);
-    if (sdt > 100.0f) sdt = 100.0f;
-    sigbar_last_frame = frame_ms;
-
-    // First frame: force structural update so panel populates immediately
-    static bool sigbar_first_run = true;
+    // ── Structural update (every 5s, or first frame) ──
     if (sigbar_first_run) {
         sigbar_sort_last_ms = 0;
         sigbar_first_run = false;
     }
 
-    // ── Structural update (every 5s): remove ALL dead slots, fill ALL empty slots ──
     if (frame_ms - sigbar_sort_last_ms >= 5000 || sigbar_sort_last_ms == 0) {
         sigbar_sort_last_ms = frame_ms;
 
@@ -5060,16 +5061,16 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             if (!still_here) sigbar_state[si].occupied = false;
         }
 
-        // Fill all empty slots with new devices
+        // Fill ALL empty slots with new devices
         for (int vi = 0; vi < visible_count; vi++) {
-            bool already_slotted = false;
+            bool already = false;
             for (int si = 0; si < SIGBAR_MAX; si++) {
                 if (sigbar_state[si].occupied &&
                     strncmp(sigbar_state[si].name, visible[vi].name, 19) == 0) {
-                    already_slotted = true; break;
+                    already = true; break;
                 }
             }
-            if (already_slotted) continue;
+            if (already) continue;
 
             int free_slot = -1;
             for (int si = 0; si < SIGBAR_MAX; si++) {
@@ -5081,17 +5082,73 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             strncpy(sigbar_state[free_slot].name, visible[vi].name, 19);
             sigbar_state[free_slot].name[19] = '\0';
             sigbar_state[free_slot].width_f = 0.0f;
-            sigbar_state[free_slot].peak_w  = 0.0f;
-            sigbar_state[free_slot].y_f     = (float)(VIZ_Y - BAR_H - 4);
+            sigbar_state[free_slot].y_f = (float)(VIZ_Y - BAR_H - 4);
         }
     }
 
-    // ── Compact slots — pack occupied slots top-to-bottom, update widths ──
+    // ── dBm scale along the bottom ──
+    spr.drawFastHLine(BAR_X, SCALE_Y, BAR_MAX_W,
+                      lerp_col16(BG_COLOR, CARD_BORDER, 0.35f));
+
+    struct ScaleTick { float pct; const char* label; };
+    const ScaleTick ticks[4] = {
+        {0.0f,  "-90"},
+        {0.33f, "-70"},
+        {0.67f, "-50"},
+        {1.0f,  "-30"},
+    };
+    for (int t = 0; t < 4; t++) {
+        int tx = BAR_X + (int)(ticks[t].pct * (float)BAR_MAX_W);
+
+        spr.drawFastVLine(tx, START_Y, SCALE_Y - START_Y,
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.15f));
+        spr.drawFastVLine(tx, SCALE_Y, 3,
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.40f));
+
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        int label_w = (int)strlen(ticks[t].label) * 6;
+        spr.setCursor(tx - label_w / 2, SCALE_Y + 4);
+        spr.print(ticks[t].label);
+    }
+
+    // ── Empty state ──
     int occupied_count = 0;
+    for (int si = 0; si < SIGBAR_MAX; si++) {
+        if (sigbar_state[si].occupied) occupied_count++;
+    }
+
+    if (occupied_count == 0 && visible_count == 0) {
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(VIZ_X + VIZ_W / 2 - 20, VIZ_Y + VIZ_H / 2 - 8);
+        spr.print("listening");
+        return;
+    }
+
+    // ── Draw ALL 4 tracks (always visible, even if empty) ──
+    for (int row = 0; row < MAX_BARS; row++) {
+        int y = START_Y + row * (BAR_H + BAR_GAP);
+
+        spr.fillRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.25f));
+        spr.drawRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
+                          lerp_col16(BG_COLOR, CARD_BORDER, 0.40f));
+
+        spr.setClipRect(BAR_X, y, BAR_MAX_W, BAR_H);
+        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.15f);
+        for (int d = -BAR_H; d < BAR_MAX_W + BAR_H; d += 5) {
+            spr.drawLine(BAR_X + d, y, BAR_X + d + BAR_H, y + BAR_H, hatch_col);
+        }
+        spr.clearClipRect();
+    }
+
+    // ── Compact slots + ease positions + update widths ──
+    int slot_order = 0;
     for (int si = 0; si < SIGBAR_MAX; si++) {
         if (!sigbar_state[si].occupied) continue;
 
-        int target_y = START_Y + occupied_count * (BAR_H + BAR_GAP);
+        int target_y = START_Y + slot_order * (BAR_H + BAR_GAP);
         sigbar_state[si].y_f = anim_filter(
             sigbar_state[si].y_f, (float)target_y, 200.0f, sdt);
 
@@ -5100,39 +5157,11 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
                 float target_w = visible[vi].rssi_pct * (float)BAR_MAX_W;
                 sigbar_state[si].width_f = anim_filter(
                     sigbar_state[si].width_f, target_w, 500.0f, sdt);
-                if (sigbar_state[si].width_f > sigbar_state[si].peak_w) {
-                    sigbar_state[si].peak_w = sigbar_state[si].width_f;
-                }
-                sigbar_state[si].peak_w = anim_filter(
-                    sigbar_state[si].peak_w, sigbar_state[si].width_f, 3000.0f, sdt);
                 break;
             }
         }
 
-        occupied_count++;
-    }
-
-    if (occupied_count == 0) {
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(VIZ_X + VIZ_W / 2 - 20, VIZ_Y + VIZ_H / 2 - 4);
-        spr.print("listening");
-        return;
-    }
-
-    // ── Scale reference marks — dense background grid ──
-    {
-        uint16_t scale_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.20f);
-        const int NUM_MARKS = 7;
-        int scale_top = START_Y;
-        int scale_bot = START_Y + MAX_BARS * (BAR_H + BAR_GAP);
-        if (scale_bot > VIZ_Y + VIZ_H) scale_bot = VIZ_Y + VIZ_H;
-        int scale_h = scale_bot - scale_top;
-        for (int m = 0; m <= NUM_MARKS; m++) {
-            float t = (float)m / (float)NUM_MARKS;
-            int sx = BAR_X + (int)(t * (float)BAR_MAX_W);
-            spr.drawFastVLine(sx, scale_top, scale_h, scale_col);
-        }
+        slot_order++;
     }
 
     // ── Render each occupied slot ──
@@ -5152,23 +5181,21 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         int y     = (int)(sigbar_state[si].y_f + 0.5f);
         int bar_w = (int)(sigbar_state[si].width_f + 0.5f);
 
-        // Per-device phase for live edge and tip glow
-        uint32_t name_hash = 0;
-        for (const char* p = e.name; *p; p++) name_hash = name_hash * 31 + (uint8_t)*p;
-        float dev_phase = (float)(name_hash % 1000) / 1000.0f * 6.28f;
-
-        // Live edge — two overlapping sines
+        // Live edge jitter
         {
-            float wave1 = sinf((float)frame_ms * 0.003f  + dev_phase) * 2.0f;
-            float wave2 = sinf((float)frame_ms * 0.0017f + dev_phase * 1.7f) * 1.5f;
+            uint32_t name_hash = 0;
+            for (const char* p = e.name; *p; p++)
+                name_hash = name_hash * 31 + (uint8_t)*p;
+            float phase = (float)(name_hash % 1000) / 1000.0f * 6.28f;
+            float wave1 = sinf((float)frame_ms * 0.003f  + phase) * 2.0f;
+            float wave2 = sinf((float)frame_ms * 0.0017f + phase * 1.7f) * 1.5f;
             bar_w += (int)(wave1 + wave2);
         }
         if (bar_w < 3)         bar_w = 3;
         if (bar_w > BAR_MAX_W) bar_w = BAR_MAX_W;
 
-        // Colors — bar encodes protocol, name always white
+        // Bar colors
         uint16_t bar_col, sym_col;
-        uint16_t name_col = TEXT_COLOR;
         if (e.is_flock) {
             bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
             sym_col = CAUTION_COLOR;
@@ -5180,32 +5207,22 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             sym_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
         }
 
-        // Pill track background
-        int pill_r = BAR_H / 2;
-        spr.fillRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.18f));
-
-        // Track hatching — diagonal stripes, bar fill paints over the left portion
-        {
-            uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.20f);
-            spr.setClipRect(BAR_X, y, BAR_MAX_W, BAR_H);
-            for (int d = -BAR_H; d < BAR_MAX_W + BAR_H; d += 6) {
-                int x0 = BAR_X + d;
-                int x1 = x0 + BAR_H;
-                spr.drawLine(x0, y, x1, y + BAR_H, hatch_col);
+        // Gradient fill — quadratic falloff top→bottom, clipped to pill
+        if (bar_w > pill_r * 2) {
+            spr.setClipRect(BAR_X, y, bar_w, BAR_H);
+            for (int fy = 0; fy < BAR_H; fy++) {
+                float t = (float)fy / (float)(BAR_H - 1);
+                float fill_alpha = 0.35f + (1.0f - t * t) * 0.50f;
+                spr.drawFastHLine(BAR_X, y + fy, bar_w,
+                                  lerp_col16(BG_COLOR, bar_col, fill_alpha));
             }
             spr.clearClipRect();
-        }
-
-        // Bar: solid fill + 1px outlined pill
-        if (bar_w > pill_r * 2) {
-            spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, bar_col);
             spr.drawRoundRect(BAR_X, y, bar_w, BAR_H, pill_r,
-                              lerp_col16(bar_col, TEXT_COLOR, 0.25f));
+                              lerp_col16(bar_col, TEXT_COLOR, 0.30f));
         } else if (bar_w > 0) {
             spr.fillCircle(BAR_X + pill_r, y + pill_r, pill_r, bar_col);
             spr.drawCircle(BAR_X + pill_r, y + pill_r, pill_r,
-                           lerp_col16(bar_col, TEXT_COLOR, 0.25f));
+                           lerp_col16(bar_col, TEXT_COLOR, 0.30f));
         }
 
         // Protocol symbol
@@ -5218,27 +5235,30 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
                              sym_col);
         } else {
             int dhr = 3;
-            spr.drawLine(sym_x + 3,       sym_cy - dhr, sym_x + 3 + dhr, sym_cy,       sym_col);
-            spr.drawLine(sym_x + 3 + dhr, sym_cy,       sym_x + 3,       sym_cy + dhr, sym_col);
-            spr.drawLine(sym_x + 3,       sym_cy + dhr, sym_x + 3 - dhr, sym_cy,       sym_col);
-            spr.drawLine(sym_x + 3 - dhr, sym_cy,       sym_x + 3,       sym_cy - dhr, sym_col);
+            spr.drawLine(sym_x + 3,       sym_cy - dhr,
+                         sym_x + 3 + dhr, sym_cy,       sym_col);
+            spr.drawLine(sym_x + 3 + dhr, sym_cy,
+                         sym_x + 3,       sym_cy + dhr, sym_col);
+            spr.drawLine(sym_x + 3,       sym_cy + dhr,
+                         sym_x + 3 - dhr, sym_cy,       sym_col);
+            spr.drawLine(sym_x + 3 - dhr, sym_cy,
+                         sym_x + 3,       sym_cy - dhr, sym_col);
         }
 
-        // Device name — after symbol
+        // Device name — white, truncated
         int name_x    = VIZ_X + 10;
         int max_chars = (NAME_W - 10) / 6;
-        if (max_chars < 3) max_chars = 3;
-        if (max_chars > 9) max_chars = 9;
-        char nd[10];
+        if (max_chars > 7) max_chars = 7;
+        if (max_chars < 2) max_chars = 2;
+        char nd[8];
         strncpy(nd, e.name, max_chars);
         nd[max_chars] = '\0';
-        spr.setTextColor(name_col, BG_COLOR);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
         spr.setCursor(name_x, y + 1);
         spr.print(nd);
     }
 }
-
 // ── Viz mode 4: WAVEFORM ──────────────────────────────────────────────────
 // Scrolling oscilloscope of RF packet rate. Amplitude = packets per
 // sample interval. Color shifts blue→coral based on WiFi/BLE ratio.
