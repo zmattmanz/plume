@@ -737,8 +737,6 @@ struct SigBarState {
 static SigBarState       sigbar_state[SIGBAR_MAX] = {};
 static unsigned long     sigbar_last_frame = 0;
 static unsigned long     sigbar_sort_last_ms = 0;
-static int               sigbar_sorted_cache[FEED_SIZE];
-static int               sigbar_sorted_count = 0;
 
 // Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
 #define WAVEFORM_SAMPLES 134
@@ -5005,54 +5003,32 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
     const int BAR_MAX_W = VIZ_W - NAME_W - 4;
     const int START_Y   = VIZ_Y + 2;
 
-    // ── Sort + dedup (throttled to every 800ms) ──
-    if (frame_ms - sigbar_sort_last_ms >= 5000 || sigbar_sort_last_ms == 0) {
-        int sorted_idx[FEED_SIZE];
-        int valid_count = 0;
+    // ── Build visible device list (deduped, 60s timeout) ──
+    struct VisibleDevice {
+        int   feed_idx;
+        char  name[20];
+        float rssi_pct;
+    };
+    VisibleDevice visible[FEED_SIZE];
+    int visible_count = 0;
 
-        for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
-            int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-            FeedEntry& e = scan_local_feed[idx];
-            if (e.mac[0] == '\0') continue;
-            if ((frame_ms - e.timestamp) > 30000UL) continue;
-            sorted_idx[valid_count++] = idx;
+    for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
+        int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
+        if (e.mac[0] == '\0') continue;
+        if ((frame_ms - e.timestamp) > 60000UL) continue;
+
+        bool dup = false;
+        for (int j = 0; j < visible_count; j++) {
+            if (strncmp(e.name, visible[j].name, 19) == 0) { dup = true; break; }
         }
+        if (dup) continue;
 
-        for (int i = 1; i < valid_count; i++) {
-            int key = sorted_idx[i];
-            int8_t key_rssi = scan_local_feed[key].rssi;
-            int j = i - 1;
-            while (j >= 0 && scan_local_feed[sorted_idx[j]].rssi < key_rssi) {
-                sorted_idx[j + 1] = sorted_idx[j];
-                j--;
-            }
-            sorted_idx[j + 1] = key;
-        }
-
-        sigbar_sorted_count = 0;
-        for (int i = 0; i < valid_count; i++) {
-            FeedEntry& e = scan_local_feed[sorted_idx[i]];
-            bool dup = false;
-            for (int j = 0; j < sigbar_sorted_count; j++) {
-                if (strncmp(e.name, scan_local_feed[sigbar_sorted_cache[j]].name,
-                            sizeof(e.name)) == 0) {
-                    dup = true; break;
-                }
-            }
-            if (!dup) sigbar_sorted_cache[sigbar_sorted_count++] = sorted_idx[i];
-        }
-        sigbar_sort_last_ms = frame_ms;
-    }
-
-    int bars_to_show = (sigbar_sorted_count < MAX_BARS)
-                     ? sigbar_sorted_count : MAX_BARS;
-
-    if (bars_to_show == 0) {
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(VIZ_X + VIZ_W / 2 - 20, VIZ_Y + VIZ_H / 2 - 4);
-        spr.print("listening");
-        return;
+        strncpy(visible[visible_count].name, e.name, 19);
+        visible[visible_count].name[19] = '\0';
+        visible[visible_count].feed_idx = idx;
+        visible[visible_count].rssi_pct = rssi_pct_for(e.rssi);
+        visible_count++;
     }
 
     // ── Animation dt ──
@@ -5061,49 +5037,87 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
     if (sdt > 100.0f) sdt = 100.0f;
     sigbar_last_frame = frame_ms;
 
-    // ── Match devices to animation slots ──
-    bool slot_matched[SIGBAR_MAX] = {false};
-    for (int bi = 0; bi < bars_to_show; bi++) {
-        FeedEntry& e = scan_local_feed[sigbar_sorted_cache[bi]];
-        int   target_y = START_Y + bi * (BAR_H + BAR_GAP);
-        float target_w = rssi_pct_for(e.rssi) * (float)BAR_MAX_W;
+    // ── Structural update (one change per 5s tick) ──
+    // Devices keep their slot. One slot is removed OR one new device is added per tick.
+    if (frame_ms - sigbar_sort_last_ms >= 5000 || sigbar_sort_last_ms == 0) {
+        sigbar_sort_last_ms = frame_ms;
 
-        int slot = -1;
+        bool did_remove = false;
         for (int si = 0; si < SIGBAR_MAX; si++) {
-            if (sigbar_state[si].occupied &&
-                strncmp(sigbar_state[si].name, e.name, 19) == 0) {
-                slot = si; slot_matched[si] = true; break;
-            }
-        }
-        if (slot < 0) {
-            for (int si = 0; si < SIGBAR_MAX; si++) {
-                if (!sigbar_state[si].occupied) { slot = si; break; }
-            }
-            if (slot < 0) {
-                for (int si = 0; si < SIGBAR_MAX; si++) {
-                    if (!slot_matched[si]) { slot = si; break; }
+            if (!sigbar_state[si].occupied) continue;
+            bool still_here = false;
+            for (int vi = 0; vi < visible_count; vi++) {
+                if (strncmp(sigbar_state[si].name, visible[vi].name, 19) == 0) {
+                    still_here = true; break;
                 }
             }
-            if (slot < 0) slot = 0;
-            sigbar_state[slot].y_f      = (float)(VIZ_Y - BAR_H - 4);
-            sigbar_state[slot].width_f  = target_w;
-            sigbar_state[slot].peak_w   = target_w;
-            sigbar_state[slot].occupied = true;
-            strncpy(sigbar_state[slot].name, e.name, 19);
-            sigbar_state[slot].name[19] = '\0';
-            slot_matched[slot] = true;
+            if (!still_here) {
+                sigbar_state[si].occupied = false;
+                did_remove = true;
+                break;
+            }
         }
-        sigbar_state[slot].y_f     = anim_filter(sigbar_state[slot].y_f,     (float)target_y, 200.0f, sdt);
-        sigbar_state[slot].width_f = anim_filter(sigbar_state[slot].width_f, target_w,        500.0f, sdt);
-        // Peak hold: rise instantly, decay toward 0 over ~10s
-        if (target_w >= sigbar_state[slot].peak_w) {
-            sigbar_state[slot].peak_w = target_w;
-        } else {
-            sigbar_state[slot].peak_w = anim_filter(sigbar_state[slot].peak_w, 0.0f, 10000.0f, sdt);
+
+        if (!did_remove) {
+            for (int vi = 0; vi < visible_count; vi++) {
+                bool already_slotted = false;
+                for (int si = 0; si < SIGBAR_MAX; si++) {
+                    if (sigbar_state[si].occupied &&
+                        strncmp(sigbar_state[si].name, visible[vi].name, 19) == 0) {
+                        already_slotted = true; break;
+                    }
+                }
+                if (already_slotted) continue;
+
+                int free_slot = -1;
+                for (int si = 0; si < SIGBAR_MAX; si++) {
+                    if (!sigbar_state[si].occupied) { free_slot = si; break; }
+                }
+                if (free_slot < 0) break;
+
+                sigbar_state[free_slot].occupied = true;
+                strncpy(sigbar_state[free_slot].name, visible[vi].name, 19);
+                sigbar_state[free_slot].name[19] = '\0';
+                sigbar_state[free_slot].width_f = 0.0f;
+                sigbar_state[free_slot].peak_w  = 0.0f;
+                sigbar_state[free_slot].y_f     = (float)(VIZ_Y - BAR_H - 4);
+                break;
+            }
         }
     }
+
+    // ── Compact slots — pack occupied slots top-to-bottom, update widths ──
+    int occupied_count = 0;
     for (int si = 0; si < SIGBAR_MAX; si++) {
-        if (!slot_matched[si]) sigbar_state[si].occupied = false;
+        if (!sigbar_state[si].occupied) continue;
+
+        int target_y = START_Y + occupied_count * (BAR_H + BAR_GAP);
+        sigbar_state[si].y_f = anim_filter(
+            sigbar_state[si].y_f, (float)target_y, 200.0f, sdt);
+
+        for (int vi = 0; vi < visible_count; vi++) {
+            if (strncmp(sigbar_state[si].name, visible[vi].name, 19) == 0) {
+                float target_w = visible[vi].rssi_pct * (float)BAR_MAX_W;
+                sigbar_state[si].width_f = anim_filter(
+                    sigbar_state[si].width_f, target_w, 500.0f, sdt);
+                if (sigbar_state[si].width_f > sigbar_state[si].peak_w) {
+                    sigbar_state[si].peak_w = sigbar_state[si].width_f;
+                }
+                sigbar_state[si].peak_w = anim_filter(
+                    sigbar_state[si].peak_w, sigbar_state[si].width_f, 3000.0f, sdt);
+                break;
+            }
+        }
+
+        occupied_count++;
+    }
+
+    if (occupied_count == 0) {
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.4f), BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(VIZ_X + VIZ_W / 2 - 20, VIZ_Y + VIZ_H / 2 - 4);
+        spr.print("listening");
+        return;
     }
 
     // ── Scale reference marks — dense background grid ──
@@ -5121,21 +5135,22 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         }
     }
 
-    // ── Render each bar ──
-    for (int bi = 0; bi < bars_to_show; bi++) {
-        FeedEntry& e = scan_local_feed[sigbar_sorted_cache[bi]];
+    // ── Render each occupied slot ──
+    for (int si = 0; si < SIGBAR_MAX; si++) {
+        if (!sigbar_state[si].occupied) continue;
 
-        int slot = -1;
-        for (int si = 0; si < SIGBAR_MAX; si++) {
-            if (sigbar_state[si].occupied &&
-                strncmp(sigbar_state[si].name, e.name, 19) == 0) {
-                slot = si; break;
+        FeedEntry* ep = nullptr;
+        for (int vi = 0; vi < visible_count; vi++) {
+            if (strncmp(sigbar_state[si].name, visible[vi].name, 19) == 0) {
+                ep = &scan_local_feed[visible[vi].feed_idx];
+                break;
             }
         }
-        if (slot < 0) continue;
+        if (!ep) continue;
+        FeedEntry& e = *ep;
 
-        int y     = (int)(sigbar_state[slot].y_f + 0.5f);
-        int bar_w = (int)(sigbar_state[slot].width_f + 0.5f);
+        int y     = (int)(sigbar_state[si].y_f + 0.5f);
+        int bar_w = (int)(sigbar_state[si].width_f + 0.5f);
 
         // Per-device phase for live edge and tip glow
         uint32_t name_hash = 0;
@@ -5151,17 +5166,15 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         if (bar_w < 3)         bar_w = 3;
         if (bar_w > BAR_MAX_W) bar_w = BAR_MAX_W;
 
-        uint16_t bar_col, name_col, sym_col;
-        name_col = TEXT_COLOR;
+        // Colors — name always white, bar color encodes protocol
+        uint16_t bar_col;
+        uint16_t name_col = TEXT_COLOR;
         if (e.is_flock) {
-            bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
-            sym_col  = CAUTION_COLOR;
+            bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
         } else if (e.proto == 0) {
-            bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f);
-            sym_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
+            bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f);
         } else {
-            bar_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f);
-            sym_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
+            bar_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f);
         }
 
         // Pill track background
@@ -5181,33 +5194,20 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             spr.clearClipRect();
         }
 
-        // Gradient bar fill — base + top highlight + bottom shadow
+        // Bar: solid fill + 1px outlined pill
         if (bar_w > pill_r * 2) {
             spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, bar_col);
-
-            int highlight_h = BAR_H * 2 / 5;
-            uint16_t hi_col = lerp_col16(bar_col, TEXT_COLOR, 0.20f);
-            spr.setClipRect(BAR_X, y, bar_w, highlight_h);
-            spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, hi_col);
-            spr.clearClipRect();
-
-            int shadow_y = y + BAR_H - (BAR_H * 3 / 10);
-            int shadow_h = BAR_H * 3 / 10;
-            uint16_t sh_col = lerp_col16(bar_col, BG_COLOR, 0.25f);
-            spr.setClipRect(BAR_X, shadow_y, bar_w, shadow_h);
-            spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, sh_col);
-            spr.clearClipRect();
-
-            // Pill outline
             spr.drawRoundRect(BAR_X, y, bar_w, BAR_H, pill_r,
-                              lerp_col16(BG_COLOR, bar_col, 0.8f));
+                              lerp_col16(bar_col, TEXT_COLOR, 0.25f));
         } else if (bar_w > 0) {
             spr.fillCircle(BAR_X + pill_r, y + pill_r, pill_r, bar_col);
+            spr.drawCircle(BAR_X + pill_r, y + pill_r, pill_r,
+                           lerp_col16(bar_col, TEXT_COLOR, 0.25f));
         }
 
-        // Peak hold marker — double-pixel vertical tick at peak position
+        // Peak hold marker — double-pixel vertical tick
         {
-            int pk_x = BAR_X + (int)(sigbar_state[slot].peak_w + 0.5f);
+            int pk_x = BAR_X + (int)(sigbar_state[si].peak_w + 0.5f);
             if (pk_x > BAR_X + pill_r && pk_x < BAR_X + BAR_MAX_W - 1) {
                 uint16_t pk_col = lerp_col16(BG_COLOR, bar_col, 0.7f);
                 spr.drawFastVLine(pk_x,     y + 1, BAR_H - 2, pk_col);
@@ -5227,25 +5227,9 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
                           lerp_col16(BG_COLOR, glow_base, 0.85f + 0.15f * glow_t));
         }
 
-        // Protocol symbol
-        int sym_x  = VIZ_X + 1;
-        int sym_cy = y + BAR_H / 2;
-        if (e.proto == 0) {
-            spr.drawTriangle(sym_x + 3, sym_cy - 3,
-                             sym_x,     sym_cy + 3,
-                             sym_x + 6, sym_cy + 3,
-                             sym_col);
-        } else {
-            int dhr = 3;
-            spr.drawLine(sym_x + 3,       sym_cy - dhr, sym_x + 3 + dhr, sym_cy,       sym_col);
-            spr.drawLine(sym_x + 3 + dhr, sym_cy,       sym_x + 3,       sym_cy + dhr, sym_col);
-            spr.drawLine(sym_x + 3,       sym_cy + dhr, sym_x + 3 - dhr, sym_cy,       sym_col);
-            spr.drawLine(sym_x + 3 - dhr, sym_cy,       sym_x + 3,       sym_cy - dhr, sym_col);
-        }
-
-        // Device name — truncated to fit name column
-        int name_x    = VIZ_X + 10;
-        int max_chars = (NAME_W - 10) / 6;
+        // Device name — full width of name column, white
+        int name_x    = VIZ_X + 3;
+        int max_chars = (NAME_W - 3) / 6;
         if (max_chars < 3) max_chars = 3;
         if (max_chars > 9) max_chars = 9;
         char nd[10];
