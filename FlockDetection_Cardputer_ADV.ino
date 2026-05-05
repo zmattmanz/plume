@@ -5000,7 +5000,7 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
     const int MAX_BARS  = 4;
     const int BAR_H     = 11;
     const int BAR_GAP   = 2;
-    const int NAME_W    = 48;
+    const int NAME_W    = 58;
     const int BAR_X     = VIZ_X + NAME_W;
     const int BAR_MAX_W = VIZ_W - NAME_W - 4;
     const int START_Y   = VIZ_Y + 2;
@@ -5085,7 +5085,7 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
                 }
             }
             if (slot < 0) slot = 0;
-            sigbar_state[slot].y_f      = (float)target_y;
+            sigbar_state[slot].y_f      = (float)(VIZ_Y - BAR_H - 4);
             sigbar_state[slot].width_f  = target_w;
             sigbar_state[slot].peak_w   = target_w;
             sigbar_state[slot].occupied = true;
@@ -5093,7 +5093,7 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             sigbar_state[slot].name[19] = '\0';
             slot_matched[slot] = true;
         }
-        sigbar_state[slot].y_f     = anim_filter(sigbar_state[slot].y_f,     (float)target_y, 800.0f, sdt);
+        sigbar_state[slot].y_f     = anim_filter(sigbar_state[slot].y_f,     (float)target_y, 200.0f, sdt);
         sigbar_state[slot].width_f = anim_filter(sigbar_state[slot].width_f, target_w,        500.0f, sdt);
         // Peak hold: rise instantly, decay toward 0 over ~10s
         if (target_w >= sigbar_state[slot].peak_w) {
@@ -5106,14 +5106,19 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         if (!slot_matched[si]) sigbar_state[si].occupied = false;
     }
 
-    // Scale reference ticks at 0%, 50%, 100% of bar span
+    // ── Scale reference marks — dense background grid ──
     {
-        int tick_y1  = VIZ_Y + 1;
-        int tick_len = VIZ_H - 2;
-        uint16_t tick_col = lerp_col16(BG_COLOR, DIM_COLOR, 0.22f);
-        spr.drawFastVLine(BAR_X,                 tick_y1, tick_len, tick_col);
-        spr.drawFastVLine(BAR_X + BAR_MAX_W / 2, tick_y1, tick_len, tick_col);
-        spr.drawFastVLine(BAR_X + BAR_MAX_W - 1, tick_y1, tick_len, tick_col);
+        uint16_t scale_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.20f);
+        const int NUM_MARKS = 7;
+        int scale_top = START_Y;
+        int scale_bot = START_Y + MAX_BARS * (BAR_H + BAR_GAP);
+        if (scale_bot > VIZ_Y + VIZ_H) scale_bot = VIZ_Y + VIZ_H;
+        int scale_h = scale_bot - scale_top;
+        for (int m = 0; m <= NUM_MARKS; m++) {
+            float t = (float)m / (float)NUM_MARKS;
+            int sx = BAR_X + (int)(t * (float)BAR_MAX_W);
+            spr.drawFastVLine(sx, scale_top, scale_h, scale_col);
+        }
     }
 
     // ── Render each bar ──
@@ -5147,26 +5152,55 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         if (bar_w > BAR_MAX_W) bar_w = BAR_MAX_W;
 
         uint16_t bar_col, name_col, sym_col;
+        name_col = TEXT_COLOR;
         if (e.is_flock) {
             bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
-            name_col = CAUTION_COLOR;
             sym_col  = CAUTION_COLOR;
         } else if (e.proto == 0) {
             bar_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f);
-            name_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
             sym_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
         } else {
             bar_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f);
-            name_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
             sym_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
         }
 
-        // Pill track + fill
+        // Pill track background
         int pill_r = BAR_H / 2;
         spr.fillRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
                           lerp_col16(BG_COLOR, CARD_BORDER, 0.18f));
+
+        // Track hatching — diagonal stripes, bar fill paints over the left portion
+        {
+            uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.20f);
+            spr.setClipRect(BAR_X, y, BAR_MAX_W, BAR_H);
+            for (int d = -BAR_H; d < BAR_MAX_W + BAR_H; d += 6) {
+                int x0 = BAR_X + d;
+                int x1 = x0 + BAR_H;
+                spr.drawLine(x0, y, x1, y + BAR_H, hatch_col);
+            }
+            spr.clearClipRect();
+        }
+
+        // Gradient bar fill — base + top highlight + bottom shadow
         if (bar_w > pill_r * 2) {
             spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, bar_col);
+
+            int highlight_h = BAR_H * 2 / 5;
+            uint16_t hi_col = lerp_col16(bar_col, TEXT_COLOR, 0.20f);
+            spr.setClipRect(BAR_X, y, bar_w, highlight_h);
+            spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, hi_col);
+            spr.clearClipRect();
+
+            int shadow_y = y + BAR_H - (BAR_H * 3 / 10);
+            int shadow_h = BAR_H * 3 / 10;
+            uint16_t sh_col = lerp_col16(bar_col, BG_COLOR, 0.25f);
+            spr.setClipRect(BAR_X, shadow_y, bar_w, shadow_h);
+            spr.fillRoundRect(BAR_X, y, bar_w, BAR_H, pill_r, sh_col);
+            spr.clearClipRect();
+
+            // Pill outline
+            spr.drawRoundRect(BAR_X, y, bar_w, BAR_H, pill_r,
+                              lerp_col16(BG_COLOR, bar_col, 0.8f));
         } else if (bar_w > 0) {
             spr.fillCircle(BAR_X + pill_r, y + pill_r, pill_r, bar_col);
         }
@@ -5209,20 +5243,12 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             spr.drawLine(sym_x + 3 - dhr, sym_cy,       sym_x + 3,       sym_cy - dhr, sym_col);
         }
 
-        // Flock star
-        if (e.is_flock) {
-            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            spr.setCursor(sym_x + 7, y + 1);
-            spr.print("*");
-        }
-
         // Device name — truncated to fit name column
-        int name_x    = VIZ_X + (e.is_flock ? 16 : 10);
-        int max_chars = (NAME_W - (e.is_flock ? 16 : 10)) / 6;
+        int name_x    = VIZ_X + 10;
+        int max_chars = (NAME_W - 10) / 6;
         if (max_chars < 3) max_chars = 3;
-        if (max_chars > 7) max_chars = 7;
-        char nd[8];
+        if (max_chars > 9) max_chars = 9;
+        char nd[10];
         strncpy(nd, e.name, max_chars);
         nd[max_chars] = '\0';
         spr.setTextColor(name_col, BG_COLOR);
