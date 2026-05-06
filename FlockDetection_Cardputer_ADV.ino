@@ -1537,70 +1537,135 @@ void load_sd_history() {
     File f = SD.open(current_log_file, FILE_READ);
     if (!f) return;
 
-    // Ring buffer: keep last SD_HIST_SIZE parsed entries
-    SDHistEntry ring[SD_HIST_SIZE];
-    int ri = 0, total = 0;
-    char buf[SD_LINE_LEN];
+    size_t file_size = f.size();
+    if (file_size == 0) { f.close(); return; }
 
-    while (f.available()) {
-        // Long log files can take many ms to scan — keep the WDT alive every
-        // ~32 lines so a big history load doesn't trip the 30s timeout.
-        if ((total & 0x1F) == 0) esp_task_wdt_reset();
-        int len = 0;
-        while (len < SD_LINE_LEN - 1 && f.available()) {
-            char c = (char)f.read();
-            if (c == '\n' || c == '\r') break;
-            buf[len++] = c;
+    // Read the last TAIL_BYTES of the file. 4KB covers ~20 typical CSV lines
+    // (~200 bytes each), well above the 12 we need. Constant-time regardless
+    // of file size — eliminates the 10s+ freeze on large log files.
+    const size_t TAIL_BYTES_INITIAL = 4096;
+    const size_t TAIL_BYTES_MAX     = 8192;
+
+    size_t tail_bytes = TAIL_BYTES_INITIAL;
+    if (tail_bytes > file_size) tail_bytes = file_size;
+
+    char* tail_buf = (char*)malloc(tail_bytes + 1);
+    if (!tail_buf) {
+        Serial.println("[SD] load_sd_history: malloc failed");
+        f.close();
+        return;
+    }
+
+    size_t seek_pos = file_size - tail_bytes;
+    f.seek(seek_pos);
+    size_t bytes_read = f.read((uint8_t*)tail_buf, tail_bytes);
+    tail_buf[bytes_read] = '\0';
+
+    // Skip the first partial line (we seeked into the middle of it).
+    // Find first '\n', then collect line-start positions after each '\n'.
+    size_t first_newline = 0;
+    while (first_newline < bytes_read && tail_buf[first_newline] != '\n') {
+        first_newline++;
+    }
+    if (first_newline >= bytes_read) {
+        // No newline — try a larger read once, then give up.
+        if (tail_bytes < TAIL_BYTES_MAX && tail_bytes < file_size) {
+            free(tail_buf);
+            tail_bytes = TAIL_BYTES_MAX;
+            if (tail_bytes > file_size) tail_bytes = file_size;
+            tail_buf = (char*)malloc(tail_bytes + 1);
+            if (!tail_buf) { f.close(); return; }
+            seek_pos = file_size - tail_bytes;
+            f.seek(seek_pos);
+            bytes_read = f.read((uint8_t*)tail_buf, tail_bytes);
+            tail_buf[bytes_read] = '\0';
+            first_newline = 0;
+            while (first_newline < bytes_read && tail_buf[first_newline] != '\n') {
+                first_newline++;
+            }
         }
-        buf[len] = '\0';
-        if (len < 10) continue;
+        if (first_newline >= bytes_read) {
+            free(tail_buf);
+            f.close();
+            return;
+        }
+    }
 
-        // CSV: 0=Uptime_ms,1=EpochUTC,2=EpochIsGPS,3=Channel,4=Type,5=Proto,
-        //      6=RSSI,7=MAC,8=Name,9=TXPower,10=Method,11=Conf,...
+    f.close();
+
+    // Collect up to 64 line-start offsets (positions after each '\n').
+    const int MAX_LINE_STARTS = 64;
+    size_t line_starts[MAX_LINE_STARTS];
+    int    line_start_count = 0;
+
+    for (size_t i = first_newline + 1;
+         i < bytes_read && line_start_count < MAX_LINE_STARTS; i++) {
+        if (tail_buf[i - 1] == '\n') {
+            if (i < bytes_read && tail_buf[i] != '\n' && tail_buf[i] != '\r') {
+                line_starts[line_start_count++] = i;
+            }
+        }
+    }
+
+    if (line_start_count == 0) { free(tail_buf); return; }
+
+    // Parse the last SD_HIST_SIZE complete lines (oldest → newest),
+    // then reverse into sd_hist[] so index 0 = most recent.
+    int first_line_idx = line_start_count - SD_HIST_SIZE;
+    if (first_line_idx < 0) first_line_idx = 0;
+
+    SDHistEntry parsed[SD_HIST_SIZE];
+    int parsed_count = 0;
+
+    for (int li = first_line_idx;
+         li < line_start_count && parsed_count < SD_HIST_SIZE; li++) {
+        char* line = &tail_buf[line_starts[li]];
+        int len = 0;
+        while (line_starts[li] + len < bytes_read &&
+               line[len] != '\n' && line[len] != '\r') {
+            len++;
+        }
+        if (len < 10) continue;
+        line[len] = '\0';
+
         int fs[21]; int fc = 0;
         fs[0] = 0;
         for (int ci = 0; ci < len && fc < 20; ci++) {
-            if (buf[ci] == ',') fs[++fc] = ci + 1;
+            if (line[ci] == ',') fs[++fc] = ci + 1;
         }
-        if (fc < 11) { total++; continue; }
+        if (fc < 11) continue;
+        if (strncmp(line, "Uptime_ms", 9) == 0) continue;  // skip CSV header
 
-        // Extract a field: from fs[n] up to the next comma (or end of buf)
         auto copy_f = [&](int n, char* dest, int maxlen) {
             int start = fs[n];
             int end = start;
-            while (end < len && buf[end] != ',') end++;
+            while (end < len && line[end] != ',') end++;
             int flen = end - start;
             if (flen >= maxlen) flen = maxlen - 1;
-            strncpy(dest, buf + start, flen);
+            strncpy(dest, line + start, flen);
             dest[flen] = '\0';
         };
 
-        SDHistEntry& e = ring[ri % SD_HIST_SIZE];
+        SDHistEntry& e = parsed[parsed_count];
         copy_f(4,  e.type,   16);
         copy_f(7,  e.mac,    18);
         copy_f(8,  e.name,   32);
         copy_f(10, e.method, 24);
-        e.rssi       = atoi(buf + fs[6]);
-        e.confidence = atoi(buf + fs[11]);
-        // SD CSV doesn't carry an ID column — entries loaded from disk show
-        // "----" until they're replaced by fresh detections logged this run.
+        e.rssi       = atoi(line + fs[6]);
+        e.confidence = atoi(line + fs[11]);
         e.id         = 0;
         {
-            unsigned long uptime = (unsigned long)strtoul(buf + fs[0], NULL, 10);
+            unsigned long uptime = (unsigned long)strtoul(line + fs[0], NULL, 10);
             format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
         }
-
-        ri++;
-        total++;
+        parsed_count++;
     }
-    f.close();
 
-    int count = (total < SD_HIST_SIZE) ? total : SD_HIST_SIZE;
-    sd_hist_count = count;
-    // Reorder so sd_hist[0] = most recent
-    for (int i = 0; i < count; i++) {
-        int ridx = ((ri - 1 - i) % SD_HIST_SIZE + SD_HIST_SIZE) % SD_HIST_SIZE;
-        sd_hist[i] = ring[ridx];
+    free(tail_buf);
+
+    sd_hist_count = parsed_count;
+    for (int i = 0; i < parsed_count; i++) {
+        sd_hist[i] = parsed[parsed_count - 1 - i];
     }
 }
 
