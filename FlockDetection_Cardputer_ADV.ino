@@ -356,6 +356,7 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define PERSIST_FILE  "/flock_session.dat"
 #define DETECT_FILE   "/flock_detections.txt"
 #define TOAST_DURATION_MS 3500
+#define DATA_MUTEX_TIMEOUT_MS 500
 
 #define LOC_MAX_SAMPLES 40
 #define LOC_SAMPLE_INTERVAL 500
@@ -401,6 +402,15 @@ TaskHandle_t GPSTaskHandle;
 static TaskHandle_t BLEWorkerHandle = nullptr;
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t sdMutex;    // guards all SD card I/O — FAT is not thread-safe
+
+static inline bool take_data_mutex(TickType_t timeout_ticks = pdMS_TO_TICKS(DATA_MUTEX_TIMEOUT_MS)) {
+    if (xSemaphoreTakeRecursive(dataMutex, timeout_ticks) == pdTRUE) return true;
+    Serial.println("[MUTEX] dataMutex timeout -- skipping operation");
+    return false;
+}
+static inline void give_data_mutex() {
+    xSemaphoreGiveRecursive(dataMutex);
+}
 
 static uint8_t current_channel = 1;
 static unsigned long last_channel_hop = 0;
@@ -1931,7 +1941,7 @@ static void load_wifi_credentials() {
 
 void rssi_track_update(const char* mac, int rssi) {
     unsigned long now = millis();
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     for (int i = 0; i < rssi_tracker_count; i++) {
         if (strncmp(rssi_tracker[i].mac, mac, 17) == 0) {
             if (rssi_tracker[i].sample_count < RSSI_TRACK_SAMPLES) {
@@ -1958,12 +1968,12 @@ void rssi_track_update(const char* mac, int rssi) {
         rssi_tracker[rssi_tracker_count].scored = false;
         rssi_tracker_count++;
     }
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 }
 
 bool rssi_track_is_stationary(const char* mac) {
     bool result = false;
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return false;
     for (int i = 0; i < rssi_tracker_count; i++) {
         if (strncmp(rssi_tracker[i].mac, mac, 17) == 0
             && rssi_tracker[i].sample_count >= 3
@@ -1993,12 +2003,12 @@ bool rssi_track_is_stationary(const char* mac) {
             break;
         }
     }
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
     return result;
 }
 
 void rssi_track_expire() {
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     unsigned long now = millis();
     for (int i = rssi_tracker_count - 1; i >= 0; i--) {
         if ((now - rssi_tracker[i].last_seen) > RSSI_TRACK_EXPIRY_MS) {
@@ -2013,7 +2023,7 @@ void rssi_track_expire() {
     if (locator_tracker_idx >= rssi_tracker_count) {
         locator_tracker_idx = -1;
     }
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 }
 
 // ============================================================================
@@ -2085,7 +2095,7 @@ static void update_radar_data(unsigned long frame_ms) {
     float decay_amount = SPIKE_DECAY_PER_MS * (float)(frame_ms - last_decay_ms);
     last_decay_ms = frame_ms;
 
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     radar_time_since_blip = frame_ms - last_blip_time;
     for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
         // 2-minute max blip lifetime
@@ -2098,7 +2108,7 @@ static void update_radar_data(unsigned long frame_ms) {
         radial_spikes[i] -= decay_amount;
         if (radial_spikes[i] < 0) radial_spikes[i] = 0;
     }
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 
     // Particle life decay
     static unsigned long last_particle_ms = 0;
@@ -2284,7 +2294,7 @@ void flush_sd_buffer() {
 // (battery warnings, flash errors, export-mode messages) that bypass the queue.
 // Does NOT touch the queue — it only sets the currently-displayed toast.
 static void set_toast_direct(const char* text, uint16_t accent) {
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     if (toast_active && toast_queue_count > 0) {
         // Replace the head entry so the expiry handler in draw_toast_spr
         // doesn't pop a phantom slot.
@@ -2320,7 +2330,7 @@ static void set_toast_direct(const char* text, uint16_t accent) {
     toast_start        = millis();
     toast_active       = true;
     screen_dirty       = true;
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 }
 
 void trigger_toast(const char* type, const char* name, int confidence) {
@@ -2341,7 +2351,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
         snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
     }
 
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
 
     // Enqueue; if full, drop oldest to make room
     if (toast_queue_count >= TOAST_QUEUE_SIZE) {
@@ -2366,7 +2376,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
     }
     screen_dirty = true;
 
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 }
 
 void add_to_capture_history(const char* type, const char* mac, const char* name, int rssi, int confidence) {
@@ -2592,17 +2602,17 @@ static int locator_distance_trend() {
 }
 
 void locator_add_sample(const char* mac, int rssi) {
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     if (!locator_active || strncmp(mac, locator_target_mac, 17) != 0) {
-        xSemaphoreGiveRecursive(dataMutex);
+        give_data_mutex();
         return;
     }
     if (millis() - locator_last_sample < LOC_SAMPLE_INTERVAL) {
-        xSemaphoreGiveRecursive(dataMutex);
+        give_data_mutex();
         return;
     }
     if (!gps.location.isValid() || gps.location.age() > 2000) {
-        xSemaphoreGiveRecursive(dataMutex);
+        give_data_mutex();
         return;
     }
 
@@ -2625,7 +2635,7 @@ void locator_add_sample(const char* mac, int rssi) {
         if (new_r < 0) new_r = 0; if (new_r > 1) new_r = 1;
         float new_score = new_r * 1.0f;
         if (new_score > worst_score) { idx = worst; }
-        else { xSemaphoreGiveRecursive(dataMutex); return; }
+        else { give_data_mutex(); return; }
     } else { locator_sample_count++; }
 
     locator_samples[idx] = {gps.location.lat(), gps.location.lng(), rssi, millis()};
@@ -2657,11 +2667,11 @@ void locator_add_sample(const char* mac, int rssi) {
             }
         }
     }
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 }
 
 void locator_start(const char* mac, const char* name, const char* type = "", int id = 0) {
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     locator_active = true;
     safe_copy(locator_target_mac,  mac,  sizeof(locator_target_mac));
     safe_copy(locator_target_name, name, sizeof(locator_target_name));
@@ -2675,11 +2685,11 @@ void locator_start(const char* mac, const char* name, const char* type = "", int
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
     locator_tracker_idx = -1;
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 }
 
 void locator_stop() {
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     locator_active = false; locator_has_estimate = false; locator_sample_count = 0;
     locator_newest_sample_ms = 0;
     locator_estimate_announced = false;
@@ -2687,7 +2697,7 @@ void locator_stop() {
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
     locator_tracker_idx = -1;
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 }
 
 // ============================================================================
@@ -3496,10 +3506,10 @@ void draw_header_spr(int screen_num) {
     // Each pill renders right-to-left, tracking icon_right as the cursor.
 
     bool gps_lock_now;
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
     long pill_det  = lifetime_flock_total;
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
     bool muted_now = is_muted;
 
     int icon_right = DISP_W - 4;
@@ -3573,7 +3583,7 @@ void draw_toast_spr() {
     unsigned long start_snap     = 0;
     int           queue_count_snap = 0;
 
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     active_snap = toast_active;
     if (active_snap) {
         strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
@@ -3583,7 +3593,7 @@ void draw_toast_spr() {
         start_snap       = toast_start;
         queue_count_snap = toast_queue_count;
     }
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 
     if (!active_snap) return;
 
@@ -3591,7 +3601,7 @@ void draw_toast_spr() {
 
     // Expiration handling — advance queue or clear under mutex
     if (elapsed > TOAST_DURATION_MS) {
-        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+        if (!take_data_mutex()) return;
         if (toast_queue_count > 0) {
             toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
             toast_queue_count--;
@@ -3606,7 +3616,7 @@ void draw_toast_spr() {
         } else {
             toast_active = false;
         }
-        xSemaphoreGiveRecursive(dataMutex);
+        give_data_mutex();
         return;
     }
 
@@ -4352,10 +4362,10 @@ void draw_scanner_screen() {
     // Step 4: scorecard — scanning status, then WIFI/BLE labels + numbers.
     // Vertical rhythm uses named spacing tokens (UI_PAD_SM, UI_PAD_XS).
     long sw, sb;
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     sw = session_flock_wifi;
     sb = session_flock_ble;
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 
     int status_y  = VIZ_BOTTOM + UI_PAD_SM;          // 73 + 6 = 79
     int labels_y  = status_y + 8 + UI_PAD_SM;        // 79 + 8 + 6 = 93
@@ -4396,12 +4406,13 @@ void draw_scanner_screen() {
     kprint(spr, "FEED");
 
     if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
-        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-        scan_local_count = feed_count;
-        scan_local_head  = feed_head;
-        for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
-        xSemaphoreGiveRecursive(dataMutex);
-        scan_feed_last_snapshot = frame_ms;
+        if (take_data_mutex()) {
+            scan_local_count = feed_count;
+            scan_local_head  = feed_head;
+            for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
+            give_data_mutex();
+            scan_feed_last_snapshot = frame_ms;
+        }
     }
 
     const int feed_row_h    = 14;
@@ -4647,11 +4658,12 @@ static void draw_radar_common(unsigned long frame_ms,
         if (diff >  (float)M_PI) diff -= TWO_PIf;
         if (diff < -(float)M_PI) diff += TWO_PIf;
         if (diff >= 0.0f && diff < BLIP_RELIGHT_ARC) {
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            if (radial_spikes[i] > 0.05f) {
-                radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
+            if (take_data_mutex()) {
+                if (radial_spikes[i] > 0.05f) {
+                    radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
+                }
+                give_data_mutex();
             }
-            xSemaphoreGiveRecursive(dataMutex);
         }
     }
 
@@ -5726,7 +5738,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
 }
 
 void draw_locator_screen() {
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
     char target_name[65]; safe_copy(target_name, locator_target_name, sizeof(target_name));
@@ -5743,7 +5755,7 @@ void draw_locator_screen() {
             rssi_tracker[locator_tracker_idx].sample_count - 1];
         has_rssi = true;
     }
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 
     bool demo = !active;
 
@@ -5998,9 +6010,9 @@ void draw_capture_history_screen() {
     // We work directly from sd_hist or capture_history
     int total = use_sd ? sd_hist_count : 0;
     if (!use_sd) {
-        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+        if (!take_data_mutex()) return;
         total = capture_history_count;
-        xSemaphoreGiveRecursive(dataMutex);
+        give_data_mutex();
     }
 
     // Clamp selection and scroll
@@ -6043,9 +6055,9 @@ void draw_capture_history_screen() {
     // Snapshot in-memory history if needed
     CaptureEntry mem_hist[CAPTURE_HISTORY_SIZE];
     if (!use_sd) {
-        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+        if (!take_data_mutex()) return;
         for (int i = 0; i < total; i++) mem_hist[i] = capture_history[i];
-        xSemaphoreGiveRecursive(dataMutex);
+        give_data_mutex();
     }
 
     int rows_shown = 0;
@@ -6294,7 +6306,7 @@ void draw_gps_screen() {
     bool hdop_valid, time_valid;
     int gps_hour, gps_min, gps_sec;
 
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     has_loc     = gps.location.isValid();
     stale       = has_loc && (gps.location.age() > 2000);
     sats        = gps.satellites.isValid() ? gps.satellites.value() : 0;
@@ -6308,7 +6320,7 @@ void draw_gps_screen() {
     gps_hour    = time_valid ? gps.time.hour()   : 0;
     gps_min     = time_valid ? gps.time.minute() : 0;
     gps_sec     = time_valid ? gps.time.second() : 0;
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
     // Solid BG fill, diagonal axis tilt like a real globe on a stand
@@ -6726,7 +6738,7 @@ void draw_device_info_screen() {
     // Snapshot stats under mutex
     long lt, sr, sw, sb, lb, lfw;
     unsigned long l_sec;
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     lt    = lifetime_flock_total;
     sr    = session_raven;
     sw    = session_flock_wifi;
@@ -6734,7 +6746,7 @@ void draw_device_info_screen() {
     lb    = lifetime_boots;
     lfw   = lifetime_flash_writes;
     l_sec = lifetime_seconds;
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 
     int32_t  bat_mv      = get_filtered_voltage();
     size_t   free_heap   = esp_get_free_heap_size();
@@ -6902,14 +6914,14 @@ void draw_feed_expanded_overlay() {
     static FeedEntry local_feed[FEED_SIZE];
     int local_count, local_head;
     unsigned long local_now;
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     local_count = feed_count;
     local_head = feed_head;
     // feed_entries is a ring keyed by feed_head; copy the whole array
     // so the renderer's modular index reaches the actual newest entry.
     for (int i = 0; i < FEED_SIZE; i++) local_feed[i] = feed_entries[i];
     local_now = millis();
-    xSemaphoreGiveRecursive(dataMutex);
+    give_data_mutex();
 
     // Slide-in animation state — tracks new entries arriving while overlay is open
     static int           expand_prev_head   = -1;
