@@ -1209,18 +1209,18 @@ const char* confidence_label(int score) {
 
 // Prefer GPS UTC for PCAP timestamps so captures open in Wireshark with
 // real wall-clock time. Falls back to a synthetic monotonic epoch if no
-// GPS lock is available. Caller must NOT hold dataMutex (non-recursive).
+// GPS lock is available. Caller need not hold dataMutex; function acquires it internally.
 static void compute_pcap_ts(uint32_t* sec, uint32_t* usec) {
     unsigned long ms = millis();
     bool got_gps = false;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
             uint32_t epoch = utc_to_epoch(
                 gps.date.year(), gps.date.month(), gps.date.day(),
                 gps.time.hour(), gps.time.minute(), gps.time.second());
             if (epoch > 0) { *sec = epoch; got_gps = true; }
         }
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
     }
     if (!got_gps) {
         *sec = 1700000000UL + (uint32_t)(ms / 1000UL);
@@ -1233,7 +1233,7 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
     uint32_t capture_len = (length > 256) ? 256 : length;
     uint32_t ts_sec = 0, ts_usec = 0;
     compute_pcap_ts(&ts_sec, &ts_usec);
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (pcap_write_count < MAX_PCAP_BUFFER) {
         pcap_write_buffer[pcap_write_count].ts_sec  = ts_sec;
         pcap_write_buffer[pcap_write_count].ts_usec = ts_usec;
@@ -1242,7 +1242,7 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
         memcpy(pcap_write_buffer[pcap_write_count].payload, payload, capture_len);
         pcap_write_count++;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void write_ble_pcap(const uint8_t* payload, uint32_t length) {
@@ -1250,7 +1250,7 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
     uint32_t capture_len = (length > 256) ? 256 : length;
     uint32_t ts_sec = 0, ts_usec = 0;
     compute_pcap_ts(&ts_sec, &ts_usec);
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (ble_pcap_write_count < MAX_PCAP_BUFFER) {
         ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = ts_sec;
         ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = ts_usec;
@@ -1259,7 +1259,7 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
         memcpy(ble_pcap_write_buffer[ble_pcap_write_count].payload, payload, capture_len);
         ble_pcap_write_count++;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 // ============================================================================
@@ -1447,11 +1447,11 @@ void export_mode_stop() {
 // ============================================================================
 void save_detections_to_flash() {
     if (!littlefs_available) return;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     int cnt = capture_history_count;
     CaptureEntry local_hist[CAPTURE_HISTORY_SIZE];
     for (int i = 0; i < cnt; i++) local_hist[i] = capture_history[i];
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
     File f = LittleFS.open(DETECT_FILE, "w");
     if (!f) return;
     for (int i = 0; i < cnt; i++) {
@@ -1606,13 +1606,13 @@ static void save_session_to_flash() {
     long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes, l_next_id;
     int l_vol;
     bool l_boot_sound;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
     l_writes = lifetime_flash_writes + 1;
     l_next_id = next_detection_id;
     l_boot_sound = boot_sound_enabled;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
@@ -1640,9 +1640,9 @@ static void save_session_to_flash() {
         last_persist_save = millis();
         save_detections_to_flash();
         save_stats_to_sd();
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         lifetime_flash_writes = l_writes;
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         // Wear toasts: once at 80K (warning) and once at 100K (critical).
         // Equality checks fire exactly once per crossing.
         if (l_writes == 80000) {
@@ -1666,14 +1666,14 @@ void save_stats_to_sd() {
     // half-updated set (other tasks bump these counters concurrently).
     long          l_wifi, l_ble, l_flock, l_boots, l_writes;
     unsigned long l_sec;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     l_wifi   = lifetime_wifi;
     l_ble    = lifetime_ble;
     l_sec    = lifetime_seconds;
     l_flock  = lifetime_flock_total;
     l_boots  = lifetime_boots;
     l_writes = lifetime_flash_writes;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     // Timed take — if the lock is held for too long, skip this cycle. The
     // next persist tick will retry. Keeps PersistTask's WDT alive even when
@@ -1768,7 +1768,7 @@ static void sd_check_hotplug() {
             // self-lock) and inline the stats write rather than recursing
             // into save_stats_to_sd which would try to take the mutex again.
             load_sd_history();
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             sd_hist_dirty = false;
             long          l_wifi   = lifetime_wifi;
             long          l_ble    = lifetime_ble;
@@ -1776,7 +1776,7 @@ static void sd_check_hotplug() {
             long          l_flock  = lifetime_flock_total;
             long          l_boots  = lifetime_boots;
             long          l_writes = lifetime_flash_writes;
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
 
             File sf = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
             if (sf) {
@@ -1931,7 +1931,7 @@ static void load_wifi_credentials() {
 
 void rssi_track_update(const char* mac, int rssi) {
     unsigned long now = millis();
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     for (int i = 0; i < rssi_tracker_count; i++) {
         if (strncmp(rssi_tracker[i].mac, mac, 17) == 0) {
             if (rssi_tracker[i].sample_count < RSSI_TRACK_SAMPLES) {
@@ -1945,7 +1945,7 @@ void rssi_track_update(const char* mac, int rssi) {
             if (locator_active && strncmp(rssi_tracker[i].mac, locator_target_mac, 17) == 0) {
                 locator_tracker_idx = i;
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
             return;
         }
     }
@@ -1958,12 +1958,12 @@ void rssi_track_update(const char* mac, int rssi) {
         rssi_tracker[rssi_tracker_count].scored = false;
         rssi_tracker_count++;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 bool rssi_track_is_stationary(const char* mac) {
     bool result = false;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     for (int i = 0; i < rssi_tracker_count; i++) {
         if (strncmp(rssi_tracker[i].mac, mac, 17) == 0
             && rssi_tracker[i].sample_count >= 3
@@ -1993,12 +1993,12 @@ bool rssi_track_is_stationary(const char* mac) {
             break;
         }
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
     return result;
 }
 
 void rssi_track_expire() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     unsigned long now = millis();
     for (int i = rssi_tracker_count - 1; i >= 0; i--) {
         if ((now - rssi_tracker[i].last_seen) > RSSI_TRACK_EXPIRY_MS) {
@@ -2013,7 +2013,7 @@ void rssi_track_expire() {
     if (locator_tracker_idx >= rssi_tracker_count) {
         locator_tracker_idx = -1;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 // ============================================================================
@@ -2085,7 +2085,7 @@ static void update_radar_data(unsigned long frame_ms) {
     float decay_amount = SPIKE_DECAY_PER_MS * (float)(frame_ms - last_decay_ms);
     last_decay_ms = frame_ms;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     radar_time_since_blip = frame_ms - last_blip_time;
     for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
         // 2-minute max blip lifetime
@@ -2098,7 +2098,7 @@ static void update_radar_data(unsigned long frame_ms) {
         radial_spikes[i] -= decay_amount;
         if (radial_spikes[i] < 0) radial_spikes[i] = 0;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     // Particle life decay
     static unsigned long last_particle_ms = 0;
@@ -2126,9 +2126,9 @@ static bool feed_recently_pushed(const char* mac) {
 static void feed_push_candidate(const char* mac, const char* name, int rssi,
                                 int proto, bool is_flock) {
     if (!mac || mac[0] == '\0') return;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (feed_recently_pushed(mac)) { xSemaphoreGive(dataMutex); return; }
-    if (feed_pending_valid && rssi <= feed_pending.rssi) { xSemaphoreGive(dataMutex); return; }
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (feed_recently_pushed(mac)) { xSemaphoreGiveRecursive(dataMutex); return; }
+    if (feed_pending_valid && rssi <= feed_pending.rssi) { xSemaphoreGiveRecursive(dataMutex); return; }
 
     strncpy(feed_pending.mac, mac, 17); feed_pending.mac[17] = '\0';
     if (name && name[0] != '\0') {
@@ -2144,26 +2144,26 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
     feed_pending.is_flock  = is_flock;
     feed_pending.timestamp = millis();
     feed_pending_valid     = true;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 static void feed_commit_pending() {
     unsigned long now = millis();
     unsigned long interval = show_feed_expanded ? 667UL : FEED_MIN_PUSH_INTERVAL_MS;
     if (now - last_feed_push_ms < interval) return;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (!feed_pending_valid) { xSemaphoreGive(dataMutex); return; }
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!feed_pending_valid) { xSemaphoreGiveRecursive(dataMutex); return; }
     feed_head = (feed_head + 1) % FEED_SIZE;
     feed_entries[feed_head] = feed_pending;
     feed_entries[feed_head].timestamp = now;
     if (feed_count < FEED_SIZE) feed_count++;
     feed_pending_valid = false;
     last_feed_push_ms  = now;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void add_blip(uint16_t blip_color, int rssi) {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     last_blip_time = millis();
     int band = random(0, NUM_RADIAL_BANDS);
     float strength_mult = constrain(map(rssi, -100, -30, 50, 200), 50, 200) / 100.0f;
@@ -2171,7 +2171,7 @@ void add_blip(uint16_t blip_color, int rssi) {
     radial_colors[band]      = blip_color;
     radial_rssi[band]        = rssi;
     radial_spike_birth[band] = millis();
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 // ============================================================================
@@ -2186,7 +2186,7 @@ void flush_sd_buffer() {
     int pcap_count = 0;
     int ble_pcap_count = 0;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     log_count = sd_write_count;
     for (int i = 0; i < log_count; i++) {
         strncpy(local_log_buf[i], sd_write_buffer[i], SD_LINE_LEN - 1);
@@ -2204,7 +2204,7 @@ void flush_sd_buffer() {
         local_ble_pcap_buf[i] = ble_pcap_write_buffer[i];
     }
     ble_pcap_write_count = 0;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     if (!sd_available) return;
 
@@ -2284,7 +2284,7 @@ void flush_sd_buffer() {
 // (battery warnings, flash errors, export-mode messages) that bypass the queue.
 // Does NOT touch the queue — it only sets the currently-displayed toast.
 static void set_toast_direct(const char* text, uint16_t accent) {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (toast_active && toast_queue_count > 0) {
         // Replace the head entry so the expiry handler in draw_toast_spr
         // doesn't pop a phantom slot.
@@ -2320,7 +2320,7 @@ static void set_toast_direct(const char* text, uint16_t accent) {
     toast_start        = millis();
     toast_active       = true;
     screen_dirty       = true;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void trigger_toast(const char* type, const char* name, int confidence) {
@@ -2341,7 +2341,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
         snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
     }
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
 
     // Enqueue; if full, drop oldest to make room
     if (toast_queue_count >= TOAST_QUEUE_SIZE) {
@@ -2366,7 +2366,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
     }
     screen_dirty = true;
 
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void add_to_capture_history(const char* type, const char* mac, const char* name, int rssi, int confidence) {
@@ -2408,20 +2408,20 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     uint32_t ts_epoch = 0;
     bool ts_is_gps = false;
     {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
             uint32_t epoch = utc_to_epoch(
                 gps.date.year(), gps.date.month(), gps.date.day(),
                 gps.time.hour(), gps.time.minute(), gps.time.second());
             if (epoch > 0) { ts_epoch = epoch; ts_is_gps = true; }
         }
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
     }
 
     // Brief window 2: is_new check, counters, history, LED
     bool is_new = false;
     uint16_t blip_col = ACCENT_COLOR;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     is_new = !is_mac_recently_seen(mac);
 
     if (is_new) {
@@ -2436,8 +2436,8 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         else if (strcmp(proto, "BLE") == 0) { session_flock_ble++; }
         lifetime_flock_total++;
         add_to_capture_history(type, mac, name, rssi, confidence);
-        // NOTE: trigger_toast() is deferred until after we release dataMutex —
-        // it takes dataMutex internally and our mutex is non-recursive.
+        // trigger_toast() is deferred until after we release dataMutex to minimize
+        // critical section duration.
         // Flash LED: yellow for WiFi, purple for BLE
         if (strcmp(proto, "WIFI") == 0) {
             led_detect_r = 255; led_detect_g = 200; led_detect_b = 0;
@@ -2482,7 +2482,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     last_cap_rssi       = rssi;
     last_cap_confidence = confidence;
     last_cap_seq_num    = seq_num;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     if (is_new) {
         trigger_toast(type, name, confidence);
@@ -2512,7 +2512,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         // Brief window: GPS snapshot
         char gps_fields[80];
         bool gps_fresh; double g_lat=0, g_lng=0; float g_spd=0, g_crs=0, g_alt=0;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         gps_fresh = gps.location.isValid() && (gps.location.age() < 2000);
         if (gps_fresh) {
             g_lat = gps.location.lat(); g_lng = gps.location.lng();
@@ -2520,7 +2520,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
             g_crs = gps.course.isValid()   ? gps.course.deg()      : 0.0f;
             g_alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0f;
         }
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
 
         if (gps_fresh)
             snprintf(gps_fields, sizeof(gps_fields), "%.6f,%.6f,%.1f,%.1f,%.1f", g_lat, g_lng, g_spd, g_crs, g_alt);
@@ -2535,13 +2535,13 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
             confidence_label(confidence), clean_extra, seq_num, gps_fields);
 
         // Brief window 3: commit line to sd_write_buffer
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         if (sd_write_count < MAX_LOG_BUFFER) {
             strncpy(sd_write_buffer[sd_write_count], local_line, SD_LINE_LEN - 1);
             sd_write_buffer[sd_write_count][SD_LINE_LEN - 1] = '\0';
             sd_write_count++;
         }
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
     }
 }
 
@@ -2592,17 +2592,17 @@ static int locator_distance_trend() {
 }
 
 void locator_add_sample(const char* mac, int rssi) {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (!locator_active || strncmp(mac, locator_target_mac, 17) != 0) {
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         return;
     }
     if (millis() - locator_last_sample < LOC_SAMPLE_INTERVAL) {
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         return;
     }
     if (!gps.location.isValid() || gps.location.age() > 2000) {
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         return;
     }
 
@@ -2625,7 +2625,7 @@ void locator_add_sample(const char* mac, int rssi) {
         if (new_r < 0) new_r = 0; if (new_r > 1) new_r = 1;
         float new_score = new_r * 1.0f;
         if (new_score > worst_score) { idx = worst; }
-        else { xSemaphoreGive(dataMutex); return; }
+        else { xSemaphoreGiveRecursive(dataMutex); return; }
     } else { locator_sample_count++; }
 
     locator_samples[idx] = {gps.location.lat(), gps.location.lng(), rssi, millis()};
@@ -2657,11 +2657,11 @@ void locator_add_sample(const char* mac, int rssi) {
             }
         }
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void locator_start(const char* mac, const char* name, const char* type = "", int id = 0) {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     locator_active = true;
     safe_copy(locator_target_mac,  mac,  sizeof(locator_target_mac));
     safe_copy(locator_target_name, name, sizeof(locator_target_name));
@@ -2675,11 +2675,11 @@ void locator_start(const char* mac, const char* name, const char* type = "", int
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
     locator_tracker_idx = -1;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void locator_stop() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     locator_active = false; locator_has_estimate = false; locator_sample_count = 0;
     locator_newest_sample_ms = 0;
     locator_estimate_announced = false;
@@ -2687,7 +2687,7 @@ void locator_stop() {
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
     locator_tracker_idx = -1;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 // ============================================================================
@@ -2714,15 +2714,16 @@ struct WifiEvent {
     uint8_t  payload_snap[256];
     uint16_t payload_snap_len;
     uint16_t orig_len;
-    volatile bool ready;
+    volatile uint32_t ready;
     bool     is_wpa2_psk;
     uint8_t  vendor_ouis[4][3];
     uint8_t  vendor_oui_count;
 };
 
 static WifiEvent wifi_event_queue[WIFI_EVENT_QUEUE_SIZE];
-static volatile uint8_t wifi_eq_write_idx = 0;
-static uint8_t          wifi_eq_read_idx  = 0;
+// Written only from the WiFi promiscuous callback (single task context on Core 0).
+static volatile uint32_t wifi_eq_write_idx = 0;
+static uint8_t           wifi_eq_read_idx  = 0;
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
@@ -2750,10 +2751,11 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     // Check the slot we're about to write rather than the next one — the
     // previous "next.ready" gate wasted a slot and capped capacity at 7
     // when the consumer was even one step behind.
-    if (wifi_event_queue[wifi_eq_write_idx].ready) return;
-    uint8_t next = (wifi_eq_write_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
+    uint32_t cur_idx = __atomic_load_n(&wifi_eq_write_idx, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) return;
+    uint32_t next = (cur_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
-    WifiEvent* ev = &wifi_event_queue[wifi_eq_write_idx];
+    WifiEvent* ev = &wifi_event_queue[cur_idx];
 
     // Copy only raw metadata and the frame snapshot.
     // SSID extraction, RSN parsing, and vendor OUI collection are
@@ -2776,9 +2778,8 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->is_wpa2_psk = false;
     ev->vendor_oui_count = 0;
 
-    __sync_synchronize();   // release: publish all field writes before `ready`
-    ev->ready = true;
-    wifi_eq_write_idx = next;
+    __atomic_store_n(&ev->ready, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&wifi_eq_write_idx, next, __ATOMIC_RELAXED);
 }
 
 // Parse tagged parameters from a locally-copied WiFi event. Extracts SSID,
@@ -2873,14 +2874,13 @@ void process_wifi_event_queue() {
     // Cap drained events per call so a packet burst (e.g. crowded
     // conference center) cannot starve the rest of loop().
     int budget = 4;
-    while (budget-- > 0 && wifi_event_queue[wifi_eq_read_idx].ready) {
+    while (budget-- > 0 &&
+           __atomic_load_n(&wifi_event_queue[wifi_eq_read_idx].ready, __ATOMIC_ACQUIRE)) {
         WifiEvent* ev = &wifi_event_queue[wifi_eq_read_idx];
-        __sync_synchronize();   // acquire: pair with producer's release below
 
         WifiEvent local;
         memcpy(&local, ev, sizeof(WifiEvent));
-        __sync_synchronize();   // release: ensure memcpy of *ev completes before producer can reuse slot
-        ev->ready = false;
+        __atomic_store_n(&ev->ready, 0u, __ATOMIC_RELEASE);
         wifi_eq_read_idx = (wifi_eq_read_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
         if (local.rssi < IGNORE_WEAK_RSSI) continue;
@@ -2989,9 +2989,9 @@ void process_wifi_event_queue() {
         }
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             channel_lock_until = millis() + 10000;
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
             rssi_track_update(mac_str, local.rssi);
             if (rssi_track_is_stationary(mac_str)) confidence += SCORE_BONUS_STAT;
             if (confidence > 100) confidence = 100;
@@ -3020,13 +3020,13 @@ void process_wifi_event_queue() {
                           local.channel, 0, extra_combined, methods, confidence, local.seq_num);
             write_threat_pcap(local.payload_snap, local.payload_snap_len);
 
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
                 trigger_alarm_confidence = confidence;
                 trigger_alarm_source = 0;  // WiFi
                 last_buzzer_time = millis();
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
     }
 }
@@ -3162,9 +3162,9 @@ static void ble_worker_task(void* pvParameters) {
             ev->mac[3], ev->mac[4], ev->mac[5]);
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             channel_lock_until = millis() + 10000;
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
             rssi_track_update(mac_string, ev->rssi);
             if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
             locator_add_sample(mac_string, ev->rssi);
@@ -3241,13 +3241,13 @@ static void ble_worker_task(void* pvParameters) {
                           ev->adv_channel, ev->have_tx_power ? ev->tx_power : 0,
                           extra_data, methods, confidence, -1);
 
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
                 trigger_alarm_confidence = confidence;
                 trigger_alarm_source = 1;  // BLE
                 last_buzzer_time = millis();
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
 
         ev->in_use = false;
@@ -3402,11 +3402,11 @@ void GPSLoopTask(void* pvParameters) {
         if (avail > 0) {
             uint8_t buf[128];
             int bytes_read = SerialGPS.readBytes(buf, min(avail, 128));
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             for(int i = 0; i < bytes_read; i++) {
                 gps.encode(buf[i]);
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
@@ -3496,10 +3496,10 @@ void draw_header_spr(int screen_num) {
     // Each pill renders right-to-left, tracking icon_right as the cursor.
 
     bool gps_lock_now;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
     long pill_det  = lifetime_flock_total;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
     bool muted_now = is_muted;
 
     int icon_right = DISP_W - 4;
@@ -3573,7 +3573,7 @@ void draw_toast_spr() {
     unsigned long start_snap     = 0;
     int           queue_count_snap = 0;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     active_snap = toast_active;
     if (active_snap) {
         strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
@@ -3583,7 +3583,7 @@ void draw_toast_spr() {
         start_snap       = toast_start;
         queue_count_snap = toast_queue_count;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     if (!active_snap) return;
 
@@ -3591,7 +3591,7 @@ void draw_toast_spr() {
 
     // Expiration handling — advance queue or clear under mutex
     if (elapsed > TOAST_DURATION_MS) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         if (toast_queue_count > 0) {
             toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
             toast_queue_count--;
@@ -3606,7 +3606,7 @@ void draw_toast_spr() {
         } else {
             toast_active = false;
         }
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         return;
     }
 
@@ -4280,7 +4280,7 @@ void handle_menu_select() {
             break;
         case 11: {
             // Clear all stats — session and lifetime
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             session_wifi = 0; session_ble = 0;
             session_flock_wifi = 0; session_flock_ble = 0;
             session_raven = 0;
@@ -4290,7 +4290,7 @@ void handle_menu_select() {
             lifetime_boots = 0;
             lifetime_flash_writes = 0;
             session_start_time = millis();
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
             // Hand the write off to PersistTask on Core 1 so the main
             // loop doesn't freeze for the LittleFS + SD round-trip
             // (~200-800ms, longer on a slow card). schedule_persist
@@ -4352,10 +4352,10 @@ void draw_scanner_screen() {
     // Step 4: scorecard — scanning status, then WIFI/BLE labels + numbers.
     // Vertical rhythm uses named spacing tokens (UI_PAD_SM, UI_PAD_XS).
     long sw, sb;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     sw = session_flock_wifi;
     sb = session_flock_ble;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     int status_y  = VIZ_BOTTOM + UI_PAD_SM;          // 73 + 6 = 79
     int labels_y  = status_y + 8 + UI_PAD_SM;        // 79 + 8 + 6 = 93
@@ -4396,11 +4396,11 @@ void draw_scanner_screen() {
     kprint(spr, "FEED");
 
     if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         scan_local_count = feed_count;
         scan_local_head  = feed_head;
         for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         scan_feed_last_snapshot = frame_ms;
     }
 
@@ -4647,11 +4647,11 @@ static void draw_radar_common(unsigned long frame_ms,
         if (diff >  (float)M_PI) diff -= TWO_PIf;
         if (diff < -(float)M_PI) diff += TWO_PIf;
         if (diff >= 0.0f && diff < BLIP_RELIGHT_ARC) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             if (radial_spikes[i] > 0.05f) {
                 radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
     }
 
@@ -5726,7 +5726,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
 }
 
 void draw_locator_screen() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     bool active=locator_active, has_est=locator_has_estimate;
     char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
     char target_name[65]; safe_copy(target_name, locator_target_name, sizeof(target_name));
@@ -5743,7 +5743,7 @@ void draw_locator_screen() {
             rssi_tracker[locator_tracker_idx].sample_count - 1];
         has_rssi = true;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     bool demo = !active;
 
@@ -5998,9 +5998,9 @@ void draw_capture_history_screen() {
     // We work directly from sd_hist or capture_history
     int total = use_sd ? sd_hist_count : 0;
     if (!use_sd) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         total = capture_history_count;
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
     }
 
     // Clamp selection and scroll
@@ -6043,9 +6043,9 @@ void draw_capture_history_screen() {
     // Snapshot in-memory history if needed
     CaptureEntry mem_hist[CAPTURE_HISTORY_SIZE];
     if (!use_sd) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         for (int i = 0; i < total; i++) mem_hist[i] = capture_history[i];
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
     }
 
     int rows_shown = 0;
@@ -6294,7 +6294,7 @@ void draw_gps_screen() {
     bool hdop_valid, time_valid;
     int gps_hour, gps_min, gps_sec;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     has_loc     = gps.location.isValid();
     stale       = has_loc && (gps.location.age() > 2000);
     sats        = gps.satellites.isValid() ? gps.satellites.value() : 0;
@@ -6308,7 +6308,7 @@ void draw_gps_screen() {
     gps_hour    = time_valid ? gps.time.hour()   : 0;
     gps_min     = time_valid ? gps.time.minute() : 0;
     gps_sec     = time_valid ? gps.time.second() : 0;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
     // Solid BG fill, diagonal axis tilt like a real globe on a stand
@@ -6726,7 +6726,7 @@ void draw_device_info_screen() {
     // Snapshot stats under mutex
     long lt, sr, sw, sb, lb, lfw;
     unsigned long l_sec;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     lt    = lifetime_flock_total;
     sr    = session_raven;
     sw    = session_flock_wifi;
@@ -6734,7 +6734,7 @@ void draw_device_info_screen() {
     lb    = lifetime_boots;
     lfw   = lifetime_flash_writes;
     l_sec = lifetime_seconds;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     int32_t  bat_mv      = get_filtered_voltage();
     size_t   free_heap   = esp_get_free_heap_size();
@@ -6902,14 +6902,14 @@ void draw_feed_expanded_overlay() {
     static FeedEntry local_feed[FEED_SIZE];
     int local_count, local_head;
     unsigned long local_now;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     local_count = feed_count;
     local_head = feed_head;
     // feed_entries is a ring keyed by feed_head; copy the whole array
     // so the renderer's modular index reaches the actual newest entry.
     for (int i = 0; i < FEED_SIZE; i++) local_feed[i] = feed_entries[i];
     local_now = millis();
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     // Slide-in animation state — tracks new entries arriving while overlay is open
     static int           expand_prev_head   = -1;
@@ -7613,7 +7613,7 @@ void setup() {
     }
 
     // dataMutex MUST be created before any task that uses it is spawned.
-    dataMutex = xSemaphoreCreateMutex();
+    dataMutex = xSemaphoreCreateRecursiveMutex();
     sdMutex   = xSemaphoreCreateMutex();
 
     // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
@@ -7916,11 +7916,11 @@ void setup() {
     // Pre-populate the scanner feed snapshot so the first frame of
     // draw_scanner_screen() already has rows to display.
     {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         scan_local_count = feed_count;
         scan_local_head  = feed_head;
         for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         scan_feed_last_snapshot = millis();
     }
 
@@ -8061,14 +8061,14 @@ void loop() {
 
     int conf_snapshot = 0;
     int src_snapshot = 0;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (trigger_alarm_confidence >= 50) {
         conf_snapshot = trigger_alarm_confidence;
         src_snapshot = trigger_alarm_source;
     }
     trigger_alarm_confidence = 0;
     trigger_alarm_source = 0;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     if (conf_snapshot >= 50) {
         play_escalated_alarm(conf_snapshot, src_snapshot);
@@ -8368,24 +8368,24 @@ void loop() {
                     
                     if (sim_wifi) {
                         log_detection("SIMULATION", "WIFI", random(-80, -30), fake_mac, "Test_WiFi", 6, 0, "Beacon", "manual_test", 100, 1);
-                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                         session_flock_wifi--; session_wifi--; lifetime_wifi--;
                         lifetime_flock_total--;
-                        xSemaphoreGive(dataMutex);
+                        xSemaphoreGiveRecursive(dataMutex);
                     } else {
                         log_detection("SIMULATION", "BLE", random(-90, -40), fake_mac, "Test_BLE", 0, 0, "Adv", "manual_test", 100, 1);
-                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                         session_flock_ble--; session_ble--; lifetime_ble--;
                         lifetime_flock_total--;
-                        xSemaphoreGive(dataMutex);
+                        xSemaphoreGiveRecursive(dataMutex);
                     }
                     // Set alarm trigger under mutex — both fields together,
                     // matching the producer pattern in process_wifi_event_queue
                     // and ble_worker_task.
-                    xSemaphoreTake(dataMutex, portMAX_DELAY);
+                    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                     trigger_alarm_confidence = 100;
                     trigger_alarm_source = sim_wifi ? 0 : 1;  // 0=WiFi, 1=BLE
-                    xSemaphoreGive(dataMutex);
+                    xSemaphoreGiveRecursive(dataMutex);
 
                     sim_wifi = !sim_wifi;
                 }
@@ -8393,7 +8393,7 @@ void loop() {
             else if (c == 't') { 
                 if (!stealth_mode && capture_history_count > 0) {
                     static int target_select_idx = -1;
-                    xSemaphoreTake(dataMutex, portMAX_DELAY);
+                    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                     int current_hist_count = capture_history_count;
                     target_select_idx = (target_select_idx + 1) % current_hist_count;
                     char t_mac[18];  strncpy(t_mac,  capture_history[target_select_idx].mac,  17); t_mac[17]  = '\0';
@@ -8401,7 +8401,7 @@ void loop() {
                     char t_type[16]; strncpy(t_type, capture_history[target_select_idx].type, 15); t_type[15] = '\0';
                     int t_conf = capture_history[target_select_idx].confidence;
                     int t_id   = capture_history[target_select_idx].id;
-                    xSemaphoreGive(dataMutex);
+                    xSemaphoreGiveRecursive(dataMutex);
 
                     locator_start(t_mac, t_name, t_type, t_id);
                     trigger_toast("TARGET", t_name, t_conf);
@@ -8660,7 +8660,7 @@ void loop() {
         beep(led_breathing_on ? 800 : 400, 30);
     }
 
-    if (millis() - last_time_save >= 1000) { xSemaphoreTake(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGive(dataMutex); last_time_save = millis(); }
+    if (millis() - last_time_save >= 1000) { xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGiveRecursive(dataMutex); last_time_save = millis(); }
     if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) {
         // Only advance the gate when the spawn actually took. If heap was
         // too low to allocate the task stack, retry on the next loop tick
@@ -8705,14 +8705,14 @@ void loop() {
         last_sd_flush_check = millis(); 
         bool should_flush = false; 
         
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         if (sd_write_count >= MAX_LOG_BUFFER || pcap_write_count >= MAX_PCAP_BUFFER ||
             ble_pcap_write_count >= MAX_PCAP_BUFFER ||
             (millis() - last_sd_flush > SD_FLUSH_INTERVAL &&
              (sd_write_count > 0 || pcap_write_count > 0 || ble_pcap_write_count > 0))) {
             should_flush = true;
         }
-        xSemaphoreGive(dataMutex); 
+        xSemaphoreGiveRecursive(dataMutex); 
         
         if (should_flush) flush_sd_buffer();
     }
@@ -8720,19 +8720,19 @@ void loop() {
 
     {
         bool need_update;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         need_update = locator_active && locator_has_estimate;
         if (need_update && gps.location.isValid() && gps.location.age() < 2000) {
             double my_lat = gps.location.lat();
             double my_lng = gps.location.lng();
             double tgt_lat = locator_est_lat;
             double tgt_lng = locator_est_lng;
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
 
             float dist = (float)haversine_m(my_lat, my_lng, tgt_lat, tgt_lng);
             float brng = bearing_to(my_lat, my_lng, tgt_lat, tgt_lng);
 
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             locator_est_distance = dist;
             locator_bearing = brng;
             // Sample the distance into the trend history (every ~500ms)
@@ -8743,21 +8743,21 @@ void loop() {
                 if (locator_dist_history_count < LOC_TREND_SAMPLES) locator_dist_history_count++;
                 locator_last_trend_sample_ms = now_t;
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         } else {
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
     }
 
     {
         bool was_dirty = false;
         if (current_screen == 2 && !hist_detail_open) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             if (sd_hist_dirty) {
                 sd_hist_dirty = false;
                 was_dirty = true;
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
         if (was_dirty) {
             // Same timed-take pattern — skip the load if PersistTask is busy;
@@ -8805,9 +8805,9 @@ void loop() {
 
             // Detection counter (bottom-right, flashes ACCENT after a blip)
             long det_total;
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             det_total = session_flock_wifi + session_flock_ble + session_raven;
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
             uint16_t det_col = (radar_time_since_blip < 3000) ? ACCENT_COLOR : DIM_COLOR;
             char det_str[16];
             snprintf(det_str, sizeof(det_str), "D:%ld", det_total);
