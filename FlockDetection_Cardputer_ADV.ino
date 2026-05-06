@@ -69,6 +69,7 @@ static void set_toast_direct(const char* text, uint16_t accent);
 static void apply_ble_scan_params();
 struct WifiEvent;
 static void parse_wifi_event(struct WifiEvent* ev);
+static void update_channel_histogram();
 static void draw_scanner_viz_radar(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms);
@@ -4350,6 +4351,7 @@ void draw_scanner_screen() {
     // All modes use the same tight clip rect — radar is cropped at the
     // panel boundary, giving a "viewport into a larger instrument" look.
     spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+    update_channel_histogram();
     switch (scanner_viz_mode) {
         case 0: draw_scanner_viz_radar(frame_ms);        break;
         case 1: draw_scanner_viz_spectrum(frame_ms);     break;
@@ -4732,22 +4734,27 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
 // 13-bar 2.4 GHz channel histogram driven by channel_pkt_counts[],
 // incremented in the WiFi sniffer ISR. Display values refresh every 2 s
 // with a 2/3 decay so the bars represent a rolling window. Current
+// Maintain the per-channel packet histogram used by the SPECTRUM viz.
+// Called regularly regardless of which viz mode is active so counts don't
+// accumulate unbounded while SPECTRUM is off-screen.
+static void update_channel_histogram() {
+    unsigned long now = millis();
+    if (now - channel_display_last_update < 5000) return;
+
+    channel_peak = 1;
+    for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+        channel_pkt_display[i] = channel_pkt_counts[i];
+        channel_pkt_counts[i]  = channel_pkt_counts[i] / 2;
+        if (channel_pkt_display[i] > channel_peak)
+            channel_peak = channel_pkt_display[i];
+    }
+    channel_display_last_update = now;
+}
+
 // hopping channel renders bright with a triangle marker; flock
 // detections briefly flash the peak bar in CAUTION_COLOR.
 static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
-    // Longer accumulation window — 13 channels × 400ms hop ≈ 5s/cycle,
-    // so a 5s snapshot represents a full hop cycle and gentler /2 decay
-    // keeps a couple cycles of history alive in the bars.
-    if (frame_ms - channel_display_last_update >= 5000) {
-        channel_peak = 1;
-        for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
-            channel_pkt_display[i] = channel_pkt_counts[i];
-            channel_pkt_counts[i]  = channel_pkt_counts[i] / 2;
-            if (channel_pkt_display[i] > channel_peak)
-                channel_peak = channel_pkt_display[i];
-        }
-        channel_display_last_update = frame_ms;
-    }
+    update_channel_histogram();
 
     // Per-channel smoothing — eases each value toward the normalised
     // packet ratio with a 300 ms time constant so the curve glides
@@ -8069,6 +8076,7 @@ void loop() {
 
     process_wifi_event_queue();
     feed_commit_pending();
+    update_channel_histogram();
     if (wdt_subscribed) esp_task_wdt_reset();
 
     int conf_snapshot = 0;
@@ -8366,10 +8374,20 @@ void loop() {
             }
             else if (c == 'v') {
                 if (!stealth_mode && current_screen == 0) {
+                    int prev_mode = scanner_viz_mode;
                     scanner_viz_mode = (scanner_viz_mode + 1) % SCANNER_VIZ_COUNT;
                     viz_indicator_show_ms = millis();
                     screen_dirty = true;
                     menu_click();
+
+                    if (scanner_viz_mode == 1 && prev_mode != 1) {
+                        for (int i = 0; i < NUM_WIFI_CHANNELS; i++) spectrum_smooth[i] = 0.0f;
+                        spectrum_ghost_head   = 0;
+                        spectrum_ghost_filled = false;
+                        spectrum_ghost_last_ms = 0;
+                        spectrum_last_frame   = 0;
+                        scan_line_last_frame  = 0;
+                    }
                 }
             }
             else if (c == 'x') {
