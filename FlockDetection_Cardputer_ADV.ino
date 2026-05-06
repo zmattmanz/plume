@@ -86,6 +86,16 @@ uint16_t BG_COLOR, CARD_COLOR, CARD_BORDER;
 uint16_t HEADER_COLOR, TEXT_COLOR, DIM_COLOR;
 uint16_t ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
 uint16_t CAUTION_COLOR, GPS_COLOR;
+uint16_t HATCH_COLOR;          // lerp(BG, CARD_BORDER, 0.80) — hatch fill lines
+uint16_t GRID_LINE_DIM;        // lerp(BG, CARD_BORDER, 0.30) — faint grid/axis
+uint16_t GRID_LINE_MED;        // lerp(BG, CARD_BORDER, 0.50) — medium grid lines
+uint16_t SWEEP_LINE_COLOR;     // lerp(BG, HEADER, 0.60) — spectrum scan line
+uint16_t HEADER_DIM_BLEND;     // lerp(BG, HEADER, 0.25) — dim header accent
+uint16_t RING_COLOR;           // lerp(BG, HEADER, 0.25) — flatradar ring lines
+uint16_t CENTER_DOT;           // lerp(BG, HEADER, 0.50) — flatradar center dot
+uint16_t CENTER_DOT_BRIGHT;    // lerp(BG, HEADER, 0.80) — flatradar center highlight
+uint16_t SCALE_LABEL_COLOR;    // lerp(BG, DIM, 0.80) — dBm scale tick labels
+uint16_t STATUS_TEXT_DIM;      // lerp(BG, DIM, 0.60) — scanner status line text
 bool night_mode = false;
 bool show_help_overlay = false;
 static unsigned long help_ease_start = 0;
@@ -143,6 +153,24 @@ static unsigned long led_detection_flash_until = 0;
 static uint8_t  led_detect_r = 0, led_detect_g = 0, led_detect_b = 0;
 static bool     led_detect_active = false;
 
+// Fixed-point color lerp — defined here so apply_color_palette can call it.
+// t_256 is 0..256 (256 = exact tc, no off-by-one). Works in RGB565 component
+// space directly; no lgfx::color565 overhead or float multiply.
+static inline uint16_t lerp_col16_i(uint16_t fc, uint16_t tc, int t_256) {
+    if (t_256 <= 0)   return fc;
+    if (t_256 >= 256) return tc;
+    int fr = (fc >> 11) & 0x1F, fg = (fc >> 5) & 0x3F, fb = fc & 0x1F;
+    int tr = (tc >> 11) & 0x1F, tg = (tc >> 5) & 0x3F, tb = tc & 0x1F;
+    int rr = fr + (((tr - fr) * t_256) >> 8);
+    int rg = fg + (((tg - fg) * t_256) >> 8);
+    int rb = fb + (((tb - fb) * t_256) >> 8);
+    return (uint16_t)((rr << 11) | (rg << 5) | rb);
+}
+// Float wrapper — one float-to-int conversion replaces three float multiplies.
+static inline uint16_t lerp_col16(uint16_t fc, uint16_t tc, float t) {
+    return lerp_col16_i(fc, tc, (int)(t * 256.0f + 0.5f));
+}
+
 void apply_color_palette() {
     if (night_mode) {
         // Night: red chrome, lifted dim for readability, amber caution.
@@ -174,16 +202,19 @@ void apply_color_palette() {
         CAUTION_COLOR = lgfx::color565(255, 123,  92);   // #FF7B5C coral
         GPS_COLOR     = lgfx::color565(110, 200, 255);   // = HEADER (collapsed)
     }
+    HATCH_COLOR       = lerp_col16(BG_COLOR, CARD_BORDER,  0.80f);
+    GRID_LINE_DIM     = lerp_col16(BG_COLOR, CARD_BORDER,  0.30f);
+    GRID_LINE_MED     = lerp_col16(BG_COLOR, CARD_BORDER,  0.50f);
+    SWEEP_LINE_COLOR  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.60f);
+    HEADER_DIM_BLEND  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f);
+    RING_COLOR        = lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f);
+    CENTER_DOT        = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
+    CENTER_DOT_BRIGHT = lerp_col16(BG_COLOR, HEADER_COLOR, 0.80f);
+    SCALE_LABEL_COLOR = lerp_col16(BG_COLOR, DIM_COLOR,    0.80f);
+    STATUS_TEXT_DIM   = lerp_col16(BG_COLOR, DIM_COLOR,    0.60f);
 }
 
 // ── Module-level rendering helpers ──────────────────────────────────────────
-// lerp_col16: linearly interpolate two RGB565 colours by t ∈ [0,1]
-static inline uint16_t lerp_col16(uint16_t fc, uint16_t tc, float t) {
-    int fr=((fc>>11)&0x1F)<<3, fg=((fc>>5)&0x3F)<<2, fb=(fc&0x1F)<<3;
-    int tr=((tc>>11)&0x1F)<<3, tg=((tc>>5)&0x3F)<<2, tb=(tc&0x1F)<<3;
-    return lgfx::color565((uint8_t)(fr+(tr-fr)*t),(uint8_t)(fg+(tg-fg)*t),(uint8_t)(fb+(tb-fb)*t));
-}
-
 // kprint: print text with +1 px inter-character spacing (kerning) at textSize=1
 // Pass cx/cy from the current sprite cursor position before calling.
 static void kprint(M5Canvas& s, const char* text, int extra = 1) {
@@ -4374,7 +4405,7 @@ void draw_scanner_screen() {
     int numbers_y = labels_y + 10 + UI_PAD_XS;       // 93 + 10 + 2 = 105
 
     bool ble_scanning = (pBLEScan != nullptr && pBLEScan->isScanning());
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.6f), BG_COLOR);
+    spr.setTextColor(STATUS_TEXT_DIM, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(6, status_y);
     if (ble_scanning) {
@@ -4813,7 +4844,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     // inside the panel; we restore the outer scanner clip afterwards so
     // the rest of the spectrum renders against the same bounds.
     {
-        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.80f);
+        uint16_t hatch_col = HATCH_COLOR;
         spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
         for (int d = -VIZ_H; d < VIZ_W + VIZ_H; d += 8) {
             int x0 = VIZ_X + d;
@@ -4826,8 +4857,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         spr.setClipRect(0, VIZ_Y - 2, DIVIDER_X, VIZ_H + 4);
     }
 
-    spr.drawFastHLine(plot_x, plot_bottom, plot_w,
-                      lerp_col16(BG_COLOR, CARD_BORDER, 0.3f));
+    spr.drawFastHLine(plot_x, plot_bottom, plot_w, GRID_LINE_DIM);
 
     auto val_to_y = [&](float val) -> int {
         return plot_bottom - (int)(val * (float)plot_h);
@@ -4967,8 +4997,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         spr.drawFastVLine(wake_x, plot_y, plot_h,
                           lerp_col16(BG_COLOR, HEADER_COLOR, wake_alpha));
     }
-    spr.drawFastVLine(scan_x, plot_y, plot_h,
-                      lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f));
+    spr.drawFastVLine(scan_x, plot_y, plot_h, SWEEP_LINE_COLOR);
 
     // Catmull-Rom curve, walked pixel by pixel. Single 1px drawLine per
     // segment in full HEADER_COLOR (CAUTION_COLOR near flock detection).
@@ -5005,7 +5034,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     // CH indicator at the top-right of the viz area.
     char ch_str[6];
     snprintf(ch_str, sizeof(ch_str), "CH%d", current_channel);
-    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.6f), BG_COLOR);
+    spr.setTextColor(SWEEP_LINE_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(VIZ_RIGHT - 18, VIZ_Y - 10);
     spr.print(ch_str);
@@ -5174,8 +5203,7 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
     }
 
     // ── dBm scale along the bottom ──
-    spr.drawFastHLine(BAR_X, SCALE_Y, BAR_MAX_W,
-                      lerp_col16(BG_COLOR, CARD_BORDER, 0.50f));
+    spr.drawFastHLine(BAR_X, SCALE_Y, BAR_MAX_W, GRID_LINE_MED);
 
     struct ScaleTick { float pct; const char* label; };
     const ScaleTick ticks[4] = {
@@ -5188,11 +5216,11 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         int tx = BAR_X + (int)(ticks[t].pct * (float)BAR_MAX_W);
 
         spr.drawFastVLine(tx, START_Y, SCALE_Y - START_Y,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.35f));
+                          GRID_LINE_DIM);
         spr.drawFastVLine(tx, SCALE_Y, 3,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.55f));
+                          GRID_LINE_MED);
 
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.8f), BG_COLOR);
+        spr.setTextColor(SCALE_LABEL_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
         int label_w = (int)strlen(ticks[t].label) * 6;
         spr.setCursor(tx - label_w / 2, SCALE_Y + 4);
@@ -5204,11 +5232,11 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         int y = START_Y + row * (BAR_H + BAR_GAP);
 
         spr.fillRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.35f));
+                          GRID_LINE_DIM);
         spr.drawRoundRect(BAR_X, y, BAR_MAX_W, BAR_H, pill_r,
-                          lerp_col16(BG_COLOR, CARD_BORDER, 0.55f));
+                          GRID_LINE_MED);
 
-        uint16_t hatch_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.80f);
+        uint16_t hatch_col = HATCH_COLOR;
         spr.setClipRect(BAR_X, y, BAR_MAX_W, BAR_H);
         for (int d = -BAR_H; d < BAR_MAX_W + BAR_H; d += 8) {
             int x0 = BAR_X + d,  y0 = y;
@@ -5492,8 +5520,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         const float ring_pcts[] = {0.33f, 0.66f, 1.0f};
         for (int ri = 0; ri < 3; ri++) {
             int rr = (int)(ring_pcts[ri] * (float)R_R);
-            spr.drawCircle(CX, CY, rr,
-                           lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
+            spr.drawCircle(CX, CY, rr, RING_COLOR);
         }
     }
 
@@ -5740,8 +5767,8 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
     }
 
     // ── 8. Center dot ──
-    spr.fillCircle(CX, CY, 2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f));
-    spr.drawPixel(CX, CY, lerp_col16(BG_COLOR, HEADER_COLOR, 0.80f));
+    spr.fillCircle(CX, CY, 2, CENTER_DOT);
+    spr.drawPixel(CX, CY, CENTER_DOT_BRIGHT);
 }
 
 void draw_locator_screen() {
