@@ -1927,8 +1927,6 @@ static void sd_check_hotplug() {
         esp_task_wdt_reset();  // SD.begin can take several hundred ms
 
         if (mounted) {
-            sd_available = true;
-
             if (!SD.exists("/FLOCK_FINDER"))          SD.mkdir("/FLOCK_FINDER");
             if (!SD.exists("/FLOCK_FINDER/logs"))     SD.mkdir("/FLOCK_FINDER/logs");
             if (!SD.exists("/FLOCK_FINDER/captures")) SD.mkdir("/FLOCK_FINDER/captures");
@@ -1966,6 +1964,11 @@ static void sd_check_hotplug() {
             // Phase 1 complete — release mutex so flush_sd_buffer and
             // PersistTask can run between phases.
             xSemaphoreGive(sdMutex);
+
+            // Only now advertise the card as available — directories and
+            // PCAP headers are confirmed written, so flush_sd_buffer and
+            // PersistTask will find a fully initialized filesystem.
+            sd_available = true;
 
             // Phase 2: history load + stats write. Re-acquire with a
             // longer timeout; if contention persists, skip (PersistTask
@@ -4904,6 +4907,8 @@ static void draw_radar_common(unsigned long frame_ms,
                  modulated_col);
 
     // 24-step dot trail — original RGB formula.
+    // Pre-compute sin/cos per trail step so the inner r_step loop
+    // uses multiplies instead of trig calls.
     for (int i = 1; i <= 24; i++) {
         float trail_angle = sweep_rad - (i * 0.05f);
         float ratio = (24.0f - i) / 24.0f;
@@ -4912,9 +4917,12 @@ static void draw_radar_common(unsigned long frame_ms,
         int tb = 48 + (255 - 48) * ratio;
         uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0)
                                        : lgfx::color565(tr, tg, tb);
+        float trail_cos, trail_sin;
+        fast_sincos(trail_angle, &trail_sin, &trail_cos);
+        float trail_sin_tilt = trail_sin * tilt;
         for (int r_step = ir + 2; r_step < r; r_step += 4) {
-            spr.drawPixel(cx + (int)(r_step * cosf(trail_angle)),
-                          cy + (int)(r_step * sinf(trail_angle) * tilt), fade_col);
+            spr.drawPixel(cx + (int)(r_step * trail_cos),
+                          cy + (int)(r_step * trail_sin_tilt), fade_col);
         }
     }
 
@@ -5927,26 +5935,35 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         if (d.vy >  MAX_VEL) d.vy =  MAX_VEL;
         if (d.vy < -MAX_VEL) d.vy = -MAX_VEL;
 
-        // Clamp to inner circle with bounce
+        // Clamp to inner circle with bounce + sweep brightness.
+        // dist is computed lazily — only when needed by the clamp body
+        // or the sweep brightness logic.
         float dev_dist_sq = d.x * d.x + d.y * d.y;
-        float dist = sqrtf(dev_dist_sq);
-        if (dist > (float)R_IR) {
+        float dist = 0.0f;
+        bool dist_computed = false;
+
+        const float R_IR_SQ = (float)(R_IR * R_IR);
+        if (dev_dist_sq > R_IR_SQ) {
+            dist = sqrtf(dev_dist_sq);
+            dist_computed = true;
             float scale = (float)R_IR / dist;
             d.x *= scale;
             d.y *= scale;
             float nx = d.x / dist, ny = d.y / dist;
             float dot = d.vx * nx + d.vy * ny;
             if (dot > 0) { d.vx -= 2.0f * dot * nx; d.vy -= 2.0f * dot * ny; }
+            dev_dist_sq = d.x * d.x + d.y * d.y;
         }
 
         // ── Sweep brightness — long lingering glow ──
-        // Use dot/cross against pre-computed sweep direction to get the
-        // angular offset without a separate atan2f(d.y, d.x) call.
-        // Reuses `dist` computed above, saving one sqrtf.
         float behind;
-        if (dist < 0.1f) {
+        if (dev_dist_sq < 0.01f) {
             behind = 0.0f;
         } else {
+            if (!dist_computed) {
+                dist = sqrtf(dev_dist_sq);
+                dist_computed = true;
+            }
             float inv_dist = 1.0f / dist;
             float dx_n = d.x * inv_dist;
             float dy_n = d.y * inv_dist;
