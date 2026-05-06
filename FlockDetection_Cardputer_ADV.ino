@@ -7872,8 +7872,8 @@ void setup() {
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 1536, NULL, 1, &ScannerTaskHandle, 0);
-    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 1280, NULL, 1, &GPSTaskHandle, 0);
+    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 2048, NULL, 1, &ScannerTaskHandle, 0);
+    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 2048, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
 
@@ -8027,8 +8027,8 @@ void loop() {
             UBaseType_t led_hw  = LedTaskHandle ? uxTaskGetStackHighWaterMark(LedTaskHandle) : 0;
             UBaseType_t loop_hw = uxTaskGetStackHighWaterMark(NULL);  // NULL = calling task (loop)
             Serial.printf("[STACK] High-water marks (bytes remaining):\n");
-            Serial.printf("  Scanner: %u / 1792\n", (unsigned)scan_hw);
-            Serial.printf("  GPS:     %u / 1536\n", (unsigned)gps_hw);
+            Serial.printf("  Scanner: %u / 2048\n", (unsigned)scan_hw);
+            Serial.printf("  GPS:     %u / 2048\n", (unsigned)gps_hw);
             Serial.printf("  BLE:     %u / 2560\n", (unsigned)ble_hw);
             Serial.printf("  LED:     %u / 1536\n", (unsigned)led_hw);
             Serial.printf("  Loop:    %u / 8192\n", (unsigned)loop_hw);
