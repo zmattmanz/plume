@@ -5460,6 +5460,13 @@ static void draw_scanner_viz_waveform(unsigned long frame_ms) {
     }
 }
 
+// Compute sin and cos in one call — GCC/Xtensa won't auto-fuse separate
+// sinf/cosf calls on the same angle.
+static inline void fast_sincos(float angle, float* s, float* c) {
+    *s = sinf(angle);
+    *c = cosf(angle);
+}
+
 // ── Viz mode 4: FLAT RADAR — phosphor decay (zoomed in) ──────────────────
 // R_R = 90 extends far beyond the 134x53 panel. Clip rect crops to the
 // viewport — phosphor sweep fills every pixel edge to edge.
@@ -5482,10 +5489,15 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
     flatradar_angle += dt * 0.001f * (PI2f / 6.0f);
     if (flatradar_angle > PI2f) flatradar_angle -= PI2f;
 
-    // ── 1. Phosphor decay — 90 filled triangle slices ──
+    // Pre-compute sweep angle sin/cos at function scope — reused by both
+    // the sweep layer renderer and the per-device sweep brightness below.
+    float sweep_sin, sweep_cos;
+    fast_sincos(flatradar_angle, &sweep_sin, &sweep_cos);
+
+    // ── 1. Phosphor decay — 45 filled triangle slices ──
     // Slices extend to R_DRAW so clip rect fills every panel corner.
     {
-        const int   NUM_SLICES = 90;
+        const int   NUM_SLICES = 45;
         const float DECAY_ARC  = PI2f * 0.83f;
 
         for (int si = 0; si < NUM_SLICES; si++) {
@@ -5496,20 +5508,23 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
             float a1 = flatradar_angle - t1 * DECAY_ARC;
 
             float brightness;
-            if (t0 < 0.04f) {
+            if (t0 < 0.08f) {
                 brightness = 0.55f;
             } else {
-                float fade = (t0 - 0.04f) / 0.96f;
+                float fade = (t0 - 0.08f) / 0.92f;
                 brightness = 0.45f * (1.0f - fade) * (1.0f - fade) * (1.0f - fade);
             }
             if (brightness < 0.008f) continue;
 
             uint16_t col = lerp_col16(BG_COLOR, HEADER_COLOR, brightness);
 
-            int x0 = CX + (int)((float)R_DRAW * cosf(a0));
-            int y0 = CY + (int)((float)R_DRAW * sinf(a0));
-            int x1 = CX + (int)((float)R_DRAW * cosf(a1));
-            int y1 = CY + (int)((float)R_DRAW * sinf(a1));
+            float s0, c0, s1, c1;
+            fast_sincos(a0, &s0, &c0);
+            fast_sincos(a1, &s1, &c1);
+            int x0 = CX + (int)((float)R_DRAW * c0);
+            int y0 = CY + (int)((float)R_DRAW * s0);
+            int x1 = CX + (int)((float)R_DRAW * c1);
+            int y1 = CY + (int)((float)R_DRAW * s1);
 
             spr.fillTriangle(CX, CY, x0, y0, x1, y1, col);
         }
@@ -5535,8 +5550,15 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
             float t = (float)li / (float)(SWEEP_LAYERS - 1);
             float layer_angle = flatradar_angle - t * SWEEP_FAN;
 
-            int ex = CX + (int)((float)R_R * cosf(layer_angle));
-            int ey = CY + (int)((float)R_R * sinf(layer_angle));
+            float ls, lc;
+            if (li == 0) {
+                ls = sweep_sin;
+                lc = sweep_cos;
+            } else {
+                fast_sincos(layer_angle, &ls, &lc);
+            }
+            int ex = CX + (int)((float)R_R * lc);
+            int ey = CY + (int)((float)R_R * ls);
 
             float alpha;
             if (li == 0) {
@@ -5621,6 +5643,11 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
     }
 
     // ── 5. Update device positions + physics ──
+    float wander_t1 = (float)frame_ms * 0.00025f;
+    float wander_t2 = (float)frame_ms * 0.00040f;
+    float wander_t3 = (float)frame_ms * 0.00030f;
+    float wander_t4 = (float)frame_ms * 0.00020f;
+
     for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
         if (!flatradar_devs[pi].occupied) continue;
         FlatRadarDevice& d = flatradar_devs[pi];
@@ -5634,10 +5661,10 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         uint32_t fh = 0;
         for (const char* p = d.name; *p; p++) fh = fh * 31 + (uint8_t)*p;
         float fp = (float)(fh % 1000) / 1000.0f * 6.28f;
-        tx += sinf((float)frame_ms * 0.00025f + fp)        * 3.0f
-            + sinf((float)frame_ms * 0.00040f + fp * 1.7f) * 1.5f;
-        ty += sinf((float)frame_ms * 0.00030f + fp * 0.6f) * 2.0f
-            + cosf((float)frame_ms * 0.00020f + fp * 2.1f) * 1.0f;
+        tx += sinf(wander_t1 + fp)        * 3.0f
+            + sinf(wander_t2 + fp * 1.7f) * 1.5f;
+        ty += sinf(wander_t3 + fp * 0.6f) * 2.0f
+            + cosf(wander_t4 + fp * 2.1f) * 1.0f;
 
         d.x = anim_filter(d.x, tx + d.vx, 400.0f, dt);
         d.y = anim_filter(d.y, ty + d.vy, 400.0f, dt);
@@ -5652,7 +5679,8 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         if (d.vy < -MAX_VEL) d.vy = -MAX_VEL;
 
         // Clamp to inner circle with bounce
-        float dist = sqrtf(d.x * d.x + d.y * d.y);
+        float dev_dist_sq = d.x * d.x + d.y * d.y;
+        float dist = sqrtf(dev_dist_sq);
         if (dist > (float)R_IR) {
             float scale = (float)R_IR / dist;
             d.x *= scale;
@@ -5663,10 +5691,21 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         }
 
         // ── Sweep brightness — long lingering glow ──
-        float dev_angle = atan2f(d.y, d.x);
-        float behind = flatradar_angle - dev_angle;
-        while (behind < 0)    behind += PI2f;
-        while (behind > PI2f) behind -= PI2f;
+        // Use dot/cross against pre-computed sweep direction to get the
+        // angular offset without a separate atan2f(d.y, d.x) call.
+        // Reuses `dist` computed above, saving one sqrtf.
+        float behind;
+        if (dist < 0.1f) {
+            behind = 0.0f;
+        } else {
+            float inv_dist = 1.0f / dist;
+            float dx_n = d.x * inv_dist;
+            float dy_n = d.y * inv_dist;
+            float dot   = dx_n * sweep_cos + dy_n * sweep_sin;
+            float cross = dx_n * sweep_sin - dy_n * sweep_cos;
+            behind = atan2f(cross, dot);
+            if (behind < 0.0f) behind += PI2f;
+        }
 
         float sweep_zone = PI2f * 0.33f;
         if (behind < sweep_zone) {
