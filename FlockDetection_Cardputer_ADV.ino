@@ -2717,7 +2717,16 @@ static int locator_distance_trend() {
 }
 
 void locator_add_sample(const char* mac, int rssi) {
+    // ── Phase 1: validate and snapshot under mutex (short hold) ──
+    LocSample local_samples[LOC_MAX_SAMPLES];
+    int       local_sample_count = 0;
+    int       local_peak_rssi    = -120;
+    bool      should_compute     = false;
+    double    my_lat = 0, my_lng = 0;
+    bool      my_loc_valid = false;
+
     if (!take_data_mutex()) return;
+
     if (!locator_active || strncmp(mac, locator_target_mac, 17) != 0) {
         give_data_mutex();
         return;
@@ -2746,42 +2755,82 @@ void locator_add_sample(const char* mac, int rssi) {
             float combined = r * rec;
             if (combined < worst_score) { worst_score = combined; worst = i; }
         }
-        float new_r   = (float)(rssi + 100) / 80.0f;
+        float new_r = (float)(rssi + 100) / 80.0f;
         if (new_r < 0) new_r = 0; if (new_r > 1) new_r = 1;
-        float new_score = new_r * 1.0f;
-        if (new_score > worst_score) { idx = worst; }
+        if (new_r > worst_score) { idx = worst; }
         else { give_data_mutex(); return; }
-    } else { locator_sample_count++; }
+    } else {
+        locator_sample_count++;
+    }
 
     locator_samples[idx] = {gps.location.lat(), gps.location.lng(), rssi, millis()};
-    locator_last_sample = millis();
+    locator_last_sample      = millis();
     locator_newest_sample_ms = millis();
     if (rssi > locator_peak_rssi) locator_peak_rssi = rssi;
 
     if (locator_sample_count >= LOC_MIN_SAMPLES_EST) {
-        double sum_wlat = 0, sum_wlng = 0, sum_w = 0;
-        for (int i = 0; i < locator_sample_count; i++) {
-            double w = rssi_to_weight(locator_samples[i].rssi);
-            sum_wlat += locator_samples[i].lat * w; sum_wlng += locator_samples[i].lng * w; sum_w += w;
-        }
-        if (sum_w > 0) {
-            locator_est_lat = sum_wlat / sum_w; locator_est_lng = sum_wlng / sum_w; locator_has_estimate = true;
-            if (gps.location.isValid()) {
-                locator_est_distance = haversine_m(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
-                locator_bearing = bearing_to(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
-            }
-            double sum_wd2 = 0;
-            for (int i = 0; i < locator_sample_count; i++) {
-                double d = haversine_m(locator_samples[i].lat, locator_samples[i].lng, locator_est_lat, locator_est_lng);
-                double w = rssi_to_weight(locator_samples[i].rssi); sum_wd2 += w * d * d;
-            }
-            locator_confidence_radius = sqrt(sum_wd2 / sum_w);
-            if (!locator_estimate_announced) {
-                locator_estimate_announced = true;
-                locator_announce_pending = true;
-            }
+        local_sample_count = locator_sample_count;
+        for (int i = 0; i < local_sample_count; i++) local_samples[i] = locator_samples[i];
+        local_peak_rssi = locator_peak_rssi;
+        should_compute  = true;
+        if (gps.location.isValid()) {
+            my_lat = gps.location.lat();
+            my_lng = gps.location.lng();
+            my_loc_valid = true;
         }
     }
+
+    give_data_mutex();
+
+    // ── Phase 2: heavy FP computation outside mutex ──
+    if (!should_compute) return;
+
+    double sum_wlat = 0, sum_wlng = 0, sum_w = 0;
+    for (int i = 0; i < local_sample_count; i++) {
+        double w = rssi_to_weight(local_samples[i].rssi);
+        sum_wlat += local_samples[i].lat * w;
+        sum_wlng += local_samples[i].lng * w;
+        sum_w    += w;
+    }
+    if (sum_w <= 0) return;
+
+    double est_lat      = sum_wlat / sum_w;
+    double est_lng      = sum_wlng / sum_w;
+    float  est_distance = 0.0f;
+    float  est_bearing  = 0.0f;
+    if (my_loc_valid) {
+        est_distance = haversine_m(my_lat, my_lng, est_lat, est_lng);
+        est_bearing  = bearing_to(my_lat, my_lng, est_lat, est_lng);
+    }
+
+    double sum_wd2 = 0;
+    for (int i = 0; i < local_sample_count; i++) {
+        double d = haversine_m(local_samples[i].lat, local_samples[i].lng, est_lat, est_lng);
+        double w = rssi_to_weight(local_samples[i].rssi);
+        sum_wd2 += w * d * d;
+    }
+    float conf_radius = (float)sqrt(sum_wd2 / sum_w);
+
+    // ── Phase 3: write results back under mutex (short hold) ──
+    if (!take_data_mutex()) return;
+
+    if (!locator_active) {
+        give_data_mutex();
+        return;
+    }
+
+    locator_est_lat       = est_lat;
+    locator_est_lng       = est_lng;
+    locator_has_estimate  = true;
+    locator_est_distance  = est_distance;
+    locator_bearing       = est_bearing;
+    locator_confidence_radius = conf_radius;
+
+    if (!locator_estimate_announced) {
+        locator_estimate_announced = true;
+        locator_announce_pending   = true;
+    }
+
     give_data_mutex();
 }
 
@@ -2894,8 +2943,17 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->seq_num          = (uint16_t)(hdr->sequence_ctrl >> 4);
     ev->is_beacon        = is_beacon;
     ev->is_probe_req     = is_probe_req;
-    ev->orig_len         = (uint16_t)ppkt->rx_ctrl.sig_len;
-    ev->payload_snap_len = (ppkt->rx_ctrl.sig_len < 256) ? (uint16_t)ppkt->rx_ctrl.sig_len : 256;
+    // sig_len is the OTA frame length. Sanity-cap before snapshotting:
+    // values > 512 indicate DMA corruption or a malformed rx_ctrl struct.
+    uint16_t sig_len = (uint16_t)ppkt->rx_ctrl.sig_len;
+    if (sig_len < 24) {
+        // Shouldn't reach here (checked above), but guard the snapshot path.
+        __atomic_store_n(&ev->ready, 0u, __ATOMIC_RELEASE);
+        return;
+    }
+    if (sig_len > 512) sig_len = 512;
+    ev->orig_len         = sig_len;
+    ev->payload_snap_len = (sig_len < 256) ? sig_len : 256;
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
 
     // Clear parsed fields — they'll be populated by parse_wifi_event()
@@ -2918,6 +2976,7 @@ static void parse_wifi_event(WifiEvent* ev) {
     //         before tagged parameters.
     // Probe Request: tagged parameters start immediately after MAC header.
     if (ev->payload_snap_len < 24) return;
+    if (ev->payload_snap_len > sizeof(ev->payload_snap)) return;
 
     uint8_t* frame_body = ev->payload_snap + 24;
     uint8_t* tagged_params;
@@ -3386,8 +3445,21 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
         // Claim a pool slot. If the slot is still being processed by the
         // worker task, drop this advertisement — better than heap-allocating.
-        uint32_t slot = __atomic_load_n(&ble_pool_write, __ATOMIC_RELAXED);
-        if (__atomic_load_n(&ble_pool[slot].in_use, __ATOMIC_ACQUIRE)) return;
+        uint32_t slot = __atomic_load_n(&ble_pool_write, __ATOMIC_ACQUIRE);
+        uint32_t next = (slot + 1) % BLE_POOL_SIZE;
+
+        // Atomically claim this slot by advancing the write cursor.
+        // If another callback already advanced it, CAS fails — drop this ad.
+        if (!__atomic_compare_exchange_n(&ble_pool_write, &slot, next,
+                                          false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            return;
+        }
+
+        // We now own 'slot' exclusively. If the worker hasn't drained it yet,
+        // drop the advertisement — don't revert the cursor.
+        if (__atomic_load_n(&ble_pool[slot].in_use, __ATOMIC_ACQUIRE)) {
+            return;
+        }
 
         BleEventData* ev = &ble_pool[slot];
         memset(ev, 0, sizeof(BleEventData));
@@ -3434,11 +3506,8 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         // NimBLE does not reliably expose advertising channel on ESP32.
         ev->adv_channel = 0;
 
-        // Mark slot as occupied and advance the write cursor BEFORE queuing —
-        // the worker dereferences ble_pool[idx] directly and relies on
-        // in_use to know the slot is valid.
+        // Mark slot as occupied — cursor was already advanced by the CAS above.
         __atomic_store_n(&ev->in_use, 1u, __ATOMIC_RELEASE);
-        __atomic_store_n(&ble_pool_write, (slot + 1) % BLE_POOL_SIZE, __ATOMIC_RELAXED);
 
         // Queue the slot index. If the queue is full, release the slot.
         uint8_t idx = (uint8_t)slot;
