@@ -126,7 +126,7 @@ static unsigned long wifi_config_open_ms = 0;
 static bool show_menu = false;
 static int  menu_selected = 0;
 static unsigned long menu_open_ms = 0;
-#define MENU_ITEM_COUNT 12
+static const int MENU_ITEM_COUNT = 12;
 static int   menu_scroll_offset = 0;        // index of first visible item
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
@@ -4269,7 +4269,7 @@ void draw_menu_overlay() {
         snprintf(export_label, sizeof(export_label), "Export Data");
     }
 
-    MenuLine items[MENU_ITEM_COUNT] = {
+    MenuLine items[] = {
         {"Scanner",       HEADER_COLOR},
         {"Locator",       HEADER_COLOR},
         {"Detections",    HEADER_COLOR},
@@ -4283,6 +4283,8 @@ void draw_menu_overlay() {
         {boot_label,      DIM_COLOR},
         {"Clear Stats",   CAUTION_COLOR},
     };
+    static_assert(sizeof(items) / sizeof(items[0]) == MENU_ITEM_COUNT,
+                  "MENU_ITEM_COUNT does not match items[] array size");
 
     if (menu_selected < 0) menu_selected = 0;
     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
@@ -6373,7 +6375,7 @@ void draw_capture_history_screen() {
     }
 
     // Snapshot in-memory history if needed
-    CaptureEntry mem_hist[CAPTURE_HISTORY_SIZE];
+    static CaptureEntry mem_hist[CAPTURE_HISTORY_SIZE];
     if (!use_sd) {
         if (!take_data_mutex()) return;
         for (int i = 0; i < total; i++) mem_hist[i] = capture_history[i];
