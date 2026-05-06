@@ -311,6 +311,10 @@ static inline float ui_progress(unsigned long start_ms, unsigned long duration_m
 // ── Animation primitives ───────────────────────────────────────────
 // Built on ui_ease/ui_progress. New animation code should reach for
 // these instead of hand-rolling the math at every site.
+//
+// For smoothed values that persist across screen visits, use
+// anim_filter_seed() to avoid the first-frame pop from an unseeded
+// initial value. Pass a static bool alongside the static float.
 
 // Returns the current y for an element animating from
 // (target_y + slide_distance) to target_y over duration_ms with the
@@ -344,6 +348,17 @@ static inline float anim_filter(float state, float target,
     if (time_constant_ms <= 0.0f) return target;
     float alpha = 1.0f - expf(-dt_ms / time_constant_ms);
     return state + alpha * (target - state);
+}
+
+// Self-seeding variant — snaps to target on the first call (when
+// *initialized is false), then eases normally on subsequent calls.
+// Eliminates the first-frame pop without requiring manual pre-seeding
+// at every call site.
+static inline float anim_filter_seed(float state, float target,
+                                     float time_constant_ms, float dt_ms,
+                                     bool* initialized) {
+    if (!*initialized) { *initialized = true; return target; }
+    return anim_filter(state, target, time_constant_ms, dt_ms);
 }
 
 // Writes 0..max_dots ASCII dots into out_buf, cycling at period_ms per
@@ -409,8 +424,9 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define SD_SPI_MOSI_PIN 14
 #define SD_CS_PIN       12
 
-// Version string — single source of truth
+// Version strings — update BOTH when bumping the version.
 #define VERSION_STRING "FLOCK DETECTOR v9.6"
+#define VERSION_SHORT  "v9.6"
 
 // Pre-configure WiFi credentials for export mode. User edits these in source
 // once, then they're saved to flash on first boot. To change later, edit
@@ -516,15 +532,14 @@ long lifetime_flock_total = 0;
 long lifetime_boots = 0;
 long lifetime_flash_writes = 0;
 
-#define MAX_SEEN_MACS 50
+#define MAX_SEEN_MACS 128
 
 struct SeenMacEntry {
     char   mac[18];
     unsigned long ts;
     bool   occupied;
 };
-static SeenMacEntry seen_mac_table[MAX_SEEN_MACS * 2];
-static uint32_t seen_mac_evict_cursor = 0;
+static SeenMacEntry seen_mac_table[MAX_SEEN_MACS];
 
 static uint32_t hash_mac(const char* mac) {
     uint32_t h = 2166136261u;
@@ -535,53 +550,20 @@ static uint32_t hash_mac(const char* mac) {
     return h;
 }
 
-static const int SEEN_MAC_TABLE_SIZE = MAX_SEEN_MACS * 2;
-// Bound the linear-probe walk. Once eviction starts overwriting slots
-// out-of-band, an unbounded probe degrades into a full-table linear
-// scan and the linear-probe invariant is violated anyway. Capping at 8
-// keeps lookup cost O(1); occasional false negatives just trigger a
-// re-toast within the 5-minute redetect window — acceptable.
-static const int SEEN_MAC_PROBE_LIMIT = 8;
-
 bool is_mac_recently_seen(const char* mac) {
-    const char* key = mac;
-    uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
+    SeenMacEntry& e = seen_mac_table[hash_mac(mac) % MAX_SEEN_MACS];
+    if (!e.occupied || strncmp(e.mac, mac, 17) != 0) return false;
     unsigned long now = millis();
-    for (int probe = 0; probe < SEEN_MAC_PROBE_LIMIT; probe++) {
-        int slot = (idx + probe) % SEEN_MAC_TABLE_SIZE;
-        if (!seen_mac_table[slot].occupied) return false;
-        if (strncmp(seen_mac_table[slot].mac, key, 17) == 0) {
-            if ((now - seen_mac_table[slot].ts) < REDETECT_WINDOW_MS) return true;
-            seen_mac_table[slot].ts = now;
-            return false;
-        }
-    }
-    return false;
+    if ((now - e.ts) >= REDETECT_WINDOW_MS) { e.ts = now; return false; }
+    return true;
 }
 
 void add_seen_mac(const char* mac) {
-    const char* key = mac;
-    uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
-    for (int probe = 0; probe < SEEN_MAC_PROBE_LIMIT; probe++) {
-        int slot = (idx + probe) % SEEN_MAC_TABLE_SIZE;
-        if (!seen_mac_table[slot].occupied ||
-            strncmp(seen_mac_table[slot].mac, key, 17) == 0) {
-            strncpy(seen_mac_table[slot].mac, key, 17);
-            seen_mac_table[slot].mac[17] = '\0';
-            seen_mac_table[slot].ts       = millis();
-            seen_mac_table[slot].occupied = true;
-            return;
-        }
-    }
-    // Round-robin eviction: O(1), approximates LRU well enough given the
-    // 5-minute redetect window and 400-slot capacity. The cursor advances
-    // monotonically so we don't repeatedly evict the same slot.
-    int evict = (int)(seen_mac_evict_cursor % SEEN_MAC_TABLE_SIZE);
-    seen_mac_evict_cursor++;
-    strncpy(seen_mac_table[evict].mac, key, 17);
-    seen_mac_table[evict].mac[17] = '\0';
-    seen_mac_table[evict].ts       = millis();
-    seen_mac_table[evict].occupied = true;
+    SeenMacEntry& e = seen_mac_table[hash_mac(mac) % MAX_SEEN_MACS];
+    strncpy(e.mac, mac, 17);
+    e.mac[17] = '\0';
+    e.ts       = millis();
+    e.occupied = true;
 }
 
 char last_cap_type[16]       = "None";
@@ -1337,40 +1319,68 @@ void export_server_setup_routes() {
 
     auto serve_sd_file = [](const char* path, const char* mime) {
         if (!sd_available) { export_server->send(503, "text/plain", "SD unavailable"); return; }
-        // Serialize against PersistTask / flush_sd_buffer — the Arduino SD/FAT
-        // driver isn't reentrancy-safe and concurrent reads/writes through
-        // separate File handles can corrupt the FAT cluster table mid-pcap.
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            export_server->send(503, "text/plain", "SD busy");
-            return;
-        }
-        File f = SD.open(path, FILE_READ);
-        if (!f) {
+
+        // Phase 1: stat the file under mutex to get size and confirm existence.
+        size_t total = 0;
+        {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+                export_server->send(503, "text/plain", "SD busy");
+                return;
+            }
+            File f = SD.open(path, FILE_READ);
+            if (!f) {
+                xSemaphoreGive(sdMutex);
+                export_server->send(404, "text/plain", "Not found");
+                return;
+            }
+            total = f.size();
+            f.close();
             xSemaphoreGive(sdMutex);
-            export_server->send(404, "text/plain", "Not found");
-            return;
         }
-        size_t total = f.size();
+
+        if (total == 0) { export_server->send(200, mime, ""); return; }
+
         export_server->setContentLength(total);
         export_server->sendHeader("Content-Disposition",
                                   String("attachment; filename=\"") + (path + 1) + "\"");
         export_server->send(200, mime, "");
 
-        // Stream in 1 KB chunks, resetting the WDT and yielding to TCP/WiFi
-        // tasks between each. streamFile() would block the main loop for the
-        // entire transfer (10–30s on slow clients with multi-MB pcaps),
-        // tripping the 30-second WDT and stalling alarms / event drain.
         WiFiClient client = export_server->client();
         uint8_t buf[1024];
-        while (f.available() && client.connected()) {
-            int n = f.read(buf, sizeof(buf));
+        size_t offset = 0;
+
+        // Phase 2: stream in 1KB chunks, acquiring sdMutex only for each
+        // individual read so flush_sd_buffer and PersistTask can interleave.
+        // Re-open + seek each chunk — the Arduino SD File handle is not safe
+        // to hold across mutex release boundaries.
+        while (offset < total && client.connected()) {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+                Serial.println("[EXPORT] sdMutex timeout mid-transfer, aborting");
+                break;
+            }
+            File f = SD.open(path, FILE_READ);
+            if (!f) {
+                xSemaphoreGive(sdMutex);
+                Serial.println("[EXPORT] Re-open failed mid-transfer, aborting");
+                break;
+            }
+            if (!f.seek(offset)) {
+                f.close();
+                xSemaphoreGive(sdMutex);
+                Serial.println("[EXPORT] Seek failed mid-transfer, aborting");
+                break;
+            }
+            size_t to_read = ((total - offset) < sizeof(buf)) ? (total - offset) : sizeof(buf);
+            int n = f.read(buf, to_read);
+            f.close();
+            xSemaphoreGive(sdMutex);
+
             if (n <= 0) break;
-            client.write(buf, n);
+            if (client.write(buf, n) == 0) break;
+            offset += n;
             esp_task_wdt_reset();
             yield();
         }
-        f.close();
-        xSemaphoreGive(sdMutex);
     };
 
     export_server->on("/FlockLog.csv", HTTP_GET, [serve_sd_file]() {
@@ -1870,34 +1880,42 @@ static void sd_check_hotplug() {
             ensure_pcap(current_ble_pcap_file, 0x000000fb);  // Bluetooth LE
             esp_task_wdt_reset();
 
-            // load_sd_history & save_stats_to_sd both touch SD. We already
-            // hold sdMutex, so call load_sd_history directly (it doesn't
-            // self-lock) and inline the stats write rather than recursing
-            // into save_stats_to_sd which would try to take the mutex again.
-            load_sd_history();
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            sd_hist_dirty = false;
-            long          l_wifi   = lifetime_wifi;
-            long          l_ble    = lifetime_ble;
-            unsigned long l_sec    = lifetime_seconds;
-            long          l_flock  = lifetime_flock_total;
-            long          l_boots  = lifetime_boots;
-            long          l_writes = lifetime_flash_writes;
-            xSemaphoreGiveRecursive(dataMutex);
+            // Phase 1 complete — release mutex so flush_sd_buffer and
+            // PersistTask can run between phases.
+            xSemaphoreGive(sdMutex);
 
-            File sf = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
-            if (sf) {
-                sf.printf("lifetime_wifi=%ld\n",          l_wifi);
-                sf.printf("lifetime_ble=%ld\n",           l_ble);
-                sf.printf("lifetime_seconds=%lu\n",       l_sec);
-                sf.printf("lifetime_flock_total=%ld\n",   l_flock);
-                sf.printf("lifetime_boots=%ld\n",         l_boots);
-                sf.printf("lifetime_flash_writes=%ld\n",  l_writes);
-                sf.close();
+            // Phase 2: history load + stats write. Re-acquire with a
+            // longer timeout; if contention persists, skip (PersistTask
+            // writes stats on the next 60s cycle).
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                load_sd_history();
+                xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                sd_hist_dirty = false;
+                long          l_wifi   = lifetime_wifi;
+                long          l_ble    = lifetime_ble;
+                unsigned long l_sec    = lifetime_seconds;
+                long          l_flock  = lifetime_flock_total;
+                long          l_boots  = lifetime_boots;
+                long          l_writes = lifetime_flash_writes;
+                xSemaphoreGiveRecursive(dataMutex);
+
+                File sf = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
+                if (sf) {
+                    sf.printf("lifetime_wifi=%ld\n",          l_wifi);
+                    sf.printf("lifetime_ble=%ld\n",           l_ble);
+                    sf.printf("lifetime_seconds=%lu\n",       l_sec);
+                    sf.printf("lifetime_flock_total=%ld\n",   l_flock);
+                    sf.printf("lifetime_boots=%ld\n",         l_boots);
+                    sf.printf("lifetime_flash_writes=%ld\n",  l_writes);
+                    sf.close();
+                }
+                xSemaphoreGive(sdMutex);
             }
 
+            sd_was_available = true;
             set_toast_direct("SD CARD MOUNTED", ACCENT_COLOR);
             Serial.println("[SD] Hot-plug mount succeeded");
+            return;
         }
     } else {
         // Probe at the controller level — independent of any file existing.
@@ -4001,7 +4019,7 @@ void draw_help_overlay() {
         spr.setCursor(UI_PAD_SM, DISP_H - 10);
         spr.print("TAB close  M=clear stats");
         spr.setCursor(DISP_W - 30, DISP_H - 10);
-        spr.print("v9.6");
+        spr.print(VERSION_SHORT);
         return;
     }
 
@@ -4054,7 +4072,7 @@ void draw_help_overlay() {
     spr.print("TAB to close");
     // Version tag, right-aligned
     spr.setCursor(DISP_W - 30, DISP_H - 10);
-    spr.print("v9.6");
+    spr.print(VERSION_SHORT);
 }
 
 // Soft UI click — brief tone that reads as a tactile tick.
@@ -6940,7 +6958,7 @@ void draw_device_info_screen() {
         seed[SC_SD]         = sd_str;
         seed[SC_BOOTS]      = boots_str;
         seed[SC_FLASH]      = flash_str;
-        seed[SC_VERSION]    = "v9.6";
+        seed[SC_VERSION]    = VERSION_SHORT;
         for (int i = 0; i < STATS_CARD_COUNT; i++) {
             strncpy(stats_prev_strings[i], seed[i], STAT_MAX_CHARS - 1);
             stats_prev_strings[i][STAT_MAX_CHARS - 1] = '\0';
@@ -7023,7 +7041,7 @@ void draw_device_info_screen() {
     card(x_h2, 224, w_half, H_NORMAL, "FLASH", flash_str, SC_FLASH);
 
     // Row 7 (vy = 266): VERSION (half width, left only)
-    card(x_h1, 266, w_half, H_NORMAL, "VERSION", "v9.6", SC_VERSION);
+    card(x_h1, 266, w_half, H_NORMAL, "VERSION", VERSION_SHORT, SC_VERSION);
 
     spr.clearClipRect();
 
@@ -8137,7 +8155,14 @@ void loop() {
     if (export_mode_active) {
         if (export_server) export_server->handleClient();
         if ((millis() - export_mode_started_at) > EXPORT_MODE_MAX_MS) {
-            export_mode_stop();
+            WiFiClient check_client = export_server->client();
+            if (!check_client || !check_client.connected()) {
+                export_mode_stop();
+            } else {
+                // Extend 60s while a client is active; prevents premature
+                // server teardown during slow chunked transfers.
+                export_mode_started_at = millis() - EXPORT_MODE_MAX_MS + 60000UL;
+            }
         }
     }
 
