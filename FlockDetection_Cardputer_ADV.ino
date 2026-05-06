@@ -4418,7 +4418,7 @@ void handle_menu_select() {
         case 5:
             night_mode = !night_mode;
             apply_color_palette();
-            draw_current_screen(); spr.pushSprite(0, 0);
+            screen_dirty = true;
             break;
         case 6:
             low_power_mode = !low_power_mode;
@@ -4430,12 +4430,12 @@ void handle_menu_select() {
                 set_toast_direct("LOW POWER OFF", DIM_COLOR);
             }
             apply_ble_scan_params();
-            draw_current_screen(); spr.pushSprite(0, 0);
+            screen_dirty = true;
             break;
         case 7:
             is_muted = !is_muted;
             if (!is_muted) beep(600, 50);
-            draw_current_screen(); spr.pushSprite(0, 0);
+            screen_dirty = true;
             break;
         case 8:
             show_menu = false;
@@ -4456,15 +4456,15 @@ void handle_menu_select() {
                 char ip_toast[32];
                 snprintf(ip_toast, sizeof(ip_toast), "http://%s", export_ip_str);
                 set_toast_direct(ip_toast, ACCENT_COLOR);
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
             } else if (export_connecting) {
                 show_menu = false;
                 export_mode_stop();
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
             } else {
                 show_menu = false;
                 export_mode_start();
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
             }
             break;
         case 10:
@@ -4473,7 +4473,7 @@ void handle_menu_select() {
                 M5Cardputer.Speaker.tone(240, 100);
             }
             schedule_persist();
-            draw_current_screen(); spr.pushSprite(0, 0);
+            screen_dirty = true;
             break;
         case 11: {
             // Clear all stats — session and lifetime
@@ -4494,7 +4494,7 @@ void handle_menu_select() {
             // already no-ops if a write is in flight.
             schedule_persist();
             set_toast_direct("STATS CLEARED", CAUTION_COLOR);
-            draw_current_screen(); spr.pushSprite(0, 0);
+            screen_dirty = true;
             break;
         }
     }
@@ -5056,6 +5056,13 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         return val;
     };
 
+    // Pre-evaluate the spline into a cache so fill, line, and dot passes
+    // read from memory instead of recomputing 8 FP muls per pixel.
+    float curve_cache[VIZ_W + 2];
+    for (int px_col = 0; px_col <= plot_w; px_col++) {
+        curve_cache[px_col] = eval_curve(px_col);
+    }
+
     // Gradient fill under the curve. Quadratic falloff (1 - t*t) at 30%
     // peak makes the fill clearly visible as a colored shape rather
     // than a faint suggestion. Drawn before the scan line + curve so
@@ -5066,7 +5073,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         bool flock_fill = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
         uint16_t fill_base = flock_fill ? CAUTION_COLOR : HEADER_COLOR;
 
-        float val = eval_curve(px_col);
+        float val = curve_cache[px_col];
         int cx = plot_x + px_col;
         int cy = val_to_y(val);
         for (int fy = cy + 1; fy < plot_bottom; fy++) {
@@ -5160,7 +5167,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     for (int px_col = 0; px_col <= plot_w; px_col++) {
         float ch_f = (float)px_col / (float)plot_w * 12.0f;
         int ch_i = (int)ch_f;
-        float val = eval_curve(px_col);
+        float val = curve_cache[px_col];
         int cx = plot_x + px_col;
         int cy = val_to_y(val);
 
@@ -5180,7 +5187,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         int dot_col = scan_x - plot_x;
         if (dot_col < 0)      dot_col = 0;
         if (dot_col > plot_w) dot_col = plot_w;
-        float dot_val = eval_curve(dot_col);
+        float dot_val = curve_cache[dot_col];
         int dot_y = val_to_y(dot_val);
         spr.fillCircle(scan_x, dot_y, 1, HEADER_COLOR);
         spr.drawCircle(scan_x, dot_y, 2, HEADER_COLOR);
@@ -8543,7 +8550,7 @@ void loop() {
                     current_volume = 0;
                     M5Cardputer.Speaker.setVolume(0);
                 }
-                draw_current_screen(); spr.pushSprite(0,0);
+                screen_dirty = true;
             }
             else if (c == ';') {
                 // Up arrow — context-dependent scroll
@@ -8584,7 +8591,7 @@ void loop() {
                     unsigned long el = millis() - vol_overlay_start;
                     if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
             }
             else if (c == '+' || c == '=') {
                 // Volume up
@@ -8597,7 +8604,7 @@ void loop() {
                     unsigned long el = millis() - vol_overlay_start;
                     if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
             }
             else if (c == 'v') {
                 if (!stealth_mode && current_screen == 0) {
@@ -8811,7 +8818,7 @@ void loop() {
                             menu_selected++;
                             if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
                         }
-                        draw_current_screen(); spr.pushSprite(0, 0);
+                        screen_dirty = true;
                     } else if (current_screen == 2) {
                         if (cur_arrow == ';') {
                             history_selected_idx--;
@@ -8821,7 +8828,7 @@ void loop() {
                             history_selected_idx++;
                             if (history_selected_idx >= ht) history_selected_idx = max(0, ht - 1);
                         }
-                        draw_current_screen(); spr.pushSprite(0, 0);
+                        screen_dirty = true;
                     } else if (current_screen == 4) {
                         // Target only — render loop eases via anim_filter
                         if (cur_arrow == ';') {
@@ -8932,14 +8939,45 @@ void loop() {
     // corruption that can build up during multi-hour continuous scanning.
     if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
         last_ble_restart_ms = millis();
-        // Suspend ScannerLoopTask first — without this, the Core 0 task can
-        // be inside pBLEScan->start()/isScanning() while we deinit the stack
-        // and free the underlying object, dereferencing a dangling pointer.
+
+        // 1. Stop scanning so the callback stops producing new events.
         if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
         if (pBLEScan) {
             pBLEScan->stop();
             pBLEScan->clearResults();
         }
+
+        // 2. Drain the BLE event queue so the worker doesn't pick up stale
+        //    slot indices after deinit.
+        xQueueReset(ble_event_queue);
+
+        // 3. Wait for any in-flight pool slot to finish. Timeout 500ms.
+        {
+            unsigned long drain_start = millis();
+            bool all_clear = false;
+            while ((millis() - drain_start) < 500) {
+                all_clear = true;
+                for (int i = 0; i < BLE_POOL_SIZE; i++) {
+                    if (__atomic_load_n(&ble_pool[i].in_use, __ATOMIC_ACQUIRE)) {
+                        all_clear = false;
+                        break;
+                    }
+                }
+                if (all_clear) break;
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+            }
+            if (!all_clear) {
+                Serial.println("[BLE] Warning: pool slots still in-use after drain timeout");
+                for (int i = 0; i < BLE_POOL_SIZE; i++) {
+                    __atomic_store_n(&ble_pool[i].in_use, 0u, __ATOMIC_RELEASE);
+                }
+            }
+        }
+
+        // 4. Reset write cursor so post-reinit callbacks start clean.
+        __atomic_store_n(&ble_pool_write, 0u, __ATOMIC_RELEASE);
+
+        // 5. Tear down and reinitialize the stack.
         NimBLEDevice::deinit(true);
         delay(100);
         NimBLEDevice::init("");
@@ -8948,7 +8986,7 @@ void loop() {
         pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
         apply_ble_scan_params();
-        pBLEScan->setMaxResults(0);  // see setup() — callback handles everything
+        pBLEScan->setMaxResults(0);
         last_ble_scan = millis();
         if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
         Serial.println("[BLE] Periodic stack restart completed");
