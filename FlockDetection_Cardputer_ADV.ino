@@ -531,7 +531,7 @@ long lifetime_flock_total = 0;
 long lifetime_boots = 0;
 long lifetime_flash_writes = 0;
 
-#define MAX_SEEN_MACS 128
+#define MAX_SEEN_MACS 256
 
 struct SeenMacEntry {
     char   mac[18];
@@ -550,19 +550,92 @@ static uint32_t hash_mac(const char* mac) {
 }
 
 bool is_mac_recently_seen(const char* mac) {
-    SeenMacEntry& e = seen_mac_table[hash_mac(mac) % MAX_SEEN_MACS];
-    if (!e.occupied || strncmp(e.mac, mac, 17) != 0) return false;
+    uint32_t start = hash_mac(mac) % MAX_SEEN_MACS;
     unsigned long now = millis();
-    if ((now - e.ts) >= REDETECT_WINDOW_MS) { e.ts = now; return false; }
-    return true;
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        uint32_t idx = (start + i) % MAX_SEEN_MACS;
+        SeenMacEntry& e = seen_mac_table[idx];
+        if (!e.occupied) return false;
+        if (strncmp(e.mac, mac, 17) == 0) {
+            if ((now - e.ts) >= REDETECT_WINDOW_MS) { e.ts = now; return false; }
+            return true;
+        }
+    }
+    return false;
 }
 
 void add_seen_mac(const char* mac) {
-    SeenMacEntry& e = seen_mac_table[hash_mac(mac) % MAX_SEEN_MACS];
-    strncpy(e.mac, mac, 17);
-    e.mac[17] = '\0';
-    e.ts       = millis();
-    e.occupied = true;
+    uint32_t start = hash_mac(mac) % MAX_SEEN_MACS;
+    unsigned long now = millis();
+
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        uint32_t idx = (start + i) % MAX_SEEN_MACS;
+        SeenMacEntry& e = seen_mac_table[idx];
+        if (!e.occupied) {
+            strncpy(e.mac, mac, 17);
+            e.mac[17] = '\0';
+            e.ts       = now;
+            e.occupied = true;
+            return;
+        }
+        if (strncmp(e.mac, mac, 17) == 0) {
+            e.ts = now;
+            return;
+        }
+    }
+
+    // Table full — evict the entry with the oldest timestamp.
+    uint32_t oldest_idx = 0;
+    unsigned long oldest_ts = seen_mac_table[0].ts;
+    for (uint32_t i = 1; i < MAX_SEEN_MACS; i++) {
+        if (seen_mac_table[i].ts < oldest_ts) {
+            oldest_ts  = seen_mac_table[i].ts;
+            oldest_idx = i;
+        }
+    }
+    SeenMacEntry& victim = seen_mac_table[oldest_idx];
+    strncpy(victim.mac, mac, 17);
+    victim.mac[17] = '\0';
+    victim.ts       = now;
+}
+
+// Expires old entries and rehashes to repair probe chains broken by removals.
+// Called from loop() under dataMutex once per second.
+void seen_mac_expire() {
+    unsigned long now = millis();
+    bool any_expired = false;
+
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        if (seen_mac_table[i].occupied &&
+            (now - seen_mac_table[i].ts) >= REDETECT_WINDOW_MS) {
+            seen_mac_table[i].occupied = false;
+            any_expired = true;
+        }
+    }
+
+    if (!any_expired) return;
+
+    // Robin Hood rehash: remove each occupied entry and re-insert so probe
+    // chains remain contiguous after gaps left by expired entries.
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        if (!seen_mac_table[i].occupied) continue;
+        char mac_copy[18];
+        unsigned long ts_copy = seen_mac_table[i].ts;
+        strncpy(mac_copy, seen_mac_table[i].mac, 17);
+        mac_copy[17] = '\0';
+        seen_mac_table[i].occupied = false;
+        uint32_t start = hash_mac(mac_copy) % MAX_SEEN_MACS;
+        for (uint32_t j = 0; j < MAX_SEEN_MACS; j++) {
+            uint32_t idx = (start + j) % MAX_SEEN_MACS;
+            if (!seen_mac_table[idx].occupied) {
+                strncpy(seen_mac_table[idx].mac, mac_copy, 17);
+                seen_mac_table[idx].mac[17] = '\0';
+                seen_mac_table[idx].ts       = ts_copy;
+                seen_mac_table[idx].occupied = true;
+                break;
+            }
+        }
+    }
 }
 
 char last_cap_type[16]       = "None";
@@ -1559,9 +1632,15 @@ void load_sd_history() {
     size_t tail_bytes = TAIL_BYTES_INITIAL;
     if (tail_bytes > file_size) tail_bytes = file_size;
 
-    char* tail_buf = (char*)malloc(tail_bytes + 1);
+    // Prefer PSRAM for the tail buffer — keeps internal heap free for
+    // WiFi/BLE stacks. Falls back to internal SRAM if PSRAM unavailable.
+    char* tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tail_buf) tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_8BIT);
     if (!tail_buf) {
-        Serial.println("[SD] load_sd_history: malloc failed");
+        Serial.printf("[SD] load_sd_history: malloc failed (%u bytes, free heap: %u, free PSRAM: %u)\n",
+                      (unsigned)(tail_bytes + 1),
+                      (unsigned)esp_get_free_heap_size(),
+                      (unsigned)ESP.getFreePsram());
         f.close();
         return;
     }
@@ -1583,8 +1662,14 @@ void load_sd_history() {
             free(tail_buf);
             tail_bytes = TAIL_BYTES_MAX;
             if (tail_bytes > file_size) tail_bytes = file_size;
-            tail_buf = (char*)malloc(tail_bytes + 1);
-            if (!tail_buf) { f.close(); return; }
+            tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!tail_buf) tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_8BIT);
+            if (!tail_buf) {
+                Serial.printf("[SD] load_sd_history: retry malloc failed (%u bytes)\n",
+                              (unsigned)(tail_bytes + 1));
+                f.close();
+                return;
+            }
             seek_pos = file_size - tail_bytes;
             f.seek(seek_pos);
             bytes_read = f.read((uint8_t*)tail_buf, tail_bytes);
@@ -8934,6 +9019,10 @@ void loop() {
         }
     }
     rssi_track_expire();
+    if (take_data_mutex()) {
+        seen_mac_expire();
+        give_data_mutex();
+    }
 
     // Periodic BLE stack health restart — prevents NimBLE internal state
     // corruption that can build up during multi-hour continuous scanning.
