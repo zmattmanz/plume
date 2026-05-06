@@ -7531,11 +7531,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             fill_anim_start = millis();
         }
 
-        // Boot bar fill uses a shorter duration than UI_ANIM_NORMAL so the
-        // bar arrives authoritatively rather than creeping. Must be shorter
-        // than BOOT_RUSH approach_max_ms (120) so even the fastest stage
-        // can fully resolve to its target.
-        static const unsigned long BOOT_BAR_FILL_MS = 160;
+        // Boot bar fill matches the digit roll duration (100ms) so both
+        // animations land together. Must be <= BOOT_RUSH approach_max_ms
+        // (120ms) so even the fastest personality fully resolves.
+        static const unsigned long BOOT_BAR_FILL_MS = 100;
         float ease = ui_progress(fill_anim_start, BOOT_BAR_FILL_MS);
         boot_eased_fill = (float)fill_anim_from + (float)(fill_anim_to - fill_anim_from) * ease;
 
