@@ -695,8 +695,6 @@ static const float  HIST_SEL_TC      = 80.0f;     // snappy
 static float        hist_sel_y_f     = 0.0f;
 static unsigned long hist_last_frame_ms  = 0;
 static unsigned long hist_detail_open_ms = 0;
-static unsigned long hist_detail_close_ms = 0;
-static bool          hist_detail_closing  = false;
 
 // Stats screen vertical scroll (Option D — uniform card grid, smoothed).
 // Keys set stats_scroll_target (instant). Renderer eases stats_scroll_y_f
@@ -3105,17 +3103,19 @@ static void parse_wifi_event(WifiEvent* ev) {
                 int rsn_len = tag_len;
                 if (rsn_len >= 8) {
                     uint16_t pw_count = rsn[6] | (rsn[7] << 8);
-                    int akm_off = 8 + pw_count * 4;
-                    if (akm_off + 2 <= rsn_len) {
-                        uint16_t akm_count = rsn[akm_off] | (rsn[akm_off + 1] << 8);
-                        int akm_list = akm_off + 2;
-                        for (uint16_t a = 0; a < akm_count && akm_list + 4 <= rsn_len; a++) {
-                            if (rsn[akm_list] == 0x00 && rsn[akm_list+1] == 0x0F
-                                && rsn[akm_list+2] == 0xAC && rsn[akm_list+3] == 0x02) {
-                                ev->is_wpa2_psk = true;
-                                break;
+                    if (pw_count <= 10) {
+                        int akm_off = 8 + pw_count * 4;
+                        if (akm_off + 2 <= rsn_len) {
+                            uint16_t akm_count = rsn[akm_off] | (rsn[akm_off + 1] << 8);
+                            int akm_list = akm_off + 2;
+                            for (uint16_t a = 0; a < akm_count && akm_list + 4 <= rsn_len; a++) {
+                                if (rsn[akm_list] == 0x00 && rsn[akm_list+1] == 0x0F
+                                    && rsn[akm_list+2] == 0xAC && rsn[akm_list+3] == 0x02) {
+                                    ev->is_wpa2_psk = true;
+                                    break;
+                                }
+                                akm_list += 4;
                             }
-                            akm_list += 4;
                         }
                     }
                 }
@@ -7431,9 +7431,7 @@ void transition_screen(int new_screen, int dir) {
         history_scroll_offset = 0;
         history_selected_idx = 0;
         hist_detail_open     = false;
-        hist_detail_closing  = false;
         hist_detail_open_ms  = 0;
-        hist_detail_close_ms = 0;
         // Seed the eased selection at the first row so there's no fly-in
         // from a stale position when the user lands on the screen.
         hist_sel_y_f         = (float)CONTENT_Y;
@@ -8600,8 +8598,7 @@ void loop() {
                     continue;
                 }
                 if (current_screen == 2 && hist_detail_open) {
-                    hist_detail_open    = false;
-                    hist_detail_closing = false;
+                    hist_detail_open = false;
                     screen_dirty = true;
                     draw_current_screen(); spr.pushSprite(0, 0);
                     continue;
@@ -8853,14 +8850,9 @@ void loop() {
                     if (hist_total > 0) {
                         if (!hist_detail_open) {
                             hist_detail_open    = true;
-                            hist_detail_closing = false;
                             hist_detail_open_ms = millis();
                         } else {
-                            // Instant close — animated close left the renderer
-                            // in a backdrop-only state if frames stopped before
-                            // the next redraw, which read as a black screen.
-                            hist_detail_open    = false;
-                            hist_detail_closing = false;
+                            hist_detail_open = false;
                         }
                         screen_dirty = true;
                         draw_current_screen(); spr.pushSprite(0, 0);
@@ -8952,11 +8944,9 @@ void loop() {
                 if (hist_total > 0) {
                     if (!hist_detail_open) {
                         hist_detail_open    = true;
-                        hist_detail_closing = false;
                         hist_detail_open_ms = millis();
                     } else {
-                        hist_detail_open    = false;
-                        hist_detail_closing = false;
+                        hist_detail_open = false;
                     }
                     screen_dirty = true;
                     draw_current_screen(); spr.pushSprite(0, 0);
@@ -8991,8 +8981,7 @@ void loop() {
                 show_menu = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (current_screen == 2 && hist_detail_open) {
-                hist_detail_open    = false;
-                hist_detail_closing = false;
+                hist_detail_open = false;
                 screen_dirty = true;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (current_screen != 0) {
