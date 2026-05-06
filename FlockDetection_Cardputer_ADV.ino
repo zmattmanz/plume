@@ -2409,6 +2409,32 @@ void rssi_track_expire() {
 #define radar_r  34
 #define inner_r  14
 
+// ── Proximity radar device state ──────────────────────────────────────
+// Each slot tracks a live device observed in the feed. Angle is derived
+// from MAC hash for spatial stability; radial position tracks RSSI via
+// anim_filter for smooth motion. Sweep brightness follows the phosphor
+// decay model — devices illuminate when the sweep passes their angle
+// and fade on the standard cubic-then-exponential curve.
+#define PROX_RADAR_MAX_DEVICES 12
+
+struct ProxRadarDevice {
+    char     mac[18];
+    char     name[20];
+    float    angle;
+    float    radius_f;
+    float    radius_target;
+    float    sweep_bright;
+    uint8_t  proto;
+    bool     is_flock;
+    bool     occupied;
+    unsigned long last_seen;
+    int8_t   rssi;
+};
+
+static ProxRadarDevice prox_devs[PROX_RADAR_MAX_DEVICES] = {};
+static unsigned long   prox_last_refresh_ms = 0;
+static unsigned long   prox_last_frame_ms   = 0;
+
 #define NUM_RADIAL_BANDS 36
 float radial_spikes[NUM_RADIAL_BANDS] = {0};
 uint16_t radial_colors[NUM_RADIAL_BANDS] = {0};
@@ -2429,6 +2455,13 @@ static int noise_max_life[NUM_PARTICLES] = {0};
 static float        local_spikes[NUM_RADIAL_BANDS] = {0};
 static uint16_t     local_colors[NUM_RADIAL_BANDS] = {0};
 static unsigned long radar_time_since_blip = 0;
+
+// ── DEPRECATED: Old decorative radar infrastructure ──────────────────
+// The following functions and state (update_radar_data, draw_radar_common,
+// add_blip, radial_spikes, radial_colors, noise_*, NUM_RADIAL_BANDS,
+// NUM_PARTICLES, hud_rotation) are no longer called by any active viz
+// mode. They are retained temporarily for reference and can be removed
+// in a future cleanup pass once the proximity radar is confirmed stable.
 
 // Drive particle activation from packet counts, decay particle lifetimes,
 // and decay+snapshot radial spikes for the current frame. Idempotent per
@@ -5172,16 +5205,293 @@ static void draw_radar_common(unsigned long frame_ms,
 // the cylinder shows. The clip rect set by draw_scanner_screen() hides
 // everything outside the panel; we draw the full cylinder anyway and
 // the bottom half is naturally invisible.
-static void draw_scanner_viz_radar(unsigned long frame_ms) {
-    const int   R_CX    = VIZ_X + VIZ_W / 2;
-    const int   R_CY    = VIZ_Y + (int)(VIZ_H * 0.45f);
-    const int   R_R     = 45;
-    const int   R_IR    = 15;
-    const float R_TILT  = 0.55f;
-    const int   R_THICK = 6;
+// Refresh proximity radar device list from the feed snapshot.
+static void prox_radar_refresh(unsigned long frame_ms) {
+    if (frame_ms - prox_last_refresh_ms < 500 && prox_last_refresh_ms != 0) return;
+    prox_last_refresh_ms = frame_ms;
 
-    update_radar_data(frame_ms);
-    draw_radar_common(frame_ms, R_CX, R_CY, R_R, R_IR, R_TILT, R_THICK);
+    const float PI2f = 2.0f * (float)M_PI;
+
+    bool matched[PROX_RADAR_MAX_DEVICES] = {false};
+
+    for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
+        int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
+        if (e.mac[0] == '\0') continue;
+        if ((frame_ms - e.timestamp) > 60000UL) continue;
+
+        bool dup = false;
+        for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+            if (prox_devs[pi].occupied && matched[pi] &&
+                strncmp(prox_devs[pi].mac, e.mac, 17) == 0) {
+                dup = true; break;
+            }
+        }
+        if (dup) continue;
+
+        int slot = -1;
+        for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+            if (prox_devs[pi].occupied &&
+                strncmp(prox_devs[pi].mac, e.mac, 17) == 0) {
+                slot = pi;
+                matched[pi] = true;
+                break;
+            }
+        }
+
+        float rssi_norm = (float)(e.rssi - (-90)) / (float)((-30) - (-90));
+        if (rssi_norm < 0.0f) rssi_norm = 0.0f;
+        if (rssi_norm > 1.0f) rssi_norm = 1.0f;
+        float target_r = 0.95f - rssi_norm * 0.80f;
+
+        if (slot >= 0) {
+            prox_devs[slot].radius_target = target_r;
+            prox_devs[slot].proto         = e.proto;
+            prox_devs[slot].is_flock      = e.is_flock;
+            prox_devs[slot].last_seen     = frame_ms;
+            prox_devs[slot].rssi          = e.rssi;
+            strncpy(prox_devs[slot].name, e.name, 19);
+            prox_devs[slot].name[19] = '\0';
+        } else {
+            for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+                if (!prox_devs[pi].occupied) { slot = pi; break; }
+            }
+            if (slot < 0) {
+                unsigned long oldest_time = ULONG_MAX;
+                int oldest_idx = 0;
+                for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+                    if (prox_devs[pi].last_seen < oldest_time) {
+                        oldest_time = prox_devs[pi].last_seen;
+                        oldest_idx = pi;
+                    }
+                }
+                slot = oldest_idx;
+            }
+
+            ProxRadarDevice& d = prox_devs[slot];
+            d.occupied = true;
+            strncpy(d.mac, e.mac, 17); d.mac[17] = '\0';
+            strncpy(d.name, e.name, 19); d.name[19] = '\0';
+            d.proto         = e.proto;
+            d.is_flock      = e.is_flock;
+            d.rssi          = e.rssi;
+            d.last_seen     = frame_ms;
+            d.radius_target = target_r;
+            d.radius_f      = target_r;
+            d.sweep_bright  = 0.0f;
+
+            uint32_t h = hash_mac(e.mac);
+            d.angle = ((float)(h % 10000) / 10000.0f) * PI2f;
+
+            matched[slot] = true;
+        }
+    }
+
+    for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+        if (prox_devs[pi].occupied && !matched[pi]) {
+            if ((frame_ms - prox_devs[pi].last_seen) > 60000UL) {
+                prox_devs[pi].occupied = false;
+            }
+        }
+    }
+}
+
+static void draw_scanner_viz_radar(unsigned long frame_ms) {
+    const float PI2f = 2.0f * (float)M_PI;
+
+    const int CX = VIZ_X + VIZ_W / 2;
+    const int CY = VIZ_Y + VIZ_H / 2;
+    const int R  = (VIZ_H / 2) - 2;
+    const int R_INNER = 4;
+
+    float dt = (prox_last_frame_ms == 0) ? 16.0f
+             : (float)(frame_ms - prox_last_frame_ms);
+    if (dt > 100.0f) dt = 100.0f;
+    prox_last_frame_ms = frame_ms;
+
+    static float prox_sweep_angle = 0.0f;
+    prox_sweep_angle += dt * 0.001f * (PI2f / 4.0f);
+    if (prox_sweep_angle > PI2f) prox_sweep_angle -= PI2f;
+
+    float sweep_sin, sweep_cos;
+    fast_sincos(prox_sweep_angle, &sweep_sin, &sweep_cos);
+
+    // ── 1. Range rings ──
+    {
+        const float ring_pcts[] = {0.33f, 0.66f, 1.0f};
+        for (int ri = 0; ri < 3; ri++) {
+            int rr = (int)(ring_pcts[ri] * (float)R);
+            spr.drawCircle(CX, CY, rr, RING_COLOR);
+        }
+        spr.drawFastHLine(CX - R, CY, R * 2, GRID_LINE_DIM);
+        spr.drawFastVLine(CX, CY - R, R * 2, GRID_LINE_DIM);
+    }
+
+    // ── 2. Phosphor sweep — pixel-level radial glow ──
+    {
+        const float DECAY_ARC = PI2f * 0.75f;
+        const float FAST_ZONE = PI2f * 0.06f;
+        const int   R_SQ      = R * R;
+
+        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py++) {
+            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px++) {
+                float dx = (float)(px - CX);
+                float dy = (float)(py - CY);
+                float dist_sq = dx * dx + dy * dy;
+                if (dist_sq > (float)R_SQ) continue;
+
+                float pixel_angle = atan2f(dy, dx);
+                float behind = prox_sweep_angle - pixel_angle;
+                if (behind < 0.0f) behind += PI2f;
+                if (behind >= PI2f) behind -= PI2f;
+                if (behind > DECAY_ARC) continue;
+
+                float brightness;
+                if (behind < FAST_ZONE) {
+                    float t = behind / FAST_ZONE;
+                    float inv = 1.0f - t;
+                    brightness = 0.10f + 0.30f * inv * inv * inv;
+                } else {
+                    float t = (behind - FAST_ZONE) / (DECAY_ARC - FAST_ZONE);
+                    brightness = 0.10f * expf(-3.5f * t);
+                }
+                if (brightness < 0.006f) continue;
+
+                spr.drawPixel(px, py, lerp_col16(BG_COLOR, HEADER_COLOR, brightness));
+            }
+        }
+    }
+
+    // ── 3. Sweep line ──
+    {
+        int ex = CX + (int)((float)R * sweep_cos);
+        int ey = CY + (int)((float)R * sweep_sin);
+        spr.drawLine(CX, CY, ex, ey, lerp_col16(BG_COLOR, HEADER_COLOR, 0.60f));
+
+        for (int li = 1; li <= 2; li++) {
+            float t = (float)li / 3.0f;
+            float trail_a = prox_sweep_angle - t * 0.04f;
+            float ts, tc;
+            fast_sincos(trail_a, &ts, &tc);
+            int tx = CX + (int)((float)R * tc);
+            int ty = CY + (int)((float)R * ts);
+            float alpha = 0.30f * (1.0f - t) * (1.0f - t);
+            spr.drawLine(CX, CY, tx, ty,
+                         lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
+        }
+    }
+
+    // ── 4. Refresh device list from feed ──
+    prox_radar_refresh(frame_ms);
+
+    // ── 5. Update device positions and sweep brightness ──
+    for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+        if (!prox_devs[pi].occupied) continue;
+        ProxRadarDevice& d = prox_devs[pi];
+
+        d.radius_f = anim_filter(d.radius_f, d.radius_target, 300.0f, dt);
+
+        float dev_behind = prox_sweep_angle - d.angle;
+        if (dev_behind < 0.0f) dev_behind += PI2f;
+        if (dev_behind >= PI2f) dev_behind -= PI2f;
+
+        float sweep_zone = PI2f * 0.25f;
+        if (dev_behind < sweep_zone) {
+            float t = dev_behind / sweep_zone;
+            float target_sb = (1.0f - t) * (1.0f - t) * (1.0f - t);
+            if (target_sb > d.sweep_bright) {
+                d.sweep_bright = target_sb;
+            } else {
+                d.sweep_bright = anim_filter(d.sweep_bright, target_sb, 300.0f, dt);
+            }
+        } else {
+            d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 600.0f, dt);
+        }
+    }
+
+    // ── 6. Render devices ──
+    for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+        if (!prox_devs[pi].occupied) continue;
+        ProxRadarDevice& d = prox_devs[pi];
+
+        float draw_r = (float)R_INNER + d.radius_f * (float)(R - R_INNER);
+        float dev_sin, dev_cos;
+        fast_sincos(d.angle, &dev_sin, &dev_cos);
+        int px = CX + (int)(draw_r * dev_cos);
+        int py = CY + (int)(draw_r * dev_sin);
+
+        if (px < VIZ_X - 6 || px > VIZ_X + VIZ_W + 6) continue;
+        if (py < VIZ_Y - 6 || py > VIZ_Y + VIZ_H + 6) continue;
+
+        float age_fade = 1.0f;
+        unsigned long age = frame_ms - d.last_seen;
+        if (age > 10000UL) {
+            age_fade = 1.0f - 0.7f * (float)(age - 10000UL) / 50000.0f;
+            if (age_fade < 0.3f) age_fade = 0.3f;
+        }
+
+        uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
+        float combined_bright = (0.35f + d.sweep_bright * 0.65f) * age_fade;
+
+        if (d.sweep_bright > 0.1f) {
+            int max_glow_r = 3 + (int)(d.sweep_bright * 5.0f);
+            for (int gr = max_glow_r; gr >= 1; gr--) {
+                float t = (float)gr / (float)max_glow_r;
+                float ga = d.sweep_bright * (1.0f - t) * (1.0f - t) * 0.25f * age_fade;
+                if (ga < 0.005f) continue;
+                spr.drawCircle(px, py, gr, lerp_col16(BG_COLOR, base_col, ga));
+            }
+        }
+
+        const int SZ = 3;
+        uint16_t fill_col = lerp_col16(BG_COLOR, base_col, combined_bright * 0.7f);
+        uint16_t edge_col = lerp_col16(BG_COLOR, base_col, combined_bright);
+
+        if (d.proto == 0) {
+            spr.fillTriangle(px,      py - SZ,
+                             px - SZ, py + SZ,
+                             px + SZ, py + SZ, fill_col);
+            spr.drawTriangle(px,      py - SZ,
+                             px - SZ, py + SZ,
+                             px + SZ, py + SZ, edge_col);
+        } else {
+            spr.fillTriangle(px, py - SZ, px + SZ, py, px, py + SZ, fill_col);
+            spr.fillTriangle(px, py - SZ, px - SZ, py, px, py + SZ, fill_col);
+            spr.drawLine(px,      py - SZ, px + SZ, py,      edge_col);
+            spr.drawLine(px + SZ, py,      px,      py + SZ, edge_col);
+            spr.drawLine(px,      py + SZ, px - SZ, py,      edge_col);
+            spr.drawLine(px - SZ, py,      px,      py - SZ, edge_col);
+        }
+
+        if (d.is_flock && combined_bright > 0.4f) {
+            spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, combined_bright),
+                             BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(px + SZ + 2, py - SZ);
+            spr.print("*");
+        }
+    }
+
+    // ── 7. Center dot ──
+    spr.fillCircle(CX, CY, 2, CENTER_DOT);
+    spr.drawPixel(CX, CY, CENTER_DOT_BRIGHT);
+
+    // ── 8. Device count label ──
+    {
+        int count = 0;
+        for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+            if (prox_devs[pi].occupied) count++;
+        }
+        if (count > 0) {
+            char cnt_str[6];
+            snprintf(cnt_str, sizeof(cnt_str), "%d", count);
+            spr.setTextColor(STATUS_TEXT_DIM, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            int cw = (int)strlen(cnt_str) * 6;
+            spr.setCursor(VIZ_X + VIZ_W - cw - 2, VIZ_Y + VIZ_H - 9);
+            spr.print(cnt_str);
+        }
+    }
 }
 
 // ── Viz mode 1: SPECTRUM ───────────────────────────────────────────────────
@@ -9386,8 +9696,160 @@ void loop() {
             spr.fillSprite(BG_COLOR);
 
             unsigned long frame_ms = now_amb;
-            update_radar_data(frame_ms);
-            draw_radar_common(frame_ms, 120, 68, 56, 22, 0.55f, 7);
+            // Refresh the feed snapshot for the proximity radar
+            if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
+                if (take_data_mutex()) {
+                    scan_local_count = feed_count;
+                    scan_local_head  = feed_head;
+                    for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
+                    give_data_mutex();
+                    scan_feed_last_snapshot = frame_ms;
+                }
+            }
+
+            // Draw proximity radar at ambient scale
+            {
+                const float PI2f = 2.0f * (float)M_PI;
+                const int ACX = DISP_W / 2;
+                const int ACY = DISP_H / 2;
+                const int AR  = 52;
+                const int AR_INNER = 6;
+
+                float adt = (prox_last_frame_ms == 0) ? 16.0f
+                          : (float)(frame_ms - prox_last_frame_ms);
+                if (adt > 100.0f) adt = 100.0f;
+                prox_last_frame_ms = frame_ms;
+
+                static float amb_sweep = 0.0f;
+                amb_sweep += adt * 0.001f * (PI2f / 5.0f);
+                if (amb_sweep > PI2f) amb_sweep -= PI2f;
+
+                float as_sin, as_cos;
+                fast_sincos(amb_sweep, &as_sin, &as_cos);
+
+                // Range rings + crosshair
+                spr.drawCircle(ACX, ACY, (int)(0.33f * AR), RING_COLOR);
+                spr.drawCircle(ACX, ACY, (int)(0.66f * AR), RING_COLOR);
+                spr.drawCircle(ACX, ACY, AR, RING_COLOR);
+                spr.drawFastHLine(ACX - AR, ACY, AR * 2, GRID_LINE_DIM);
+                spr.drawFastVLine(ACX, ACY - AR, AR * 2, GRID_LINE_DIM);
+
+                // Phosphor sweep — triangle slices for performance at 30fps fullscreen
+                {
+                    const int SLICES = 30;
+                    const float DECAY = PI2f * 0.70f;
+                    const int DRAW_R = AR + 8;
+                    for (int si = 0; si < SLICES; si++) {
+                        float t0 = (float)si / (float)SLICES;
+                        float t1 = (float)(si + 1) / (float)SLICES;
+                        float a0 = amb_sweep - t0 * DECAY;
+                        float a1 = amb_sweep - t1 * DECAY;
+                        float bright;
+                        if (t0 < 0.06f) {
+                            bright = 0.35f;
+                        } else {
+                            float fade = (t0 - 0.06f) / 0.94f;
+                            bright = 0.30f * (1.0f - fade) * (1.0f - fade) * (1.0f - fade);
+                        }
+                        if (bright < 0.006f) continue;
+                        float s0, c0, s1, c1;
+                        fast_sincos(a0, &s0, &c0);
+                        fast_sincos(a1, &s1, &c1);
+                        int x0 = ACX + (int)((float)DRAW_R * c0);
+                        int y0 = ACY + (int)((float)DRAW_R * s0);
+                        int x1 = ACX + (int)((float)DRAW_R * c1);
+                        int y1 = ACY + (int)((float)DRAW_R * s1);
+                        spr.fillTriangle(ACX, ACY, x0, y0, x1, y1,
+                                         lerp_col16(BG_COLOR, HEADER_COLOR, bright));
+                    }
+                }
+
+                // Sweep line
+                {
+                    int ex = ACX + (int)((float)AR * as_cos);
+                    int ey = ACY + (int)((float)AR * as_sin);
+                    spr.drawLine(ACX, ACY, ex, ey,
+                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f));
+                }
+
+                // Refresh + update devices
+                prox_radar_refresh(frame_ms);
+                for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+                    if (!prox_devs[pi].occupied) continue;
+                    ProxRadarDevice& d = prox_devs[pi];
+                    d.radius_f = anim_filter(d.radius_f, d.radius_target, 300.0f, adt);
+
+                    float dev_behind = amb_sweep - d.angle;
+                    if (dev_behind < 0.0f) dev_behind += PI2f;
+                    if (dev_behind >= PI2f) dev_behind -= PI2f;
+                    float sz = PI2f * 0.25f;
+                    if (dev_behind < sz) {
+                        float t = dev_behind / sz;
+                        float tsb = (1.0f - t) * (1.0f - t) * (1.0f - t);
+                        if (tsb > d.sweep_bright) d.sweep_bright = tsb;
+                        else d.sweep_bright = anim_filter(d.sweep_bright, tsb, 300.0f, adt);
+                    } else {
+                        d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 600.0f, adt);
+                    }
+                }
+
+                // Render devices at ambient scale
+                for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
+                    if (!prox_devs[pi].occupied) continue;
+                    ProxRadarDevice& d = prox_devs[pi];
+                    float draw_r = (float)AR_INNER + d.radius_f * (float)(AR - AR_INNER);
+                    float ds, dc;
+                    fast_sincos(d.angle, &ds, &dc);
+                    int dpx = ACX + (int)(draw_r * dc);
+                    int dpy = ACY + (int)(draw_r * ds);
+
+                    float af = 1.0f;
+                    unsigned long age = frame_ms - d.last_seen;
+                    if (age > 10000UL) {
+                        af = 1.0f - 0.7f * (float)(age - 10000UL) / 50000.0f;
+                        if (af < 0.3f) af = 0.3f;
+                    }
+
+                    uint16_t bcol = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
+                    float cb = (0.35f + d.sweep_bright * 0.65f) * af;
+
+                    if (d.sweep_bright > 0.1f) {
+                        int mgr = 4 + (int)(d.sweep_bright * 6.0f);
+                        for (int gr = mgr; gr >= 1; gr--) {
+                            float gt = (float)gr / (float)mgr;
+                            float ga = d.sweep_bright * (1.0f - gt) * (1.0f - gt) * 0.25f * af;
+                            if (ga < 0.005f) continue;
+                            spr.drawCircle(dpx, dpy, gr, lerp_col16(BG_COLOR, bcol, ga));
+                        }
+                    }
+
+                    const int DSZ = 4;
+                    uint16_t fc = lerp_col16(BG_COLOR, bcol, cb * 0.7f);
+                    uint16_t ec = lerp_col16(BG_COLOR, bcol, cb);
+                    if (d.proto == 0) {
+                        spr.fillTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy + DSZ, dpx + DSZ, dpy + DSZ, fc);
+                        spr.drawTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy + DSZ, dpx + DSZ, dpy + DSZ, ec);
+                    } else {
+                        spr.fillTriangle(dpx, dpy - DSZ, dpx + DSZ, dpy, dpx, dpy + DSZ, fc);
+                        spr.fillTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy, dpx, dpy + DSZ, fc);
+                        spr.drawLine(dpx, dpy - DSZ, dpx + DSZ, dpy, ec);
+                        spr.drawLine(dpx + DSZ, dpy, dpx, dpy + DSZ, ec);
+                        spr.drawLine(dpx, dpy + DSZ, dpx - DSZ, dpy, ec);
+                        spr.drawLine(dpx - DSZ, dpy, dpx, dpy - DSZ, ec);
+                    }
+
+                    if (d.is_flock && cb > 0.4f) {
+                        spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, cb), BG_COLOR);
+                        spr.setTextSize(TS_MICRO);
+                        spr.setCursor(dpx + DSZ + 2, dpy - DSZ);
+                        spr.print("*");
+                    }
+                }
+
+                // Center dot
+                spr.fillCircle(ACX, ACY, 2, CENTER_DOT);
+                spr.drawPixel(ACX, ACY, CENTER_DOT_BRIGHT);
+            }
 
             // Detection counter (bottom-right, flashes ACCENT after a blip)
             long det_total;
