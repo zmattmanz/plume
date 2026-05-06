@@ -784,8 +784,8 @@ static uint16_t      scanner_flash_color = 0;
 
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
-static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=SIGNAL BARS 3=WAVEFORM 4=FLATRADAR
-static const int SCANNER_VIZ_COUNT = 5;
+static int       scanner_viz_mode  = 0;   // 0=SPECTRUM 1=SIGNAL BARS 2=TIMELINE 3=FLATRADAR
+static const int SCANNER_VIZ_COUNT = 4;
 static unsigned long viz_indicator_show_ms = 0;
 static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
 
@@ -4842,6 +4842,15 @@ static const int FEED_RIGHT   = DISP_W - UI_PAD_SM;       // 234
 void draw_scanner_screen() {
     unsigned long frame_ms = millis();
 
+    // Keep timeline bins populated regardless of which viz is active
+    // so the timeline has history when the user first visits it.
+    if (!tl_initialized) {
+        timeline_init(frame_ms);
+    }
+    if (frame_ms - tl_last_bin_ms >= TIMELINE_BIN_MS) {
+        timeline_shift_bins(frame_ms);
+    }
+
     // Step 1: clear + header
     spr.fillSprite(BG_COLOR);
     draw_header_spr(0);
@@ -4858,11 +4867,10 @@ void draw_scanner_screen() {
     spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
     update_channel_histogram();
     switch (scanner_viz_mode) {
-        case 0: draw_scanner_viz_radar(frame_ms);        break;
-        case 1: draw_scanner_viz_spectrum(frame_ms);     break;
-        case 2: draw_scanner_viz_signal_bars(frame_ms);  break;
-        case 3: draw_scanner_viz_timeline(frame_ms);     break;
-        case 4: draw_scanner_viz_flatradar(frame_ms);    break;
+        case 0: draw_scanner_viz_spectrum(frame_ms);     break;
+        case 1: draw_scanner_viz_signal_bars(frame_ms);  break;
+        case 2: draw_scanner_viz_timeline(frame_ms);     break;
+        case 3: draw_scanner_viz_flatradar(frame_ms);    break;
     }
     spr.clearClipRect();
 
@@ -6305,216 +6313,329 @@ static void timeline_init(unsigned long frame_ms) {
 // ── Viz mode 3: LAYERED TIMELINE ─────────────────────────────────────────
 static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
-    if (!tl_initialized) timeline_init(frame_ms);
-
-    if (frame_ms - tl_last_bin_ms >= TIMELINE_BIN_MS) {
-        timeline_shift_bins(frame_ms);
-    }
-
+    // ── Animation dt ──
     float dt = (tl_last_frame_ms == 0) ? 16.0f
              : (float)(frame_ms - tl_last_frame_ms);
     if (dt > 100.0f) dt = 100.0f;
     tl_last_frame_ms = frame_ms;
 
+    // ── Smooth bin values + decay flock highlights ──
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        tl_wifi_smooth[i] = anim_filter(tl_wifi_smooth[i], (float)tl_bins[i].wifi, 300.0f, dt);
-        tl_ble_smooth[i]  = anim_filter(tl_ble_smooth[i],  (float)tl_bins[i].ble,  300.0f, dt);
+        tl_wifi_smooth[i] = anim_filter(tl_wifi_smooth[i],
+                                         (float)tl_bins[i].wifi, 300.0f, dt);
+        tl_ble_smooth[i]  = anim_filter(tl_ble_smooth[i],
+                                         (float)tl_bins[i].ble, 300.0f, dt);
         if (tl_flock_fade[i] > 0.0f) {
             tl_flock_fade[i] -= dt / 3000.0f;
             if (tl_flock_fade[i] < 0.0f) tl_flock_fade[i] = 0.0f;
         }
     }
 
+    // ── Normalization ──
     float max_wifi = 1.0f, max_ble = 1.0f;
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
         if (tl_wifi_smooth[i] > max_wifi) max_wifi = tl_wifi_smooth[i];
         if (tl_ble_smooth[i]  > max_ble)  max_ble  = tl_ble_smooth[i];
     }
 
+    // ── Layout — more dramatic isometric offset ──
     const int padL = 4;
     const int padR = 4;
-    const int padB = 9;
+    const int padT = 1;
+    const int padB = 10;    // space for time ticks
     const int plotW = VIZ_W - padL - padR;
-    const int plotH = (int)((float)(VIZ_H - padB) * 0.60f);
+    const int plotH = (VIZ_H - padT - padB) / 2 - 2;  // each plane gets half height
     const int plotBottom = VIZ_Y + VIZ_H - padB;
-    const int backShiftX = 8;
-    const int backShiftY = -7;
 
-    auto curveY = [&](float val, float maxVal, int offY) -> int {
-        float norm = val / maxVal;
-        if (norm > 1.0f) norm = 1.0f;
-        return plotBottom + offY - (int)(norm * (float)plotH);
-    };
+    // Isometric offset — back plane shifts up and right
+    const int backShiftX = 5;
+    const int backShiftY = -14;
 
-    auto binX = [&](int i, int offX) -> int {
-        return VIZ_X + padL + (i * plotW) / (TIMELINE_BIN_COUNT - 1) + offX;
-    };
+    // Pre-compute curve Y values for both planes into arrays.
+    int wifi_cy[TIMELINE_BIN_COUNT];
+    int ble_cy[TIMELINE_BIN_COUNT];
+    int wifi_x[TIMELINE_BIN_COUNT];
+    int ble_x[TIMELINE_BIN_COUNT];
+    int wifiBaseY = plotBottom;
+    int bleBaseY  = plotBottom + backShiftY;
 
-    // ── Back plane (BLE) ──
-    {
-        int bleBaseY = plotBottom + backShiftY;
+    for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+        int bx = VIZ_X + padL + (i * plotW) / (TIMELINE_BIN_COUNT - 1);
+        wifi_x[i] = bx;
+        ble_x[i]  = bx + backShiftX;
 
-        // Shadow
-        for (int sx = 0; sx < 2; sx++) {
-            int shadow_off = 1 + sx;
-            uint16_t sc = lerp_col16(BG_COLOR, CARD_BORDER, 0.15f - (float)sx * 0.05f);
-            int px = -1, py = -1;
-            for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-                int x = binX(i, backShiftX + shadow_off);
-                int y = curveY(tl_ble_smooth[i], max_ble, backShiftY + shadow_off);
-                if (px >= 0) spr.drawLine(px, py, x, y, sc);
-                px = x; py = y;
-            }
-        }
+        float wn = tl_wifi_smooth[i] / max_wifi;
+        if (wn > 1.0f) wn = 1.0f;
+        wifi_cy[i] = wifiBaseY - (int)(wn * (float)plotH);
 
-        // Fill
-        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-            int x = binX(i, backShiftX);
-            int y = curveY(tl_ble_smooth[i], max_ble, backShiftY);
-            int fillH = bleBaseY - y;
-            for (int fy = y; fy < bleBaseY && fillH > 0; fy++) {
-                float ft = (float)(fy - y) / (float)fillH;
-                float alpha = (1.0f - ft * ft) * 0.35f;
-                if (alpha < 0.01f) break;
-                spr.drawPixel(x, fy, lerp_col16(BG_COLOR, PURPLE_COLOR, alpha));
-            }
-        }
-
-        // Baseline
-        spr.drawFastHLine(binX(0, backShiftX), bleBaseY,
-                          binX(TIMELINE_BIN_COUNT - 1, backShiftX) - binX(0, backShiftX),
-                          lerp_col16(BG_COLOR, PURPLE_COLOR, 0.15f));
-
-        // Curve line
-        int px = -1, py = -1;
-        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-            int x = binX(i, backShiftX);
-            int y = curveY(tl_ble_smooth[i], max_ble, backShiftY);
-            if (px >= 0) spr.drawLine(px, py, x, y, PURPLE_COLOR);
-            px = x; py = y;
-        }
-
-        // Label
-        spr.setTextColor(lerp_col16(BG_COLOR, PURPLE_COLOR, 0.55f), BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(binX(0, backShiftX), bleBaseY - plotH + 2);
-        spr.print("BLE");
+        float bn = tl_ble_smooth[i] / max_ble;
+        if (bn > 1.0f) bn = 1.0f;
+        ble_cy[i] = bleBaseY - (int)(bn * (float)plotH);
     }
 
-    // ── BLE flock highlights ──
-    {
-        int bleBaseY = plotBottom + backShiftY;
-        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-            if (tl_flock_fade[i] <= 0.0f) continue;
-            if (!tl_bins[i].has_flock || tl_bins[i].flock_proto != 1) continue;
-            int x = binX(i, backShiftX);
-            int y = curveY(tl_ble_smooth[i], max_ble, backShiftY);
-            int fillH = bleBaseY - y;
-            if (fillH < 2) fillH = 2;
-            float fade = tl_flock_fade[i];
-            int segW = max(2, plotW / TIMELINE_BIN_COUNT);
-            int segLeft = x - segW / 2;
-            for (int sy = y; sy < bleBaseY; sy++) {
-                float ft = (float)(sy - y) / (float)fillH;
-                float alpha = fade * (1.0f - ft) * 0.50f;
-                if (alpha < 0.01f) break;
-                for (int fx = segLeft; fx < segLeft + segW; fx++)
-                    spr.drawPixel(fx, sy, lerp_col16(BG_COLOR, CAUTION_COLOR, alpha));
-            }
-            for (int fx = segLeft; fx < segLeft + segW; fx++) {
-                spr.drawPixel(fx, y, lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.9f));
-                if (y + 1 < bleBaseY)
-                    spr.drawPixel(fx, y + 1, lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.5f));
+    // ── Color definitions ──
+    uint16_t wifi_line_col    = CAUTION_COLOR;
+    uint16_t wifi_fill_bright = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.35f);
+    uint16_t wifi_fill_dim    = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.08f);
+    uint16_t wifi_hatch_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.18f);
+
+    uint16_t ble_line_col    = HEADER_COLOR;
+    uint16_t ble_fill_bright = lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f);
+    uint16_t ble_fill_dim    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.08f);
+    uint16_t ble_hatch_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
+
+    // ════════════════════════════════════════════════════════════════
+    // BACK PLANE: BLE (ice blue) — drawn first, behind WiFi
+    // ════════════════════════════════════════════════════════════════
+
+    for (int i = 0; i < TIMELINE_BIN_COUNT - 1; i++) {
+        int x0 = ble_x[i];
+        int x1 = ble_x[i + 1];
+        int y0 = ble_cy[i];
+        int y1 = ble_cy[i + 1];
+        int colW = x1 - x0;
+        if (colW < 1) colW = 1;
+
+        for (int cx = x0; cx < x1; cx++) {
+            float col_t = (float)(cx - x0) / (float)max(1, x1 - x0);
+            int cy = y0 + (int)(col_t * (float)(y1 - y0));
+            int fillH = bleBaseY - cy;
+            if (fillH < 1) continue;
+
+            int bright_h = fillH / 4;
+            if (bright_h < 1) bright_h = 1;
+            spr.drawFastVLine(cx, cy, bright_h, ble_fill_bright);
+            if (fillH > bright_h) {
+                spr.drawFastVLine(cx, cy + bright_h, fillH - bright_h, ble_fill_dim);
             }
         }
     }
 
-    // ── Front plane (WiFi) ──
+    // Diagonal hatch texture over the BLE fill
     {
-        int wifiBaseY = plotBottom;
-
-        // Fill
-        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-            int x = binX(i, 0);
-            int y = curveY(tl_wifi_smooth[i], max_wifi, 0);
-            int fillH = wifiBaseY - y;
-            for (int fy = y; fy < wifiBaseY && fillH > 0; fy++) {
-                float ft = (float)(fy - y) / (float)fillH;
-                float alpha = (1.0f - ft * ft) * 0.28f;
-                if (alpha < 0.01f) break;
-                spr.drawPixel(x, fy, lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
+        int hatch_left  = ble_x[0];
+        int hatch_right = ble_x[TIMELINE_BIN_COUNT - 1];
+        int hatch_top   = bleBaseY - plotH;
+        int hatch_bot   = bleBaseY;
+        spr.setClipRect(hatch_left, hatch_top,
+                        hatch_right - hatch_left, hatch_bot - hatch_top);
+        for (int d = -(hatch_bot - hatch_top); d < (hatch_right - hatch_left + hatch_bot - hatch_top); d += 6) {
+            int lx0 = hatch_left + d;
+            int ly0 = hatch_top;
+            int lx1 = lx0 + (hatch_bot - hatch_top);
+            int ly1 = hatch_bot;
+            int mid_i = ((lx0 + lx1) / 2 - hatch_left) * (TIMELINE_BIN_COUNT - 1) / max(1, hatch_right - hatch_left);
+            if (mid_i < 0) mid_i = 0;
+            if (mid_i >= TIMELINE_BIN_COUNT) mid_i = TIMELINE_BIN_COUNT - 1;
+            if (ble_cy[mid_i] < hatch_bot) {
+                spr.drawLine(lx0, ly0, lx1, ly1, ble_hatch_col);
             }
         }
-
-        // Baseline
-        spr.drawFastHLine(binX(0, 0), wifiBaseY,
-                          binX(TIMELINE_BIN_COUNT - 1, 0) - binX(0, 0),
-                          lerp_col16(BG_COLOR, HEADER_COLOR, 0.15f));
-
-        // Curve line
-        int px = -1, py = -1;
-        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-            int x = binX(i, 0);
-            int y = curveY(tl_wifi_smooth[i], max_wifi, 0);
-            if (px >= 0) spr.drawLine(px, py, x, y, HEADER_COLOR);
-            px = x; py = y;
-        }
-
-        // Label
-        spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f), BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(binX(0, 0), wifiBaseY - plotH + 2);
-        spr.print("WiFi");
+        spr.clearClipRect();
+        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
     }
 
-    // ── WiFi flock highlights ──
-    {
-        int wifiBaseY = plotBottom;
-        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-            if (tl_flock_fade[i] <= 0.0f) continue;
-            if (!tl_bins[i].has_flock || tl_bins[i].flock_proto != 0) continue;
-            int x = binX(i, 0);
-            int y = curveY(tl_wifi_smooth[i], max_wifi, 0);
-            int fillH = wifiBaseY - y;
-            if (fillH < 2) fillH = 2;
-            float fade = tl_flock_fade[i];
-            int segW = max(2, plotW / TIMELINE_BIN_COUNT);
-            int segLeft = x - segW / 2;
-            for (int sy = y; sy < wifiBaseY; sy++) {
-                float ft = (float)(sy - y) / (float)fillH;
-                float alpha = fade * (1.0f - ft) * 0.55f;
-                if (alpha < 0.01f) break;
-                for (int fx = segLeft; fx < segLeft + segW; fx++)
-                    spr.drawPixel(fx, sy, lerp_col16(BG_COLOR, CAUTION_COLOR, alpha));
-            }
-            for (int fx = segLeft; fx < segLeft + segW; fx++) {
-                spr.drawPixel(fx, y, lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.9f));
-                if (y + 1 < wifiBaseY)
-                    spr.drawPixel(fx, y + 1, lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.5f));
-            }
+    // BLE baseline
+    spr.drawFastHLine(ble_x[0], bleBaseY,
+                      ble_x[TIMELINE_BIN_COUNT - 1] - ble_x[0],
+                      lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f));
+
+    // BLE curve line — 2px thick
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < TIMELINE_BIN_COUNT - 1; i++) {
+            spr.drawLine(ble_x[i],     ble_cy[i] + pass,
+                         ble_x[i + 1], ble_cy[i + 1] + pass,
+                         ble_line_col);
         }
     }
 
-    // ── Time tick marks ──
+    // BLE label
+    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(ble_x[0], bleBaseY - plotH + 1);
+    spr.print("BLE");
+
+    // ── Flock highlights on BLE band ──
+    for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+        if (tl_flock_fade[i] <= 0.0f) continue;
+        if (!tl_bins[i].has_flock || tl_bins[i].flock_proto != 1) continue;
+
+        float fade = tl_flock_fade[i];
+        int x = ble_x[i];
+        int y = ble_cy[i];
+        int fillH = bleBaseY - y;
+        if (fillH < 2) fillH = 2;
+
+        int segW = max(3, plotW / TIMELINE_BIN_COUNT);
+        int segLeft = x - segW / 2;
+
+        uint16_t hl_bright = lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.50f);
+        uint16_t hl_dim    = lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.10f);
+        for (int sx = segLeft; sx < segLeft + segW; sx++) {
+            int bh = fillH / 3;
+            if (bh < 1) bh = 1;
+            spr.drawFastVLine(sx, y, bh, hl_bright);
+            if (fillH > bh) {
+                spr.drawFastVLine(sx, y + bh, fillH - bh, hl_dim);
+            }
+        }
+        spr.fillRect(segLeft, y, segW, 2,
+                     lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.85f));
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // FRONT PLANE: WiFi (coral/warm) — drawn on top, occluding BLE
+    // ════════════════════════════════════════════════════════════════
+
+    for (int i = 0; i < TIMELINE_BIN_COUNT - 1; i++) {
+        int x0 = wifi_x[i];
+        int x1 = wifi_x[i + 1];
+        int y0 = wifi_cy[i];
+        int y1 = wifi_cy[i + 1];
+
+        for (int cx = x0; cx < x1; cx++) {
+            float col_t = (float)(cx - x0) / (float)max(1, x1 - x0);
+            int cy = y0 + (int)(col_t * (float)(y1 - y0));
+            int fillH = wifiBaseY - cy;
+            if (fillH < 1) continue;
+
+            int bright_h = fillH / 4;
+            if (bright_h < 1) bright_h = 1;
+            spr.drawFastVLine(cx, cy, bright_h, wifi_fill_bright);
+            if (fillH > bright_h) {
+                spr.drawFastVLine(cx, cy + bright_h, fillH - bright_h, wifi_fill_dim);
+            }
+        }
+    }
+
+    // Diagonal hatch texture over WiFi fill
     {
-        int tickY  = plotBottom + 1;
+        int hatch_left  = wifi_x[0];
+        int hatch_right = wifi_x[TIMELINE_BIN_COUNT - 1];
+        int hatch_top   = wifiBaseY - plotH;
+        int hatch_bot   = wifiBaseY;
+        spr.setClipRect(hatch_left, hatch_top,
+                        hatch_right - hatch_left, hatch_bot - hatch_top);
+        for (int d = -(hatch_bot - hatch_top); d < (hatch_right - hatch_left + hatch_bot - hatch_top); d += 6) {
+            int lx0 = hatch_left + d;
+            int ly0 = hatch_top;
+            int lx1 = lx0 + (hatch_bot - hatch_top);
+            int ly1 = hatch_bot;
+            int mid_i = ((lx0 + lx1) / 2 - hatch_left) * (TIMELINE_BIN_COUNT - 1) / max(1, hatch_right - hatch_left);
+            if (mid_i < 0) mid_i = 0;
+            if (mid_i >= TIMELINE_BIN_COUNT) mid_i = TIMELINE_BIN_COUNT - 1;
+            if (wifi_cy[mid_i] < hatch_bot) {
+                spr.drawLine(lx0, ly0, lx1, ly1, wifi_hatch_col);
+            }
+        }
+        spr.clearClipRect();
+        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+    }
+
+    // WiFi baseline
+    spr.drawFastHLine(wifi_x[0], wifiBaseY,
+                      wifi_x[TIMELINE_BIN_COUNT - 1] - wifi_x[0],
+                      lerp_col16(BG_COLOR, CAUTION_COLOR, 0.20f));
+
+    // WiFi curve line — 2px thick
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < TIMELINE_BIN_COUNT - 1; i++) {
+            spr.drawLine(wifi_x[i],     wifi_cy[i] + pass,
+                         wifi_x[i + 1], wifi_cy[i + 1] + pass,
+                         wifi_line_col);
+        }
+    }
+
+    // WiFi label
+    spr.setTextColor(lerp_col16(BG_COLOR, CAUTION_COLOR, 0.55f), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(wifi_x[0], wifiBaseY - plotH + 1);
+    spr.print("WiFi");
+
+    // ── Flock highlights on WiFi band ──
+    for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+        if (tl_flock_fade[i] <= 0.0f) continue;
+        if (!tl_bins[i].has_flock || tl_bins[i].flock_proto != 0) continue;
+
+        float fade = tl_flock_fade[i];
+        int x = wifi_x[i];
+        int y = wifi_cy[i];
+        int fillH = wifiBaseY - y;
+        if (fillH < 2) fillH = 2;
+
+        int segW = max(3, plotW / TIMELINE_BIN_COUNT);
+        int segLeft = x - segW / 2;
+
+        uint16_t hl_bright = lerp_col16(BG_COLOR, ACCENT_COLOR, fade * 0.55f);
+        uint16_t hl_dim    = lerp_col16(BG_COLOR, ACCENT_COLOR, fade * 0.12f);
+        for (int sx = segLeft; sx < segLeft + segW; sx++) {
+            int bh = fillH / 3;
+            if (bh < 1) bh = 1;
+            spr.drawFastVLine(sx, y, bh, hl_bright);
+            if (fillH > bh) {
+                spr.drawFastVLine(sx, y + bh, fillH - bh, hl_dim);
+            }
+        }
+        spr.fillRect(segLeft, y, segW, 2,
+                     lerp_col16(BG_COLOR, ACCENT_COLOR, fade * 0.85f));
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // ISOMETRIC CONNECTORS — depth cue lines at the edges
+    // ════════════════════════════════════════════════════════════════
+    {
+        uint16_t connector_col = lerp_col16(BG_COLOR, CARD_BORDER, 0.40f);
+        // Left edge connector
+        int lx0 = wifi_x[0], ly0 = wifiBaseY;
+        int lx1 = ble_x[0],  ly1 = bleBaseY;
+        for (int seg = 0; seg < 4; seg++) {
+            float t0 = (float)(seg * 2)     / 8.0f;
+            float t1 = (float)(seg * 2 + 1) / 8.0f;
+            int sx0 = lx0 + (int)(t0 * (float)(lx1 - lx0));
+            int sy0 = ly0 + (int)(t0 * (float)(ly1 - ly0));
+            int sx1 = lx0 + (int)(t1 * (float)(lx1 - lx0));
+            int sy1 = ly0 + (int)(t1 * (float)(ly1 - ly0));
+            spr.drawLine(sx0, sy0, sx1, sy1, connector_col);
+        }
+        // Right edge connector
+        int rx0 = wifi_x[TIMELINE_BIN_COUNT - 1], ry0 = wifiBaseY;
+        int rx1 = ble_x[TIMELINE_BIN_COUNT - 1],  ry1 = bleBaseY;
+        for (int seg = 0; seg < 4; seg++) {
+            float t0 = (float)(seg * 2)     / 8.0f;
+            float t1 = (float)(seg * 2 + 1) / 8.0f;
+            int sx0 = rx0 + (int)(t0 * (float)(rx1 - rx0));
+            int sy0 = ry0 + (int)(t0 * (float)(ry1 - ry0));
+            int sx1 = rx0 + (int)(t1 * (float)(rx1 - rx0));
+            int sy1 = ry0 + (int)(t1 * (float)(ry1 - ry0));
+            spr.drawLine(sx0, sy0, sx1, sy1, connector_col);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // TIME TICK MARKS — below the WiFi baseline
+    // ════════════════════════════════════════════════════════════════
+    {
+        int tickY  = wifiBaseY + 1;
         int labelY = tickY + 4;
         const int WINDOW_MINUTES = (int)(TIMELINE_WINDOW_MS / 60000UL);
 
         for (int m = 0; m <= WINDOW_MINUTES; m++) {
             float t = (float)m / (float)WINDOW_MINUTES;
             int x = VIZ_X + padL + (int)(t * (float)plotW);
-            spr.drawFastVLine(x, tickY, 3, GRID_LINE_MED);
-            spr.setTextColor(SCALE_LABEL_COLOR, BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            if (m == WINDOW_MINUTES) {
-                spr.setCursor(x - 10, labelY);
-                spr.print("now");
-            } else if (m == 0) {
-                char lbl[6];
-                snprintf(lbl, sizeof(lbl), "-%dm", WINDOW_MINUTES);
-                spr.setCursor(x, labelY);
-                spr.print(lbl);
+
+            if (m == 0 || m == WINDOW_MINUTES) {
+                spr.drawFastVLine(x, tickY, 3, GRID_LINE_MED);
+                spr.setTextColor(SCALE_LABEL_COLOR, BG_COLOR);
+                spr.setTextSize(TS_MICRO);
+                if (m == 0) {
+                    char lbl[6];
+                    snprintf(lbl, sizeof(lbl), "-%dm", WINDOW_MINUTES);
+                    spr.setCursor(x, labelY);
+                    spr.print(lbl);
+                } else {
+                    spr.setCursor(x - 12, labelY);
+                    spr.print("now");
+                }
             } else {
                 spr.drawFastVLine(x, tickY, 2, GRID_LINE_DIM);
             }
@@ -9522,7 +9643,7 @@ void loop() {
                     screen_dirty = true;
                     menu_click();
 
-                    if (scanner_viz_mode == 1 && prev_mode != 1) {
+                    if (scanner_viz_mode == 0 && prev_mode != 0) {
                         for (int i = 0; i < NUM_WIFI_CHANNELS; i++) spectrum_smooth[i] = 0.0f;
                         spectrum_ghost_head   = 0;
                         spectrum_ghost_filled = false;
@@ -9530,7 +9651,7 @@ void loop() {
                         spectrum_last_frame   = 0;
                         scan_line_last_frame  = 0;
                     }
-                    if (scanner_viz_mode == 3 && prev_mode != 3) {
+                    if (scanner_viz_mode == 2 && prev_mode != 2) {
                         for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
                             tl_wifi_smooth[i] = (float)tl_bins[i].wifi;
                             tl_ble_smooth[i]  = (float)tl_bins[i].ble;
