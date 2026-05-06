@@ -16,6 +16,8 @@
 #include "esp_task_wdt.h"
 #include "esp_partition.h"
 #include "esp_mac.h"
+#include "mbedtls/aes.h"
+#include "mbedtls/md.h"
 #include "driver/gpio.h"
 #include <SPI.h>
 #include <SD.h>
@@ -1822,12 +1824,20 @@ static void save_session_to_flash() {
             delay(5);
             continue;
         }
-        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n%ld\n%d\n",
-                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes,
-                                  export_ssid, export_pass, l_next_id,
-                                  l_boot_sound ? 1 : 0);
+        size_t written = 0;
+        written += f.printf("wifi=%ld\n",       l_wifi);
+        written += f.printf("ble=%ld\n",        l_ble);
+        written += f.printf("seconds=%lu\n",    l_sec);
+        written += f.printf("flock=%ld\n",      l_flock);
+        written += f.printf("volume=%d\n",      l_vol);
+        written += f.printf("boots=%ld\n",      l_boots);
+        written += f.printf("writes=%ld\n",     l_writes);
+        written += f.printf("ssid=%s\n",        export_ssid);
+        written += f.printf("pass=%s\n",        export_pass);
+        written += f.printf("next_id=%ld\n",    l_next_id);
+        written += f.printf("boot_sound=%d\n",  l_boot_sound ? 1 : 0);
         f.close();
-        if (written > 10) {
+        if (written > 20) {
             write_ok = true;
         } else {
             Serial.printf("[FS] Write truncated: %u bytes (attempt %d)\n",
@@ -2025,81 +2035,178 @@ void load_session_from_flash() {
     if (!LittleFS.exists(PERSIST_FILE)) return;
     File f = LittleFS.open(PERSIST_FILE, "r");
     if (!f) return;
-    String line;
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_wifi = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_ble = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_seconds = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flock_total = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt(); 
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
-    line = f.readStringUntil('\n');
-    if (line.length() > 0 && line.length() < sizeof(export_ssid)) {
-        strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
-        export_ssid[sizeof(export_ssid) - 1] = '\0';
+
+    // Detect format: old positional files start with a digit (the wifi
+    // count); new key=value files start with a letter. Peek at the first
+    // character to choose the parser.
+    int first_char = f.peek();
+    if (first_char < 0) { f.close(); return; }
+
+    if (first_char >= '0' && first_char <= '9') {
+        // ── Legacy positional format — read once, then the next save
+        //    will overwrite with key=value format automatically. ──
+        String line;
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_wifi = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_ble = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_seconds = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flock_total = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
+        line = f.readStringUntil('\n');
+        if (line.length() > 0 && line.length() < sizeof(export_ssid)) {
+            strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
+            export_ssid[sizeof(export_ssid) - 1] = '\0';
+        }
+        line = f.readStringUntil('\n');
+        if (line.length() > 0 && line.length() < sizeof(export_pass)) {
+            strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
+            export_pass[sizeof(export_pass) - 1] = '\0';
+        }
+        line = f.readStringUntil('\n');
+        if (line.length() > 0) {
+            long parsed = line.toInt();
+            if (parsed >= 1) next_detection_id = parsed;
+        }
+        line = f.readStringUntil('\n');
+        if (line.length() > 0) {
+            boot_sound_enabled = (line.toInt() != 0);
+        }
+        f.close();
+        return;
     }
-    line = f.readStringUntil('\n');
-    if (line.length() > 0 && line.length() < sizeof(export_pass)) {
-        strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
-        export_pass[sizeof(export_pass) - 1] = '\0';
-    }
-    // next_detection_id was added later; older save files end here and the
-    // counter stays at its 1 default. Files that include it pick up where
-    // they left off so detection IDs don't restart on reboot.
-    line = f.readStringUntil('\n');
-    if (line.length() > 0) {
-        long parsed = line.toInt();
-        if (parsed >= 1) next_detection_id = parsed;
-    }
-    // boot_sound_enabled — added even later; older files end above and the
-    // setting stays at its default (true).
-    line = f.readStringUntil('\n');
-    if (line.length() > 0) {
-        boot_sound_enabled = (line.toInt() != 0);
+
+    // ── Key=value format — order independent, unknown keys ignored ──
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        if (line.length() < 3) continue;
+
+        int eq = line.indexOf('=');
+        if (eq <= 0 || eq >= (int)line.length() - 1) continue;
+
+        String key = line.substring(0, eq);
+        String val = line.substring(eq + 1);
+
+        if      (key == "wifi")       lifetime_wifi = val.toInt();
+        else if (key == "ble")        lifetime_ble = val.toInt();
+        else if (key == "seconds")    lifetime_seconds = val.toInt();
+        else if (key == "flock")      lifetime_flock_total = val.toInt();
+        else if (key == "volume")     current_volume = val.toInt();
+        else if (key == "boots")      lifetime_boots = val.toInt();
+        else if (key == "writes")     lifetime_flash_writes = val.toInt();
+        else if (key == "next_id") {
+            long parsed = val.toInt();
+            if (parsed >= 1) next_detection_id = parsed;
+        }
+        else if (key == "boot_sound") boot_sound_enabled = (val.toInt() != 0);
+        else if (key == "ssid") {
+            if (val.length() > 0 && val.length() < sizeof(export_ssid)) {
+                strncpy(export_ssid, val.c_str(), sizeof(export_ssid) - 1);
+                export_ssid[sizeof(export_ssid) - 1] = '\0';
+            }
+        }
+        else if (key == "pass") {
+            if (val.length() > 0 && val.length() < sizeof(export_pass)) {
+                strncpy(export_pass, val.c_str(), sizeof(export_pass) - 1);
+                export_pass[sizeof(export_pass) - 1] = '\0';
+            }
+        }
+        // Unknown keys are silently ignored — forward compatibility
     }
     f.close();
 }
 
-// ── Simple XOR cipher using the ESP32 eFuse MAC as key ──
-// Not cryptographically strong, but prevents casual reading of
-// credentials from a removed SD card or flash dump. The MAC is
-// unique per physical device and lives in one-time-programmable
-// eFuse — not in any user-accessible storage.
-static void xor_cipher(char* data, size_t len) {
+// Derive a 16-byte AES key from the ESP32 eFuse MAC using HMAC-SHA256.
+// The MAC is unique per physical device and lives in one-time-programmable
+// eFuse — not in any user-accessible storage. HMAC with a fixed salt
+// produces a key that cannot be reversed to the MAC without brute force.
+static void derive_aes_key(uint8_t key_out[16]) {
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
-    uint8_t key[16];
-    for (int i = 0; i < 16; i++) {
-        key[i] = mac[i % 6] ^ (uint8_t)(i * 0x5A + 0x37);
+
+    // HMAC-SHA256(key=salt, message=mac) → 32 bytes; truncate to 16.
+    static const uint8_t salt[16] = {
+        0xF1, 0x0C, 0x4D, 0xE7, 0xA9, 0x3B, 0x58, 0x72,
+        0x6E, 0xC0, 0x1F, 0x84, 0xD6, 0x2A, 0x95, 0x4B
+    };
+    uint8_t hmac_out[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+    mbedtls_md_hmac_starts(&ctx, salt, sizeof(salt));
+    mbedtls_md_hmac_update(&ctx, mac, sizeof(mac));
+    mbedtls_md_hmac_finish(&ctx, hmac_out);
+    mbedtls_md_free(&ctx);
+
+    memcpy(key_out, hmac_out, 16);
+}
+
+// PKCS7 pad/unpad helpers for AES-CBC (block size = 16).
+static size_t pkcs7_pad(uint8_t* buf, size_t data_len, size_t buf_size) {
+    size_t pad_len = 16 - (data_len % 16);
+    if (data_len + pad_len > buf_size) return 0;
+    memset(buf + data_len, (uint8_t)pad_len, pad_len);
+    return data_len + pad_len;
+}
+
+static size_t pkcs7_unpad(const uint8_t* buf, size_t padded_len) {
+    if (padded_len == 0 || padded_len % 16 != 0) return 0;
+    uint8_t pad_val = buf[padded_len - 1];
+    if (pad_val == 0 || pad_val > 16) return 0;
+    for (size_t i = 0; i < pad_val; i++) {
+        if (buf[padded_len - 1 - i] != pad_val) return 0;
     }
-    for (size_t i = 0; i < len; i++) {
-        data[i] ^= key[i % 16];
-    }
+    return padded_len - pad_val;
 }
 
 #define WIFI_CRED_FILE "/wifi_cred.dat"
 
 static void save_wifi_credentials() {
     if (!littlefs_available) return;
-    char enc_ssid[33], enc_pass[65];
-    strncpy(enc_ssid, export_ssid, sizeof(enc_ssid) - 1);
-    enc_ssid[sizeof(enc_ssid) - 1] = '\0';
-    strncpy(enc_pass, export_pass, sizeof(enc_pass) - 1);
-    enc_pass[sizeof(enc_pass) - 1] = '\0';
 
-    size_t ssid_len = strlen(enc_ssid);
-    size_t pass_len = strlen(enc_pass);
+    uint8_t key[16];
+    derive_aes_key(key);
 
-    xor_cipher(enc_ssid, ssid_len);
-    xor_cipher(enc_pass, pass_len);
+    // Generate a random IV for each save — ensures identical plaintext
+    // produces different ciphertext across saves.
+    uint8_t iv[16];
+    esp_fill_random(iv, sizeof(iv));
 
+    // Prepare plaintext: [1 byte ssid_len] [ssid] [1 byte pass_len] [pass]
+    size_t ssid_len = strlen(export_ssid);
+    size_t pass_len = strlen(export_pass);
+    size_t plain_len = 1 + ssid_len + 1 + pass_len;
+
+    // Padded buffer — max plaintext is 1+32+1+64 = 98, padded to 112
+    uint8_t plain[128] = {0};
+    plain[0] = (uint8_t)ssid_len;
+    memcpy(plain + 1, export_ssid, ssid_len);
+    plain[1 + ssid_len] = (uint8_t)pass_len;
+    memcpy(plain + 1 + ssid_len + 1, export_pass, pass_len);
+
+    size_t padded_len = pkcs7_pad(plain, plain_len, sizeof(plain));
+    if (padded_len == 0) { memset(key, 0, sizeof(key)); return; }
+
+    uint8_t iv_copy[16];
+    memcpy(iv_copy, iv, 16);  // mbedtls modifies the IV buffer
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 128);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, iv_copy, plain, plain);
+    mbedtls_aes_free(&aes);
+
+    // Write: [16 bytes IV] [2 bytes padded_len LE] [ciphertext]
     File f = LittleFS.open(WIFI_CRED_FILE, "w");
-    if (!f) return;
-    f.write((uint8_t)ssid_len);
-    f.write((uint8_t)pass_len);
-    f.write((const uint8_t*)enc_ssid, ssid_len);
-    f.write((const uint8_t*)enc_pass, pass_len);
+    if (!f) { memset(plain, 0, sizeof(plain)); memset(key, 0, sizeof(key)); return; }
+    f.write(iv, 16);
+    uint8_t len_bytes[2] = { (uint8_t)(padded_len & 0xFF), (uint8_t)(padded_len >> 8) };
+    f.write(len_bytes, 2);
+    f.write(plain, padded_len);
     f.close();
+
+    memset(plain, 0, sizeof(plain));
+    memset(key, 0, sizeof(key));
 }
 
 static void load_wifi_credentials() {
@@ -2108,35 +2215,102 @@ static void load_wifi_credentials() {
     File f = LittleFS.open(WIFI_CRED_FILE, "r");
     if (!f) return;
 
-    int ssid_len_raw = f.read();
-    int pass_len_raw = f.read();
-    if (ssid_len_raw < 0 || pass_len_raw < 0) { f.close(); return; }
-    uint8_t ssid_len = (uint8_t)ssid_len_raw;
-    uint8_t pass_len = (uint8_t)pass_len_raw;
+    size_t file_size = f.size();
+    bool loaded = false;
 
-    if (ssid_len > 32 || pass_len > 64) { f.close(); return; }
+    // ── Try AES-CBC format ──
+    if (file_size >= 34) {
+        uint8_t iv[16];
+        if (f.read(iv, 16) == 16) {
+            uint8_t len_bytes[2];
+            if (f.read(len_bytes, 2) == 2) {
+                size_t padded_len = len_bytes[0] | (len_bytes[1] << 8);
+                if (padded_len >= 16 && padded_len <= 128 && padded_len % 16 == 0 &&
+                    file_size >= 18 + padded_len) {
+                    uint8_t cipher[128];
+                    if (f.read(cipher, padded_len) == (int)padded_len) {
+                        uint8_t key[16];
+                        derive_aes_key(key);
 
-    char enc_ssid[33] = {0}, enc_pass[65] = {0};
-    f.readBytes(enc_ssid, ssid_len);
-    f.readBytes(enc_pass, pass_len);
-    f.close();
+                        mbedtls_aes_context aes;
+                        mbedtls_aes_init(&aes);
+                        mbedtls_aes_setkey_dec(&aes, key, 128);
+                        mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, padded_len, iv, cipher, cipher);
+                        mbedtls_aes_free(&aes);
+                        memset(key, 0, sizeof(key));
 
-    xor_cipher(enc_ssid, ssid_len);
-    xor_cipher(enc_pass, pass_len);
-
-    // Validate: if decrypted result contains non-printable chars,
-    // the file is corrupt or from a different device — discard.
-    bool valid = true;
-    for (int i = 0; i < (int)ssid_len; i++) {
-        if ((unsigned char)enc_ssid[i] < 32 || (unsigned char)enc_ssid[i] > 126) {
-            valid = false; break;
+                        size_t plain_len = pkcs7_unpad(cipher, padded_len);
+                        if (plain_len >= 2) {
+                            uint8_t ssid_len = cipher[0];
+                            if (ssid_len <= 32 && 1 + ssid_len + 1 <= plain_len) {
+                                uint8_t pass_len = cipher[1 + ssid_len];
+                                if (pass_len <= 64 && 1 + ssid_len + 1 + pass_len <= plain_len) {
+                                    bool valid = true;
+                                    for (int i = 0; i < (int)ssid_len && valid; i++) {
+                                        if (cipher[1 + i] < 32 || cipher[1 + i] > 126) valid = false;
+                                    }
+                                    if (valid) {
+                                        memcpy(export_ssid, cipher + 1, ssid_len);
+                                        export_ssid[ssid_len] = '\0';
+                                        memcpy(export_pass, cipher + 1 + ssid_len + 1, pass_len);
+                                        export_pass[pass_len] = '\0';
+                                        loaded = true;
+                                    }
+                                }
+                            }
+                        }
+                        memset(cipher, 0, sizeof(cipher));
+                    }
+                }
+            }
         }
     }
-    if (valid) {
-        strncpy(export_ssid, enc_ssid, sizeof(export_ssid) - 1);
-        export_ssid[sizeof(export_ssid) - 1] = '\0';
-        strncpy(export_pass, enc_pass, sizeof(export_pass) - 1);
-        export_pass[sizeof(export_pass) - 1] = '\0';
+
+    // ── Fallback: old XOR format ──
+    if (!loaded) {
+        f.seek(0);
+        int ssid_len_raw = f.read();
+        int pass_len_raw = f.read();
+        if (ssid_len_raw >= 0 && pass_len_raw >= 0) {
+            uint8_t ssid_len = (uint8_t)ssid_len_raw;
+            uint8_t pass_len = (uint8_t)pass_len_raw;
+            if (ssid_len <= 32 && pass_len <= 64) {
+                char enc_ssid[33] = {0}, enc_pass[65] = {0};
+                f.readBytes(enc_ssid, ssid_len);
+                f.readBytes(enc_pass, pass_len);
+
+                // Reconstruct old XOR key
+                uint8_t mac[6];
+                esp_efuse_mac_get_default(mac);
+                uint8_t old_key[16];
+                for (int i = 0; i < 16; i++) {
+                    old_key[i] = mac[i % 6] ^ (uint8_t)(i * 0x5A + 0x37);
+                }
+                for (size_t i = 0; i < ssid_len; i++) enc_ssid[i] ^= old_key[i % 16];
+                for (size_t i = 0; i < pass_len; i++) enc_pass[i] ^= old_key[i % 16];
+
+                bool valid = true;
+                for (int i = 0; i < (int)ssid_len; i++) {
+                    if ((unsigned char)enc_ssid[i] < 32 || (unsigned char)enc_ssid[i] > 126) {
+                        valid = false; break;
+                    }
+                }
+                if (valid) {
+                    strncpy(export_ssid, enc_ssid, sizeof(export_ssid) - 1);
+                    export_ssid[sizeof(export_ssid) - 1] = '\0';
+                    strncpy(export_pass, enc_pass, sizeof(export_pass) - 1);
+                    export_pass[sizeof(export_pass) - 1] = '\0';
+                    loaded = true;
+                }
+            }
+        }
+    }
+
+    f.close();
+
+    // If loaded from old XOR format, re-save in AES format immediately.
+    if (loaded && file_size < 34) {
+        save_wifi_credentials();
     }
 }
 
@@ -5633,13 +5807,32 @@ static void draw_scanner_viz_waveform(unsigned long frame_ms) {
         waveform_prev_pkt_count = cur;
 
         float raw = (float)delta;
+
+        // Dual-track normalization: a fast peak for responsiveness and a
+        // slow rolling average for a stable floor. The display peak is
+        // the greater of the two, preventing the yo-yo between clipped
+        // spikes and invisible traces during traffic transitions.
         if (raw > waveform_peak) {
             waveform_peak = raw;
         } else {
             waveform_peak *= 0.995f;
-            if (waveform_peak < 1.0f) waveform_peak = 1.0f;
         }
-        float norm = raw / waveform_peak;
+
+        static float waveform_avg      = 0.0f;
+        static bool  waveform_avg_init = false;
+        if (!waveform_avg_init) {
+            waveform_avg      = raw;
+            waveform_avg_init = true;
+        } else {
+            waveform_avg = waveform_avg * 0.98f + raw * 0.02f;
+        }
+
+        float effective_floor = waveform_avg * 3.0f;
+        if (effective_floor < 3.0f) effective_floor = 3.0f;
+        float effective_peak = waveform_peak;
+        if (effective_peak < effective_floor) effective_peak = effective_floor;
+
+        float norm = raw / effective_peak;
         if (norm > 1.0f) norm = 1.0f;
 
         uint32_t wifi_ch = 0;
