@@ -227,10 +227,9 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
     }
 }
 
-static void safe_copy(char* dest, const char* src, size_t dest_size) {
+static inline void safe_copy(char* dest, const char* src, size_t dest_size) {
     if (dest_size == 0) return;
-    strncpy(dest, src, dest_size - 1);
-    dest[dest_size - 1] = '\0';
+    strlcpy(dest, src, dest_size);
 }
 
 // ── Unified UI animation vocabulary ──
@@ -1153,10 +1152,11 @@ static uint32_t utc_to_epoch(int year, int mon, int day,
 }
 
 void format_time_buf(unsigned long total_sec, char* buf, size_t buf_len) {
-    unsigned long h = total_sec / 3600;
-    unsigned long m = (total_sec / 60) % 60;
-    unsigned long s = total_sec % 60;
-    snprintf(buf, buf_len, "%02lu:%02lu:%02lu", h, m, s);
+    // h/m/s are always small; unsigned int + %u is warning-free on all platforms.
+    unsigned int h = (unsigned int)(total_sec / 3600);
+    unsigned int m = (unsigned int)((total_sec / 60) % 60);
+    unsigned int s = (unsigned int)(total_sec % 60);
+    snprintf(buf, buf_len, "%02u:%02u:%02u", h, m, s);
 }
 
 // Translate detection method codes into a plain-English summary.
@@ -3173,14 +3173,17 @@ struct BleEventData {
     char     service_uuids[8][37];
     uint8_t  uuid_count;
     uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
-    volatile bool in_use;  // pool slot occupancy flag
+    volatile uint32_t in_use;  // pool slot occupancy flag (0 = free, 1 = occupied)
 };
 
 // Static pool — eliminates all malloc/free from the BLE advertisement
 // hot path. 6 slots × ~380 bytes ≈ 2.3KB static cost, zero fragmentation.
 #define BLE_POOL_SIZE 6
 static BleEventData ble_pool[BLE_POOL_SIZE];
-static volatile uint8_t ble_pool_write = 0;
+// Written only from NimBLE's scan callback (single FreeRTOS task context,
+// never re-entrant). Atomic store ensures the cursor advance is visible
+// to ble_worker_task on Core 1 after the pool slot's in_use flag is set.
+static volatile uint32_t ble_pool_write = 0;
 
 static void ble_worker_task(void* pvParameters) {
     bool wdt_subscribed = false;
@@ -3196,7 +3199,7 @@ static void ble_worker_task(void* pvParameters) {
 
         BleEventData* ev = &ble_pool[pool_idx];
 
-        if (ev->rssi < IGNORE_WEAK_RSSI) { ev->in_use = false; continue; }
+        if (ev->rssi < IGNORE_WEAK_RSSI) { __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE); continue; }
 
         int  confidence   = 0;
         char methods[64]  = {0};
@@ -3375,7 +3378,7 @@ static void ble_worker_task(void* pvParameters) {
             xSemaphoreGiveRecursive(dataMutex);
         }
 
-        ev->in_use = false;
+        __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE);
     }
 }
 
@@ -3383,8 +3386,8 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
         // Claim a pool slot. If the slot is still being processed by the
         // worker task, drop this advertisement — better than heap-allocating.
-        uint8_t slot = ble_pool_write;
-        if (ble_pool[slot].in_use) return;  // pool exhausted, drop
+        uint32_t slot = __atomic_load_n(&ble_pool_write, __ATOMIC_RELAXED);
+        if (__atomic_load_n(&ble_pool[slot].in_use, __ATOMIC_ACQUIRE)) return;
 
         BleEventData* ev = &ble_pool[slot];
         memset(ev, 0, sizeof(BleEventData));
@@ -3434,13 +3437,13 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         // Mark slot as occupied and advance the write cursor BEFORE queuing —
         // the worker dereferences ble_pool[idx] directly and relies on
         // in_use to know the slot is valid.
-        ev->in_use = true;
-        ble_pool_write = (slot + 1) % BLE_POOL_SIZE;
+        __atomic_store_n(&ev->in_use, 1u, __ATOMIC_RELEASE);
+        __atomic_store_n(&ble_pool_write, (slot + 1) % BLE_POOL_SIZE, __ATOMIC_RELAXED);
 
         // Queue the slot index. If the queue is full, release the slot.
-        uint8_t idx = slot;
+        uint8_t idx = (uint8_t)slot;
         if (xQueueSend(ble_event_queue, &idx, 0) != pdTRUE) {
-            ev->in_use = false;
+            __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE);
         }
     }
 };
