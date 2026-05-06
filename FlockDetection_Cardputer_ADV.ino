@@ -784,7 +784,7 @@ static uint16_t      scanner_flash_color = 0;
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
 static int       scanner_viz_mode  = 0;   // 0=RADAR 1=SPECTRUM 2=SIGNAL BARS 3=WAVEFORM 4=FLATRADAR
-static const int SCANNER_VIZ_COUNT = 5;
+static const int SCANNER_VIZ_COUNT = 4;
 static unsigned long viz_indicator_show_ms = 0;
 static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
 
@@ -4780,9 +4780,9 @@ static const int VIZ_RIGHT    = VIZ_X + VIZ_W;            // 138
 static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;            // 73
 static const int COUNTS_Y     = VIZ_BOTTOM + 6;           // 79
 static const int FEED_X       = 144;
-static const int FEED_LABEL_Y = 20;
-static const int FEED_FIRST_Y = 34;
-static const int FEED_RIGHT   = DISP_W - 1;               // 239
+static const int FEED_LABEL_Y = 20 + UI_PAD_XS;
+static const int FEED_FIRST_Y = 34 + UI_PAD_XS;
+static const int FEED_RIGHT   = DISP_W - UI_PAD_SM;       // 234
 
 void draw_scanner_screen() {
     unsigned long frame_ms = millis();
@@ -4806,8 +4806,7 @@ void draw_scanner_screen() {
         case 0: draw_scanner_viz_radar(frame_ms);        break;
         case 1: draw_scanner_viz_spectrum(frame_ms);     break;
         case 2: draw_scanner_viz_signal_bars(frame_ms);  break;
-        case 3: draw_scanner_viz_waveform(frame_ms);     break;
-        case 4: draw_scanner_viz_flatradar(frame_ms);    break;
+        case 3: draw_scanner_viz_flatradar(frame_ms);    break;
     }
     spr.clearClipRect();
 
@@ -4854,7 +4853,7 @@ void draw_scanner_screen() {
     // Step 6: feed panel (right side) — FEED label + rows.
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_BODY);
-    spr.setCursor(FEED_X, FEED_LABEL_Y);
+    spr.setCursor(FEED_X + UI_PAD_SM, FEED_LABEL_Y);
     kprint(spr, "FEED");
 
     if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
@@ -4887,8 +4886,8 @@ void draw_scanner_screen() {
     }
     int slide_offset = (int)((1.0f - slide_t) * (float)feed_row_h);
 
-    spr.setClipRect(FEED_X, FEED_FIRST_Y,
-                    DISP_W - FEED_X, DISP_H - FEED_FIRST_Y);
+    spr.setClipRect(FEED_X + UI_PAD_SM, FEED_FIRST_Y,
+                    DISP_W - FEED_X - UI_PAD_SM, DISP_H - FEED_FIRST_Y);
 
     for (int i = 0; i < scan_local_count && i < max_feed_rows; i++) {
         int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
@@ -4904,7 +4903,7 @@ void draw_scanner_screen() {
 
         // Symbol — identical geometry/colors to draw_feed_expanded_overlay,
         // with the row's age-fade applied as a final blend toward BG.
-        int sym_x = FEED_X;
+        int sym_x = FEED_X + UI_PAD_SM;
         int sym_y = ry + 3;
         uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
         if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
@@ -4923,13 +4922,13 @@ void draw_scanner_screen() {
             spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
         }
 
-        int name_x = FEED_X + 12;
+        int name_x = FEED_X + UI_PAD_SM + 12;
         if (e.is_flock) {
             spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, af), BG_COLOR);
             spr.setTextSize(TS_BODY);
             spr.setCursor(sym_x + 10, ry + 3);
             spr.print("*");
-            name_x = FEED_X + 20;
+            name_x = FEED_X + UI_PAD_SM + 20;
         }
 
         spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
@@ -5944,39 +5943,46 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
     float sweep_sin, sweep_cos;
     fast_sincos(flatradar_angle, &sweep_sin, &sweep_cos);
 
-    // ── 1. Phosphor decay — 45 filled triangle slices ──
-    // Slices extend to R_DRAW so clip rect fills every panel corner.
+    // ── 1. Phosphor decay — pixel-level radial sweep ──────────────────
+    // Instead of discrete triangle slices (which read as a rotating
+    // wedge), paint each pixel individually with brightness computed
+    // from its angular distance behind the sweep line. The result is
+    // a smooth phosphor glow that fades continuously — no visible
+    // slice boundaries, no hard leading edge.
     {
-        const int   NUM_SLICES = 45;
-        const float DECAY_ARC  = PI2f * 0.83f;
+        const float DECAY_ARC = PI2f * 0.83f;  // total arc of visible glow
+        const float FAST_ZONE = PI2f * 0.08f;  // 0–30°: fast cubic decay
+        const float R_SQ = (float)(R_DRAW * R_DRAW);
 
-        for (int si = 0; si < NUM_SLICES; si++) {
-            float t0 = (float)si / (float)NUM_SLICES;
-            float t1 = (float)(si + 1) / (float)NUM_SLICES;
+        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py++) {
+            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px++) {
+                float dx = (float)(px - CX);
+                float dy = (float)(py - CY);
+                float dist_sq = dx * dx + dy * dy;
 
-            float a0 = flatradar_angle - t0 * DECAY_ARC;
-            float a1 = flatradar_angle - t1 * DECAY_ARC;
+                if (dist_sq > R_SQ) continue;
 
-            float brightness;
-            if (t0 < 0.08f) {
-                brightness = 0.55f;
-            } else {
-                float fade = (t0 - 0.08f) / 0.92f;
-                brightness = 0.45f * (1.0f - fade) * (1.0f - fade) * (1.0f - fade);
+                float pixel_angle = atan2f(dy, dx);
+                float behind = flatradar_angle - pixel_angle;
+                if (behind < 0.0f) behind += PI2f;
+                if (behind >= PI2f) behind -= PI2f;
+
+                if (behind > DECAY_ARC) continue;
+
+                float brightness;
+                if (behind < FAST_ZONE) {
+                    float t = behind / FAST_ZONE;
+                    float inv = 1.0f - t;
+                    brightness = 0.12f + 0.43f * inv * inv * inv;
+                } else {
+                    float t = (behind - FAST_ZONE) / (DECAY_ARC - FAST_ZONE);
+                    brightness = 0.12f * expf(-4.0f * t);
+                }
+
+                if (brightness < 0.008f) continue;
+
+                spr.drawPixel(px, py, lerp_col16(BG_COLOR, HEADER_COLOR, brightness));
             }
-            if (brightness < 0.008f) continue;
-
-            uint16_t col = lerp_col16(BG_COLOR, HEADER_COLOR, brightness);
-
-            float s0, c0, s1, c1;
-            fast_sincos(a0, &s0, &c0);
-            fast_sincos(a1, &s1, &c1);
-            int x0 = CX + (int)((float)R_DRAW * c0);
-            int y0 = CY + (int)((float)R_DRAW * s0);
-            int x1 = CX + (int)((float)R_DRAW * c1);
-            int y1 = CY + (int)((float)R_DRAW * s1);
-
-            spr.fillTriangle(CX, CY, x0, y0, x1, y1, col);
         }
     }
 
@@ -5989,34 +5995,30 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         }
     }
 
-    // ── 3. Sweep — thick wedge with layered transparency ──
-    // 6 lines fan behind the sweep angle. Leading edge is crisp;
-    // trailing layers fade quadratically over ~4.5 degrees.
+    // ── 3. Sweep line — single bright line with soft trailing fade ──
+    // One crisp line at the sweep angle (the "beam") plus 3 trailing
+    // lines that fade smoothly. No hard leading edge — the beam is
+    // the natural peak of the phosphor brightness curve.
     {
-        const int   SWEEP_LAYERS = 6;
-        const float SWEEP_FAN    = 0.08f;
+        // Leading beam — single line at full sweep angle
+        {
+            int ex = CX + (int)((float)R_R * sweep_cos);
+            int ey = CY + (int)((float)R_R * sweep_sin);
+            spr.drawLine(CX, CY, ex, ey,
+                         lerp_col16(BG_COLOR, HEADER_COLOR, 0.70f));
+        }
 
-        for (int li = 0; li < SWEEP_LAYERS; li++) {
-            float t = (float)li / (float)(SWEEP_LAYERS - 1);
-            float layer_angle = flatradar_angle - t * SWEEP_FAN;
-
-            float ls, lc;
-            if (li == 0) {
-                ls = sweep_sin;
-                lc = sweep_cos;
-            } else {
-                fast_sincos(layer_angle, &ls, &lc);
-            }
-            int ex = CX + (int)((float)R_R * lc);
-            int ey = CY + (int)((float)R_R * ls);
-
-            float alpha;
-            if (li == 0) {
-                alpha = 0.85f;
-            } else {
-                alpha = 0.50f * (1.0f - t) * (1.0f - t);
-            }
-
+        // Trailing fade — 3 lines fanning behind, quadratic falloff
+        const int   TRAIL_LINES = 3;
+        const float TRAIL_FAN   = 0.06f;
+        for (int li = 1; li <= TRAIL_LINES; li++) {
+            float t = (float)li / (float)(TRAIL_LINES + 1);
+            float trail_angle = flatradar_angle - t * TRAIL_FAN;
+            float ts, tc;
+            fast_sincos(trail_angle, &ts, &tc);
+            int ex = CX + (int)((float)R_R * tc);
+            int ey = CY + (int)((float)R_R * ts);
+            float alpha = 0.35f * (1.0f - t) * (1.0f - t);
             spr.drawLine(CX, CY, ex, ey,
                          lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
         }
@@ -6074,7 +6076,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
                 flatradar_devs[slot].is_flock     = e.is_flock;
                 flatradar_devs[slot].orbit_r      = target_r;
                 flatradar_devs[slot].orbit_angle  = (float)(nh % 628) / 100.0f;
-                flatradar_devs[slot].orbit_speed  = 0.05f + rssi_norm * 0.10f;
+                flatradar_devs[slot].orbit_speed  = 0.02f + rssi_norm * 0.04f;
                 flatradar_devs[slot].sweep_bright = 0.0f;
                 flatradar_devs[slot].glow_r       = 0.0f;
                 flatradar_devs[slot].vx           = 0.0f;
@@ -6111,13 +6113,13 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         uint32_t fh = 0;
         for (const char* p = d.name; *p; p++) fh = fh * 31 + (uint8_t)*p;
         float fp = (float)(fh % 1000) / 1000.0f * 6.28f;
-        tx += sinf(wander_t1 + fp)        * 3.0f
-            + sinf(wander_t2 + fp * 1.7f) * 1.5f;
-        ty += sinf(wander_t3 + fp * 0.6f) * 2.0f
-            + cosf(wander_t4 + fp * 2.1f) * 1.0f;
+        tx += sinf(wander_t1 + fp)        * 1.2f
+            + sinf(wander_t2 + fp * 1.7f) * 0.6f;
+        ty += sinf(wander_t3 + fp * 0.6f) * 0.8f
+            + cosf(wander_t4 + fp * 2.1f) * 0.4f;
 
-        d.x = anim_filter(d.x, tx + d.vx, 400.0f, dt);
-        d.y = anim_filter(d.y, ty + d.vy, 400.0f, dt);
+        d.x = anim_filter(d.x, tx + d.vx, 800.0f, dt);
+        d.y = anim_filter(d.y, ty + d.vy, 800.0f, dt);
 
         d.vx *= 0.90f;
         d.vy *= 0.90f;
@@ -6214,7 +6216,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         }
     }
 
-    // ── 7. Render devices ──
+    // ── 7. Render devices — sweep-reactive glow ──────────────────────
     for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
         if (!flatradar_devs[pi].occupied) continue;
         FlatRadarDevice& d = flatradar_devs[pi];
@@ -6222,28 +6224,27 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         int px = CX + (int)(d.x + 0.5f);
         int py = CY + (int)(d.y + 0.5f);
 
-        if (px < VIZ_X - 4 || px > VIZ_X + VIZ_W + 4) continue;
-        if (py < VIZ_Y - 4 || py > VIZ_Y + VIZ_H + 4) continue;
+        if (px < VIZ_X - 10 || px > VIZ_X + VIZ_W + 10) continue;
+        if (py < VIZ_Y - 10 || py > VIZ_Y + VIZ_H + 10) continue;
 
         uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
         const int SZ = 5;
 
-        // Glow halo — eased radius, pulses in smoothly
-        if (d.glow_r > 1.0f) {
-            int gr_outer = (int)(d.glow_r + 0.5f);
-            int gr_inner = (int)(d.glow_r * 0.65f + 0.5f);
-            if (gr_outer > 1) {
-                spr.fillCircle(px, py, gr_outer,
-                    lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.18f));
-            }
-            if (gr_inner > 1) {
-                spr.fillCircle(px, py, gr_inner,
-                    lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.30f));
+        // Glow halo — multi-ring radial gradient driven by sweep_bright
+        if (d.glow_r > 1.5f) {
+            int max_r = (int)(d.glow_r + 0.5f);
+            for (int gr = max_r; gr >= 2; gr--) {
+                float t = (float)gr / (float)max_r;
+                float alpha = d.sweep_bright * (1.0f - t) * (1.0f - t) * 0.35f;
+                if (alpha < 0.005f) continue;
+                spr.drawCircle(px, py, gr, lerp_col16(BG_COLOR, base_col, alpha));
             }
         }
 
-        // Icon — always full saturated color
-        uint16_t fill_col = lerp_col16(BG_COLOR, base_col, 0.55f);
+        // Icon — brightness modulated by sweep proximity
+        float icon_brightness = 0.55f + d.sweep_bright * 0.45f;
+        uint16_t fill_col = lerp_col16(BG_COLOR, base_col, icon_brightness * 0.7f);
+        uint16_t edge_col = lerp_col16(BG_COLOR, base_col, icon_brightness);
 
         if (d.proto == 0) {
             spr.fillTriangle(px,      py - SZ,
@@ -6253,14 +6254,14 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
             spr.drawTriangle(px,      py - SZ,
                              px - SZ, py + SZ,
                              px + SZ, py + SZ,
-                             base_col);
+                             edge_col);
         } else {
             spr.fillTriangle(px, py - SZ, px + SZ, py, px, py + SZ, fill_col);
             spr.fillTriangle(px, py - SZ, px - SZ, py, px, py + SZ, fill_col);
-            spr.drawLine(px,      py - SZ, px + SZ, py,      base_col);
-            spr.drawLine(px + SZ, py,      px,      py + SZ, base_col);
-            spr.drawLine(px,      py + SZ, px - SZ, py,      base_col);
-            spr.drawLine(px - SZ, py,      px,      py - SZ, base_col);
+            spr.drawLine(px,      py - SZ, px + SZ, py,      edge_col);
+            spr.drawLine(px + SZ, py,      px,      py + SZ, edge_col);
+            spr.drawLine(px,      py + SZ, px - SZ, py,      edge_col);
+            spr.drawLine(px - SZ, py,      px,      py - SZ, edge_col);
         }
     }
 
@@ -7503,7 +7504,7 @@ void draw_feed_expanded_overlay() {
         //   x=162  SIGNAL (STRONG/MEDIUM/WEAK = up to 6 chars = 42px)
         //   x=210  AGE (short form like "1m" or "45s" = 20px)
 
-        const int col_sym    = 4;
+        const int col_sym    = UI_PAD_SM;
         const int col_rssi   = 140;
         const int col_sig    = 195;
 
