@@ -756,6 +756,7 @@ struct FlatRadarDevice {
     uint8_t       proto;
     bool          is_flock;
     float         sweep_bright;
+    float         glow_r;
     bool          occupied;
 };
 static FlatRadarDevice flatradar_devs[FLATRADAR_MAX_DEVICES] = {};
@@ -5477,32 +5478,29 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         }
     }
 
-    // ── 3. Sweep line — bright leading edge ──
+    // ── 3. Sweep — thick wedge with layered transparency ──
+    // 6 lines fan behind the sweep angle. Leading edge is crisp;
+    // trailing layers fade quadratically over ~4.5 degrees.
     {
-        int ex = CX + (int)((float)R_R * cosf(flatradar_angle));
-        int ey = CY + (int)((float)R_R * sinf(flatradar_angle));
+        const int   SWEEP_LAYERS = 6;
+        const float SWEEP_FAN    = 0.08f;
 
-        spr.drawLine(CX, CY, ex, ey,
-                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.40f));
-        spr.drawLine(CX, CY, ex, ey,
-                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f));
+        for (int li = 0; li < SWEEP_LAYERS; li++) {
+            float t = (float)li / (float)(SWEEP_LAYERS - 1);
+            float layer_angle = flatradar_angle - t * SWEEP_FAN;
 
-        int ex2 = CX + (int)((float)R_R * cosf(flatradar_angle + 0.015f));
-        int ey2 = CY + (int)((float)R_R * sinf(flatradar_angle + 0.015f));
-        spr.drawLine(CX, CY, ex2, ey2,
-                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.65f));
+            int ex = CX + (int)((float)R_R * cosf(layer_angle));
+            int ey = CY + (int)((float)R_R * sinf(layer_angle));
 
-        // Ring intersection highlights — only draw if inside panel
-        const float ring_pcts[] = {0.33f, 0.66f, 1.0f};
-        for (int ri = 0; ri < 3; ri++) {
-            float rr = ring_pcts[ri] * (float)R_R;
-            int ix = CX + (int)(rr * cosf(flatradar_angle));
-            int iy = CY + (int)(rr * sinf(flatradar_angle));
-            if (ix >= VIZ_X && ix <= VIZ_X + VIZ_W &&
-                iy >= VIZ_Y && iy <= VIZ_Y + VIZ_H) {
-                spr.fillCircle(ix, iy, 2,
-                               lerp_col16(BG_COLOR, HEADER_COLOR, 0.90f));
+            float alpha;
+            if (li == 0) {
+                alpha = 0.85f;
+            } else {
+                alpha = 0.50f * (1.0f - t) * (1.0f - t);
             }
+
+            spr.drawLine(CX, CY, ex, ey,
+                         lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
         }
     }
 
@@ -5539,7 +5537,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
 
             if (slot >= 0) {
                 flatradar_devs[slot].orbit_r = anim_filter(
-                    flatradar_devs[slot].orbit_r, target_r, 600.0f, 500.0f);
+                    flatradar_devs[slot].orbit_r, target_r, 1000.0f, 500.0f);
                 flatradar_devs[slot].proto    = e.proto;
                 flatradar_devs[slot].is_flock = e.is_flock;
             } else {
@@ -5558,8 +5556,9 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
                 flatradar_devs[slot].is_flock     = e.is_flock;
                 flatradar_devs[slot].orbit_r      = target_r;
                 flatradar_devs[slot].orbit_angle  = (float)(nh % 628) / 100.0f;
-                flatradar_devs[slot].orbit_speed  = 0.08f + rssi_norm * 0.15f;
+                flatradar_devs[slot].orbit_speed  = 0.05f + rssi_norm * 0.10f;
                 flatradar_devs[slot].sweep_bright = 0.0f;
+                flatradar_devs[slot].glow_r       = 0.0f;
                 flatradar_devs[slot].vx           = 0.0f;
                 flatradar_devs[slot].vy           = 0.0f;
                 flatradar_devs[slot].x = target_r * cosf(flatradar_devs[slot].orbit_angle);
@@ -5589,14 +5588,22 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         uint32_t fh = 0;
         for (const char* p = d.name; *p; p++) fh = fh * 31 + (uint8_t)*p;
         float fp = (float)(fh % 1000) / 1000.0f * 6.28f;
-        tx += sinf((float)frame_ms * 0.0005f + fp)        * 4.0f;
-        ty += sinf((float)frame_ms * 0.0007f + fp * 0.6f) * 3.0f;
+        tx += sinf((float)frame_ms * 0.00025f + fp)        * 3.0f
+            + sinf((float)frame_ms * 0.00040f + fp * 1.7f) * 1.5f;
+        ty += sinf((float)frame_ms * 0.00030f + fp * 0.6f) * 2.0f
+            + cosf((float)frame_ms * 0.00020f + fp * 2.1f) * 1.0f;
 
-        d.x = anim_filter(d.x, tx + d.vx, 250.0f, dt);
-        d.y = anim_filter(d.y, ty + d.vy, 250.0f, dt);
+        d.x = anim_filter(d.x, tx + d.vx, 400.0f, dt);
+        d.y = anim_filter(d.y, ty + d.vy, 400.0f, dt);
 
-        d.vx *= 0.94f;
-        d.vy *= 0.94f;
+        d.vx *= 0.90f;
+        d.vy *= 0.90f;
+
+        const float MAX_VEL = 2.0f;
+        if (d.vx >  MAX_VEL) d.vx =  MAX_VEL;
+        if (d.vx < -MAX_VEL) d.vx = -MAX_VEL;
+        if (d.vy >  MAX_VEL) d.vy =  MAX_VEL;
+        if (d.vy < -MAX_VEL) d.vy = -MAX_VEL;
 
         // Clamp to inner circle with bounce
         float dist = sqrtf(d.x * d.x + d.y * d.y);
@@ -5618,7 +5625,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         float sweep_zone = PI2f * 0.33f;
         if (behind < sweep_zone) {
             float t = behind / sweep_zone;
-            float target_sb = (1.0f - t) * (1.0f - t);
+            float target_sb = (1.0f - t) * (1.0f - t) * (1.0f - t);
             if (target_sb > d.sweep_bright) {
                 d.sweep_bright = target_sb;
             } else {
@@ -5627,12 +5634,18 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         } else {
             d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 800.0f, dt);
         }
+
+        // ── Glow radius — pulses in when swept, shrinks when fading ──
+        float target_glow_r = (d.sweep_bright > 0.1f)
+                            ? 10.0f * d.sweep_bright : 0.0f;  // SZ(5)+5 = 10
+        float glow_tc = (target_glow_r > d.glow_r) ? 150.0f : 600.0f;
+        d.glow_r = anim_filter(d.glow_r, target_glow_r, glow_tc, dt);
     }
 
     // ── 6. Soft collision ──
     {
-        const float REPEL_DIST  = 14.0f;
-        const float REPEL_FORCE = 0.6f;
+        const float REPEL_DIST  = 18.0f;
+        const float REPEL_FORCE = 0.3f;
 
         for (int a = 0; a < FLATRADAR_MAX_DEVICES; a++) {
             if (!flatradar_devs[a].occupied) continue;
@@ -5671,12 +5684,18 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
         const int SZ = 5;
 
-        // Glow halo — lingers after sweep
-        if (d.sweep_bright > 0.08f) {
-            spr.fillCircle(px, py, SZ + 5,
-                           lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.18f));
-            spr.fillCircle(px, py, SZ + 3,
-                           lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.30f));
+        // Glow halo — eased radius, pulses in smoothly
+        if (d.glow_r > 1.0f) {
+            int gr_outer = (int)(d.glow_r + 0.5f);
+            int gr_inner = (int)(d.glow_r * 0.65f + 0.5f);
+            if (gr_outer > 1) {
+                spr.fillCircle(px, py, gr_outer,
+                    lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.18f));
+            }
+            if (gr_inner > 1) {
+                spr.fillCircle(px, py, gr_inner,
+                    lerp_col16(BG_COLOR, base_col, d.sweep_bright * 0.30f));
+            }
         }
 
         // Icon — always full saturated color
