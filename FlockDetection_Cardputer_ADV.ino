@@ -130,7 +130,54 @@ static bool show_menu = false;
 static int  menu_selected = 0;
 static unsigned long menu_open_ms = 0;
 static const int MENU_ITEM_COUNT = 12;
-static int   menu_scroll_offset = 0;        // index of first visible item
+static int   menu_scroll_offset = 0;        // kept for compat
+
+static float         menu_scroll_y      = 0.0f;
+static int           menu_scroll_target = 0;
+static unsigned long menu_last_frame_ms = 0;
+static float         menu_toggle_ease[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+// ── Menu section model ──
+struct MenuItem {
+    const char* label;
+    bool        is_toggle;
+    bool        is_danger;
+    int         action_id;
+};
+
+struct MenuSection {
+    const char* label;
+    const MenuItem* items;
+    int count;
+};
+
+static const MenuItem nav_items[] = {
+    {"Scanner",     false, false, 0},
+    {"Locator",     false, false, 1},
+    {"Detections",  false, false, 2},
+    {"GPS",         false, false, 3},
+    {"Stats",       false, false, 4},
+};
+
+static const MenuItem settings_items[] = {
+    {"Night Mode",  true,  false, 5},
+    {"Low Power",   true,  false, 6},
+    {"Mute",        true,  false, 7},
+};
+
+static const MenuItem tools_items[] = {
+    {"WiFi Config", false, false, 8},
+    {"Export Data", false, false, 9},
+    {"Boot Sound",  true,  false, 10},
+    {"Clear Stats", false, true,  11},
+};
+
+static const MenuSection menu_sections[] = {
+    {"NAVIGATE", nav_items,      5},
+    {"SETTINGS", settings_items, 3},
+    {"TOOLS",    tools_items,    4},
+};
+static const int MENU_SECTION_COUNT = 3;
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
 static bool low_power_mode = false;
@@ -876,9 +923,23 @@ struct FlatRadarDevice {
     float         sweep_bright;
     float         glow_r;
     bool          occupied;
+    float         fade;     // 0..1 eased — birth fades in, death fades out
+    bool          dying;    // true = fading out, reclaim slot when fade < 0.02
 };
 static FlatRadarDevice flatradar_devs[FLATRADAR_MAX_DEVICES] = {};
 static unsigned long   flatradar_dev_refresh_ms = 0;
+
+// Ambient noise particles
+#define FLATRADAR_PARTICLE_COUNT 8
+struct FlatRadarParticle {
+    float angle;
+    float radius;
+    float drift_speed;
+    float phase;
+    float sweep_bright;
+};
+static FlatRadarParticle flatradar_particles[FLATRADAR_PARTICLE_COUNT];
+static bool              flatradar_particles_init = false;
 
 // Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
 #define WAVEFORM_SAMPLES 134
@@ -4470,125 +4531,155 @@ static void menu_click() {
     M5Cardputer.Speaker.tone(660, 5);  // soft mechanical-keyboard tick
 }
 
+// ── Menu layout constants ──
+static const int MENU_ROW_H       = 14;
+static const int MENU_SECTION_H   = 12;
+static const int MENU_SECTION_GAP = 8;
+static const int MENU_TEXT_X      = 10;
+static const int MENU_LABEL_X     = 6;
+
+static int compute_menu_item_y(int flat_idx) {
+    int y = 0, fi = 0;
+    for (int si = 0; si < MENU_SECTION_COUNT; si++) {
+        if (si > 0) y += MENU_SECTION_GAP;
+        y += MENU_SECTION_H;
+        for (int ii = 0; ii < menu_sections[si].count; ii++) {
+            if (fi == flat_idx) return y;
+            y += MENU_ROW_H;
+            fi++;
+        }
+    }
+    return y;
+}
+
+static int compute_menu_total_height() {
+    int y = 0;
+    for (int si = 0; si < MENU_SECTION_COUNT; si++) {
+        if (si > 0) y += MENU_SECTION_GAP;
+        y += MENU_SECTION_H;
+        y += menu_sections[si].count * MENU_ROW_H;
+    }
+    return y;
+}
+
+static void draw_menu_toggle(int x, int y, float on_t, float alpha) {
+    uint16_t off_col  = lerp_col16(BG_COLOR, DIM_COLOR,    alpha * 0.20f);
+    uint16_t on_col   = lerp_col16(BG_COLOR, ACCENT_COLOR, alpha * 0.60f);
+    uint16_t track    = lerp_col16(off_col, on_col, on_t);
+    spr.fillRoundRect(x, y, 14, 7, 3, track);
+    int knob_x = x + 1 + (int)(on_t * 7.0f);
+    uint16_t knob_col = lerp_col16(BG_COLOR, TEXT_COLOR, alpha * 0.90f);
+    spr.fillRoundRect(knob_x, y + 1, 5, 5, 2, knob_col);
+}
+
 void draw_menu_overlay() {
     unsigned long now_ms = millis();
-    float alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+    float dt = (menu_last_frame_ms == 0) ? 16.0f : (float)(now_ms - menu_last_frame_ms);
+    if (dt > 100.0f) dt = 100.0f;
+    menu_last_frame_ms = now_ms;
 
-    // Solid backdrop matching the rest of the app
+    // Smooth scroll
+    menu_scroll_y = anim_filter(menu_scroll_y, (float)menu_scroll_target, 80.0f, dt);
+    int scroll_px = (int)(menu_scroll_y + 0.5f);
+
+    float open_alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
+
+    // Backdrop
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
-    // Overwrite the screen name area with "MENU"
+    // Header override — "MENU" replaces screen name
     spr.fillRect(0, 0, 90, CONTENT_Y, BG_COLOR);
-    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(TS_BODY);  // matches draw_header_spr style
+    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, open_alpha), BG_COLOR);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(4, 5);
     kprint(spr, "MENU");
 
-    struct MenuLine {
-        const char* label;
-        uint16_t    accent;
-    };
+    // Clip to content area
+    spr.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
 
-    char night_label[20], lp_label[20], mute_label[20], export_label[28], boot_label[24];
-    snprintf(night_label, sizeof(night_label), "Night Mode: %s", night_mode ? "ON" : "OFF");
-    snprintf(lp_label,    sizeof(lp_label),    "Low Power: %s",  low_power_mode ? "ON" : "OFF");
-    snprintf(mute_label,  sizeof(mute_label),  "Mute: %s",       is_muted ? "ON" : "OFF");
-    snprintf(boot_label,  sizeof(boot_label),  "Boot Sound: %s", boot_sound_enabled ? "ON" : "OFF");
-    if (export_mode_active) {
-        snprintf(export_label, sizeof(export_label), "Export: %s", export_ip_str);
-    } else {
-        snprintf(export_label, sizeof(export_label), "Export Data");
+    int flat_index   = 0;
+    int toggle_index = 0;
+    int y = CONTENT_Y - scroll_px;
+
+    for (int si = 0; si < MENU_SECTION_COUNT; si++) {
+        const MenuSection& section = menu_sections[si];
+
+        if (si > 0) y += MENU_SECTION_GAP;
+
+        // Section label — stagger per-section
+        float section_alpha = ui_progress(menu_open_ms + (unsigned long)(si * 60), 220);
+        float section_slide = (1.0f - section_alpha) * 12.0f;
+        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, section_alpha * 0.40f), BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(MENU_LABEL_X + (int)section_slide, y + 2);
+        kprint(spr, section.label);
+
+        y += MENU_SECTION_H;
+
+        for (int ii = 0; ii < section.count; ii++) {
+            const MenuItem& item = section.items[ii];
+            unsigned long item_delay = (unsigned long)(si * 60 + 30 + ii * 40);
+            float item_alpha = ui_progress(menu_open_ms + item_delay, 180);
+            float item_slide = (1.0f - item_alpha) * 10.0f;
+            bool  is_sel     = (flat_index == menu_selected);
+
+            uint16_t name_col;
+            if (item.is_danger) {
+                name_col = lerp_col16(BG_COLOR, CAUTION_COLOR,
+                                      item_alpha * (is_sel ? 1.0f : 0.35f));
+            } else if (is_sel) {
+                name_col = lerp_col16(BG_COLOR, TEXT_COLOR, item_alpha);
+            } else {
+                name_col = lerp_col16(BG_COLOR, DIM_COLOR, item_alpha * 0.55f);
+            }
+
+            spr.setTextColor(name_col, BG_COLOR);
+            spr.setTextSize(TS_STRONG);
+            spr.setCursor(MENU_TEXT_X + (int)item_slide, y + 2);
+            spr.print(item.label);
+
+            if (item.is_toggle) {
+                bool cur_val = false;
+                switch (toggle_index) {
+                    case 0: cur_val = night_mode;           break;
+                    case 1: cur_val = low_power_mode;       break;
+                    case 2: cur_val = is_muted;             break;
+                    case 3: cur_val = boot_sound_enabled;   break;
+                }
+                menu_toggle_ease[toggle_index] = anim_filter(
+                    menu_toggle_ease[toggle_index],
+                    cur_val ? 1.0f : 0.0f, 120.0f, dt);
+                draw_menu_toggle(DISP_W - 24 + (int)item_slide, y + 3,
+                                 menu_toggle_ease[toggle_index], item_alpha);
+                toggle_index++;
+            }
+
+            y += MENU_ROW_H;
+            flat_index++;
+        }
     }
 
-    MenuLine items[] = {
-        {"Scanner",       HEADER_COLOR},
-        {"Locator",       HEADER_COLOR},
-        {"Detections",    HEADER_COLOR},
-        {"GPS",           HEADER_COLOR},
-        {"Stats",         HEADER_COLOR},
-        {night_label,     DIM_COLOR},
-        {lp_label,        DIM_COLOR},
-        {mute_label,      DIM_COLOR},
-        {"WiFi Config",   DIM_COLOR},
-        {export_label,    export_mode_active ? ACCENT_COLOR : DIM_COLOR},
-        {boot_label,      DIM_COLOR},
-        {"Clear Stats",   CAUTION_COLOR},
-    };
-    static_assert(sizeof(items) / sizeof(items[0]) == MENU_ITEM_COUNT,
-                  "MENU_ITEM_COUNT does not match items[] array size");
+    spr.clearClipRect();
 
-    if (menu_selected < 0) menu_selected = 0;
-    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
-
-    const int row_h    = 14;
-    const int row_gap  = UI_PAD_SM;          // 6px standard gap
-    const int start_y  = CONTENT_Y + UI_PAD_XS;  // 2px below header
-
-    // Scrollable viewport — compute how many items fit between start_y and bottom
-    // (footer was removed; the row space extends to the bottom of the screen).
-    const int footer_y = DISP_H - 2;
-    const int visible_h = footer_y - start_y;
-    const int menu_visible_count = visible_h / (row_h + row_gap);
-
-    if (menu_selected < menu_scroll_offset) {
-        menu_scroll_offset = menu_selected;
-    }
-    if (menu_selected >= menu_scroll_offset + menu_visible_count) {
-        menu_scroll_offset = menu_selected - menu_visible_count + 1;
-    }
-    if (menu_scroll_offset < 0) menu_scroll_offset = 0;
-    int max_scroll = MENU_ITEM_COUNT - menu_visible_count;
-    if (max_scroll < 0) max_scroll = 0;
-    if (menu_scroll_offset > max_scroll) menu_scroll_offset = max_scroll;
-
-    // Instant highlight snap — no easing. The reduced row height makes
-    // interpolation look like jitter rather than smooth motion.
-    int sel_vi = menu_selected - menu_scroll_offset;
-    int ease_y = start_y + sel_vi * (row_h + row_gap);
-
-    // ── Row grid — only draw visible items ──
-    for (int vi = 0; vi < menu_visible_count && (vi + menu_scroll_offset) < MENU_ITEM_COUNT; vi++) {
-        int i = vi + menu_scroll_offset;
-        int y = start_y + vi * (row_h + row_gap);
-
-        spr.fillRect(0, y, DISP_W, row_h, BG_COLOR);
-
-        int text_x = 16;  // padded to clear the selection bar
-        // Selected item renders in header color (ice blue), others in text color.
-        // Creates a "glow" effect without position shifts.
-        uint16_t item_col = (i == menu_selected) ? HEADER_COLOR : TEXT_COLOR;
-        spr.setTextColor(ea(item_col), BG_COLOR);
-        spr.setTextSize(TS_STRONG);
-        spr.setCursor(text_x, y + 1);
-        spr.print(items[i].label);
-    }
-
-    // ── Selection bar ──
-    // 3px wide vertical bar on the left edge, full row height.
-    // Text color is already set per-item in the row grid loop.
-    {
-        spr.fillRect(UI_PAD_XS, ease_y, 3, row_h, ea(HEADER_COLOR));
-    }
-
-    // ── Scrollbar — only show if list exceeds viewport ──
-    if (MENU_ITEM_COUNT > menu_visible_count) {
+    // Scrollbar — only when content overflows the viewport
+    int total_h = compute_menu_total_height();
+    int view_h  = DISP_H - CONTENT_Y;
+    if (total_h > view_h) {
         const int track_x = DISP_W - 4;
-        const int track_y = start_y;
-        const int track_h = menu_visible_count * (row_h + row_gap) - row_gap;
+        const int track_y = CONTENT_Y;
+        const int track_h = view_h;
 
-        spr.drawFastVLine(track_x + 1, track_y, track_h, ea(CARD_BORDER));
+        spr.drawFastVLine(track_x + 1, track_y, track_h,
+                          lerp_col16(BG_COLOR, CARD_BORDER, open_alpha * 0.30f));
 
-        int thumb_h = max(8, (track_h * menu_visible_count) / MENU_ITEM_COUNT);
-        float scroll_t = (max_scroll > 0) ? (float)menu_scroll_offset / (float)max_scroll : 0.0f;
+        int thumb_h = max(8, (track_h * view_h) / total_h);
+        int max_s   = total_h - view_h;
+        float scroll_t = (max_s > 0) ? menu_scroll_y / (float)max_s : 0.0f;
         int thumb_y = track_y + (int)(scroll_t * (float)(track_h - thumb_h));
 
-        spr.fillRect(track_x, thumb_y, 3, thumb_h, ea(HEADER_COLOR));
+        spr.fillRect(track_x, thumb_y, 3, thumb_h,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, open_alpha));
     }
-
-    // Footer removed — extra row space goes to menu items. The keys are
-    // documented in the help overlay (TAB) and are intuitive: ; / . scroll,
-    // ENTER selects, DEL closes.
 }
 
 void draw_wifi_config_overlay() {
@@ -4829,11 +4920,10 @@ void handle_menu_select() {
 static const int DIVIDER_X    = 140;
 static const int VIZ_X        = 4;
 static const int VIZ_Y        = 20;
-static const int VIZ_H        = 53;
-static const int VIZ_W        = DIVIDER_X - VIZ_X - 2;   // 134
-static const int VIZ_RIGHT    = VIZ_X + VIZ_W;            // 138
-static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;            // 73
-static const int COUNTS_Y     = VIZ_BOTTOM + 6;           // 79
+static const int VIZ_H        = 67;                        // was 53 — 14px gained from status line removal
+static const int VIZ_W        = DIVIDER_X - VIZ_X - 2;    // 134
+static const int VIZ_RIGHT    = VIZ_X + VIZ_W;             // 138
+static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;             // 87
 static const int FEED_X       = 144;
 static const int FEED_LABEL_Y = 20 + UI_PAD_XS;
 static const int FEED_FIRST_Y = 34 + UI_PAD_XS;
@@ -4874,29 +4964,15 @@ void draw_scanner_screen() {
     }
     spr.clearClipRect();
 
-    // Step 4: scorecard — scanning status, then WIFI/BLE labels + numbers.
-    // Vertical rhythm uses named spacing tokens (UI_PAD_SM, UI_PAD_XS).
+    // Step 4: scorecard — WIFI/BLE labels + numbers (status line removed).
     long sw, sb;
     if (!take_data_mutex()) return;
     sw = session_flock_wifi;
     sb = session_flock_ble;
     give_data_mutex();
 
-    int status_y  = VIZ_BOTTOM + UI_PAD_SM;          // 73 + 6 = 79
-    int labels_y  = status_y + 8 + UI_PAD_SM;        // 79 + 8 + 6 = 93
+    int labels_y  = VIZ_BOTTOM + UI_PAD_SM;          // 87 + 6 = 93
     int numbers_y = labels_y + 10 + UI_PAD_XS;       // 93 + 10 + 2 = 105
-
-    bool ble_scanning = (pBLEScan != nullptr && pBLEScan->isScanning());
-    spr.setTextColor(STATUS_TEXT_DIM, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(6, status_y);
-    if (ble_scanning) {
-        spr.print("BLE scanning");
-    } else {
-        char scan_status[20];
-        snprintf(scan_status, sizeof(scan_status), "WiFi: CH%d", current_channel);
-        spr.print(scan_status);
-    }
 
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_BODY);
@@ -6662,6 +6738,18 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
     const int   R_DRAW = R_R + 10;
     const float PI2f  = 2.0f * (float)M_PI;
 
+    // ── One-time particle initialization ──
+    if (!flatradar_particles_init) {
+        for (int i = 0; i < FLATRADAR_PARTICLE_COUNT; i++) {
+            flatradar_particles[i].angle        = random(0, 628) / 100.0f;
+            flatradar_particles[i].radius       = 45.0f + (float)random(0, 35);
+            flatradar_particles[i].drift_speed  = 0.008f + random(0, 15) / 1000.0f;
+            flatradar_particles[i].phase        = random(0, 1000) / 1000.0f * 6.28f;
+            flatradar_particles[i].sweep_bright = 0.0f;
+        }
+        flatradar_particles_init = true;
+    }
+
     // ── Animation dt ──
     float dt = (flatradar_last_ms == 0) ? 16.0f
              : (float)(frame_ms - flatradar_last_ms);
@@ -6678,18 +6766,17 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
     fast_sincos(flatradar_angle, &sweep_sin, &sweep_cos);
 
     // ── 1. Phosphor decay — pixel-level radial sweep ──────────────────
-    // Instead of discrete triangle slices (which read as a rotating
-    // wedge), paint each pixel individually with brightness computed
-    // from its angular distance behind the sweep line. The result is
-    // a smooth phosphor glow that fades continuously — no visible
-    // slice boundaries, no hard leading edge.
+    // Single Gaussian curve: no hard edge, no zone boundary.
+    // Half-resolution 2×2 blocks cut atan2f iterations by 75%.
     {
-        const float DECAY_ARC = PI2f * 0.83f;  // total arc of visible glow
-        const float FAST_ZONE = PI2f * 0.08f;  // 0–30°: fast cubic decay
+        static const float SIGMA     = 0.55f;
+        static const float INV_2SIG2 = 1.0f / (2.0f * SIGMA * SIGMA);
+        static const float PEAK      = 0.42f;
+        static const float CUTOFF    = 0.006f;
         const float R_SQ = (float)(R_DRAW * R_DRAW);
 
-        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py++) {
-            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px++) {
+        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py += 2) {
+            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px += 2) {
                 float dx = (float)(px - CX);
                 float dy = (float)(py - CY);
                 float dist_sq = dx * dx + dy * dy;
@@ -6701,21 +6788,11 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
                 if (behind < 0.0f) behind += PI2f;
                 if (behind >= PI2f) behind -= PI2f;
 
-                if (behind > DECAY_ARC) continue;
+                float brightness = PEAK * expf(-behind * behind * INV_2SIG2);
+                if (brightness < CUTOFF) continue;
 
-                float brightness;
-                if (behind < FAST_ZONE) {
-                    float t = behind / FAST_ZONE;
-                    float inv = 1.0f - t;
-                    brightness = 0.12f + 0.43f * inv * inv * inv;
-                } else {
-                    float t = (behind - FAST_ZONE) / (DECAY_ARC - FAST_ZONE);
-                    brightness = 0.12f * expf(-4.0f * t);
-                }
-
-                if (brightness < 0.008f) continue;
-
-                spr.drawPixel(px, py, lerp_col16(BG_COLOR, HEADER_COLOR, brightness));
+                spr.fillRect(px, py, 2, 2,
+                             lerp_col16(BG_COLOR, HEADER_COLOR, brightness));
             }
         }
     }
@@ -6729,33 +6806,13 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         }
     }
 
-    // ── 3. Sweep line — single bright line with soft trailing fade ──
-    // One crisp line at the sweep angle (the "beam") plus 3 trailing
-    // lines that fade smoothly. No hard leading edge — the beam is
-    // the natural peak of the phosphor brightness curve.
+    // ── 3. Sweep line ──
+    // Gaussian glow provides the soft trail — only the leading beam is needed.
     {
-        // Leading beam — single line at full sweep angle
-        {
-            int ex = CX + (int)((float)R_R * sweep_cos);
-            int ey = CY + (int)((float)R_R * sweep_sin);
-            spr.drawLine(CX, CY, ex, ey,
-                         lerp_col16(BG_COLOR, HEADER_COLOR, 0.70f));
-        }
-
-        // Trailing fade — 3 lines fanning behind, quadratic falloff
-        const int   TRAIL_LINES = 3;
-        const float TRAIL_FAN   = 0.06f;
-        for (int li = 1; li <= TRAIL_LINES; li++) {
-            float t = (float)li / (float)(TRAIL_LINES + 1);
-            float trail_angle = flatradar_angle - t * TRAIL_FAN;
-            float ts, tc;
-            fast_sincos(trail_angle, &ts, &tc);
-            int ex = CX + (int)((float)R_R * tc);
-            int ey = CY + (int)((float)R_R * ts);
-            float alpha = 0.35f * (1.0f - t) * (1.0f - t);
-            spr.drawLine(CX, CY, ex, ey,
-                         lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
-        }
+        int ex = CX + (int)((float)R_R * sweep_cos);
+        int ey = CY + (int)((float)R_R * sweep_sin);
+        spr.drawLine(CX, CY, ex, ey,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f));
     }
 
     // ── 4. Refresh device list every 500ms ──
@@ -6796,7 +6853,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
                 flatradar_devs[slot].is_flock = e.is_flock;
             } else {
                 for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
-                    if (!flatradar_devs[pi].occupied) { slot = pi; break; }
+                    if (!flatradar_devs[pi].occupied || flatradar_devs[pi].dying) { slot = pi; break; }
                 }
                 if (slot < 0) continue;
 
@@ -6810,20 +6867,22 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
                 flatradar_devs[slot].is_flock     = e.is_flock;
                 flatradar_devs[slot].orbit_r      = target_r;
                 flatradar_devs[slot].orbit_angle  = (float)(nh % 628) / 100.0f;
-                flatradar_devs[slot].orbit_speed  = 0.02f + rssi_norm * 0.04f;
+                flatradar_devs[slot].orbit_speed  = 0.05f + rssi_norm * 0.10f;
                 flatradar_devs[slot].sweep_bright = 0.0f;
                 flatradar_devs[slot].glow_r       = 0.0f;
                 flatradar_devs[slot].vx           = 0.0f;
                 flatradar_devs[slot].vy           = 0.0f;
-                flatradar_devs[slot].x = target_r * cosf(flatradar_devs[slot].orbit_angle);
-                flatradar_devs[slot].y = target_r * sinf(flatradar_devs[slot].orbit_angle);
+                flatradar_devs[slot].x     = target_r * cosf(flatradar_devs[slot].orbit_angle);
+                flatradar_devs[slot].y     = target_r * sinf(flatradar_devs[slot].orbit_angle);
+                flatradar_devs[slot].fade  = 0.0f;
+                flatradar_devs[slot].dying = false;
                 matched[slot] = true;
             }
         }
 
         for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
             if (flatradar_devs[pi].occupied && !matched[pi])
-                flatradar_devs[pi].occupied = false;
+                flatradar_devs[pi].dying = true;
         }
         flatradar_dev_refresh_ms = frame_ms;
     }
@@ -6838,6 +6897,13 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         if (!flatradar_devs[pi].occupied) continue;
         FlatRadarDevice& d = flatradar_devs[pi];
 
+        // Fade animation — birth eases in, death eases out
+        d.fade = anim_filter(d.fade, d.dying ? 0.0f : 1.0f, 400.0f, dt);
+        if (d.dying && d.fade < 0.02f) {
+            d.occupied = false;
+            continue;
+        }
+
         d.orbit_angle += d.orbit_speed * dt / 1000.0f;
         if (d.orbit_angle > PI2f) d.orbit_angle -= PI2f;
 
@@ -6847,10 +6913,10 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         uint32_t fh = 0;
         for (const char* p = d.name; *p; p++) fh = fh * 31 + (uint8_t)*p;
         float fp = (float)(fh % 1000) / 1000.0f * 6.28f;
-        tx += sinf(wander_t1 + fp)        * 1.2f
-            + sinf(wander_t2 + fp * 1.7f) * 0.6f;
-        ty += sinf(wander_t3 + fp * 0.6f) * 0.8f
-            + cosf(wander_t4 + fp * 2.1f) * 0.4f;
+        tx += sinf(wander_t1 + fp)        * 3.5f
+            + sinf(wander_t2 + fp * 1.7f) * 2.0f;
+        ty += sinf(wander_t3 + fp * 0.6f) * 2.5f
+            + cosf(wander_t4 + fp * 2.1f) * 1.5f;
 
         d.x = anim_filter(d.x, tx + d.vx, 800.0f, dt);
         d.y = anim_filter(d.y, ty + d.vy, 800.0f, dt);
@@ -6922,6 +6988,30 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         d.glow_r = anim_filter(d.glow_r, target_glow_r, glow_tc, dt);
     }
 
+    // ── Ambient particle update ──
+    for (int i = 0; i < FLATRADAR_PARTICLE_COUNT; i++) {
+        FlatRadarParticle& p = flatradar_particles[i];
+        p.angle += p.drift_speed * dt / 1000.0f;
+        if (p.angle > PI2f) p.angle -= PI2f;
+
+        float p_cos   = cosf(p.angle);
+        float p_sin   = sinf(p.angle);
+        float p_dot   = p_cos * sweep_cos + p_sin * sweep_sin;
+        float p_cross = p_cos * sweep_sin - p_sin * sweep_cos;
+        float p_behind = atan2f(p_cross, p_dot);
+        if (p_behind < 0.0f) p_behind += PI2f;
+
+        float p_sweep_zone = PI2f * 0.20f;
+        if (p_behind < p_sweep_zone) {
+            float t = p_behind / p_sweep_zone;
+            float target = (1.0f - t) * (1.0f - t);
+            if (target > p.sweep_bright) p.sweep_bright = target;
+            else p.sweep_bright = anim_filter(p.sweep_bright, target, 200.0f, dt);
+        } else {
+            p.sweep_bright = anim_filter(p.sweep_bright, 0.0f, 400.0f, dt);
+        }
+    }
+
     // ── 6. Soft collision ──
     {
         const float REPEL_DIST  = 18.0f;
@@ -6962,21 +7052,27 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         if (py < VIZ_Y - 10 || py > VIZ_Y + VIZ_H + 10) continue;
 
         uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
-        const int SZ = 5;
+
+        // Breathing icon size — each device has its own phase offset
+        uint32_t name_hash = 0;
+        for (const char* p = d.name; *p; p++) name_hash = name_hash * 31 + (uint8_t)*p;
+        float breath_phase = (float)(name_hash % 1000) / 1000.0f;
+        float breath = anim_pulse(UI_PULSE_BREATHE, breath_phase);
+        int SZ = 4 + (int)(breath * 2.0f);
 
         // Glow halo — multi-ring radial gradient driven by sweep_bright
         if (d.glow_r > 1.5f) {
             int max_r = (int)(d.glow_r + 0.5f);
             for (int gr = max_r; gr >= 2; gr--) {
                 float t = (float)gr / (float)max_r;
-                float alpha = d.sweep_bright * (1.0f - t) * (1.0f - t) * 0.35f;
+                float alpha = d.sweep_bright * (1.0f - t) * (1.0f - t) * 0.35f * d.fade;
                 if (alpha < 0.005f) continue;
                 spr.drawCircle(px, py, gr, lerp_col16(BG_COLOR, base_col, alpha));
             }
         }
 
-        // Icon — brightness modulated by sweep proximity
-        float icon_brightness = 0.55f + d.sweep_bright * 0.45f;
+        // Icon — brightness modulated by sweep proximity and fade
+        float icon_brightness = (0.55f + d.sweep_bright * 0.45f) * d.fade;
         uint16_t fill_col = lerp_col16(BG_COLOR, base_col, icon_brightness * 0.7f);
         uint16_t edge_col = lerp_col16(BG_COLOR, base_col, icon_brightness);
 
@@ -6996,6 +7092,39 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
             spr.drawLine(px + SZ, py,      px,      py + SZ, edge_col);
             spr.drawLine(px,      py + SZ, px - SZ, py,      edge_col);
             spr.drawLine(px - SZ, py,      px,      py - SZ, edge_col);
+        }
+
+        // Flock asterisk — dim star above icon
+        if (d.is_flock && icon_brightness > 0.4f) {
+            spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, icon_brightness * d.fade),
+                             BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(px - 2, py - SZ - 5);
+            spr.print("*");
+        }
+    }
+
+    // ── Ambient particle rendering ──
+    for (int i = 0; i < FLATRADAR_PARTICLE_COUNT; i++) {
+        FlatRadarParticle& p = flatradar_particles[i];
+        float wander_x = sinf((float)frame_ms * 0.0003f  + p.phase) * 2.0f;
+        float wander_y = cosf((float)frame_ms * 0.00025f + p.phase * 1.4f) * 1.5f;
+        int ppx = CX + (int)(p.radius * cosf(p.angle) + wander_x);
+        int ppy = CY + (int)(p.radius * sinf(p.angle) + wander_y);
+
+        if (ppx < VIZ_X - 2 || ppx > VIZ_X + VIZ_W + 2) continue;
+        if (ppy < VIZ_Y - 2 || ppy > VIZ_Y + VIZ_H + 2) continue;
+
+        float bright = 0.06f + p.sweep_bright * 0.14f;
+        uint16_t dot_col = lerp_col16(BG_COLOR, HEADER_COLOR, bright);
+        spr.drawPixel(ppx, ppy, dot_col);
+
+        if (p.sweep_bright > 0.3f) {
+            uint16_t cross_col = lerp_col16(BG_COLOR, HEADER_COLOR, bright * 0.6f);
+            spr.drawPixel(ppx - 1, ppy,     cross_col);
+            spr.drawPixel(ppx + 1, ppy,     cross_col);
+            spr.drawPixel(ppx,     ppy - 1, cross_col);
+            spr.drawPixel(ppx,     ppy + 1, cross_col);
         }
     }
 
@@ -9512,13 +9641,34 @@ void loop() {
                     int prev = menu_selected;
                     menu_selected--;
                     if (menu_selected < 0) menu_selected = 0;
-                    if (menu_selected != prev) menu_click();
+                    if (menu_selected != prev) {
+                        menu_click();
+                        int sel_y  = compute_menu_item_y(menu_selected);
+                        int view_h = DISP_H - CONTENT_Y;
+                        if (sel_y < menu_scroll_target)
+                            menu_scroll_target = sel_y - 2;
+                        if (sel_y + MENU_ROW_H > menu_scroll_target + view_h)
+                            menu_scroll_target = sel_y + MENU_ROW_H - view_h + 2;
+                        if (menu_scroll_target < 0) menu_scroll_target = 0;
+                    }
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '.') {
                     int prev = menu_selected;
                     menu_selected++;
                     if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
-                    if (menu_selected != prev) menu_click();
+                    if (menu_selected != prev) {
+                        menu_click();
+                        int sel_y  = compute_menu_item_y(menu_selected);
+                        int view_h = DISP_H - CONTENT_Y;
+                        if (sel_y < menu_scroll_target)
+                            menu_scroll_target = sel_y - 2;
+                        if (sel_y + MENU_ROW_H > menu_scroll_target + view_h)
+                            menu_scroll_target = sel_y + MENU_ROW_H - view_h + 2;
+                        if (menu_scroll_target < 0) menu_scroll_target = 0;
+                        int max_s = compute_menu_total_height() - view_h;
+                        if (max_s < 0) max_s = 0;
+                        if (menu_scroll_target > max_s) menu_scroll_target = max_s;
+                    }
                     draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (c == '\n' || c == '\r') {
                     menu_click();
@@ -9560,8 +9710,15 @@ void loop() {
                     if (show_menu) {
                         menu_open_ms = millis();
                         menu_scroll_offset = 0;
+                        menu_scroll_target = 0;
+                        menu_scroll_y = 0.0f;
+                        menu_last_frame_ms = 0;
                         show_feed_expanded = false;
                         show_help_overlay = false;
+                        menu_toggle_ease[0] = night_mode ? 1.0f : 0.0f;
+                        menu_toggle_ease[1] = low_power_mode ? 1.0f : 0.0f;
+                        menu_toggle_ease[2] = is_muted ? 1.0f : 0.0f;
+                        menu_toggle_ease[3] = boot_sound_enabled ? 1.0f : 0.0f;
                     }
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
