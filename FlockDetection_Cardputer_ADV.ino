@@ -913,15 +913,12 @@ struct FlatRadarDevice {
     char          name[20];
     float         x;
     float         y;
-    float         vx;
-    float         vy;
     float         orbit_r;
     float         orbit_angle;
     float         orbit_speed;
     uint8_t       proto;
     bool          is_flock;
     float         sweep_bright;
-    float         glow_r;
     bool          occupied;
     float         fade;           // 0..1 eased — birth fades in, death fades out
     bool          dying;          // true = fading out, reclaim slot when fade < 0.02
@@ -4075,6 +4072,8 @@ void draw_header_spr(int screen_num) {
     if (!take_data_mutex()) return;
     gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
     long pill_det  = lifetime_flock_total;
+    long pill_wifi = session_flock_wifi;
+    long pill_ble  = session_flock_ble;
     give_data_mutex();
     bool muted_now = is_muted;
 
@@ -4134,6 +4133,21 @@ void draw_header_spr(int screen_num) {
         int dw = (int)strlen(det_str) * 7 + 6;
         drawPill(icon_right - dw, icon_y, det_str, ACCENT_COLOR, 0.0f, true);
         icon_right -= dw + 2;
+    }
+
+    // WiFi + BLE session count pills — outline style, subordinate to detection pill
+    {
+        char b_str[8];
+        snprintf(b_str, sizeof(b_str), "B%ld", pill_ble);
+        int bw = (int)strlen(b_str) * 7 + 6;
+        drawPill(icon_right - bw, icon_y, b_str, DIM_COLOR);
+        icon_right -= bw + 2;
+
+        char w_str[8];
+        snprintf(w_str, sizeof(w_str), "W%ld", pill_wifi);
+        int ww = (int)strlen(w_str) * 7 + 6;
+        drawPill(icon_right - ww, icon_y, w_str, DIM_COLOR);
+        icon_right -= ww + 2;
     }
 }
 
@@ -4915,16 +4929,15 @@ void handle_menu_select() {
 // UI RENDERING - SCREENS 
 // ============================================================================
 // ── Layout constants for the scanner screen ──
-// Viz panel sits TOP-LEFT directly below the header; counts stack
-// BELOW it (RATE removed — counts own the bottom-left quadrant).
+// Viz panel fills the entire left side; W/B counts moved to header pills.
 // Feed runs full-height down the right side of the divider.
 static const int DIVIDER_X    = 140;
 static const int VIZ_X        = 4;
 static const int VIZ_Y        = 20;
-static const int VIZ_H        = 67;                        // was 53 — 14px gained from status line removal
+static const int VIZ_H        = DISP_H - VIZ_Y;           // 115 — fills to screen bottom
 static const int VIZ_W        = DIVIDER_X - VIZ_X - 2;    // 134
 static const int VIZ_RIGHT    = VIZ_X + VIZ_W;             // 138
-static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;             // 87
+static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;             // 135 (== DISP_H)
 static const int FEED_X       = 144;
 static const int FEED_LABEL_Y = 20 + UI_PAD_XS;
 static const int FEED_FIRST_Y = 34 + UI_PAD_XS;
@@ -4964,32 +4977,6 @@ void draw_scanner_screen() {
         case 3: draw_scanner_viz_flatradar(frame_ms);    break;
     }
     spr.clearClipRect();
-
-    // Step 4: scorecard — WIFI/BLE labels + numbers (status line removed).
-    long sw, sb;
-    if (!take_data_mutex()) return;
-    sw = session_flock_wifi;
-    sb = session_flock_ble;
-    give_data_mutex();
-
-    int labels_y  = VIZ_BOTTOM + UI_PAD_SM;          // 87 + 6 = 93
-    int numbers_y = labels_y + 10 + UI_PAD_XS;       // 93 + 10 + 2 = 105
-
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(6, labels_y);
-    kprint(spr, "WIFI", 1);
-    spr.setCursor(72, labels_y);
-    kprint(spr, "BLE", 1);
-
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setTextSize(TS_H1);
-    char wifi_str[6]; snprintf(wifi_str, sizeof(wifi_str), "%ld", sw);
-    spr.setCursor(6, numbers_y);
-    spr.print(wifi_str);
-    char ble_str[6]; snprintf(ble_str, sizeof(ble_str), "%ld", sb);
-    spr.setCursor(72, numbers_y);
-    spr.print(ble_str);
 
     // Step 6: feed panel (right side) — FEED label + rows.
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
@@ -6806,9 +6793,8 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
 
     // ── 2. Crosshairs + Rings ──
     {
-        uint16_t cross_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
-        spr.drawFastHLine(VIZ_X, CY, VIZ_W, cross_col);
-        spr.drawFastVLine(CX, VIZ_Y, VIZ_H, cross_col);
+        spr.drawFastHLine(VIZ_X, CY, VIZ_W, GRID_LINE_DIM);
+        spr.drawFastVLine(CX, VIZ_Y, VIZ_H, GRID_LINE_DIM);
 
         uint16_t ring_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.40f);
         const float ring_pcts[] = {0.33f, 0.66f, 1.0f};
@@ -6882,10 +6868,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
                 flatradar_devs[slot].orbit_angle  = (float)(nh % 628) / 100.0f;
                 flatradar_devs[slot].orbit_speed  = 0.05f + rssi_norm * 0.10f;
                 flatradar_devs[slot].sweep_bright  = 0.0f;
-                flatradar_devs[slot].glow_r        = 0.0f;
                 flatradar_devs[slot].last_sweep_ms = 0;
-                flatradar_devs[slot].vx            = 0.0f;
-                flatradar_devs[slot].vy           = 0.0f;
                 flatradar_devs[slot].x     = target_r * cosf(flatradar_devs[slot].orbit_angle);
                 flatradar_devs[slot].y     = target_r * sinf(flatradar_devs[slot].orbit_angle);
                 flatradar_devs[slot].fade  = 0.0f;
@@ -6932,19 +6915,10 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         ty += sinf(wander_t3 + fp * 0.6f) * 2.5f
             + cosf(wander_t4 + fp * 2.1f) * 1.5f;
 
-        d.x = anim_filter(d.x, tx + d.vx, 800.0f, dt);
-        d.y = anim_filter(d.y, ty + d.vy, 800.0f, dt);
+        d.x = anim_filter(d.x, tx, 800.0f, dt);
+        d.y = anim_filter(d.y, ty, 800.0f, dt);
 
-        d.vx *= 0.90f;
-        d.vy *= 0.90f;
-
-        const float MAX_VEL = 2.0f;
-        if (d.vx >  MAX_VEL) d.vx =  MAX_VEL;
-        if (d.vx < -MAX_VEL) d.vx = -MAX_VEL;
-        if (d.vy >  MAX_VEL) d.vy =  MAX_VEL;
-        if (d.vy < -MAX_VEL) d.vy = -MAX_VEL;
-
-        // Clamp to inner circle with bounce + sweep brightness.
+        // Clamp to inner circle — no bounce, devices stop at edge and drift back.
         // dist is computed lazily — only when needed by the clamp body
         // or the sweep brightness logic.
         float dev_dist_sq = d.x * d.x + d.y * d.y;
@@ -6958,9 +6932,6 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
             float scale = (float)R_IR / dist;
             d.x *= scale;
             d.y *= scale;
-            float nx = d.x / dist, ny = d.y / dist;
-            float dot = d.vx * nx + d.vy * ny;
-            if (dot > 0) { d.vx -= 2.0f * dot * nx; d.vy -= 2.0f * dot * ny; }
             dev_dist_sq = d.x * d.x + d.y * d.y;
         }
 
@@ -6992,11 +6963,6 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
             d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 1200.0f, dt);
         }
 
-        // ── Glow radius — pulses in when swept, shrinks when fading ──
-        float target_glow_r = (d.sweep_bright > 0.1f)
-                            ? 14.0f * d.sweep_bright : 0.0f;
-        float glow_tc = (target_glow_r > d.glow_r) ? 150.0f : 600.0f;
-        d.glow_r = anim_filter(d.glow_r, target_glow_r, glow_tc, dt);
     }
 
     // ── Ambient particle update ──
@@ -7023,35 +6989,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         }
     }
 
-    // ── 6. Soft collision ──
-    {
-        const float REPEL_DIST  = 18.0f;
-        const float REPEL_FORCE = 0.3f;
-
-        for (int a = 0; a < FLATRADAR_MAX_DEVICES; a++) {
-            if (!flatradar_devs[a].occupied) continue;
-            for (int b = a + 1; b < FLATRADAR_MAX_DEVICES; b++) {
-                if (!flatradar_devs[b].occupied) continue;
-
-                float dx      = flatradar_devs[a].x - flatradar_devs[b].x;
-                float dy      = flatradar_devs[a].y - flatradar_devs[b].y;
-                float dist_sq = dx * dx + dy * dy;
-
-                if (dist_sq < REPEL_DIST * REPEL_DIST && dist_sq > 0.1f) {
-                    float dist    = sqrtf(dist_sq);
-                    float overlap = REPEL_DIST - dist;
-                    float nx = dx / dist, ny = dy / dist;
-                    float impulse = overlap * REPEL_FORCE * 0.5f;
-                    flatradar_devs[a].vx += nx * impulse;
-                    flatradar_devs[a].vy += ny * impulse;
-                    flatradar_devs[b].vx -= nx * impulse;
-                    flatradar_devs[b].vy -= ny * impulse;
-                }
-            }
-        }
-    }
-
-    // ── 7. Render devices — sweep-reactive glow ──────────────────────
+    // ── 6. Render devices — phosphor glow blobs ──────────────────────
     for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
         if (!flatradar_devs[pi].occupied) continue;
         FlatRadarDevice& d = flatradar_devs[pi];
@@ -7062,65 +7000,40 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         if (px < VIZ_X - 10 || px > VIZ_X + VIZ_W + 10) continue;
         if (py < VIZ_Y - 10 || py > VIZ_Y + VIZ_H + 10) continue;
 
-        uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
-
-        // Breathing icon size — each device has its own phase offset
+        // Phosphor blob — soft radial glow, no hard edges
         uint32_t name_hash = 0;
         for (const char* p = d.name; *p; p++) name_hash = name_hash * 31 + (uint8_t)*p;
         float breath_phase = (float)(name_hash % 1000) / 1000.0f;
         float breath = anim_pulse(UI_PULSE_BREATHE, breath_phase);
-        int SZ = 4 + (int)(breath * 2.0f);
+        float blob_r_base = 3.0f + breath * 1.5f;
+        float blob_r = blob_r_base + d.sweep_bright * 4.0f;
 
-        // Glow halo — multi-ring radial gradient driven by sweep_bright
-        if (d.glow_r > 1.5f) {
-            int max_r = (int)(d.glow_r + 0.5f);
-            for (int gr = max_r; gr >= 2; gr--) {
-                float t = (float)gr / (float)max_r;
-                float alpha = d.sweep_bright * (1.0f - t) * (1.0f - t) * 0.55f * d.fade;
-                if (alpha < 0.005f) continue;
-                spr.drawCircle(px, py, gr, lerp_col16(BG_COLOR, base_col, alpha));
-            }
-            // Coral accent ring at outer edge — WiFi and flock only
-            if (d.proto == 0 || d.is_flock) {
-                int coral_r = max_r + 2;
-                float coral_alpha = d.sweep_bright * 0.50f * d.fade;
-                if (coral_alpha > 0.01f) {
-                    uint16_t coral_col = lerp_col16(BG_COLOR,
-                        lerp_col16(CAUTION_COLOR, TEXT_COLOR, 0.25f), coral_alpha);
-                    spr.drawCircle(px, py, coral_r, coral_col);
-                }
-            }
-        }
-
-        // Icon — brightness modulated by sweep proximity and fade
+        uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
         float icon_brightness = (0.70f + d.sweep_bright * 0.30f) * d.fade;
-        uint16_t fill_col = lerp_col16(BG_COLOR, base_col, icon_brightness * 0.7f);
-        uint16_t edge_col = lerp_col16(BG_COLOR, base_col, icon_brightness);
 
-        if (d.proto == 0) {
-            spr.fillTriangle(px,      py - SZ,
-                             px - SZ, py + SZ,
-                             px + SZ, py + SZ,
-                             fill_col);
-            spr.drawTriangle(px,      py - SZ,
-                             px - SZ, py + SZ,
-                             px + SZ, py + SZ,
-                             edge_col);
-        } else {
-            spr.fillTriangle(px, py - SZ, px + SZ, py, px, py + SZ, fill_col);
-            spr.fillTriangle(px, py - SZ, px - SZ, py, px, py + SZ, fill_col);
-            spr.drawLine(px,      py - SZ, px + SZ, py,      edge_col);
-            spr.drawLine(px + SZ, py,      px,      py + SZ, edge_col);
-            spr.drawLine(px,      py + SZ, px - SZ, py,      edge_col);
-            spr.drawLine(px - SZ, py,      px,      py - SZ, edge_col);
+        int max_r = (int)(blob_r + 0.5f);
+        if (max_r < 2) max_r = 2;
+
+        for (int gr = max_r; gr >= 0; gr--) {
+            float t = (max_r > 0) ? (float)gr / (float)max_r : 0.0f;
+            float alpha = icon_brightness * (1.0f - t) * (1.0f - t);
+            if (alpha < 0.01f) continue;
+            if (gr == 0) {
+                spr.drawPixel(px, py, lerp_col16(BG_COLOR, base_col, alpha));
+            } else {
+                spr.fillCircle(px, py, gr, lerp_col16(BG_COLOR, base_col, alpha));
+            }
         }
 
-        // Flock asterisk — dim star above icon
+        // Hot center pixel for definition
+        spr.drawPixel(px, py, lerp_col16(BG_COLOR, TEXT_COLOR, icon_brightness * 0.95f));
+
+        // Flock asterisk
         if (d.is_flock && icon_brightness > 0.4f) {
             spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, icon_brightness * d.fade),
                              BG_COLOR);
             spr.setTextSize(TS_MICRO);
-            spr.setCursor(px - 2, py - SZ - 5);
+            spr.setCursor(px + max_r + 2, py - max_r);
             spr.print("*");
         }
     }
