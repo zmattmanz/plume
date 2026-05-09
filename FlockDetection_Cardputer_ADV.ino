@@ -6375,8 +6375,8 @@ static void timeline_init(unsigned long frame_ms) {
 }
 
 // ── Viz mode 3: LAYERED TIMELINE ─────────────────────────────────────────
-// Max interpolated points: 50 bins × 3 sub-steps + 1 = 148
-#define TL_INTERP_FACTOR  3
+// Max interpolated points: 50 bins × 4 sub-steps + 1 = 197
+#define TL_INTERP_FACTOR  4
 #define TL_SMOOTH_MAX     ((TIMELINE_BIN_COUNT - 1) * TL_INTERP_FACTOR + 1)
 
 static void draw_scanner_viz_timeline(unsigned long frame_ms) {
@@ -6403,20 +6403,25 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         if (tl_wifi_smooth[i] > max_wifi) max_wifi = tl_wifi_smooth[i];
         if (tl_ble_smooth[i]  > max_ble)  max_ble  = tl_ble_smooth[i];
     }
+    // Shared peak so relative amplitudes match reality (WiFi vs BLE)
+    float max_shared = (max_wifi > max_ble) ? max_wifi : max_ble;
+    if (max_shared < 1.0f) max_shared = 1.0f;
 
     // ════════════════════════════════════════════════════════════════════
     // CATMULL-ROM SMOOTHING
     // ════════════════════════════════════════════════════════════════════
-    // Interpolate 3× between the 50 raw bins → ~148 smooth points.
-    // Normalized per-ribbon so each fills [0..1] of its own peak.
+    // Interpolate 4× between the 50 raw bins → ~197 smooth points.
+    // Shared-peak normalization + sqrtf compression for readable range.
 
     float wifi_norm[TIMELINE_BIN_COUNT];
     float ble_norm[TIMELINE_BIN_COUNT];
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        wifi_norm[i] = (max_wifi > 0.0f) ? (tl_wifi_smooth[i] / max_wifi) : 0.0f;
-        ble_norm[i]  = (max_ble  > 0.0f) ? (tl_ble_smooth[i]  / max_ble)  : 0.0f;
+        wifi_norm[i] = tl_wifi_smooth[i] / max_shared;
+        ble_norm[i]  = tl_ble_smooth[i]  / max_shared;
         if (wifi_norm[i] > 1.0f) wifi_norm[i] = 1.0f;
         if (ble_norm[i]  > 1.0f) ble_norm[i]  = 1.0f;
+        wifi_norm[i] = sqrtf(wifi_norm[i]);  // compress peaks, lift valleys
+        ble_norm[i]  = sqrtf(ble_norm[i]);
     }
 
     // Inline Catmull-Rom: for each span [i, i+1], emit TL_INTERP_FACTOR
@@ -6469,7 +6474,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
     const float T_LEN = 118.0f;   // time span (bleeds slightly past left edge)
     const float D_LEN =  24.0f;   // depth span (just enough to separate ribbons)
-    const float V_LEN =  58.0f;   // value span (max curve height)
+    const float V_LEN =  42.0f;   // value span (max curve height)
 
     const float TDX = -C30 * T_LEN;   // time   → upper-left
     const float TDY = -S30 * T_LEN;
@@ -6545,10 +6550,10 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     ribbons[0].smooth_pts = ble_smooth_pts;
     ribbons[0].num_pts    = ble_smooth_n;
     ribbons[0].curve_col  = HEADER_COLOR;
-    ribbons[0].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
-    ribbons[0].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
+    ribbons[0].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.42f);
+    ribbons[0].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.16f);
     ribbons[0].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(20,60,80), 0.35f);
-    ribbons[0].hatch_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.07f);
+    ribbons[0].hatch_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
     ribbons[0].base_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
     ribbons[0].flock_proto = 1;
 
@@ -6560,7 +6565,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     ribbons[1].bright_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.50f);
     ribbons[1].mid_col    = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.20f);
     ribbons[1].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(100,45,30), 0.35f);
-    ribbons[1].hatch_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.07f);
+    ribbons[1].hatch_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.04f);
     ribbons[1].base_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.18f);
     ribbons[1].flock_proto = 0;
 
