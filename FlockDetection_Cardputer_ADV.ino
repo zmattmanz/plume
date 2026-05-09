@@ -6391,8 +6391,8 @@ static void timeline_init(unsigned long frame_ms) {
 }
 
 // ── Viz mode 3: LAYERED TIMELINE ─────────────────────────────────────────
-// Max interpolated points: 50 bins × 5 sub-steps + 1 = 246
-#define TL_INTERP_FACTOR  5
+// Max interpolated points: 50 bins × 6 sub-steps + 1 = 295
+#define TL_INTERP_FACTOR  6
 #define TL_SMOOTH_MAX     ((TIMELINE_BIN_COUNT - 1) * TL_INTERP_FACTOR + 1)
 
 static void draw_scanner_viz_timeline(unsigned long frame_ms) {
@@ -6417,8 +6417,8 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
         float wifi_target = rssi_amp(tl_bins[i].wifi_rssi_sum, tl_bins[i].wifi_rssi_count, tl_bins[i].wifi);
         float ble_target  = rssi_amp(tl_bins[i].ble_rssi_sum,  tl_bins[i].ble_rssi_count,  tl_bins[i].ble);
-        tl_wifi_smooth[i] = anim_filter(tl_wifi_smooth[i], wifi_target, 500.0f, dt);
-        tl_ble_smooth[i]  = anim_filter(tl_ble_smooth[i],  ble_target,  500.0f, dt);
+        tl_wifi_smooth[i] = anim_filter(tl_wifi_smooth[i], wifi_target, 800.0f, dt);
+        tl_ble_smooth[i]  = anim_filter(tl_ble_smooth[i],  ble_target,  800.0f, dt);
         if (tl_flock_fade[i] > 0.0f) {
             tl_flock_fade[i] -= dt / 3000.0f;
             if (tl_flock_fade[i] < 0.0f) tl_flock_fade[i] = 0.0f;
@@ -6440,6 +6440,23 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         if (ble_norm[i]  > 1.0f) ble_norm[i]  = 1.0f;
         wifi_norm[i] = sqrtf(wifi_norm[i]);  // compress peaks, lift valleys
         ble_norm[i]  = sqrtf(ble_norm[i]);
+    }
+
+    // 3-tap box blur: removes single-bin spikes before Catmull-Rom
+    {
+        float tmp[TIMELINE_BIN_COUNT];
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+            float prev = (i > 0) ? wifi_norm[i-1] : wifi_norm[i];
+            float next = (i < TIMELINE_BIN_COUNT-1) ? wifi_norm[i+1] : wifi_norm[i];
+            tmp[i] = (prev + wifi_norm[i] + next) / 3.0f;
+        }
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) wifi_norm[i] = tmp[i];
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+            float prev = (i > 0) ? ble_norm[i-1] : ble_norm[i];
+            float next = (i < TIMELINE_BIN_COUNT-1) ? ble_norm[i+1] : ble_norm[i];
+            tmp[i] = (prev + ble_norm[i] + next) / 3.0f;
+        }
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) ble_norm[i] = tmp[i];
     }
 
     // Inline Catmull-Rom: for each span [i, i+1], emit TL_INTERP_FACTOR
@@ -6487,7 +6504,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     const float C30 = 0.866f;
     const float S30 = 0.5f;
 
-    const float ox = (float)(VIZ_X + VIZ_W - 22);
+    const float ox = (float)(VIZ_X + VIZ_W - 16);  // 6px past clip edge — newest data bleeds in
     const float oy = (float)(VIZ_Y + VIZ_H - 6);
 
     const float T_LEN = 118.0f;   // time span (bleeds slightly past left edge)
@@ -6506,32 +6523,43 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     #define PYf(tt, dtt, vt) (oy + (tt)*TDY + (dtt)*DDY + (vt)*VDY)
 
     // ════════════════════════════════════════════════════════════════════════
-    // CORNER GRID — back wall + floor meeting at a crease
+    // ISOMETRIC GRID — drawn first, before any ribbon
     // ════════════════════════════════════════════════════════════════════════
 
-    uint16_t grid_col   = lerp_col16(BG_COLOR, CARD_BORDER, 0.30f);
-    uint16_t crease_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.40f);
+    uint16_t grid_col   = lerp_col16(BG_COLOR, CARD_BORDER,  0.35f);
+    uint16_t crease_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.45f);
 
-    // ── Back wall — internal grid only, extended time range ──
-    for (int g = 1; g <= 3; g++) {
-        float v = (float)g * 0.25f;
-        spr.drawLine(PX(-0.2f,1), PY(-0.2f,1,v), PX(1.2f,1), PY(1.2f,1,v), grid_col);
+    // ── Floor plane (value=0): time-parallel lines across depth range ──
+    for (int di = -2; di <= 6; di++) {
+        float d = (float)di * 0.25f;
+        spr.drawLine(PX(-0.3f, d), PY(-0.3f, d, 0),
+                     PX( 1.3f, d), PY( 1.3f, d, 0), grid_col);
     }
-    for (int g = 1; g <= 3; g++) {
-        float t = (float)g * 0.25f;
-        spr.drawLine(PX(t,1), PY(t,1,0), PX(t,1), PY(t,1,1), grid_col);
-    }
-
-    // ── Floor — internal grid only, extended time and depth ranges ──
-    spr.drawLine(PX(-0.2f,0.5f), PY(-0.2f,0.5f,0), PX(1.2f,0.5f), PY(1.2f,0.5f,0), grid_col);
-    for (int g = 1; g <= 3; g++) {
-        float t = (float)g * 0.25f;
-        spr.drawLine(PX(t,-0.5f), PY(t,-0.5f,0), PX(t,1.5f), PY(t,1.5f,0), grid_col);
+    // Depth-parallel lines across time range
+    for (int ti = -1; ti <= 6; ti++) {
+        float t = (float)ti * 0.2f;
+        spr.drawLine(PX(t, -0.5f), PY(t, -0.5f, 0),
+                     PX(t,  1.5f), PY(t,  1.5f, 0), grid_col);
     }
 
-    // ── Crease — wall/floor junction, extended time range ──
-    spr.drawLine(PX(-0.2f,1), PY(-0.2f,1,0),   PX(1.2f,1), PY(1.2f,1,0),   crease_col);
-    spr.drawLine(PX(-0.2f,1), PY(-0.2f,1,0)+1, PX(1.2f,1), PY(1.2f,1,0)+1, crease_col);
+    // ── Back wall (depth=1): horizontal value lines along time axis ──
+    for (int vi = 1; vi <= 4; vi++) {
+        float v = (float)vi * 0.25f;
+        spr.drawLine(PX(-0.3f, 1.0f), PY(-0.3f, 1.0f, v),
+                     PX( 1.3f, 1.0f), PY( 1.3f, 1.0f, v), grid_col);
+    }
+    // Vertical time-division lines
+    for (int ti = -1; ti <= 6; ti++) {
+        float t = (float)ti * 0.2f;
+        spr.drawLine(PX(t, 1.0f), PY(t, 1.0f, -0.2f),
+                     PX(t, 1.0f), PY(t, 1.0f,  1.2f), grid_col);
+    }
+
+    // ── Crease: wall meets floor, 2px thick ──
+    spr.drawLine(PX(-0.3f, 1.0f), PY(-0.3f, 1.0f, 0),
+                 PX( 1.3f, 1.0f), PY( 1.3f, 1.0f, 0), crease_col);
+    spr.drawLine(PX(-0.3f, 1.0f), PY(-0.3f, 1.0f, 0) + 1,
+                 PX( 1.3f, 1.0f), PY( 1.3f, 1.0f, 0) + 1, crease_col);
 
     // ════════════════════════════════════════════════════════════════════════
     // RIBBON RENDERING — back-to-front (BLE then WiFi)
@@ -6667,6 +6695,16 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
                          (int)rx[i+1], (int)cy[i+1] + 1, R.curve_col);
         }
 
+        // ── Step E2: Leading edge glow — pulsing dot at newest (index 0) ──
+        {
+            int dot_x = (int)rx[0];
+            int dot_y = (int)cy[0];
+            float pulse = 0.7f + 0.3f * sinf((float)frame_ms * 2.0f * 3.14159f / 600.0f);
+            spr.fillCircle(dot_x, dot_y, 3, lerp_col16(BG_COLOR, R.curve_col, 0.15f * pulse));
+            spr.fillCircle(dot_x, dot_y, 2, lerp_col16(BG_COLOR, R.curve_col, 0.35f * pulse));
+            spr.fillCircle(dot_x, dot_y, 1, lerp_col16(BG_COLOR, R.curve_col, 0.80f * pulse));
+        }
+
         // ── Step F: Baseline edge ──
         for (int i = 0; i < n - 1; i++) {
             spr.drawLine((int)rx[i],   (int)by[i],
@@ -6688,24 +6726,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
             spr.fillCircle((int)rx[si], (int)cy[si] - 1, 2, pip_col);
         }
     }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // LABELS
-    // ════════════════════════════════════════════════════════════════════════
-
-    spr.setTextSize(TS_MICRO);
-
-    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f), BG_COLOR);
-    spr.setCursor(VIZ_X + 6, VIZ_Y + VIZ_H - 44);
-    spr.print("WiFi");
-
-    spr.setTextColor(lerp_col16(BG_COLOR, PURPLE_COLOR, 0.50f), BG_COLOR);
-    spr.setCursor(VIZ_X + 2, VIZ_Y + VIZ_H - 3);
-    spr.print("BLE");
-
-    spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.45f), BG_COLOR);
-    spr.setCursor(VIZ_X + VIZ_W - 18, VIZ_Y + VIZ_H - 2);
-    spr.print("now");
 
     #undef PX
     #undef PY
