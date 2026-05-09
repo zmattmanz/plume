@@ -6523,43 +6523,71 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     #define PYf(tt, dtt, vt) (oy + (tt)*TDY + (dtt)*DDY + (vt)*VDY)
 
     // ════════════════════════════════════════════════════════════════════════
-    // ISOMETRIC GRID — drawn first, before any ribbon
+    // ISOMETRIC DIAMOND GRID — fills entire viz panel
     // ════════════════════════════════════════════════════════════════════════
+    // Two families of parallel lines at 30° from horizontal forming the
+    // classic isometric diamond pattern. Pure integer math — no float
+    // endpoints — prevents the dotted aliasing from sub-pixel rounding.
 
-    uint16_t grid_col   = lerp_col16(BG_COLOR, CARD_BORDER,  0.35f);
-    uint16_t crease_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.45f);
+    uint16_t grid_col = lerp_col16(BG_COLOR, CARD_BORDER,  0.28f);
+    uint16_t axis_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
 
-    // ── Floor plane (value=0): time-parallel lines across depth range ──
-    for (int di = -2; di <= 6; di++) {
-        float d = (float)di * 0.25f;
-        spr.drawLine(PX(-0.3f, d), PY(-0.3f, d, 0),
-                     PX( 1.3f, d), PY( 1.3f, d, 0), grid_col);
-    }
-    // Depth-parallel lines across time range
-    for (int ti = -1; ti <= 6; ti++) {
-        float t = (float)ti * 0.2f;
-        spr.drawLine(PX(t, -0.5f), PY(t, -0.5f, 0),
-                     PX(t,  1.5f), PY(t,  1.5f, 0), grid_col);
-    }
+    const int GRID_SPACING = 12;
+    const int cx = VIZ_X + VIZ_W / 2;
+    const int cy = VIZ_Y + VIZ_H / 2;
 
-    // ── Back wall (depth=1): horizontal value lines along time axis ──
-    for (int vi = 1; vi <= 4; vi++) {
-        float v = (float)vi * 0.25f;
-        spr.drawLine(PX(-0.3f, 1.0f), PY(-0.3f, 1.0f, v),
-                     PX( 1.3f, 1.0f), PY( 1.3f, 1.0f, v), grid_col);
-    }
-    // Vertical time-division lines
-    for (int ti = -1; ti <= 6; ti++) {
-        float t = (float)ti * 0.2f;
-        spr.drawLine(PX(t, 1.0f), PY(t, 1.0f, -0.2f),
-                     PX(t, 1.0f), PY(t, 1.0f,  1.2f), grid_col);
+    // ── Family A: upper-left lines (parallel to time axis) ──
+    // Direction (-0.866, -0.5). Normal (+0.5, -0.866).
+    // Step origin along normal by k * GRID_SPACING.
+    for (int k = -20; k <= 20; k++) {
+        int ox_a = cx + (k * GRID_SPACING * 500) / 1000;
+        int oy_a = cy - (k * GRID_SPACING * 866) / 1000;
+        int x0 = ox_a - (200 * 866) / 1000;
+        int y0 = oy_a - (200 * 500) / 1000;
+        int x1 = ox_a + (200 * 866) / 1000;
+        int y1 = oy_a + (200 * 500) / 1000;
+        spr.drawLine(x0, y0, x1, y1, grid_col);
     }
 
-    // ── Crease: wall meets floor, 2px thick ──
-    spr.drawLine(PX(-0.3f, 1.0f), PY(-0.3f, 1.0f, 0),
-                 PX( 1.3f, 1.0f), PY( 1.3f, 1.0f, 0), crease_col);
-    spr.drawLine(PX(-0.3f, 1.0f), PY(-0.3f, 1.0f, 0) + 1,
-                 PX( 1.3f, 1.0f), PY( 1.3f, 1.0f, 0) + 1, crease_col);
+    // ── Family B: upper-right lines (parallel to depth axis) ──
+    // Direction (+0.866, -0.5). Normal (-0.5, -0.866).
+    for (int k = -20; k <= 20; k++) {
+        int ox_b = cx - (k * GRID_SPACING * 500) / 1000;
+        int oy_b = cy - (k * GRID_SPACING * 866) / 1000;
+        int x0 = ox_b - (200 * 866) / 1000;
+        int y0 = oy_b + (200 * 500) / 1000;
+        int x1 = ox_b + (200 * 866) / 1000;
+        int y1 = oy_b - (200 * 500) / 1000;
+        spr.drawLine(x0, y0, x1, y1, grid_col);
+    }
+
+    // ── Bold axis vertex ──
+    // Three lines meeting at the isometric cube corner: Z down,
+    // X upper-left (time), Y upper-right (depth).
+    {
+        int vx = VIZ_X + VIZ_W * 3 / 4;
+        int vy = VIZ_Y + VIZ_H * 3 / 4;
+        const int AXIS_LEN = 60;
+
+        // Z axis: straight down
+        spr.drawLine(vx,     vy, vx,     vy + AXIS_LEN, axis_col);
+        spr.drawLine(vx + 1, vy, vx + 1, vy + AXIS_LEN, axis_col);
+
+        // X axis: upper-left at 30°
+        int xax = vx - (AXIS_LEN * 866) / 1000;
+        int xay = vy - (AXIS_LEN * 500) / 1000;
+        spr.drawLine(vx, vy,     xax, xay,     axis_col);
+        spr.drawLine(vx, vy + 1, xax, xay + 1, axis_col);
+
+        // Y axis: upper-right at 30°
+        int yax = vx + (AXIS_LEN * 866) / 1000;
+        int yay = vy - (AXIS_LEN * 500) / 1000;
+        spr.drawLine(vx, vy,     yax, yay,     axis_col);
+        spr.drawLine(vx, vy + 1, yax, yay + 1, axis_col);
+
+        // Vertex dot
+        spr.fillCircle(vx, vy, 2, axis_col);
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     // RIBBON RENDERING — back-to-front (BLE then WiFi)
