@@ -6504,7 +6504,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     const float C30 = 0.866f;
     const float S30 = 0.5f;
 
-    const float ox = (float)(VIZ_X + VIZ_W - 16);  // 6px past clip edge — newest data bleeds in
+    const float ox = (float)(VIZ_X + VIZ_W - 12);  // 10px past clip edge — newest data bleeds in
     const float oy = (float)(VIZ_Y + VIZ_H - 6);
 
     const float T_LEN = 118.0f;   // time span (bleeds slightly past left edge)
@@ -6601,7 +6601,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         uint16_t bright_col;
         uint16_t mid_col;
         uint16_t dark_col;
-        uint16_t hatch_col;
         uint16_t base_col;
         uint8_t  flock_proto;
     };
@@ -6616,7 +6615,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     ribbons[0].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
     ribbons[0].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
     ribbons[0].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(20, 80, 65), 0.35f);
-    ribbons[0].hatch_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
     ribbons[0].base_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
     ribbons[0].flock_proto = 0;
 
@@ -6628,7 +6626,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     ribbons[1].bright_col = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.50f);
     ribbons[1].mid_col    = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.20f);
     ribbons[1].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(45, 35, 80), 0.35f);
-    ribbons[1].hatch_col  = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.04f);
     ribbons[1].base_col   = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.18f);
     ribbons[1].flock_proto = 1;
 
@@ -6643,7 +6640,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         float by[TL_SMOOTH_MAX];
 
         for (int i = 0; i < n; i++) {
-            float tt = (float)i / (float)(n - 1);
+            float tt = -0.08f + (float)i / (float)(n - 1) * 1.16f;
             rx[i] = PXf(tt, d);
             cy[i] = PYf(tt, d, R.smooth_pts[i]);
             by[i] = PYf(tt, d, 0.0f);
@@ -6666,30 +6663,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
             }
         }
 
-        // ── Step C: Diagonal hatch (UNDER gradient — z-order fix) ──
-        {
-            int hx_min = (int)rx[n - 1] - 2;
-            int hx_max = (int)rx[0] + 2;
-            int hy_min = VIZ_Y;
-            int hy_max = VIZ_Y + VIZ_H;
-            for (int i = 0; i < n; i++) {
-                if ((int)cy[i] < hy_min) hy_min = (int)cy[i];
-                if ((int)by[i] > hy_max) hy_max = (int)by[i];
-            }
-            int hw = hx_max - hx_min;
-            int hh = hy_max - hy_min;
-            if (hw > 0 && hh > 0) {
-                spr.setClipRect(hx_min, hy_min, hw, hh);
-                for (int dd = -hh; dd < hw + hh; dd += 5) {
-                    spr.drawLine(hx_min + dd, hy_min,
-                                 hx_min + dd + hh, hy_max, R.hatch_col);
-                }
-                spr.clearClipRect();
-                spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
-            }
-        }
-
-        // ── Step D: 3-band gradient fill ──
+        // ── Step C: 3-band gradient fill ──
         for (int i = 0; i < n - 1; i++) {
             float x0 = rx[i], x1 = rx[i + 1];
             float yt0 = cy[i], yt1 = cy[i + 1];
