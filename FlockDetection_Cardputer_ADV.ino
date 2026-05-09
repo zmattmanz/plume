@@ -184,14 +184,14 @@ static bool low_power_mode = false;
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
 // RGB LED state — color cycles with C key, on/off with L when locator idle
-static uint8_t led_r = 110, led_g = 200, led_b = 255; // default ice blue (matches ACCENT_COLOR)
+static uint8_t led_r = 77, led_g = 219, led_b = 194;  // default teal (matches HEADER_COLOR)
 static bool    led_breathing_on = true;
 static const uint8_t LED_COLORS[][3] = {
-    {110, 200, 255},  // ice blue (matches ACCENT_COLOR — default)
+    { 77, 219, 194},  // teal (matches HEADER_COLOR — default)
     { 80, 200, 255},  // cyan
     {  0, 200,   0},  // green
-    {  0, 160, 200},  // teal
-    {200, 100, 255},  // purple
+    {139, 124, 219},  // violet (matches PURPLE_COLOR)
+    {255, 181,  71},  // amber (matches CAUTION_COLOR)
     {255, 255, 255},  // white
     {255,  80,   0},  // orange
     {255,  30,  30},  // red
@@ -232,25 +232,22 @@ void apply_color_palette() {
         DIM_COLOR     = lgfx::color565(180,  90,  90);   // #B45A5A lifted red-dim
         ACCENT_COLOR  = lgfx::color565(255,  90,  90);   // = HEADER (unified)
         CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber
-        TEAL_COLOR    = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
-        PURPLE_COLOR  = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
+        TEAL_COLOR    = lgfx::color565(255,  90,  90);   // = HEADER (collapsed in night)
+        PURPLE_COLOR  = lgfx::color565(255, 150, 150);   // #FF9696 rose — BLE distinguishable
         GPS_COLOR     = lgfx::color565(255,  90,  90);   // = HEADER (collapsed)
     } else {
-        // Palette #3: ice blue + coral + bright steel.
-        // Softer, wider header hue reads as calm-professional.
-        // Coral caution is warmer and more urgent than amber.
-        // Dim lifted to #95A5B8 for card-background readability.
+        // Option C: Analogous Cool — teal + blue-violet + amber.
         BG_COLOR      = lgfx::color565(  5,  10,  20);   // #050A14
         CARD_COLOR    = lgfx::color565( 29,  50,  88);   // #1D3258
         CARD_BORDER   = lgfx::color565( 46,  70, 112);   // #2E4670
-        HEADER_COLOR  = lgfx::color565(110, 200, 255);   // #6EC8FF ice blue
+        HEADER_COLOR  = lgfx::color565( 77, 219, 194);   // #4DDBC2 teal
         TEXT_COLOR    = lgfx::color565(232, 239, 255);   // #E8EFFF
-        DIM_COLOR     = lgfx::color565(149, 165, 184);   // #95A5B8 bright steel
-        ACCENT_COLOR  = lgfx::color565(110, 200, 255);   // = HEADER (unified)
-        TEAL_COLOR    = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
-        PURPLE_COLOR  = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
-        CAUTION_COLOR = lgfx::color565(255, 123,  92);   // #FF7B5C coral
-        GPS_COLOR     = lgfx::color565(110, 200, 255);   // = HEADER (collapsed)
+        DIM_COLOR     = lgfx::color565(149, 165, 184);   // #95A5B8
+        ACCENT_COLOR  = lgfx::color565( 77, 219, 194);   // = HEADER (unified)
+        TEAL_COLOR    = lgfx::color565( 77, 219, 194);   // = HEADER (alias)
+        PURPLE_COLOR  = lgfx::color565(139, 124, 219);   // #8B7CDB blue-violet
+        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber
+        GPS_COLOR     = lgfx::color565( 77, 219, 194);   // = HEADER (unified)
     }
     HATCH_COLOR       = lerp_col16(BG_COLOR, CARD_BORDER,  0.80f);
     GRID_LINE_DIM     = lerp_col16(BG_COLOR, CARD_BORDER,  0.30f);
@@ -828,6 +825,7 @@ static bool feed_pending_valid = false;
 // path, consumed and decayed inside draw_scanner_screen().
 static unsigned long scanner_flash_ms = 0;
 static uint16_t      scanner_flash_color = 0;
+static uint8_t       scanner_flash_proto = 0;  // 0=WiFi 1=BLE — protocol for flock pip routing
 
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
@@ -2828,10 +2826,8 @@ static void set_toast_direct(const char* text, uint16_t accent) {
 
 void trigger_toast(const char* type, const char* name, int confidence) {
     uint16_t accent;
-    if      (strncmp(type, "RAVEN",     5) == 0) accent = TEAL_COLOR;
-    else if (strcmp (type, "FLOCK_BLE") == 0)    accent = PURPLE_COLOR;
-    else if (strcmp (type, "TARGET")    == 0)    accent = HEADER_COLOR;
-    else                                          accent = CAUTION_COLOR;
+    if (strcmp(type, "TARGET") == 0) accent = HEADER_COLOR;  // informational — teal
+    else                             accent = CAUTION_COLOR;  // all detections — amber
 
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
     bool is_action = (confidence == 0);
@@ -2941,11 +2937,11 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         add_to_capture_history(type, mac, name, rssi, confidence);
         // trigger_toast() is deferred until after we release dataMutex to minimize
         // critical section duration.
-        // Flash LED: yellow for WiFi, purple for BLE
+        // Flash LED: teal for WiFi, violet for BLE
         if (strcmp(proto, "WIFI") == 0) {
-            led_detect_r = 255; led_detect_g = 200; led_detect_b = 0;
+            led_detect_r = 77;  led_detect_g = 219; led_detect_b = 194;
         } else {
-            led_detect_r = 180; led_detect_g = 0; led_detect_b = 255;
+            led_detect_r = 139; led_detect_g = 124; led_detect_b = 219;
         }
         led_detection_flash_until = millis() + 15000;
         led_detect_active = true;
@@ -2999,7 +2995,8 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         // packet counts, so no separate per-detection trigger is
         // needed for that.
         scanner_flash_ms    = millis();
-        scanner_flash_color = (strcmp(proto, "WIFI") == 0) ? ACCENT_COLOR : PURPLE_COLOR;
+        scanner_flash_color = CAUTION_COLOR;  // all detections flash amber
+        scanner_flash_proto = (strcmp(proto, "WIFI") == 0) ? 0 : 1;
     }
 
     // Heavy work outside mutex
@@ -5037,8 +5034,8 @@ void draw_scanner_screen() {
         // with the row's age-fade applied as a final blend toward BG.
         int sym_x = FEED_X + UI_PAD_SM;
         int sym_y = ry + 3;
-        uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
-        if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
+        uint16_t proto_col = (e.proto == 0) ? HEADER_COLOR : PURPLE_COLOR;
+        if (e.is_flock) proto_col = lerp_col16(proto_col, CAUTION_COLOR, 0.5f);
         proto_col = lerp_col16(BG_COLOR, proto_col, af);
 
         if (e.proto == 0) {
@@ -5529,7 +5526,7 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
             if (age_fade < 0.3f) age_fade = 0.3f;
         }
 
-        uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
+        uint16_t base_col = d.is_flock ? CAUTION_COLOR : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
         float combined_bright = (0.35f + d.sweep_bright * 0.65f) * age_fade;
 
         if (d.sweep_bright > 0.1f) {
@@ -6135,14 +6132,14 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
             bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
             sym_col = CAUTION_COLOR;
         } else if (e.proto == 0) {
-            bar_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.65f);
-            sym_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.85f);
-        } else {
             bar_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.65f);
             sym_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.85f);
+        } else {
+            bar_col = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.65f);
+            sym_col = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.85f);
         }
 
-        uint16_t outline_col = (e.is_flock || e.proto == 0) ? CAUTION_COLOR : HEADER_COLOR;
+        uint16_t outline_col = e.is_flock ? CAUTION_COLOR : (e.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
 
         // Bar fill — solid base + leading-edge horizontal glow on right 1/2
         if (bar_w > pill_r * 2) {
@@ -6354,7 +6351,7 @@ static void timeline_shift_bins(unsigned long frame_ms) {
     if (!found_flock && scanner_flash_ms > 0 &&
         (frame_ms - scanner_flash_ms) < TIMELINE_BIN_MS) {
         found_flock = true;
-        flock_proto = (scanner_flash_color == ACCENT_COLOR) ? 0 : 1;
+        flock_proto = scanner_flash_proto;
     }
 
     int newest = TIMELINE_BIN_COUNT - 1;
@@ -6559,24 +6556,24 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     ribbons[0].depth      = 1.0f;
     ribbons[0].smooth_pts = wifi_smooth_pts;
     ribbons[0].num_pts    = smooth_n;
-    ribbons[0].curve_col  = CAUTION_COLOR;
-    ribbons[0].bright_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.50f);
-    ribbons[0].mid_col    = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.20f);
-    ribbons[0].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(100,45,30), 0.35f);
-    ribbons[0].hatch_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.04f);
-    ribbons[0].base_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.18f);
+    ribbons[0].curve_col  = HEADER_COLOR;
+    ribbons[0].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
+    ribbons[0].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
+    ribbons[0].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(20, 80, 65), 0.35f);
+    ribbons[0].hatch_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
+    ribbons[0].base_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
     ribbons[0].flock_proto = 0;
 
     // BLE (front)
     ribbons[1].depth      = 0.0f;
     ribbons[1].smooth_pts = ble_smooth_pts;
     ribbons[1].num_pts    = ble_smooth_n;
-    ribbons[1].curve_col  = HEADER_COLOR;
-    ribbons[1].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
-    ribbons[1].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
-    ribbons[1].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(20,60,80), 0.35f);
-    ribbons[1].hatch_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
-    ribbons[1].base_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
+    ribbons[1].curve_col  = PURPLE_COLOR;
+    ribbons[1].bright_col = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.50f);
+    ribbons[1].mid_col    = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.20f);
+    ribbons[1].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(45, 35, 80), 0.35f);
+    ribbons[1].hatch_col  = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.04f);
+    ribbons[1].base_col   = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.18f);
     ribbons[1].flock_proto = 1;
 
     for (int ri = 0; ri < 2; ri++) {
@@ -6698,11 +6695,11 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
     spr.setTextSize(TS_MICRO);
 
-    spr.setTextColor(lerp_col16(BG_COLOR, CAUTION_COLOR, 0.50f), BG_COLOR);
+    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f), BG_COLOR);
     spr.setCursor(VIZ_X + 6, VIZ_Y + VIZ_H - 44);
     spr.print("WiFi");
 
-    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f), BG_COLOR);
+    spr.setTextColor(lerp_col16(BG_COLOR, PURPLE_COLOR, 0.50f), BG_COLOR);
     spr.setCursor(VIZ_X + 2, VIZ_Y + VIZ_H - 3);
     spr.print("BLE");
 
@@ -7010,7 +7007,7 @@ static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
         float blob_r_base = 3.0f + breath * 1.5f;
         float blob_r = blob_r_base + d.sweep_bright * 4.0f;
 
-        uint16_t base_col = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
+        uint16_t base_col = d.is_flock ? CAUTION_COLOR : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
         float icon_brightness = (0.70f + d.sweep_bright * 0.30f) * d.fade;
 
         int max_r = (int)(blob_r + 0.5f);
@@ -7332,8 +7329,8 @@ static int history_scroll_offset = 0;
 
 // Helper: extract type-label and protocol color from type string
 static void hist_type_info(const char* type, const char** lbl, uint16_t* col) {
-    if (strstr(type, "WIFI")) { *lbl = "WiFi"; *col = TEAL_COLOR; }
-    else if (strstr(type, "BLE") || strstr(type, "RAVEN")) { *lbl = "BLE";  *col = GPS_COLOR; }
+    if (strstr(type, "WIFI")) { *lbl = "WiFi"; *col = HEADER_COLOR; }
+    else if (strstr(type, "BLE") || strstr(type, "RAVEN")) { *lbl = "BLE";  *col = PURPLE_COLOR; }
     else { *lbl = "SYS"; *col = DIM_COLOR; }
 }
 
@@ -8342,9 +8339,9 @@ void draw_feed_expanded_overlay() {
             FeedEntry& e = local_feed[idx];
             int row_y = row_top_adj + rendered * row_h - expand_slide_offset;
 
-            // Type symbol color (Flock entries tinted toward ACCENT), faded in
-            uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
-            if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
+            // Type symbol color (flock entries tinted toward amber), faded in
+            uint16_t proto_col = (e.proto == 0) ? HEADER_COLOR : PURPLE_COLOR;
+            if (e.is_flock) proto_col = lerp_col16(proto_col, CAUTION_COLOR, 0.5f);
             proto_col = ea(proto_col);
 
             // Small stats-style symbols: outline-only triangle (WiFi) or diamond (BLE)
@@ -10337,7 +10334,7 @@ void loop() {
                         if (af < 0.3f) af = 0.3f;
                     }
 
-                    uint16_t bcol = (d.proto == 0 || d.is_flock) ? CAUTION_COLOR : HEADER_COLOR;
+                    uint16_t bcol = d.is_flock ? CAUTION_COLOR : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
                     float cb = (0.35f + d.sweep_bright * 0.65f) * af;
 
                     if (d.sweep_bright > 0.1f) {
