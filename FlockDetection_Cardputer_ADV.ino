@@ -893,6 +893,10 @@ struct TimelineBin {
     bool     has_flock;
     uint8_t  flock_proto;
     unsigned long timestamp;
+    int16_t  wifi_rssi_sum;
+    int16_t  ble_rssi_sum;
+    uint8_t  wifi_rssi_count;
+    uint8_t  ble_rssi_count;
 };
 
 static TimelineBin   tl_bins[TIMELINE_BIN_COUNT]       = {};
@@ -6324,12 +6328,16 @@ static inline void fast_sincos(float angle, float* s, float* c) {
 // ── Timeline bin management ───────────────────────────────────────────────
 static void timeline_shift_bins(unsigned long frame_ms) {
     for (int i = 0; i < TIMELINE_BIN_COUNT - 1; i++) {
-        tl_bins[i]       = tl_bins[i + 1];
-        tl_flock_fade[i] = tl_flock_fade[i + 1];
+        tl_bins[i]        = tl_bins[i + 1];
+        tl_flock_fade[i]  = tl_flock_fade[i + 1];
+        tl_wifi_smooth[i] = tl_wifi_smooth[i + 1];
+        tl_ble_smooth[i]  = tl_ble_smooth[i + 1];
     }
 
     uint16_t wifi_count = 0;
     uint16_t ble_count  = 0;
+    int16_t  wifi_rssi_sum = 0, ble_rssi_sum = 0;
+    uint8_t  wifi_rssi_count = 0, ble_rssi_count = 0;
     bool     found_flock = false;
     uint8_t  flock_proto = 0;
 
@@ -6338,8 +6346,8 @@ static void timeline_shift_bins(unsigned long frame_ms) {
         FeedEntry& e = scan_local_feed[idx];
         if (e.mac[0] == '\0') continue;
         if ((frame_ms - e.timestamp) > TIMELINE_BIN_MS * 2) continue;
-        if (e.proto == 0) wifi_count++;
-        else              ble_count++;
+        if (e.proto == 0) { wifi_count++; wifi_rssi_sum += e.rssi; wifi_rssi_count++; }
+        else              { ble_count++;  ble_rssi_sum  += e.rssi; ble_rssi_count++;  }
         if (e.is_flock && !found_flock) { found_flock = true; flock_proto = e.proto; }
     }
 
@@ -6350,74 +6358,87 @@ static void timeline_shift_bins(unsigned long frame_ms) {
     }
 
     int newest = TIMELINE_BIN_COUNT - 1;
-    tl_bins[newest].wifi       = wifi_count;
-    tl_bins[newest].ble        = ble_count;
-    tl_bins[newest].has_flock  = found_flock;
-    tl_bins[newest].flock_proto = flock_proto;
-    tl_bins[newest].timestamp  = frame_ms;
-    tl_flock_fade[newest]      = found_flock ? 1.0f : 0.0f;
+    tl_bins[newest].wifi           = wifi_count;
+    tl_bins[newest].ble            = ble_count;
+    tl_bins[newest].has_flock      = found_flock;
+    tl_bins[newest].flock_proto    = flock_proto;
+    tl_bins[newest].timestamp      = frame_ms;
+    tl_bins[newest].wifi_rssi_sum  = wifi_rssi_sum;
+    tl_bins[newest].ble_rssi_sum   = ble_rssi_sum;
+    tl_bins[newest].wifi_rssi_count = wifi_rssi_count;
+    tl_bins[newest].ble_rssi_count  = ble_rssi_count;
+    tl_flock_fade[newest]          = found_flock ? 1.0f : 0.0f;
+    // Seed newest smooth from second-newest to prevent pop-in discontinuity
+    tl_wifi_smooth[newest] = tl_wifi_smooth[newest - 1];
+    tl_ble_smooth[newest]  = tl_ble_smooth[newest - 1];
     tl_last_bin_ms = frame_ms;
 }
 
 static void timeline_init(unsigned long frame_ms) {
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        tl_bins[i].wifi      = 0;
-        tl_bins[i].ble       = 0;
-        tl_bins[i].has_flock = false;
-        tl_bins[i].flock_proto = 0;
-        tl_bins[i].timestamp = frame_ms - (unsigned long)(TIMELINE_BIN_COUNT - 1 - i) * TIMELINE_BIN_MS;
-        tl_wifi_smooth[i]    = 0.0f;
-        tl_ble_smooth[i]     = 0.0f;
-        tl_flock_fade[i]     = 0.0f;
+        tl_bins[i].wifi           = 0;
+        tl_bins[i].ble            = 0;
+        tl_bins[i].has_flock      = false;
+        tl_bins[i].flock_proto    = 0;
+        tl_bins[i].timestamp      = frame_ms - (unsigned long)(TIMELINE_BIN_COUNT - 1 - i) * TIMELINE_BIN_MS;
+        tl_bins[i].wifi_rssi_sum  = 0;
+        tl_bins[i].ble_rssi_sum   = 0;
+        tl_bins[i].wifi_rssi_count = 0;
+        tl_bins[i].ble_rssi_count  = 0;
+        tl_wifi_smooth[i]         = 0.0f;
+        tl_ble_smooth[i]          = 0.0f;
+        tl_flock_fade[i]          = 0.0f;
     }
     tl_last_bin_ms = frame_ms;
     tl_initialized = true;
 }
 
 // ── Viz mode 3: LAYERED TIMELINE ─────────────────────────────────────────
-// Max interpolated points: 50 bins × 4 sub-steps + 1 = 197
-#define TL_INTERP_FACTOR  4
+// Max interpolated points: 50 bins × 5 sub-steps + 1 = 246
+#define TL_INTERP_FACTOR  5
 #define TL_SMOOTH_MAX     ((TIMELINE_BIN_COUNT - 1) * TL_INTERP_FACTOR + 1)
 
 static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
-    // ── Smoothing + normalization (UNCHANGED from original) ──────────
+    // ── Smoothing ────────────────────────────────────────────────────
     float dt = (tl_last_frame_ms == 0) ? 16.0f
              : (float)(frame_ms - tl_last_frame_ms);
     if (dt > 100.0f) dt = 100.0f;
     tl_last_frame_ms = frame_ms;
 
+    // Map avg RSSI [-90..-30 dBm] → [0..1], +15% boost if any packets present.
+    auto rssi_amp = [](int16_t rssi_sum, uint8_t rssi_count, uint16_t pkt_count) -> float {
+        if (rssi_count == 0) return 0.0f;
+        float avg = (float)rssi_sum / (float)rssi_count;
+        float amp = (avg + 90.0f) / 60.0f;  // -90..-30 → 0..1
+        if (amp < 0.0f) amp = 0.0f;
+        if (amp > 1.0f) amp = 1.0f;
+        if (pkt_count > 0) { amp += 0.15f; if (amp > 1.0f) amp = 1.0f; }
+        return amp;
+    };
+
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        tl_wifi_smooth[i] = anim_filter(tl_wifi_smooth[i],
-                                         (float)tl_bins[i].wifi, 300.0f, dt);
-        tl_ble_smooth[i]  = anim_filter(tl_ble_smooth[i],
-                                         (float)tl_bins[i].ble, 300.0f, dt);
+        float wifi_target = rssi_amp(tl_bins[i].wifi_rssi_sum, tl_bins[i].wifi_rssi_count, tl_bins[i].wifi);
+        float ble_target  = rssi_amp(tl_bins[i].ble_rssi_sum,  tl_bins[i].ble_rssi_count,  tl_bins[i].ble);
+        tl_wifi_smooth[i] = anim_filter(tl_wifi_smooth[i], wifi_target, 500.0f, dt);
+        tl_ble_smooth[i]  = anim_filter(tl_ble_smooth[i],  ble_target,  500.0f, dt);
         if (tl_flock_fade[i] > 0.0f) {
             tl_flock_fade[i] -= dt / 3000.0f;
             if (tl_flock_fade[i] < 0.0f) tl_flock_fade[i] = 0.0f;
         }
     }
 
-    float max_wifi = 1.0f, max_ble = 1.0f;
-    for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        if (tl_wifi_smooth[i] > max_wifi) max_wifi = tl_wifi_smooth[i];
-        if (tl_ble_smooth[i]  > max_ble)  max_ble  = tl_ble_smooth[i];
-    }
-    // Shared peak so relative amplitudes match reality (WiFi vs BLE)
-    float max_shared = (max_wifi > max_ble) ? max_wifi : max_ble;
-    if (max_shared < 1.0f) max_shared = 1.0f;
-
     // ════════════════════════════════════════════════════════════════════
     // CATMULL-ROM SMOOTHING
     // ════════════════════════════════════════════════════════════════════
-    // Interpolate 4× between the 50 raw bins → ~197 smooth points.
-    // Shared-peak normalization + sqrtf compression for readable range.
+    // Interpolate 5× between the 50 raw bins → 246 smooth points.
+    // Values are already [0..1] from RSSI mapping; sqrtf lifts valleys.
 
     float wifi_norm[TIMELINE_BIN_COUNT];
     float ble_norm[TIMELINE_BIN_COUNT];
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        wifi_norm[i] = tl_wifi_smooth[i] / max_shared;
-        ble_norm[i]  = tl_ble_smooth[i]  / max_shared;
+        wifi_norm[i] = tl_wifi_smooth[i];
+        ble_norm[i]  = tl_ble_smooth[i];
         if (wifi_norm[i] > 1.0f) wifi_norm[i] = 1.0f;
         if (ble_norm[i]  > 1.0f) ble_norm[i]  = 1.0f;
         wifi_norm[i] = sqrtf(wifi_norm[i]);  // compress peaks, lift valleys
@@ -6492,39 +6513,28 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     // ════════════════════════════════════════════════════════════════════════
 
     uint16_t grid_col   = lerp_col16(BG_COLOR, CARD_BORDER, 0.30f);
-    uint16_t edge_col   = lerp_col16(BG_COLOR, CARD_BORDER, 0.45f);
     uint16_t crease_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.40f);
 
-    // ── Back wall (depth=1, time × value plane) ──
-    // Outline edges
-    spr.drawLine(PX(1,1), PY(1,1,0), PX(1,1), PY(1,1,1), edge_col);   // left vertical
-    spr.drawLine(PX(1,1), PY(1,1,1), PX(0,1), PY(0,1,1), edge_col);   // top (time dir)
-    spr.drawLine(PX(0,1), PY(0,1,0), PX(0,1), PY(0,1,1), edge_col);   // right vertical
-    // Internal grid
+    // ── Back wall — internal grid only, extended time range ──
     for (int g = 1; g <= 3; g++) {
         float v = (float)g * 0.25f;
-        spr.drawLine(PX(0,1), PY(0,1,v), PX(1,1), PY(1,1,v), grid_col);   // horizontal (time dir)
+        spr.drawLine(PX(-0.2f,1), PY(-0.2f,1,v), PX(1.2f,1), PY(1.2f,1,v), grid_col);
     }
     for (int g = 1; g <= 3; g++) {
         float t = (float)g * 0.25f;
-        spr.drawLine(PX(t,1), PY(t,1,0), PX(t,1), PY(t,1,1), grid_col);   // vertical
+        spr.drawLine(PX(t,1), PY(t,1,0), PX(t,1), PY(t,1,1), grid_col);
     }
 
-    // ── Floor (value=0, time × depth plane) ──
-    // Outline edges
-    spr.drawLine(PX(1,0), PY(1,0,0), PX(0,0), PY(0,0,0), edge_col);   // front (time dir)
-    spr.drawLine(PX(0,0), PY(0,0,0), PX(0,1), PY(0,1,0), edge_col);   // right (depth dir)
-    spr.drawLine(PX(1,0), PY(1,0,0), PX(1,1), PY(1,1,0), edge_col);   // left (depth dir)
-    // Internal grid
-    spr.drawLine(PX(0,0.5f), PY(0,0.5f,0), PX(1,0.5f), PY(1,0.5f,0), grid_col);  // mid-depth
+    // ── Floor — internal grid only, extended time and depth ranges ──
+    spr.drawLine(PX(-0.2f,0.5f), PY(-0.2f,0.5f,0), PX(1.2f,0.5f), PY(1.2f,0.5f,0), grid_col);
     for (int g = 1; g <= 3; g++) {
         float t = (float)g * 0.25f;
-        spr.drawLine(PX(t,0), PY(t,0,0), PX(t,1), PY(t,1,0), grid_col);   // depth-parallel
+        spr.drawLine(PX(t,-0.5f), PY(t,-0.5f,0), PX(t,1.5f), PY(t,1.5f,0), grid_col);
     }
 
-    // ── Crease — wall/floor junction (brightest structural line) ──
-    spr.drawLine(PX(0,1), PY(0,1,0),   PX(1,1), PY(1,1,0),   crease_col);
-    spr.drawLine(PX(0,1), PY(0,1,0)+1, PX(1,1), PY(1,1,0)+1, crease_col);
+    // ── Crease — wall/floor junction, extended time range ──
+    spr.drawLine(PX(-0.2f,1), PY(-0.2f,1,0),   PX(1.2f,1), PY(1.2f,1,0),   crease_col);
+    spr.drawLine(PX(-0.2f,1), PY(-0.2f,1,0)+1, PX(1.2f,1), PY(1.2f,1,0)+1, crease_col);
 
     // ════════════════════════════════════════════════════════════════════════
     // RIBBON RENDERING — back-to-front (BLE then WiFi)
@@ -6545,29 +6555,29 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
     RibbonDef ribbons[2];
 
-    // BLE (back)
+    // WiFi (back)
     ribbons[0].depth      = 1.0f;
-    ribbons[0].smooth_pts = ble_smooth_pts;
-    ribbons[0].num_pts    = ble_smooth_n;
-    ribbons[0].curve_col  = HEADER_COLOR;
-    ribbons[0].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.42f);
-    ribbons[0].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.16f);
-    ribbons[0].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(20,60,80), 0.35f);
-    ribbons[0].hatch_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
-    ribbons[0].base_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
-    ribbons[0].flock_proto = 1;
+    ribbons[0].smooth_pts = wifi_smooth_pts;
+    ribbons[0].num_pts    = smooth_n;
+    ribbons[0].curve_col  = CAUTION_COLOR;
+    ribbons[0].bright_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.50f);
+    ribbons[0].mid_col    = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.20f);
+    ribbons[0].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(100,45,30), 0.35f);
+    ribbons[0].hatch_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.04f);
+    ribbons[0].base_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.18f);
+    ribbons[0].flock_proto = 0;
 
-    // WiFi (front)
+    // BLE (front)
     ribbons[1].depth      = 0.0f;
-    ribbons[1].smooth_pts = wifi_smooth_pts;
-    ribbons[1].num_pts    = smooth_n;
-    ribbons[1].curve_col  = CAUTION_COLOR;
-    ribbons[1].bright_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.50f);
-    ribbons[1].mid_col    = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.20f);
-    ribbons[1].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(100,45,30), 0.35f);
-    ribbons[1].hatch_col  = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.04f);
-    ribbons[1].base_col   = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.18f);
-    ribbons[1].flock_proto = 0;
+    ribbons[1].smooth_pts = ble_smooth_pts;
+    ribbons[1].num_pts    = ble_smooth_n;
+    ribbons[1].curve_col  = HEADER_COLOR;
+    ribbons[1].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
+    ribbons[1].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
+    ribbons[1].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(20,60,80), 0.35f);
+    ribbons[1].hatch_col  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.04f);
+    ribbons[1].base_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
+    ribbons[1].flock_proto = 1;
 
     for (int ri = 0; ri < 2; ri++) {
         const RibbonDef& R = ribbons[ri];
@@ -6689,11 +6699,11 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     spr.setTextSize(TS_MICRO);
 
     spr.setTextColor(lerp_col16(BG_COLOR, CAUTION_COLOR, 0.50f), BG_COLOR);
-    spr.setCursor(VIZ_X + 2, VIZ_Y + VIZ_H - 3);
+    spr.setCursor(VIZ_X + 6, VIZ_Y + VIZ_H - 44);
     spr.print("WiFi");
 
     spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f), BG_COLOR);
-    spr.setCursor(VIZ_X + 6, VIZ_Y + VIZ_H - 44);
+    spr.setCursor(VIZ_X + 2, VIZ_Y + VIZ_H - 3);
     spr.print("BLE");
 
     spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, 0.45f), BG_COLOR);
