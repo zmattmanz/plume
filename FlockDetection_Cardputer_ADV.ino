@@ -6507,7 +6507,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     const float ox = (float)(VIZ_X + VIZ_W - 12);  // 10px past clip edge — newest data bleeds in
     const float oy = (float)(VIZ_Y + VIZ_H - 6);
 
-    const float T_LEN = 118.0f;   // time span (bleeds slightly past left edge)
+    const float T_LEN = 130.0f;   // time span — far end bleeds past upper-left edge
     const float D_LEN =  24.0f;   // depth span (just enough to separate ribbons)
     const float V_LEN =  42.0f;   // value span (max curve height)
 
@@ -6530,7 +6530,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     // endpoints — prevents the dotted aliasing from sub-pixel rounding.
 
     uint16_t grid_col = lerp_col16(BG_COLOR, CARD_BORDER,  0.28f);
-    uint16_t axis_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
 
     const int GRID_SPACING = 12;
     const int cx = VIZ_X + VIZ_W / 2;
@@ -6559,34 +6558,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         int x1 = ox_b + (200 * 866) / 1000;
         int y1 = oy_b - (200 * 500) / 1000;
         spr.drawLine(x0, y0, x1, y1, grid_col);
-    }
-
-    // ── Bold axis vertex ──
-    // Three lines meeting at the isometric cube corner: Z down,
-    // X upper-left (time), Y upper-right (depth).
-    {
-        int vx = VIZ_X + VIZ_W * 3 / 4;
-        int vy = VIZ_Y + VIZ_H * 3 / 4;
-        const int AXIS_LEN = 60;
-
-        // Z axis: straight down
-        spr.drawLine(vx,     vy, vx,     vy + AXIS_LEN, axis_col);
-        spr.drawLine(vx + 1, vy, vx + 1, vy + AXIS_LEN, axis_col);
-
-        // X axis: upper-left at 30°
-        int xax = vx - (AXIS_LEN * 866) / 1000;
-        int xay = vy - (AXIS_LEN * 500) / 1000;
-        spr.drawLine(vx, vy,     xax, xay,     axis_col);
-        spr.drawLine(vx, vy + 1, xax, xay + 1, axis_col);
-
-        // Y axis: upper-right at 30°
-        int yax = vx + (AXIS_LEN * 866) / 1000;
-        int yay = vy - (AXIS_LEN * 500) / 1000;
-        spr.drawLine(vx, vy,     yax, yay,     axis_col);
-        spr.drawLine(vx, vy + 1, yax, yay + 1, axis_col);
-
-        // Vertex dot
-        spr.fillCircle(vx, vy, 2, axis_col);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -6640,7 +6611,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         float by[TL_SMOOTH_MAX];
 
         for (int i = 0; i < n; i++) {
-            float tt = -0.08f + (float)i / (float)(n - 1) * 1.16f;
+            float tt = -0.10f + (float)i / (float)(n - 1) * 1.30f;
             rx[i] = PXf(tt, d);
             cy[i] = PYf(tt, d, R.smooth_pts[i]);
             by[i] = PYf(tt, d, 0.0f);
