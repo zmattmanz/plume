@@ -72,12 +72,10 @@ static void apply_ble_scan_params();
 struct WifiEvent;
 static void parse_wifi_event(struct WifiEvent* ev);
 static void update_channel_histogram();
-static void draw_scanner_viz_radar(unsigned long frame_ms);
+static void draw_scanner_viz_scan(unsigned long frame_ms);
 static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_signal_bars(unsigned long frame_ms);
-static void draw_scanner_viz_waveform(unsigned long frame_ms);
 static void draw_scanner_viz_timeline(unsigned long frame_ms);
-static void draw_scanner_viz_flatradar(unsigned long frame_ms);
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -829,10 +827,8 @@ static uint8_t       scanner_flash_proto = 0;  // 0=WiFi 1=BLE — protocol for 
 
 // Cycleable visualization in the scanner's bottom-left panel. 'v' key
 // advances through the modes; the renderer dispatches on this value.
-static int       scanner_viz_mode  = 0;   // 0=SPECTRUM 1=SIGNAL BARS 2=TIMELINE 3=FLATRADAR
+static int       scanner_viz_mode  = 0;   // 0=SCAN 1=SPECTRUM 2=SIGNAL BARS 3=TIMELINE
 static const int SCANNER_VIZ_COUNT = 4;
-static unsigned long viz_indicator_show_ms = 0;
-static const unsigned long VIZ_INDICATOR_HOLD_MS = 1500;
 
 // Per-channel packet counter used by the SPECTRUM viz. Counts are
 // incremented in wifi_sniffer_packet_handler() (single 32-bit store on
@@ -905,50 +901,6 @@ static unsigned long tl_last_frame_ms = 0;
 static bool          tl_initialized   = false;
 static float         tl_flock_fade[TIMELINE_BIN_COUNT]  = {};
 
-// Flat radar state
-static float         flatradar_angle           = 0.0f;
-static unsigned long flatradar_last_ms         = 0;
-
-// Per-device state with position physics
-#define FLATRADAR_MAX_DEVICES 6
-struct FlatRadarDevice {
-    char          name[20];
-    float         x;
-    float         y;
-    float         orbit_r;
-    float         orbit_angle;
-    float         orbit_speed;
-    uint8_t       proto;
-    bool          is_flock;
-    float         sweep_bright;
-    bool          occupied;
-    float         fade;           // 0..1 eased — birth fades in, death fades out
-    bool          dying;          // true = fading out, reclaim slot when fade < 0.02
-    unsigned long last_sweep_ms;  // timestamp of last sweep hit — for hold-then-fade
-};
-static FlatRadarDevice flatradar_devs[FLATRADAR_MAX_DEVICES] = {};
-static unsigned long   flatradar_dev_refresh_ms = 0;
-
-// Ambient noise particles
-#define FLATRADAR_PARTICLE_COUNT 8
-struct FlatRadarParticle {
-    float angle;
-    float radius;
-    float drift_speed;
-    float phase;
-    float sweep_bright;
-};
-static FlatRadarParticle flatradar_particles[FLATRADAR_PARTICLE_COUNT];
-static bool              flatradar_particles_init = false;
-
-// Waveform ring buffer — amplitude [0..1] and WiFi ratio per frame sample.
-#define WAVEFORM_SAMPLES 134
-static float             waveform_amp[WAVEFORM_SAMPLES]   = {0};
-static float             waveform_ratio[WAVEFORM_SAMPLES] = {0};
-static int               waveform_head = 0;
-static uint32_t          waveform_prev_pkt_count = 0;
-static unsigned long     waveform_last_sample_ms = 0;
-static float             waveform_peak = 1.0f;
 
 // Feed slide-in animation — when scan_local_head changes, all rows
 // shift down together over FEED_SHIFT_ANIM_MS with an ease-out curve.
@@ -2484,23 +2436,13 @@ void rssi_track_expire() {
     give_data_mutex();
 }
 
-// ============================================================================
-// THREAT EQUALIZER DATA
-// ============================================================================
-#define radar_cx 58
-#define radar_cy 46
-#define radar_r  34
-#define inner_r  14
+// ── SCAN viz device state ─────────────────────────────────────────────
+// Each slot tracks a live device. Angle is derived from MAC hash for
+// spatial stability; radial position maps RSSI → radius via anim_filter.
+// Sweep brightness uses phosphor decay: illuminate on sweep pass, fade.
+#define SCAN_MAX_DEVICES 12
 
-// ── Proximity radar device state ──────────────────────────────────────
-// Each slot tracks a live device observed in the feed. Angle is derived
-// from MAC hash for spatial stability; radial position tracks RSSI via
-// anim_filter for smooth motion. Sweep brightness follows the phosphor
-// decay model — devices illuminate when the sweep passes their angle
-// and fade on the standard cubic-then-exponential curve.
-#define PROX_RADAR_MAX_DEVICES 12
-
-struct ProxRadarDevice {
+struct ScanDevice {
     char     mac[18];
     char     name[20];
     float    angle;
@@ -2514,105 +2456,10 @@ struct ProxRadarDevice {
     int8_t   rssi;
 };
 
-static ProxRadarDevice prox_devs[PROX_RADAR_MAX_DEVICES] = {};
-static unsigned long   prox_last_refresh_ms = 0;
-static unsigned long   prox_last_frame_ms   = 0;
-
-#define NUM_RADIAL_BANDS 36
-float radial_spikes[NUM_RADIAL_BANDS] = {0};
-uint16_t radial_colors[NUM_RADIAL_BANDS] = {0};
-int radial_rssi[NUM_RADIAL_BANDS] = {0};
-unsigned long radial_spike_birth[NUM_RADIAL_BANDS] = {0};
-static float hud_rotation = 0.0f;
-
-#define NUM_PARTICLES 24
-static float noise_r[NUM_PARTICLES] = {0};
-static float noise_a[NUM_PARTICLES] = {0};
-static int noise_life[NUM_PARTICLES] = {0};
-static int noise_max_life[NUM_PARTICLES] = {0};
-
-// Per-frame radar snapshot — populated by update_radar_data() and read by
-// both draw_scanner_screen() and the ambient-mode renderer. Hoisted to
-// file scope so ambient mode can render the same blip data the scanner
-// would, without re-running the mutex critical section.
-static float        local_spikes[NUM_RADIAL_BANDS] = {0};
-static uint16_t     local_colors[NUM_RADIAL_BANDS] = {0};
-static unsigned long radar_time_since_blip = 0;
-
-// ── DEPRECATED: Old decorative radar infrastructure ──────────────────
-// The following functions and state (update_radar_data, draw_radar_common,
-// add_blip, radial_spikes, radial_colors, noise_*, NUM_RADIAL_BANDS,
-// NUM_PARTICLES, hud_rotation) are no longer called by any active viz
-// mode. They are retained temporarily for reference and can be removed
-// in a future cleanup pass once the proximity radar is confirmed stable.
-
-// Drive particle activation from packet counts, decay particle lifetimes,
-// and decay+snapshot radial spikes for the current frame. Idempotent per
-// frame — call once before rendering. Both scanner and ambient call this
-// so ambient mode keeps the radar data alive while the scanner screen is
-// not being drawn.
-static void update_radar_data(unsigned long frame_ms) {
-    static bool p_init = false;
-    if (!p_init) {
-        for (int i = 0; i < NUM_PARTICLES; i++) {
-            noise_r[i]        = (float)random(inner_r + 4, radar_r - 4);
-            noise_a[i]        = random(0, 628) * 0.01f;
-            noise_max_life[i] = random(1200, 2200);
-            noise_life[i]     = 0;
-        }
-        p_init = true;
-    }
-
-    // Particle activation from real packet activity
-    static uint32_t last_ambient_count = 0;
-    static int      particle_pending   = 0;
-    uint32_t cur_ambient = ambient_packet_count;
-    uint32_t delta       = cur_ambient - last_ambient_count;
-    last_ambient_count   = cur_ambient;
-    particle_pending += (int)delta * 2;
-    if (particle_pending > NUM_PARTICLES * 3) particle_pending = NUM_PARTICLES * 3;
-    for (int i = 0; i < NUM_PARTICLES && particle_pending > 0; i++) {
-        if (noise_life[i] <= 0) {
-            noise_r[i]    = (float)random(inner_r + 4, radar_r - 4);
-            noise_a[i]    = random(0, 628) * 0.01f;
-            noise_life[i] = noise_max_life[i];
-            particle_pending--;
-        }
-    }
-
-    // Spike decay + snapshot under mutex (one critical section)
-    static const float SPIKE_DECAY_PER_MS = 0.00004f;
-    static unsigned long last_decay_ms = 0;
-    float decay_amount = SPIKE_DECAY_PER_MS * (float)(frame_ms - last_decay_ms);
-    last_decay_ms = frame_ms;
-
-    if (!take_data_mutex()) return;
-    radar_time_since_blip = frame_ms - last_blip_time;
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        // 2-minute max blip lifetime
-        if (radial_spike_birth[i] > 0 && (frame_ms - radial_spike_birth[i]) > 120000UL) {
-            radial_spikes[i]      = 0;
-            radial_spike_birth[i] = 0;
-        }
-        local_spikes[i] = radial_spikes[i];
-        local_colors[i] = radial_colors[i];
-        radial_spikes[i] -= decay_amount;
-        if (radial_spikes[i] < 0) radial_spikes[i] = 0;
-    }
-    give_data_mutex();
-
-    // Particle life decay
-    static unsigned long last_particle_ms = 0;
-    unsigned long dt_ms = frame_ms - last_particle_ms;
-    if (dt_ms > 100) dt_ms = 100;
-    last_particle_ms = frame_ms;
-    for (int i = 0; i < NUM_PARTICLES; i++) {
-        if (noise_life[i] > 0) {
-            noise_life[i] -= (int)dt_ms;
-            if (noise_life[i] < 0) noise_life[i] = 0;
-        }
-    }
-}
+static ScanDevice    scan_devs[SCAN_MAX_DEVICES] = {};
+static unsigned long scan_last_refresh_ms = 0;
+static unsigned long scan_last_frame_ms   = 0;
+static float         scan_sweep_angle     = 0.0f;
 
 static bool feed_recently_pushed(const char* mac) {
     unsigned long now = millis();
@@ -2664,15 +2511,8 @@ static void feed_commit_pending() {
 }
 
 void add_blip(uint16_t blip_color, int rssi) {
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    (void)blip_color; (void)rssi;
     last_blip_time = millis();
-    int band = random(0, NUM_RADIAL_BANDS);
-    float strength_mult = constrain(map(rssi, -100, -30, 50, 200), 50, 200) / 100.0f;
-    radial_spikes[band]      = 0.5f + strength_mult;
-    radial_colors[band]      = blip_color;
-    radial_rssi[band]        = rssi;
-    radial_spike_birth[band] = millis();
-    xSemaphoreGiveRecursive(dataMutex);
 }
 
 // ============================================================================
@@ -4934,8 +4774,8 @@ void handle_menu_select() {
 // Feed runs full-height down the right side of the divider.
 static const int DIVIDER_X    = 140;
 static const int VIZ_X        = 4;
-static const int VIZ_Y        = 20;
-static const int VIZ_H        = DISP_H - VIZ_Y;           // 115 — fills to screen bottom
+static const int VIZ_Y        = 36;
+static const int VIZ_H        = DISP_H - VIZ_Y;           // 99 — below shared label row
 static const int VIZ_W        = DIVIDER_X - VIZ_X - 2;    // 134
 static const int VIZ_RIGHT    = VIZ_X + VIZ_W;             // 138
 static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;             // 135 (== DISP_H)
@@ -4966,24 +4806,38 @@ void draw_scanner_screen() {
     // Step 2: vertical divider
     spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
 
-    // Step 3: viz panel — TOP LEFT, directly below the header.
-    // All modes use the same tight clip rect — radar is cropped at the
-    // panel boundary, giving a "viewport into a larger instrument" look.
+    // Step 3: shared label row — viz title + N/4 (left) | FEED (right)
+    {
+        const int LABEL_TEXT_Y = 24;
+        static const char* viz_titles[] = {"SCAN", "LINE", "STRENGTH", "TIME"};
+        const char* vt = viz_titles[scanner_viz_mode];
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(VIZ_X + 2, LABEL_TEXT_Y);
+        kprint(spr, vt);
+        int tw = (int)strlen(vt) * 7 + 2;
+        char nstr[4];
+        snprintf(nstr, sizeof(nstr), "%d/4", scanner_viz_mode + 1);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(VIZ_X + 2 + tw + 2, LABEL_TEXT_Y + 2);
+        spr.print(nstr);
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(FEED_X + UI_PAD_SM, LABEL_TEXT_Y);
+        kprint(spr, "FEED");
+    }
+
+    // Step 4: viz panel
     spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
     update_channel_histogram();
     switch (scanner_viz_mode) {
-        case 0: draw_scanner_viz_spectrum(frame_ms);     break;
-        case 1: draw_scanner_viz_signal_bars(frame_ms);  break;
-        case 2: draw_scanner_viz_timeline(frame_ms);     break;
-        case 3: draw_scanner_viz_flatradar(frame_ms);    break;
+        case 0: draw_scanner_viz_scan(frame_ms);         break;
+        case 1: draw_scanner_viz_spectrum(frame_ms);     break;
+        case 2: draw_scanner_viz_signal_bars(frame_ms);  break;
+        case 3: draw_scanner_viz_timeline(frame_ms);     break;
     }
     spr.clearClipRect();
-
-    // Step 6: feed panel (right side) — FEED label + rows.
-    spr.setTextColor(HEADER_COLOR, BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(FEED_X + UI_PAD_SM, FEED_LABEL_Y);
-    kprint(spr, "FEED");
 
     if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
         if (take_data_mutex()) {
@@ -5075,240 +4929,15 @@ void draw_scanner_screen() {
 
     spr.clearClipRect();
     feed_commit_pending();
-
-    // View indicator pill — appears for ~1.5s after pressing 'v', then
-    // fades out and stops rendering completely. Drawn after the viz so
-    // it sits on top.
-    if (viz_indicator_show_ms > 0) {
-        unsigned long ind_elapsed = frame_ms - viz_indicator_show_ms;
-        if (ind_elapsed > VIZ_INDICATOR_HOLD_MS + UI_FADE_OUT_MS) {
-            viz_indicator_show_ms = 0;
-        } else {
-            float ind_alpha;
-            if (ind_elapsed < UI_FADE_IN_MS) {
-                ind_alpha = ui_ease((float)ind_elapsed / (float)UI_FADE_IN_MS);
-            } else if (ind_elapsed > VIZ_INDICATOR_HOLD_MS) {
-                float ft = (float)(ind_elapsed - VIZ_INDICATOR_HOLD_MS)
-                         / (float)UI_FADE_OUT_MS;
-                ind_alpha = 1.0f - ui_ease(ft);
-            } else {
-                ind_alpha = 1.0f;
-            }
-            if (ind_alpha > 0.02f) {
-                char ind_str[6];
-                snprintf(ind_str, sizeof(ind_str), "%d/%d",
-                         scanner_viz_mode + 1, SCANNER_VIZ_COUNT);
-                int ind_h  = 13;
-                int ind_w  = (int)strlen(ind_str) * 6 + 12;
-                int ind_x  = VIZ_X + 3;
-                int ind_y  = VIZ_Y + 3;
-                int ind_r  = ind_h / 2;
-                uint16_t pill_bg     = lerp_col16(BG_COLOR, CARD_COLOR,   0.8f * ind_alpha);
-                uint16_t pill_border = lerp_col16(BG_COLOR, HEADER_COLOR, 0.4f * ind_alpha);
-                uint16_t text_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.9f * ind_alpha);
-                spr.fillRoundRect(ind_x, ind_y, ind_w, ind_h, ind_r, pill_bg);
-                spr.drawRoundRect(ind_x, ind_y, ind_w, ind_h, ind_r, pill_border);
-                spr.setTextColor(text_col, pill_bg);
-                spr.setTextSize(TS_MICRO);
-                spr.setCursor(ind_x + 6, ind_y + (ind_h - 8) / 2);
-                spr.print(ind_str);
-            }
-        }
-    }
 }
 
-// Shared cylinder-radar renderer used by both the scanner viz panel and
-// the fullscreen ambient mode. All geometry is parameterised so the
-// same drawing code serves both layouts; particles are scaled from the
-// global radar_r/inner_r range into the caller's r/ir range.
-static void draw_radar_common(unsigned long frame_ms,
-                              int cx, int cy, int r, int ir,
-                              float tilt, int thickness) {
-    const float TWO_PIf = (float)M_PI * 2.0f;
-
-    // Cylinder shadow
-    spr.fillEllipse(cx, cy + thickness + 2, r, r * tilt,
-                    lgfx::color565(4, 8, 16));
-    // Wall gradient — lighter toward the top
-    for (int i = thickness; i >= 1; i--) {
-        uint8_t wall_v = 8 + (thickness - i) * 2;
-        spr.fillEllipse(cx, cy + i, r, r * tilt,
-                        lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
-    }
-    // Top face fill + double-stroked rim
-    spr.fillEllipse(cx, cy, r, r * tilt, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(cx, cy,     r, (int)(r * tilt), HEADER_COLOR);
-    spr.drawEllipse(cx, cy + 1, r, (int)(r * tilt), HEADER_COLOR);
-    // Bottom rim
-    spr.drawEllipse(cx, cy + thickness,     r, r * tilt, DIM_COLOR);
-    spr.drawEllipse(cx, cy + thickness + 1, r, r * tilt, DIM_COLOR);
-    // Inner ring
-    spr.drawEllipse(cx, cy,     ir, (int)(ir * tilt), DIM_COLOR);
-    spr.drawEllipse(cx, cy + 1, ir, (int)(ir * tilt), DIM_COLOR);
-
-    // Sweep math — 360° rotation every 3 s.
-    float sweep_rad  = (frame_ms / 3000.0f) * TWO_PIf;
-    float sweep_norm = fmodf(sweep_rad, TWO_PIf);
-    unsigned long time_since_blip = radar_time_since_blip;
-
-    // Particles — outline triangles with sweep-proximity boost. Scaled
-    // from the global radar_r/inner_r range into the caller's r/ir range.
-    float noise_dimming = 1.0f;
-    if (time_since_blip < 10000)      noise_dimming = 0.0f;
-    else if (time_since_blip < 13000) noise_dimming = (time_since_blip - 10000) / 3000.0f;
-
-    if (noise_dimming > 0.01f) {
-        for (int i = 0; i < NUM_PARTICLES; i++) {
-            if (noise_life[i] <= 0) continue;
-            float fade = (float)noise_life[i] / (float)noise_max_life[i];
-            int intensity = (int)(fade * 180.0f * noise_dimming);
-            if (intensity > 200) intensity = 200;
-            if (intensity < 20) continue;
-
-            float pa = fmodf(noise_a[i], TWO_PIf);
-            float diff_sweep = sweep_norm - pa;
-            if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
-            if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
-            float trail_arc = 2.0f;
-            if (diff_sweep < 0) diff_sweep += TWO_PIf;
-            if (diff_sweep > trail_arc) continue;
-            float sweep_proximity = 1.0f - (diff_sweep / trail_arc);
-            int sweep_boost = (int)(sweep_proximity * 80);
-            int total_intensity = intensity + sweep_boost;
-            if (total_intensity > 255) total_intensity = 255;
-
-            float scaled_r = ((noise_r[i] - (float)inner_r) / (float)(radar_r - inner_r))
-                           * (float)(r - ir) + (float)ir;
-
-            int ppx = cx + (int)(scaled_r * cosf(noise_a[i]));
-            int ppy = cy + (int)(scaled_r * sinf(noise_a[i]) * tilt);
-
-            uint16_t p_col = night_mode
-                ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
-                : lgfx::color565(total_intensity / 3, (total_intensity * 3) / 4, total_intensity);
-
-            spr.drawTriangle(ppx - 1, ppy + 1, ppx + 1, ppy + 1, ppx, ppy - 2, p_col);
-            if (sweep_proximity > 0.5f) {
-                spr.drawPixel(ppx, ppy - 1, p_col);
-                spr.drawPixel(ppx, ppy,     p_col);
-            }
-        }
-    }
-
-    // Breathing crosshair
-    float    breathe       = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;
-    uint16_t modulated_col = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
-    int      dynamic_r     = (r - 6) + (int)(4 * breathe);
-    float    cos_rot       = cosf(hud_rotation);
-    float    sin_rot       = sinf(hud_rotation);
-    spr.drawLine(cx - dynamic_r * cos_rot, cy - dynamic_r * sin_rot * tilt,
-                 cx + dynamic_r * cos_rot, cy + dynamic_r * sin_rot * tilt,
-                 modulated_col);
-    spr.drawLine(cx - dynamic_r * -sin_rot, cy - dynamic_r * cos_rot * tilt,
-                 cx + dynamic_r * -sin_rot, cy + dynamic_r * cos_rot * tilt,
-                 modulated_col);
-
-    // 24-step dot trail — original RGB formula.
-    // Pre-compute sin/cos per trail step so the inner r_step loop
-    // uses multiplies instead of trig calls.
-    for (int i = 1; i <= 24; i++) {
-        float trail_angle = sweep_rad - (i * 0.05f);
-        float ratio = (24.0f - i) / 24.0f;
-        int tr = 10 + (0   - 10) * ratio;
-        int tg = 20 + (238 - 20) * ratio;
-        int tb = 48 + (255 - 48) * ratio;
-        uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0)
-                                       : lgfx::color565(tr, tg, tb);
-        float trail_cos, trail_sin;
-        fast_sincos(trail_angle, &trail_sin, &trail_cos);
-        float trail_sin_tilt = trail_sin * tilt;
-        for (int r_step = ir + 2; r_step < r; r_step += 4) {
-            spr.drawPixel(cx + (int)(r_step * trail_cos),
-                          cy + (int)(r_step * trail_sin_tilt), fade_col);
-        }
-    }
-
-    // Sweep line
-    spr.drawLine(cx, cy,
-                 cx + (int)((r - 1) * cosf(sweep_rad)),
-                 cy + (int)((r - 1) * sinf(sweep_rad) * tilt), HEADER_COLOR);
-
-    // Blip relight — sweep "re-illuminates" radial-band blips it passes.
-    float angle_step = TWO_PIf / NUM_RADIAL_BANDS;
-    const float BLIP_RELIGHT_ARC = 0.20f;
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        if (local_spikes[i] < 0.05f) continue;
-        float band_angle = fmodf(i * angle_step, TWO_PIf);
-        float diff = sweep_norm - band_angle;
-        if (diff >  (float)M_PI) diff -= TWO_PIf;
-        if (diff < -(float)M_PI) diff += TWO_PIf;
-        if (diff >= 0.0f && diff < BLIP_RELIGHT_ARC) {
-            if (take_data_mutex()) {
-                if (radial_spikes[i] > 0.05f) {
-                    radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
-                }
-                give_data_mutex();
-            }
-        }
-    }
-
-    // Detection blips — stems + triangle (WiFi) / diamond (BLE) shapes.
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        float a = i * angle_step;
-        if (local_spikes[i] > 0) {
-            bool is_strong = (local_spikes[i] > 0.8f);
-            int spike_len = (int)((r - ir) * local_spikes[i] * 0.7f);
-            if (spike_len < 3)  spike_len = 3;
-            if (spike_len > 35) spike_len = 35;
-
-            float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
-            int blip_dist = ir + 4 + (int)((r - ir - 6) * dist_ratio);
-
-            int base_x = cx + (int)(blip_dist * cosf(a));
-            int base_y = cy + (int)(blip_dist * sinf(a) * tilt);
-            uint16_t line_col = local_colors[i];
-
-            if (is_strong) {
-                int shape_bottom = base_y - spike_len + 8;
-                if (shape_bottom < base_y) {
-                    spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
-                }
-                bool is_ble_blip = (line_col == PURPLE_COLOR);
-                int tip_y = base_y - spike_len;
-                if (is_ble_blip) {
-                    int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
-                    spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
-                    spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
-                    spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
-                    spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
-                } else {
-                    spr.drawTriangle(base_x - 4, tip_y + 7,
-                                     base_x + 4, tip_y + 7,
-                                     base_x,     tip_y, line_col);
-                }
-            } else {
-                spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
-            }
-        }
-    }
-
-    hud_rotation = fmodf(hud_rotation + 0.0033f, TWO_PIf);
-}
-
-// ── Viz mode 0: RADAR ──────────────────────────────────────────────────────
-// Sunk port of the ambient-mode cylinder radar, scaled down for the viz
-// panel and pivoted below the bottom of that panel so only the top of
-// the cylinder shows. The clip rect set by draw_scanner_screen() hides
-// everything outside the panel; we draw the full cylinder anyway and
-// the bottom half is naturally invisible.
-// Refresh proximity radar device list from the feed snapshot.
+// ── SCAN viz: device-list refresh (also used by ambient radar) ────────────
 static void prox_radar_refresh(unsigned long frame_ms) {
-    if (frame_ms - prox_last_refresh_ms < 500 && prox_last_refresh_ms != 0) return;
-    prox_last_refresh_ms = frame_ms;
+    if (frame_ms - scan_last_refresh_ms < 500 && scan_last_refresh_ms != 0) return;
+    scan_last_refresh_ms = frame_ms;
 
     const float PI2f = 2.0f * (float)M_PI;
-
-    bool matched[PROX_RADAR_MAX_DEVICES] = {false};
+    bool matched[SCAN_MAX_DEVICES] = {false};
 
     for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
         int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
@@ -5317,21 +4946,19 @@ static void prox_radar_refresh(unsigned long frame_ms) {
         if ((frame_ms - e.timestamp) > 60000UL) continue;
 
         bool dup = false;
-        for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-            if (prox_devs[pi].occupied && matched[pi] &&
-                strncmp(prox_devs[pi].mac, e.mac, 17) == 0) {
+        for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+            if (scan_devs[pi].occupied && matched[pi] &&
+                strncmp(scan_devs[pi].mac, e.mac, 17) == 0) {
                 dup = true; break;
             }
         }
         if (dup) continue;
 
         int slot = -1;
-        for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-            if (prox_devs[pi].occupied &&
-                strncmp(prox_devs[pi].mac, e.mac, 17) == 0) {
-                slot = pi;
-                matched[pi] = true;
-                break;
+        for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+            if (scan_devs[pi].occupied &&
+                strncmp(scan_devs[pi].mac, e.mac, 17) == 0) {
+                slot = pi; matched[pi] = true; break;
             }
         }
 
@@ -5341,30 +4968,29 @@ static void prox_radar_refresh(unsigned long frame_ms) {
         float target_r = 0.95f - rssi_norm * 0.80f;
 
         if (slot >= 0) {
-            prox_devs[slot].radius_target = target_r;
-            prox_devs[slot].proto         = e.proto;
-            prox_devs[slot].is_flock      = e.is_flock;
-            prox_devs[slot].last_seen     = frame_ms;
-            prox_devs[slot].rssi          = e.rssi;
-            strncpy(prox_devs[slot].name, e.name, 19);
-            prox_devs[slot].name[19] = '\0';
+            scan_devs[slot].radius_target = target_r;
+            scan_devs[slot].proto         = e.proto;
+            scan_devs[slot].is_flock      = e.is_flock;
+            scan_devs[slot].last_seen     = frame_ms;
+            scan_devs[slot].rssi          = e.rssi;
+            strncpy(scan_devs[slot].name, e.name, 19);
+            scan_devs[slot].name[19] = '\0';
         } else {
-            for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-                if (!prox_devs[pi].occupied) { slot = pi; break; }
+            for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                if (!scan_devs[pi].occupied) { slot = pi; break; }
             }
             if (slot < 0) {
                 unsigned long oldest_time = ULONG_MAX;
                 int oldest_idx = 0;
-                for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-                    if (prox_devs[pi].last_seen < oldest_time) {
-                        oldest_time = prox_devs[pi].last_seen;
+                for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                    if (scan_devs[pi].last_seen < oldest_time) {
+                        oldest_time = scan_devs[pi].last_seen;
                         oldest_idx = pi;
                     }
                 }
                 slot = oldest_idx;
             }
-
-            ProxRadarDevice& d = prox_devs[slot];
+            ScanDevice& d = scan_devs[slot];
             d.occupied = true;
             strncpy(d.mac, e.mac, 17); d.mac[17] = '\0';
             strncpy(d.name, e.name, 19); d.name[19] = '\0';
@@ -5375,73 +5001,61 @@ static void prox_radar_refresh(unsigned long frame_ms) {
             d.radius_target = target_r;
             d.radius_f      = target_r;
             d.sweep_bright  = 0.0f;
-
             uint32_t h = hash_mac(e.mac);
             d.angle = ((float)(h % 10000) / 10000.0f) * PI2f;
-
             matched[slot] = true;
         }
     }
 
-    for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-        if (prox_devs[pi].occupied && !matched[pi]) {
-            if ((frame_ms - prox_devs[pi].last_seen) > 60000UL) {
-                prox_devs[pi].occupied = false;
+    for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+        if (scan_devs[pi].occupied && !matched[pi]) {
+            if ((frame_ms - scan_devs[pi].last_seen) > 60000UL) {
+                scan_devs[pi].occupied = false;
             }
         }
     }
 }
 
-static void draw_scanner_viz_radar(unsigned long frame_ms) {
+// ── Viz mode 0: SCAN (proximity radar) ────────────────────────────────────
+static void draw_scanner_viz_scan(unsigned long frame_ms) {
     const float PI2f = 2.0f * (float)M_PI;
 
     const int CX = VIZ_X + VIZ_W / 2;
     const int CY = VIZ_Y + VIZ_H / 2;
-    const int R  = (VIZ_H / 2) - 2;
-    const int R_INNER = 4;
+    const int R  = (VIZ_H < VIZ_W ? VIZ_H : VIZ_W) / 2 - 3;
 
-    float dt = (prox_last_frame_ms == 0) ? 16.0f
-             : (float)(frame_ms - prox_last_frame_ms);
+    float dt = (scan_last_frame_ms == 0) ? 16.0f
+             : (float)(frame_ms - scan_last_frame_ms);
     if (dt > 100.0f) dt = 100.0f;
-    prox_last_frame_ms = frame_ms;
+    scan_last_frame_ms = frame_ms;
 
-    static float prox_sweep_angle = 0.0f;
-    prox_sweep_angle += dt * 0.001f * (PI2f / 4.0f);
-    if (prox_sweep_angle > PI2f) prox_sweep_angle -= PI2f;
+    scan_sweep_angle += dt * 0.001f * (PI2f / 4.0f);
+    if (scan_sweep_angle >= PI2f) scan_sweep_angle -= PI2f;
 
-    float sweep_sin, sweep_cos;
-    fast_sincos(prox_sweep_angle, &sweep_sin, &sweep_cos);
-
-    // ── 1. Range rings ──
-    {
-        const float ring_pcts[] = {0.33f, 0.66f, 1.0f};
-        for (int ri = 0; ri < 3; ri++) {
-            int rr = (int)(ring_pcts[ri] * (float)R);
-            spr.drawCircle(CX, CY, rr, RING_COLOR);
-        }
-        spr.drawFastHLine(CX - R, CY, R * 2, GRID_LINE_DIM);
-        spr.drawFastVLine(CX, CY - R, R * 2, GRID_LINE_DIM);
+    // Range rings
+    uint16_t ring_col = lgfx::color565(25, 55, 45);
+    for (int ri = 1; ri <= 3; ri++) {
+        int rr = (R * ri) / 3;
+        spr.drawCircle(CX, CY, rr, ring_col);
     }
 
-    // ── 2. Phosphor sweep — pixel-level radial glow ──
+    // Phosphor sweep fill
     {
-        const float DECAY_ARC = PI2f * 0.75f;
-        const float FAST_ZONE = PI2f * 0.06f;
-        const int   R_SQ      = R * R;
+        const float DECAY_ARC = PI2f * 0.35f;
+        const float FAST_ZONE = DECAY_ARC * 0.12f;
+        float sweep_sin, sweep_cos;
+        fast_sincos(scan_sweep_angle, &sweep_sin, &sweep_cos);
 
         for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py++) {
+            int dy = py - CY;
             for (int px = VIZ_X; px < VIZ_X + VIZ_W; px++) {
-                float dx = (float)(px - CX);
-                float dy = (float)(py - CY);
-                float dist_sq = dx * dx + dy * dy;
-                if (dist_sq > (float)R_SQ) continue;
-
-                float pixel_angle = atan2f(dy, dx);
-                float behind = prox_sweep_angle - pixel_angle;
+                int dx = px - CX;
+                if (dx * dx + dy * dy > R * R) continue;
+                float pixel_angle = atan2f((float)dy, (float)dx);
+                float behind = scan_sweep_angle - pixel_angle;
                 if (behind < 0.0f) behind += PI2f;
                 if (behind >= PI2f) behind -= PI2f;
                 if (behind > DECAY_ARC) continue;
-
                 float brightness;
                 if (behind < FAST_ZONE) {
                     float t = behind / FAST_ZONE;
@@ -5452,141 +5066,92 @@ static void draw_scanner_viz_radar(unsigned long frame_ms) {
                     brightness = 0.10f * expf(-3.5f * t);
                 }
                 if (brightness < 0.006f) continue;
-
                 spr.drawPixel(px, py, lerp_col16(BG_COLOR, HEADER_COLOR, brightness));
             }
         }
+        spr.drawLine(CX, CY,
+                     CX + (int)((float)R * sweep_cos),
+                     CY + (int)((float)R * sweep_sin),
+                     HEADER_COLOR);
     }
 
-    // ── 3. Sweep line ──
-    {
-        int ex = CX + (int)((float)R * sweep_cos);
-        int ey = CY + (int)((float)R * sweep_sin);
-        spr.drawLine(CX, CY, ex, ey, lerp_col16(BG_COLOR, HEADER_COLOR, 0.60f));
-
-        for (int li = 1; li <= 2; li++) {
-            float t = (float)li / 3.0f;
-            float trail_a = prox_sweep_angle - t * 0.04f;
-            float ts, tc;
-            fast_sincos(trail_a, &ts, &tc);
-            int tx = CX + (int)((float)R * tc);
-            int ty = CY + (int)((float)R * ts);
-            float alpha = 0.30f * (1.0f - t) * (1.0f - t);
-            spr.drawLine(CX, CY, tx, ty,
-                         lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
-        }
-    }
-
-    // ── 4. Refresh device list from feed ──
     prox_radar_refresh(frame_ms);
 
-    // ── 5. Update device positions and sweep brightness ──
-    for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-        if (!prox_devs[pi].occupied) continue;
-        ProxRadarDevice& d = prox_devs[pi];
-
+    // Animate devices
+    for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+        if (!scan_devs[pi].occupied) continue;
+        ScanDevice& d = scan_devs[pi];
         d.radius_f = anim_filter(d.radius_f, d.radius_target, 300.0f, dt);
 
-        float dev_behind = prox_sweep_angle - d.angle;
+        float dev_behind = scan_sweep_angle - d.angle;
         if (dev_behind < 0.0f) dev_behind += PI2f;
         if (dev_behind >= PI2f) dev_behind -= PI2f;
-
-        float sweep_zone = PI2f * 0.25f;
-        if (dev_behind < sweep_zone) {
-            float t = dev_behind / sweep_zone;
-            float target_sb = (1.0f - t) * (1.0f - t) * (1.0f - t);
-            if (target_sb > d.sweep_bright) {
-                d.sweep_bright = target_sb;
-            } else {
-                d.sweep_bright = anim_filter(d.sweep_bright, target_sb, 300.0f, dt);
-            }
+        const float SZ = PI2f * 0.25f;
+        if (dev_behind < SZ) {
+            float t   = dev_behind / SZ;
+            float tsb = (1.0f - t) * (1.0f - t) * (1.0f - t);
+            if (tsb > d.sweep_bright) d.sweep_bright = tsb;
+            else d.sweep_bright = anim_filter(d.sweep_bright, tsb, 300.0f, dt);
         } else {
             d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 600.0f, dt);
         }
     }
 
-    // ── 6. Render devices ──
-    for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-        if (!prox_devs[pi].occupied) continue;
-        ProxRadarDevice& d = prox_devs[pi];
+    // Draw devices
+    for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+        if (!scan_devs[pi].occupied) continue;
+        ScanDevice& d = scan_devs[pi];
 
-        float draw_r = (float)R_INNER + d.radius_f * (float)(R - R_INNER);
-        float dev_sin, dev_cos;
-        fast_sincos(d.angle, &dev_sin, &dev_cos);
-        int px = CX + (int)(draw_r * dev_cos);
-        int py = CY + (int)(draw_r * dev_sin);
-
-        if (px < VIZ_X - 6 || px > VIZ_X + VIZ_W + 6) continue;
-        if (py < VIZ_Y - 6 || py > VIZ_Y + VIZ_H + 6) continue;
-
-        float age_fade = 1.0f;
+        float age_af = 1.0f;
         unsigned long age = frame_ms - d.last_seen;
         if (age > 10000UL) {
-            age_fade = 1.0f - 0.7f * (float)(age - 10000UL) / 50000.0f;
-            if (age_fade < 0.3f) age_fade = 0.3f;
+            float t = (float)(age - 10000UL) / 50000.0f;
+            if (t > 0.7f) t = 0.7f;
+            age_af = 1.0f - t;
         }
 
-        uint16_t base_col = d.is_flock ? CAUTION_COLOR : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
-        float combined_bright = (0.35f + d.sweep_bright * 0.65f) * age_fade;
+        int inner_band = R / 3;
+        float draw_r = (float)inner_band + d.radius_f * (float)(R - inner_band);
+        float ds, dc;
+        fast_sincos(d.angle, &ds, &dc);
+        int dpx = CX + (int)(draw_r * dc);
+        int dpy = CY + (int)(draw_r * ds);
 
-        if (d.sweep_bright > 0.1f) {
-            int max_glow_r = 3 + (int)(d.sweep_bright * 5.0f);
-            for (int gr = max_glow_r; gr >= 1; gr--) {
-                float t = (float)gr / (float)max_glow_r;
-                float ga = d.sweep_bright * (1.0f - t) * (1.0f - t) * 0.25f * age_fade;
-                if (ga < 0.005f) continue;
-                spr.drawCircle(px, py, gr, lerp_col16(BG_COLOR, base_col, ga));
-            }
-        }
+        uint16_t base_col = d.is_flock ? CAUTION_COLOR
+                          : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
+        float cb = (0.35f + d.sweep_bright * 0.65f) * age_af;
+        uint16_t col = lerp_col16(BG_COLOR, base_col, cb);
 
-        const int SZ = 3;
-        uint16_t fill_col = lerp_col16(BG_COLOR, base_col, combined_bright * 0.7f);
-        uint16_t edge_col = lerp_col16(BG_COLOR, base_col, combined_bright);
-
-        if (d.proto == 0) {
-            spr.fillTriangle(px,      py - SZ,
-                             px - SZ, py + SZ,
-                             px + SZ, py + SZ, fill_col);
-            spr.drawTriangle(px,      py - SZ,
-                             px - SZ, py + SZ,
-                             px + SZ, py + SZ, edge_col);
+        if (d.is_flock) {
+            spr.drawLine(dpx - 4, dpy,     dpx + 4, dpy,     col);
+            spr.drawLine(dpx,     dpy - 4, dpx,     dpy + 4, col);
+            spr.drawLine(dpx - 3, dpy - 3, dpx + 3, dpy + 3, col);
+            spr.drawLine(dpx - 3, dpy + 3, dpx + 3, dpy - 3, col);
+        } else if (d.proto == 0) {
+            int hs = 5;
+            spr.fillTriangle(dpx - hs, dpy + hs, dpx + hs, dpy + hs, dpx, dpy - hs, col);
         } else {
-            spr.fillTriangle(px, py - SZ, px + SZ, py, px, py + SZ, fill_col);
-            spr.fillTriangle(px, py - SZ, px - SZ, py, px, py + SZ, fill_col);
-            spr.drawLine(px,      py - SZ, px + SZ, py,      edge_col);
-            spr.drawLine(px + SZ, py,      px,      py + SZ, edge_col);
-            spr.drawLine(px,      py + SZ, px - SZ, py,      edge_col);
-            spr.drawLine(px - SZ, py,      px,      py - SZ, edge_col);
-        }
-
-        if (d.is_flock && combined_bright > 0.4f) {
-            spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, combined_bright),
-                             BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            spr.setCursor(px + SZ + 2, py - SZ);
-            spr.print("*");
+            int hs = 4;
+            spr.drawLine(dpx,      dpy - hs, dpx + hs, dpy,      col);
+            spr.drawLine(dpx + hs, dpy,      dpx,      dpy + hs, col);
+            spr.drawLine(dpx,      dpy + hs, dpx - hs, dpy,      col);
+            spr.drawLine(dpx - hs, dpy,      dpx,      dpy - hs, col);
         }
     }
 
-    // ── 7. Center dot ──
-    spr.fillCircle(CX, CY, 2, CENTER_DOT);
-    spr.drawPixel(CX, CY, CENTER_DOT_BRIGHT);
-
-    // ── 8. Device count label ──
-    {
-        int count = 0;
-        for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-            if (prox_devs[pi].occupied) count++;
-        }
-        if (count > 0) {
-            char cnt_str[6];
-            snprintf(cnt_str, sizeof(cnt_str), "%d", count);
-            spr.setTextColor(STATUS_TEXT_DIM, BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            int cw = (int)strlen(cnt_str) * 6;
-            spr.setCursor(VIZ_X + VIZ_W - cw - 2, VIZ_Y + VIZ_H - 9);
-            spr.print(cnt_str);
-        }
+    // Live device count
+    int live = 0;
+    for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+        if (scan_devs[pi].occupied) live++;
+    }
+    if (live > 0) {
+        char cnt_str[5];
+        snprintf(cnt_str, sizeof(cnt_str), "%d", live);
+        spr.setTextColor(STATUS_TEXT_DIM, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        int cw = (int)strlen(cnt_str) * 6;
+        spr.setCursor(VIZ_X + VIZ_W - cw - 2, VIZ_Y + VIZ_H - 9);
+        spr.print(cnt_str);
     }
 }
 
@@ -6200,196 +5765,6 @@ static void draw_scanner_viz_signal_bars(unsigned long frame_ms) {
         spr.print(nd);
     }
 }
-// ── Viz mode 4: WAVEFORM ──────────────────────────────────────────────────
-// Scrolling oscilloscope of RF packet rate. Amplitude = packets per
-// sample interval. Color shifts blue→coral based on WiFi/BLE ratio.
-static void draw_scanner_viz_waveform(unsigned long frame_ms) {
-
-    // Sample packet rate every ~50ms
-    if (frame_ms - waveform_last_sample_ms >= 50 || waveform_last_sample_ms == 0) {
-        uint32_t cur   = ambient_packet_count;
-        uint32_t delta = cur - waveform_prev_pkt_count;
-        waveform_prev_pkt_count = cur;
-
-        float raw = (float)delta;
-
-        // Dual-track normalization: a fast peak for responsiveness and a
-        // slow rolling average for a stable floor. The display peak is
-        // the greater of the two, preventing the yo-yo between clipped
-        // spikes and invisible traces during traffic transitions.
-        if (raw > waveform_peak) {
-            waveform_peak = raw;
-        } else {
-            waveform_peak *= 0.995f;
-        }
-
-        static float waveform_avg      = 0.0f;
-        static bool  waveform_avg_init = false;
-        if (!waveform_avg_init) {
-            waveform_avg      = raw;
-            waveform_avg_init = true;
-        } else {
-            waveform_avg = waveform_avg * 0.98f + raw * 0.02f;
-        }
-
-        float effective_floor = waveform_avg * 3.0f;
-        if (effective_floor < 3.0f) effective_floor = 3.0f;
-        float effective_peak = waveform_peak;
-        if (effective_peak < effective_floor) effective_peak = effective_floor;
-
-        float norm = raw / effective_peak;
-        if (norm > 1.0f) norm = 1.0f;
-
-        uint32_t wifi_ch = 0;
-        uint8_t ch = current_channel;
-        if (ch >= 1 && ch <= NUM_WIFI_CHANNELS) wifi_ch = channel_pkt_counts[ch - 1];
-        float ratio = (delta > 0) ? min(1.0f, (float)wifi_ch / (float)(delta + 1)) : 0.5f;
-
-        waveform_amp[waveform_head]   = norm;
-        waveform_ratio[waveform_head] = ratio;
-        waveform_head = (waveform_head + 1) % WAVEFORM_SAMPLES;
-        waveform_last_sample_ms = frame_ms;
-    }
-
-    const int plot_x  = VIZ_X;
-    const int plot_w  = VIZ_W;
-    const int mid_y   = VIZ_Y + VIZ_H / 2;
-    const int max_amp = VIZ_H / 2 - 2;
-
-    // Center reference line
-    spr.drawFastHLine(plot_x, mid_y, plot_w,
-                      lerp_col16(BG_COLOR, CARD_BORDER, 0.25f));
-
-    // Fill pass — faint body between trace and centerline
-    for (int px = 0; px < plot_w; px++) {
-        int age     = plot_w - 1 - px;
-        int buf_idx = (waveform_head - 1 - age + WAVEFORM_SAMPLES * 2) % WAVEFORM_SAMPLES;
-        float amp   = waveform_amp[buf_idx];
-        int deflection = (int)(amp * (float)max_amp);
-        int y_top = mid_y - deflection;
-        int y_bot = mid_y + deflection;
-        int draw_x = plot_x + px;
-        float ratio    = waveform_ratio[buf_idx];
-        uint16_t fill_col = lerp_col16(HEADER_COLOR, CAUTION_COLOR, ratio);
-        for (int fy = y_top; fy <= y_bot; fy++) {
-            float dist = (float)abs(fy - mid_y) / (float)max(1, deflection);
-            float fa = (1.0f - dist) * 0.08f;
-            if (fa > 0.01f) spr.drawPixel(draw_x, fy, lerp_col16(BG_COLOR, fill_col, fa));
-        }
-    }
-
-    // Line pass — oscilloscope trace with sinf-modulated phase for organic look
-    int prev_x = -1, prev_y = -1;
-    for (int px = 0; px < plot_w; px++) {
-        int age     = plot_w - 1 - px;
-        int buf_idx = (waveform_head - 1 - age + WAVEFORM_SAMPLES * 2) % WAVEFORM_SAMPLES;
-        float amp   = waveform_amp[buf_idx];
-        float ratio = waveform_ratio[buf_idx];
-
-        float phase      = (float)px * 0.35f + (float)frame_ms * 0.005f;
-        int   deflection = (int)(amp * (float)max_amp * sinf(phase));
-        int   cy         = mid_y - deflection;
-        int   draw_x     = plot_x + px;
-
-        uint16_t line_col = lerp_col16(HEADER_COLOR, CAUTION_COLOR, ratio);
-        float age_fade    = 0.4f + 0.6f * (float)px / (float)plot_w;
-        line_col = lerp_col16(BG_COLOR, line_col, age_fade);
-
-        if (prev_x >= 0) spr.drawLine(prev_x, prev_y, draw_x, cy, line_col);
-        prev_x = draw_x;
-        prev_y = cy;
-    }
-
-    // Detection flash — bright vertical bar at right edge
-    if (scanner_flash_ms > 0 && (frame_ms - scanner_flash_ms) < 2000) {
-        float flash_t     = (float)(frame_ms - scanner_flash_ms) / 2000.0f;
-        float flash_alpha = (1.0f - flash_t) * 0.15f;
-        if (flash_alpha > 0.01f) {
-            int flash_w = 8 + (int)((1.0f - flash_t) * 20.0f);
-            for (int fx = plot_x + plot_w - flash_w; fx < plot_x + plot_w; fx++) {
-                if (fx < plot_x) continue;
-                spr.drawFastVLine(fx, VIZ_Y, VIZ_H,
-                    lerp_col16(BG_COLOR, scanner_flash_color, flash_alpha));
-            }
-        }
-    }
-}
-
-// Compute sin and cos in one call — GCC/Xtensa won't auto-fuse separate
-// sinf/cosf calls on the same angle.
-static inline void fast_sincos(float angle, float* s, float* c) {
-    *s = sinf(angle);
-    *c = cosf(angle);
-}
-
-// ── Timeline bin management ───────────────────────────────────────────────
-static void timeline_shift_bins(unsigned long frame_ms) {
-    for (int i = 0; i < TIMELINE_BIN_COUNT - 1; i++) {
-        tl_bins[i]        = tl_bins[i + 1];
-        tl_flock_fade[i]  = tl_flock_fade[i + 1];
-        tl_wifi_smooth[i] = tl_wifi_smooth[i + 1];
-        tl_ble_smooth[i]  = tl_ble_smooth[i + 1];
-    }
-
-    uint16_t wifi_count = 0;
-    uint16_t ble_count  = 0;
-    int16_t  wifi_rssi_sum = 0, ble_rssi_sum = 0;
-    uint8_t  wifi_rssi_count = 0, ble_rssi_count = 0;
-    bool     found_flock = false;
-    uint8_t  flock_proto = 0;
-
-    for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
-        int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-        FeedEntry& e = scan_local_feed[idx];
-        if (e.mac[0] == '\0') continue;
-        if ((frame_ms - e.timestamp) > TIMELINE_BIN_MS * 2) continue;
-        if (e.proto == 0) { wifi_count++; wifi_rssi_sum += e.rssi; wifi_rssi_count++; }
-        else              { ble_count++;  ble_rssi_sum  += e.rssi; ble_rssi_count++;  }
-        if (e.is_flock && !found_flock) { found_flock = true; flock_proto = e.proto; }
-    }
-
-    if (!found_flock && scanner_flash_ms > 0 &&
-        (frame_ms - scanner_flash_ms) < TIMELINE_BIN_MS) {
-        found_flock = true;
-        flock_proto = scanner_flash_proto;
-    }
-
-    int newest = TIMELINE_BIN_COUNT - 1;
-    tl_bins[newest].wifi           = wifi_count;
-    tl_bins[newest].ble            = ble_count;
-    tl_bins[newest].has_flock      = found_flock;
-    tl_bins[newest].flock_proto    = flock_proto;
-    tl_bins[newest].timestamp      = frame_ms;
-    tl_bins[newest].wifi_rssi_sum  = wifi_rssi_sum;
-    tl_bins[newest].ble_rssi_sum   = ble_rssi_sum;
-    tl_bins[newest].wifi_rssi_count = wifi_rssi_count;
-    tl_bins[newest].ble_rssi_count  = ble_rssi_count;
-    tl_flock_fade[newest]          = found_flock ? 1.0f : 0.0f;
-    // Seed newest smooth from second-newest to prevent pop-in discontinuity
-    tl_wifi_smooth[newest] = tl_wifi_smooth[newest - 1];
-    tl_ble_smooth[newest]  = tl_ble_smooth[newest - 1];
-    tl_last_bin_ms = frame_ms;
-}
-
-static void timeline_init(unsigned long frame_ms) {
-    for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        tl_bins[i].wifi           = 0;
-        tl_bins[i].ble            = 0;
-        tl_bins[i].has_flock      = false;
-        tl_bins[i].flock_proto    = 0;
-        tl_bins[i].timestamp      = frame_ms - (unsigned long)(TIMELINE_BIN_COUNT - 1 - i) * TIMELINE_BIN_MS;
-        tl_bins[i].wifi_rssi_sum  = 0;
-        tl_bins[i].ble_rssi_sum   = 0;
-        tl_bins[i].wifi_rssi_count = 0;
-        tl_bins[i].ble_rssi_count  = 0;
-        tl_wifi_smooth[i]         = 0.0f;
-        tl_ble_smooth[i]          = 0.0f;
-        tl_flock_fade[i]          = 0.0f;
-    }
-    tl_last_bin_ms = frame_ms;
-    tl_initialized = true;
-}
-
 // ── Viz mode 3: LAYERED TIMELINE ─────────────────────────────────────────
 // Max interpolated points: 50 bins × 6 sub-steps + 1 = 295
 #define TL_INTERP_FACTOR  6
@@ -6704,1530 +6079,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     #undef PY
     #undef PXf
     #undef PYf
-}
-
-// ── Viz mode 4: FLAT RADAR — phosphor decay (zoomed in) ──────────────────
-// R_R = 90 extends far beyond the 134x53 panel. Clip rect crops to the
-// viewport — phosphor sweep fills every pixel edge to edge.
-static void draw_scanner_viz_flatradar(unsigned long frame_ms) {
-
-    const int   CX    = VIZ_X + VIZ_W / 2;
-    const int   CY    = VIZ_Y + VIZ_H / 2;
-    const int   R_R   = 90;
-    const int   R_IR  = R_R - 8;
-    const int   R_DRAW = R_R + 10;
-    const float PI2f  = 2.0f * (float)M_PI;
-
-    // ── One-time particle initialization ──
-    if (!flatradar_particles_init) {
-        for (int i = 0; i < FLATRADAR_PARTICLE_COUNT; i++) {
-            flatradar_particles[i].angle        = random(0, 628) / 100.0f;
-            flatradar_particles[i].radius       = 45.0f + (float)random(0, 35);
-            flatradar_particles[i].drift_speed  = 0.008f + random(0, 15) / 1000.0f;
-            flatradar_particles[i].phase        = random(0, 1000) / 1000.0f * 6.28f;
-            flatradar_particles[i].sweep_bright = 0.0f;
-        }
-        flatradar_particles_init = true;
-    }
-
-    // ── Animation dt ──
-    float dt = (flatradar_last_ms == 0) ? 16.0f
-             : (float)(frame_ms - flatradar_last_ms);
-    if (dt > 100.0f) dt = 100.0f;
-    flatradar_last_ms = frame_ms;
-
-    // ── Advance sweep — sinusoidal speed swing (8s period, ±40%) ──
-    {
-        static float swing_phase = 0.0f;
-        swing_phase += dt * 0.001f * (PI2f / 8.0f);
-        if (swing_phase > PI2f) swing_phase -= PI2f;
-        float swing_mult = 1.0f + 0.4f * sinf(swing_phase);
-        flatradar_angle += dt * 0.001f * (PI2f / 6.0f) * swing_mult;
-    }
-    if (flatradar_angle > PI2f) flatradar_angle -= PI2f;
-
-    // Pre-compute sweep angle sin/cos at function scope — reused by both
-    // the sweep layer renderer and the per-device sweep brightness below.
-    float sweep_sin, sweep_cos;
-    fast_sincos(flatradar_angle, &sweep_sin, &sweep_cos);
-
-    // ── 1. Phosphor decay — pixel-level radial sweep ──────────────────
-    // Single Gaussian curve: no hard edge, no zone boundary.
-    // Half-resolution 2×2 blocks cut atan2f iterations by 75%.
-    {
-        static const float SIGMA     = 0.65f;
-        static const float INV_2SIG2 = 1.0f / (2.0f * SIGMA * SIGMA);
-        static const float PEAK      = 0.58f;
-        static const float CUTOFF    = 0.006f;
-        const float R_SQ = (float)(R_DRAW * R_DRAW);
-
-        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py += 2) {
-            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px += 2) {
-                float dx = (float)(px - CX);
-                float dy = (float)(py - CY);
-                float dist_sq = dx * dx + dy * dy;
-
-                if (dist_sq > R_SQ) continue;
-
-                float pixel_angle = atan2f(dy, dx);
-                float behind = flatradar_angle - pixel_angle;
-                if (behind < 0.0f) behind += PI2f;
-                if (behind >= PI2f) behind -= PI2f;
-
-                float brightness = PEAK * expf(-behind * behind * INV_2SIG2);
-                if (brightness < CUTOFF) continue;
-
-                spr.fillRect(px, py, 2, 2,
-                             lerp_col16(BG_COLOR, HEADER_COLOR, brightness));
-            }
-        }
-    }
-
-    // ── 2. Crosshairs + Rings ──
-    {
-        spr.drawFastHLine(VIZ_X, CY, VIZ_W, GRID_LINE_DIM);
-        spr.drawFastVLine(CX, VIZ_Y, VIZ_H, GRID_LINE_DIM);
-
-        uint16_t ring_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.40f);
-        const float ring_pcts[] = {0.33f, 0.66f, 1.0f};
-        for (int ri = 0; ri < 3; ri++) {
-            int rr = (int)(ring_pcts[ri] * (float)R_R);
-            spr.drawCircle(CX, CY, rr, ring_col);
-        }
-    }
-
-    // ── 3. Sweep line ──
-    // Gaussian glow provides the soft trail — only the leading beam is needed.
-    {
-        int ex = CX + (int)((float)R_R * sweep_cos);
-        int ey = CY + (int)((float)R_R * sweep_sin);
-        spr.drawLine(CX, CY, ex, ey,
-                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f));
-    }
-
-    // ── 4. Refresh device list every 500ms ──
-    if (frame_ms - flatradar_dev_refresh_ms >= 500 ||
-        flatradar_dev_refresh_ms == 0) {
-        bool matched[FLATRADAR_MAX_DEVICES] = {false};
-
-        for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
-            int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
-            FeedEntry& e = scan_local_feed[idx];
-            if (e.mac[0] == '\0') continue;
-            if ((frame_ms - e.timestamp) > 60000UL) continue;
-
-            bool dup = false;
-            for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
-                if (flatradar_devs[pi].occupied && matched[pi] &&
-                    strncmp(flatradar_devs[pi].name, e.name, 19) == 0) {
-                    dup = true; break;
-                }
-            }
-            if (dup) continue;
-
-            int slot = -1;
-            for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
-                if (flatradar_devs[pi].occupied &&
-                    strncmp(flatradar_devs[pi].name, e.name, 19) == 0) {
-                    slot = pi; matched[pi] = true; break;
-                }
-            }
-
-            float rssi_norm = rssi_pct_for(e.rssi);
-            float radius_t  = powf(1.0f - rssi_norm, 1.8f);
-            float target_r  = 6.0f + radius_t * (float)(R_IR - 6);
-
-            if (slot >= 0) {
-                flatradar_devs[slot].orbit_r = anim_filter(
-                    flatradar_devs[slot].orbit_r, target_r, 400.0f, 500.0f);
-                flatradar_devs[slot].proto    = e.proto;
-                flatradar_devs[slot].is_flock = e.is_flock;
-            } else {
-                for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
-                    if (!flatradar_devs[pi].occupied || flatradar_devs[pi].dying) { slot = pi; break; }
-                }
-                if (slot < 0) continue;
-
-                uint32_t nh = 0;
-                for (const char* p = e.name; *p; p++) nh = nh * 31 + (uint8_t)*p;
-
-                flatradar_devs[slot].occupied     = true;
-                strncpy(flatradar_devs[slot].name, e.name, 19);
-                flatradar_devs[slot].name[19]     = '\0';
-                flatradar_devs[slot].proto        = e.proto;
-                flatradar_devs[slot].is_flock     = e.is_flock;
-                flatradar_devs[slot].orbit_r      = target_r;
-                flatradar_devs[slot].orbit_angle  = (float)(nh % 628) / 100.0f;
-                flatradar_devs[slot].orbit_speed  = 0.05f + rssi_norm * 0.10f;
-                flatradar_devs[slot].sweep_bright  = 0.0f;
-                flatradar_devs[slot].last_sweep_ms = 0;
-                flatradar_devs[slot].x     = target_r * cosf(flatradar_devs[slot].orbit_angle);
-                flatradar_devs[slot].y     = target_r * sinf(flatradar_devs[slot].orbit_angle);
-                flatradar_devs[slot].fade  = 0.0f;
-                flatradar_devs[slot].dying = false;
-                matched[slot] = true;
-            }
-        }
-
-        for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
-            if (flatradar_devs[pi].occupied && !matched[pi])
-                flatradar_devs[pi].dying = true;
-        }
-        flatradar_dev_refresh_ms = frame_ms;
-    }
-
-    // ── 5. Update device positions + physics ──
-    float wander_t1 = (float)frame_ms * 0.00025f;
-    float wander_t2 = (float)frame_ms * 0.00040f;
-    float wander_t3 = (float)frame_ms * 0.00030f;
-    float wander_t4 = (float)frame_ms * 0.00020f;
-
-    for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
-        if (!flatradar_devs[pi].occupied) continue;
-        FlatRadarDevice& d = flatradar_devs[pi];
-
-        // Fade animation — birth eases in, death eases out
-        d.fade = anim_filter(d.fade, d.dying ? 0.0f : 1.0f, 400.0f, dt);
-        if (d.dying && d.fade < 0.02f) {
-            d.occupied = false;
-            continue;
-        }
-
-        d.orbit_angle += d.orbit_speed * dt / 1000.0f;
-        if (d.orbit_angle > PI2f) d.orbit_angle -= PI2f;
-
-        float tx = d.orbit_r * cosf(d.orbit_angle);
-        float ty = d.orbit_r * sinf(d.orbit_angle);
-
-        uint32_t fh = 0;
-        for (const char* p = d.name; *p; p++) fh = fh * 31 + (uint8_t)*p;
-        float fp = (float)(fh % 1000) / 1000.0f * 6.28f;
-        tx += sinf(wander_t1 + fp)        * 3.5f
-            + sinf(wander_t2 + fp * 1.7f) * 2.0f;
-        ty += sinf(wander_t3 + fp * 0.6f) * 2.5f
-            + cosf(wander_t4 + fp * 2.1f) * 1.5f;
-
-        d.x = anim_filter(d.x, tx, 800.0f, dt);
-        d.y = anim_filter(d.y, ty, 800.0f, dt);
-
-        // Clamp to inner circle — no bounce, devices stop at edge and drift back.
-        // dist is computed lazily — only when needed by the clamp body
-        // or the sweep brightness logic.
-        float dev_dist_sq = d.x * d.x + d.y * d.y;
-        float dist = 0.0f;
-        bool dist_computed = false;
-
-        const float R_IR_SQ = (float)(R_IR * R_IR);
-        if (dev_dist_sq > R_IR_SQ) {
-            dist = sqrtf(dev_dist_sq);
-            dist_computed = true;
-            float scale = (float)R_IR / dist;
-            d.x *= scale;
-            d.y *= scale;
-            dev_dist_sq = d.x * d.x + d.y * d.y;
-        }
-
-        // ── Sweep brightness — long lingering glow ──
-        float behind;
-        if (dev_dist_sq < 0.01f) {
-            behind = 0.0f;
-        } else {
-            if (!dist_computed) {
-                dist = sqrtf(dev_dist_sq);
-                dist_computed = true;
-            }
-            float inv_dist = 1.0f / dist;
-            float dx_n = d.x * inv_dist;
-            float dy_n = d.y * inv_dist;
-            float dot   = dx_n * sweep_cos + dy_n * sweep_sin;
-            float cross = dx_n * sweep_sin - dy_n * sweep_cos;
-            behind = atan2f(cross, dot);
-            if (behind < 0.0f) behind += PI2f;
-        }
-
-        float sweep_zone = PI2f * 0.15f;
-        if (behind < sweep_zone) {
-            d.last_sweep_ms = frame_ms;
-            d.sweep_bright  = anim_filter(d.sweep_bright, 1.0f, 80.0f, dt);
-        } else if (frame_ms - d.last_sweep_ms < 1500UL) {
-            // hold — brightness stays until hold window expires
-        } else {
-            d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 1200.0f, dt);
-        }
-
-    }
-
-    // ── Ambient particle update ──
-    for (int i = 0; i < FLATRADAR_PARTICLE_COUNT; i++) {
-        FlatRadarParticle& p = flatradar_particles[i];
-        p.angle += p.drift_speed * dt / 1000.0f;
-        if (p.angle > PI2f) p.angle -= PI2f;
-
-        float p_cos   = cosf(p.angle);
-        float p_sin   = sinf(p.angle);
-        float p_dot   = p_cos * sweep_cos + p_sin * sweep_sin;
-        float p_cross = p_cos * sweep_sin - p_sin * sweep_cos;
-        float p_behind = atan2f(p_cross, p_dot);
-        if (p_behind < 0.0f) p_behind += PI2f;
-
-        float p_sweep_zone = PI2f * 0.20f;
-        if (p_behind < p_sweep_zone) {
-            float t = p_behind / p_sweep_zone;
-            float target = (1.0f - t) * (1.0f - t);
-            if (target > p.sweep_bright) p.sweep_bright = target;
-            else p.sweep_bright = anim_filter(p.sweep_bright, target, 200.0f, dt);
-        } else {
-            p.sweep_bright = anim_filter(p.sweep_bright, 0.0f, 400.0f, dt);
-        }
-    }
-
-    // ── 6. Render devices — phosphor glow blobs ──────────────────────
-    for (int pi = 0; pi < FLATRADAR_MAX_DEVICES; pi++) {
-        if (!flatradar_devs[pi].occupied) continue;
-        FlatRadarDevice& d = flatradar_devs[pi];
-
-        int px = CX + (int)(d.x + 0.5f);
-        int py = CY + (int)(d.y + 0.5f);
-
-        if (px < VIZ_X - 10 || px > VIZ_X + VIZ_W + 10) continue;
-        if (py < VIZ_Y - 10 || py > VIZ_Y + VIZ_H + 10) continue;
-
-        // Phosphor blob — soft radial glow, no hard edges
-        uint32_t name_hash = 0;
-        for (const char* p = d.name; *p; p++) name_hash = name_hash * 31 + (uint8_t)*p;
-        float breath_phase = (float)(name_hash % 1000) / 1000.0f;
-        float breath = anim_pulse(UI_PULSE_BREATHE, breath_phase);
-        float blob_r_base = 3.0f + breath * 1.5f;
-        float blob_r = blob_r_base + d.sweep_bright * 4.0f;
-
-        uint16_t base_col = d.is_flock ? CAUTION_COLOR : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
-        float icon_brightness = (0.70f + d.sweep_bright * 0.30f) * d.fade;
-
-        int max_r = (int)(blob_r + 0.5f);
-        if (max_r < 2) max_r = 2;
-
-        for (int gr = max_r; gr >= 0; gr--) {
-            float t = (max_r > 0) ? (float)gr / (float)max_r : 0.0f;
-            float alpha = icon_brightness * (1.0f - t) * (1.0f - t);
-            if (alpha < 0.01f) continue;
-            if (gr == 0) {
-                spr.drawPixel(px, py, lerp_col16(BG_COLOR, base_col, alpha));
-            } else {
-                spr.fillCircle(px, py, gr, lerp_col16(BG_COLOR, base_col, alpha));
-            }
-        }
-
-        // Hot center pixel for definition
-        spr.drawPixel(px, py, lerp_col16(BG_COLOR, TEXT_COLOR, icon_brightness * 0.95f));
-
-        // Flock asterisk
-        if (d.is_flock && icon_brightness > 0.4f) {
-            spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, icon_brightness * d.fade),
-                             BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            spr.setCursor(px + max_r + 2, py - max_r);
-            spr.print("*");
-        }
-    }
-
-    // ── Ambient particle rendering ──
-    for (int i = 0; i < FLATRADAR_PARTICLE_COUNT; i++) {
-        FlatRadarParticle& p = flatradar_particles[i];
-        float wander_x = sinf((float)frame_ms * 0.0003f  + p.phase) * 2.0f;
-        float wander_y = cosf((float)frame_ms * 0.00025f + p.phase * 1.4f) * 1.5f;
-        int ppx = CX + (int)(p.radius * cosf(p.angle) + wander_x);
-        int ppy = CY + (int)(p.radius * sinf(p.angle) + wander_y);
-
-        if (ppx < VIZ_X - 2 || ppx > VIZ_X + VIZ_W + 2) continue;
-        if (ppy < VIZ_Y - 2 || ppy > VIZ_Y + VIZ_H + 2) continue;
-
-        float bright = 0.10f + p.sweep_bright * 0.20f;
-        // Alternate warm (CAUTION) / cool (HEADER) tint per particle index
-        uint16_t tint_col = (i & 1) ? lerp_col16(HEADER_COLOR, CAUTION_COLOR, 0.30f)
-                                     : lerp_col16(HEADER_COLOR, ACCENT_COLOR,  0.20f);
-        uint16_t dot_col = lerp_col16(BG_COLOR, tint_col, bright);
-        spr.drawPixel(ppx, ppy, dot_col);
-
-        if (p.sweep_bright > 0.3f) {
-            uint16_t cross_col = lerp_col16(BG_COLOR, tint_col, bright * 0.6f);
-            spr.drawPixel(ppx - 1, ppy,     cross_col);
-            spr.drawPixel(ppx + 1, ppy,     cross_col);
-            spr.drawPixel(ppx,     ppy - 1, cross_col);
-            spr.drawPixel(ppx,     ppy + 1, cross_col);
-        }
-    }
-
-    // ── 8. Center dot ──
-    spr.fillCircle(CX, CY, 2, CENTER_DOT);
-    spr.drawPixel(CX, CY, CENTER_DOT_BRIGHT);
-}
-
-void draw_locator_screen() {
-    if (!take_data_mutex()) return;
-    bool active=locator_active, has_est=locator_has_estimate;
-    char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
-    char target_name[65]; safe_copy(target_name, locator_target_name, sizeof(target_name));
-    int  target_id = locator_target_id;
-    float dist=locator_est_distance, brng=locator_bearing;
-    bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
-    bool has_loc   = gps.location.isValid();
-    float gps_course = gps.course.deg();
-    int sample_count = locator_sample_count;
-    int target_rssi = 0; bool has_rssi = false;
-    if (locator_tracker_idx >= 0 && locator_tracker_idx < rssi_tracker_count
-        && rssi_tracker[locator_tracker_idx].sample_count > 0) {
-        target_rssi = rssi_tracker[locator_tracker_idx].samples[
-            rssi_tracker[locator_tracker_idx].sample_count - 1];
-        has_rssi = true;
-    }
-    give_data_mutex();
-
-    bool demo = !active;
-
-    spr.fillSprite(BG_COLOR); draw_header_spr(1);
-
-    // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 78;
-    const int GRID_STEP  = 14;
-    unsigned long now_ms = millis();
-
-    // Direction slowly reverses every ~10s for radar feel
-    static float  grid_speed = 1.0f;   // +1 or -1, eases between
-    static float  grid_spd_target = 1.0f;
-    static unsigned long grid_dir_ms = 0;
-    if (now_ms - grid_dir_ms > 9500) {
-        grid_dir_ms = now_ms;
-        if ((now_ms / 9500) % 3 == 0) grid_spd_target = -grid_spd_target;
-    }
-    grid_speed += (grid_spd_target - grid_speed) * 0.004f; // very slow ease
-
-    // Accumulate offset per-frame so direction reversals ease smoothly (no jump)
-    static float  cumulative_grid_offset = 0.0f;
-    static unsigned long last_grid_ms = 0;
-    if (last_grid_ms == 0) last_grid_ms = now_ms;
-    unsigned long grid_dt = now_ms - last_grid_ms;
-    if (grid_dt > 100) grid_dt = 100;  // cap on first call or long gaps
-    last_grid_ms = now_ms;
-    cumulative_grid_offset += grid_speed * (float)grid_dt / (1500.0f / GRID_STEP);
-
-    int grid_o = (int)fmodf(cumulative_grid_offset, (float)GRID_STEP);
-    if (grid_o < 0) grid_o += GRID_STEP;
-    // Wrap the accumulator after sampling so it cannot grow without
-    // bound — at multi-hour timescales the float loses sub-pixel
-    // precision and the grid stutters or jumps.
-    cumulative_grid_offset = fmodf(cumulative_grid_offset, (float)GRID_STEP);
-
-    for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
-        spr.drawLine(gx, 18, gx, DISP_H - 1, CARD_BORDER);
-    for (int gy = 18 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
-        if (gy >= 18) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
-    // Solid vertical separator on right edge of grid panel
-    spr.drawFastVLine(GRID_RIGHT, 18, DISP_H - 18, CARD_BORDER);
-
-    const int cx = 39, cy = 62;
-
-    // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
-    static float ease_arrow = 0.0f;
-    static unsigned long last_ar_ms = 0;
-    unsigned long ar_dt = now_ms - last_ar_ms;
-    if (ar_dt > 100) ar_dt = 15;
-    last_ar_ms = now_ms;
-
-    if (north_mode && gps_valid) {
-        // Compass mode while moving: rotate by the negative of travel heading
-        // so the arrow always points to true north regardless of orientation.
-        float tgt = radians(-gps_course - 90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.08f * d;
-    } else if (north_mode && !gps_valid) {
-        // No GPS heading available — arrow defaults to "up" (screen-relative north).
-        float tgt = radians(-90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.08f * d;
-    } else if (active && has_est) {
-        float rel = brng - (gps_valid ? gps_course : 0.0f);
-        float tgt = radians(rel - 90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        // Slower lock-on (was 0.09) — arrow visibly swings and settles
-        // toward the target rather than snapping into place.
-        ease_arrow += 0.06f * d;
-    } else {
-        // Clockwise drift: 1 rev per 8s — gives a more visible "searching" feel.
-        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 8000.0f);
-        if (ease_arrow > 2.0f*(float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
-    }
-    float ang = ease_arrow;
-
-    // ── Direction pointer: thin line from pivot, filled dot at tip ──
-    // Compass needle aesthetic — direction is the line, target lives at
-    // the dot. Pivot circle marks the user's position. Hatching/grid
-    // background gives the panel a tactical feel without the polygon.
-    {
-        const int line_len = 28;
-        int tip_x = cx + (int)(line_len * cosf(ang));
-        int tip_y = cy + (int)(line_len * sinf(ang));
-
-        // Direction line and tip dot — full HEADER_COLOR for emphasis.
-        spr.drawLine(cx, cy, tip_x, tip_y, HEADER_COLOR);
-        spr.fillCircle(tip_x, tip_y, 3, HEADER_COLOR);
-
-        // Open pivot ring — sits over the line at the rotation center.
-        spr.drawCircle(cx, cy, 2, DIM_COLOR);
-    }
-
-    // (Sample-acquisition boxes removed — the status badge already
-    // communicates LOCKED vs SEARCHING and the box count was an
-    // implementation detail.)
-    (void)sample_count;
-
-    // ── Right panel ──
-    int rx = 82;
-    int rpx = rx + 4;
-
-    // ── Status badge ──
-    const char* status_base; uint16_t status_col; bool status_anim = false;
-    if (north_mode) {
-        status_base = "N Mode";  status_col = GPS_COLOR;
-    } else if (!has_loc && !gps_valid) {
-        status_base = "GPS";         status_col = GPS_COLOR;     status_anim = true;
-    } else if (!active) {
-        status_base = "Need Target"; status_col = CAUTION_COLOR; status_anim = true;
-    } else {
-        status_base = "Hunting";     status_col = ACCENT_COLOR;
-    }
-    char status_str[26];
-    if (status_anim) {
-        char dots[4];
-        anim_ellipsis(dots, sizeof(dots));
-        snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
-    } else {
-        safe_copy(status_str, status_base, sizeof(status_str));
-    }
-    {
-        int max_chars_sb = (int)strlen(status_base) + (status_anim ? 3 : 0);
-        int box_w = max_chars_sb * 8 + 12;
-        int avail_w = DISP_W - rpx - 2;
-        if (box_w > avail_w) box_w = avail_w;
-        uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
-        spr.fillRoundRect(rpx, 23, box_w, 16, 5, status_fill);
-        spr.drawRoundRect(rpx, 23, box_w, 16, 5, status_col);
-        spr.setTextColor(status_col, status_fill); spr.setTextSize(TS_BODY);
-        spr.setClipRect(rpx + 1, 24, box_w - 2, 14);
-        spr.setCursor(rpx + 6, 27); kprint(spr, status_str);
-        spr.clearClipRect();
-    }
-
-    // ── TARGET label + name + ID ──
-    // Section spacing follows the standard tiers: UI_PAD_MD between the
-    // status pill and the TARGET section, UI_PAD_SM between rows.
-    int target_label_y = 23 + 16 + UI_PAD_MD;          // pill bottom + UI_PAD_MD
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-    spr.setCursor(rpx, target_label_y);
-    kprint(spr, "TARGET");
-
-    int target_name_y = target_label_y + 10;
-    {
-        char tname[18];
-        if (north_mode) {
-            safe_copy(tname, "North", sizeof(tname));
-        } else if (active) {
-            bool nok = (target_name[0] != '\0'
-                        && strcmp(target_name, "Hidden")  != 0
-                        && strcmp(target_name, "Unknown") != 0);
-            const char* src = nok ? target_name
-                                   : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
-            safe_copy(tname, src, sizeof(tname));
-        } else {
-            safe_copy(tname, "No Target", sizeof(tname));
-        }
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_STRONG);
-        spr.setCursor(rpx, target_name_y); spr.print(tname);
-
-        // Detection ID after the name (DIM, TS_MICRO).
-        if (active && target_id > 0) {
-            int name_w = (int)strlen(tname) * (int)(TS_STRONG * 6.0f);
-            char id_buf[8];
-            snprintf(id_buf, sizeof(id_buf), "#%03d", target_id);
-            spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-            // Vertical: align baseline to the bottom of the TS_STRONG name
-            int id_y = target_name_y + (int)(TS_STRONG * 8.0f) - 8;
-            spr.setCursor(rpx + name_w + UI_PAD_SM, id_y);
-            spr.print(id_buf);
-        }
-    }
-
-    // ── DIST + SIG (labels TS_MICRO, values TS_STRONG side-by-side) ──
-    // TS_STRONG fits the worst-case strings ("9999ft" / "STRONG") in the
-    // ~154 px right panel without overlap; TS_H2 would overflow.
-    int dist_label_y = target_name_y + (int)(TS_STRONG * 8.0f) + UI_PAD_SM;
-    int dist_value_y = dist_label_y + 10;
-    int sig_x        = rpx + 64;
-
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-    spr.setCursor(rpx,   dist_label_y); kprint(spr, "DIST");
-    spr.setCursor(sig_x, dist_label_y); kprint(spr, "SIG");
-
-    // Trend indicator just past the DIST label
-    {
-        int trend = (active && has_est) ? locator_distance_trend() : 0;
-        if (trend != 0) {
-            int tx = rpx + 28, ty = dist_label_y;
-            if (trend < 0) {
-                spr.fillTriangle(tx, ty, tx + 5, ty, tx + 2, ty + 5, ACCENT_COLOR);
-            } else {
-                spr.fillTriangle(tx, ty + 5, tx + 5, ty + 5, tx + 2, ty, CAUTION_COLOR);
-            }
-        }
-    }
-
-    // Distance value
-    {
-        float sd = (active && has_est && !north_mode) ? dist : -1.0f;
-        float sd_ft = sd * 3.28084f;
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_STRONG);
-        spr.setCursor(rpx, dist_value_y);
-        if (sd < 0) {
-            spr.print("--");
-        } else if (sd < 300) {
-            char db[12]; snprintf(db, sizeof(db), "%.0fft", sd_ft);
-            spr.print(db);
-        } else {
-            char db[12]; snprintf(db, sizeof(db), "%.1fkm", sd / 1000.0f);
-            spr.print(db);
-        }
-    }
-
-    // Signal value (colored by strength)
-    {
-        int sr = (active && has_rssi && !north_mode) ? target_rssi : -999;
-        uint16_t sig_col;
-        const char* sig_str;
-        if      (sr == -999) { sig_str = "--";     sig_col = DIM_COLOR; }
-        else if (sr > -60)   { sig_str = "STRONG"; sig_col = ACCENT_COLOR; }
-        else if (sr > -80)   { sig_str = "MED";    sig_col = CAUTION_COLOR; }
-        else                 { sig_str = "WEAK";   sig_col = DIM_COLOR; }
-
-        spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(TS_STRONG);
-        spr.setCursor(sig_x, dist_value_y); spr.print(sig_str);
-    }
-}
-
-static int history_scroll_offset = 0;
-
-// Helper: extract type-label and protocol color from type string
-static void hist_type_info(const char* type, const char** lbl, uint16_t* col) {
-    if (strstr(type, "WIFI")) { *lbl = "WiFi"; *col = HEADER_COLOR; }
-    else if (strstr(type, "BLE") || strstr(type, "RAVEN")) { *lbl = "BLE";  *col = PURPLE_COLOR; }
-    else { *lbl = "SYS"; *col = DIM_COLOR; }
-}
-
-void draw_capture_history_screen() {
-    // Use SD history when available, fall back to in-memory capture_history
-    bool use_sd = sd_available && sd_hist_count > 0;
-
-    // Build a unified view pointer array (avoid copying large structs)
-    // We work directly from sd_hist or capture_history
-    int total = use_sd ? sd_hist_count : 0;
-    if (!use_sd) {
-        if (!take_data_mutex()) return;
-        total = capture_history_count;
-        give_data_mutex();
-    }
-
-    // Clamp selection and scroll
-    if (total == 0) { history_selected_idx = 0; history_scroll_offset = 0; }
-    else {
-        if (history_selected_idx >= total)  history_selected_idx = total - 1;
-        if (history_selected_idx < 0)       history_selected_idx = 0;
-        if (history_selected_idx < history_scroll_offset)
-            history_scroll_offset = history_selected_idx;
-        if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
-            history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
-        int max_scroll = max(0, total - HIST_VISIBLE_ROWS);
-        if (history_scroll_offset > max_scroll) history_scroll_offset = max_scroll;
-    }
-
-    // Selection y target — eased toward via anim_filter so quick key
-    // presses produce a visible glide rather than a teleport.
-    unsigned long now_ms = millis();
-    float dt = (hist_last_frame_ms == 0) ? 16.0f
-                                         : (float)(now_ms - hist_last_frame_ms);
-    if (dt > 100.0f) dt = 100.0f;
-    hist_last_frame_ms = now_ms;
-    int target_sel_y = CONTENT_Y +
-        (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
-    hist_sel_y_f = anim_filter(hist_sel_y_f, (float)target_sel_y,
-                                HIST_SEL_TC, dt);
-
-    spr.fillSprite(BG_COLOR);
-    draw_header_spr(2);
-
-    if (total == 0) {
-        for (int i = 0; i < HIST_VISIBLE_ROWS; i++) {
-            int y = CONTENT_Y + i * HIST_ROW_H;
-            spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-            spr.setCursor(10, y + 11); spr.print(use_sd ? "-- No SD log --" : "-- Listening...");
-        }
-        return;
-    }
-
-    // Snapshot in-memory history if needed
-    static CaptureEntry mem_hist[CAPTURE_HISTORY_SIZE];
-    if (!use_sd) {
-        if (!take_data_mutex()) return;
-        for (int i = 0; i < total; i++) mem_hist[i] = capture_history[i];
-        give_data_mutex();
-    }
-
-    int rows_shown = 0;
-    for (int i = history_scroll_offset;
-         i < total && rows_shown < HIST_VISIBLE_ROWS;
-         i++, rows_shown++) {
-        int y = CONTENT_Y + rows_shown * HIST_ROW_H;
-
-        // Pull fields from whichever source
-        const char* e_type;
-        char e_mac[18], e_name[32], e_method[24];
-        int e_rssi, e_conf, e_id;
-
-        if (use_sd) {
-            e_type = sd_hist[i].type;
-            strncpy(e_mac,    sd_hist[i].mac,    17); e_mac[17]    = '\0';
-            strncpy(e_name,   sd_hist[i].name,   31); e_name[31]   = '\0';
-            strncpy(e_method, sd_hist[i].method, 23); e_method[23] = '\0';
-            e_rssi = sd_hist[i].rssi;
-            e_conf = sd_hist[i].confidence;
-            e_id   = sd_hist[i].id;
-        } else {
-            e_type = mem_hist[i].type;
-            strncpy(e_mac,  mem_hist[i].mac,  17); e_mac[17]  = '\0';
-            strncpy(e_name, mem_hist[i].name, 31); e_name[31] = '\0';
-            e_method[0] = '\0';
-            e_rssi = mem_hist[i].rssi;
-            e_conf = mem_hist[i].confidence;
-            e_id   = mem_hist[i].id;
-        }
-
-        const char* proto_lbl; uint16_t proto_col_unused;
-        hist_type_info(e_type, &proto_lbl, &proto_col_unused);
-        (void)proto_col_unused;
-
-        // Identical layout for every row regardless of selection. Selection
-        // is communicated by the eased outline drawn after the loop.
-        const int content_x = 6;
-
-        // Sequential detection ID (#001 …) — leftmost column. Entries
-        // loaded from the SD CSV (no ID column on disk) show "----".
-        char id_str[8];
-        if (e_id > 0) snprintf(id_str, sizeof(id_str), "#%03d", e_id);
-        else          snprintf(id_str, sizeof(id_str), "----");
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(content_x, y + 11);
-        spr.print(id_str);
-
-        const int proto_x = content_x + 30;  // after the 4-char ID + gap
-
-        // Protocol label (dim, TS_BODY)
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-        spr.setCursor(proto_x, y + 8); spr.print(proto_lbl);
-
-        // Device name (TEXT, TS_MICRO) — after the label
-        bool name_ok = (e_name[0] != '\0' &&
-                        strcmp(e_name, "Hidden")  != 0 &&
-                        strcmp(e_name, "Unknown") != 0);
-        char nom[20] = "";
-        if (name_ok) { strncpy(nom, e_name, 19); nom[19] = '\0'; }
-        else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 19); nom[19] = '\0'; }
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-        spr.setCursor(proto_x + 36, y + 11); spr.print(nom);
-
-        // Signal + confidence, right-aligned (DIM, TS_MICRO)
-        char right_str[16];
-        snprintf(right_str, sizeof(right_str), "%ddBm %d%%", e_rssi, e_conf);
-        int right_w = (int)strlen(right_str) * 6;  // TS_MICRO char width
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(DISP_W - right_w - 6, y + 11); spr.print(right_str);
-    }
-
-    // Selection highlight — drawn after rows so it sits on top, at the
-    // eased y so quick key presses produce a glide.
-    {
-        int sel_draw_y = (int)(hist_sel_y_f + 0.5f);
-        spr.drawRect(0, sel_draw_y, DISP_W, HIST_ROW_H, HEADER_COLOR);
-    }
-
-    {
-        const int list_y = CONTENT_Y;
-        const int list_h = HIST_VISIBLE_ROWS * HIST_ROW_H;
-        if (total > HIST_VISIBLE_ROWS) {
-            if (history_scroll_offset > 0)
-                draw_scroll_fade(list_y, list_h, 5, true);
-            if (history_scroll_offset < total - HIST_VISIBLE_ROWS)
-                draw_scroll_fade(list_y, list_h, 5, false);
-        }
-    }
-
-    // Scroll indicator
-    if (total > HIST_VISIBLE_ROWS) {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-        spr.setCursor(DISP_W - 56, DISP_H - 8);
-        char scr_buf[16]; snprintf(scr_buf, sizeof(scr_buf), "%d/%d -/+", history_selected_idx + 1, total);
-        spr.print(scr_buf);
-    }
-
-    // Detail overlay — slide-up + fade in on open, reverse on close.
-    // hist_detail_open stays true through the close anim; the renderer
-    // clears it once the fade reaches zero.
-    if (hist_detail_open && total > 0) {
-        int di = history_selected_idx;
-        if (di < 0) di = 0; if (di >= total) di = total - 1;
-
-        char d_mac[18], d_name[32], d_method[24];
-        int d_rssi, d_conf, d_id;
-        if (use_sd) {
-            strncpy(d_mac,    sd_hist[di].mac,    17); d_mac[17]    = '\0';
-            strncpy(d_name,   sd_hist[di].name,   31); d_name[31]   = '\0';
-            strncpy(d_method, sd_hist[di].method, 23); d_method[23] = '\0';
-            d_rssi = sd_hist[di].rssi; d_conf = sd_hist[di].confidence;
-            d_id   = sd_hist[di].id;
-        } else {
-            strncpy(d_mac,  mem_hist[di].mac,  17); d_mac[17]  = '\0';
-            strncpy(d_name, mem_hist[di].name, 31); d_name[31] = '\0';
-            d_method[0] = '\0';
-            d_rssi = mem_hist[di].rssi; d_conf = mem_hist[di].confidence;
-            d_id   = mem_hist[di].id;
-        }
-
-        // Open animation only — close is instant. Animated close left a
-        // backdrop-only frame on screen if no further redraw fired before
-        // the user pressed another key, which read as a black screen.
-        float detail_alpha = ui_progress(hist_detail_open_ms, UI_FADE_IN_MS);
-
-        // Slide offset — 20px from below for the standard UI feel
-        int detail_slide = (int)((1.0f - detail_alpha) * 20.0f);
-        auto da = [&](uint16_t c) -> uint16_t {
-            return lerp_col16(BG_COLOR, c, detail_alpha);
-        };
-
-        // Solid backdrop below header — wipes the row list.
-        spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
-
-        // Override header with literal "DETAILS" — name moves into the body.
-        spr.fillRect(0, 0, 120, 18, BG_COLOR);
-        spr.setTextColor(da(HEADER_COLOR), BG_COLOR);
-        spr.setTextSize(TS_BODY);
-        spr.setCursor(4, 5);
-        kprint(spr, "DETAILS");
-
-        // First body row: device name (large, bright). Falls back to MAC
-        // tail when we don't have a meaningful name.
-        bool dn_ok = (d_name[0] != '\0'
-                      && strcmp(d_name, "Hidden")  != 0
-                      && strcmp(d_name, "Unknown") != 0);
-        const char* big_name;
-        char mac_tail[12] = "";
-        if (dn_ok) {
-            big_name = d_name;
-        } else {
-            const char* sm = (strlen(d_mac) > 8) ? d_mac + 9 : d_mac;
-            strncpy(mac_tail, sm, 11); mac_tail[11] = '\0';
-            big_name = mac_tail;
-        }
-
-        const int label_x = 8;
-        const int value_x = 70;
-        const int row_gap = 14;
-        int fy = 26 + detail_slide;
-
-        spr.setTextColor(da(TEXT_COLOR), BG_COLOR);
-        spr.setTextSize(TS_STRONG);
-        spr.setCursor(label_x, fy);
-        spr.print(big_name);
-        fy += (int)(TS_STRONG * 8.0f) + 6;  // extra space after the name
-
-        auto detail_row = [&](const char* lbl, const char* val, uint16_t val_col = TEXT_COLOR) {
-            spr.setTextColor(da(ACCENT_COLOR), BG_COLOR);
-            spr.setTextSize(TS_BODY);
-            spr.setCursor(label_x, fy);
-            kprint(spr, lbl);
-            spr.setTextColor(da(val_col), BG_COLOR);
-            spr.setCursor(value_x, fy);
-            spr.print(val);
-            fy += row_gap;
-        };
-
-        if (d_id > 0) {
-            char id_label[8];
-            snprintf(id_label, sizeof(id_label), "#%03d", d_id);
-            detail_row("ID", id_label);
-        }
-
-        detail_row("MAC", d_mac);
-
-        char rssi_str[12];
-        snprintf(rssi_str, sizeof(rssi_str), "%d dBm", d_rssi);
-        uint16_t rssi_col = (d_rssi > -60) ? ACCENT_COLOR
-                          : (d_rssi > -80) ? CAUTION_COLOR
-                                           : DIM_COLOR;
-        detail_row("RSSI", rssi_str, rssi_col);
-
-        {
-            const char* band;
-            uint16_t conf_col;
-            if      (d_conf >= CONFIDENCE_CERTAIN)         { band = "CERTAIN"; conf_col = ACCENT_COLOR;  }
-            else if (d_conf >= CONFIDENCE_HIGH)            { band = "HIGH";    conf_col = ACCENT_COLOR;  }
-            else if (d_conf >= CONFIDENCE_ALARM_THRESHOLD) { band = "MEDIUM";  conf_col = CAUTION_COLOR; }
-            else                                           { band = "LOW";     conf_col = DIM_COLOR;     }
-            char conf_str[24];
-            snprintf(conf_str, sizeof(conf_str), "%d%% %s", d_conf, band);
-            detail_row("CONF", conf_str, conf_col);
-        }
-
-        if (d_method[0]) {
-            char human[48];
-            methods_to_human(d_method, human, sizeof(human));
-            spr.setTextColor(da(ACCENT_COLOR), BG_COLOR);
-            spr.setTextSize(TS_BODY);
-            spr.setCursor(label_x, fy);
-            kprint(spr, "MATCH");
-            spr.setTextColor(da(TEXT_COLOR), BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            spr.setCursor(value_x, fy);
-            spr.print(human);
-            fy += row_gap;
-        }
-
-        const char* d_ts = use_sd ? sd_hist[di].timestamp : "";
-        if (d_ts[0]) {
-            detail_row("TIME", d_ts);
-        }
-
-        // Footer hint
-        spr.setTextColor(da(DIM_COLOR), BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(8, DISP_H - 10);
-        spr.print("DEL or ENTER to close");
-    }
-}
-
-void draw_gps_screen() {
-    spr.fillSprite(BG_COLOR);
-    draw_header_spr(3);
-    unsigned long frame_ms = millis();
-
-    bool has_loc, stale, speed_valid;
-    int sats;
-    double d_lat, d_lng;
-    float f_spd;
-    float f_hdop;
-    bool hdop_valid, time_valid;
-    int gps_hour, gps_min, gps_sec;
-
-    if (!take_data_mutex()) return;
-    has_loc     = gps.location.isValid();
-    stale       = has_loc && (gps.location.age() > 2000);
-    sats        = gps.satellites.isValid() ? gps.satellites.value() : 0;
-    d_lat       = gps.location.lat();
-    d_lng       = gps.location.lng();
-    speed_valid = gps.speed.isValid();
-    f_spd       = gps.speed.mph();
-    hdop_valid  = gps.hdop.isValid();
-    f_hdop      = hdop_valid ? gps.hdop.hdop() : 0.0f;
-    time_valid  = gps.time.isValid();
-    gps_hour    = time_valid ? gps.time.hour()   : 0;
-    gps_min     = time_valid ? gps.time.minute() : 0;
-    gps_sec     = time_valid ? gps.time.second() : 0;
-    give_data_mutex();
-
-    // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
-    // Solid BG fill, diagonal axis tilt like a real globe on a stand
-    const int gx = 55, gy = 72, gr = 30;  // gy=72 leaves room below for orbit+SATS
-
-    // TILT: X-axis — north pole backward; ROLL: Z-axis — axis diagonal upper-left→lower-right
-    const float TILT  = -0.30f;
-    const float ROLL  =  0.45f;
-    float rot = fmodf((float)frame_ms / 8000.0f, 1.0f) * 2.0f * (float)M_PI;
-
-    float sr = sinf(rot),  cr = cosf(rot);
-    float st = sinf(TILT), ct = cosf(TILT);
-    float sroll = sinf(ROLL), croll = cosf(ROLL);
-
-    // Project a sphere point → screen (px, py); return z-depth [-1..1]
-    auto proj = [&](float clat, float slat, float lon_r, int* px, int* py) -> float {
-        float sx = clat * cosf(lon_r);
-        float sy = slat;
-        float sz = clat * sinf(lon_r);
-        float rx =  sx * cr - sz * sr;   // Y-spin
-        float ry =  sy;
-        float rz =  sx * sr + sz * cr;
-        float tx =  rx;
-        float ty =  ry * ct - rz * st;   // X-tilt
-        float tz =  ry * st + rz * ct;
-        float ux = tx * croll - ty * sroll;  // Z-roll (diagonal axis)
-        float uy = tx * sroll + ty * croll;
-        *px = gx + (int)(gr * ux);
-        *py = gy - (int)(gr * uy);
-        return tz;
-    };
-
-    // ─ Background starfield ──────────────────────────────────────────────
-    // Single-pixel dots with a gentle per-star twinkle. Static positions,
-    // generated once with UI_PAD_MD clearance from the globe rim and bound
-    // to the left panel so they never reach the right-side text column.
-    {
-        #define NUM_STARS 30
-        static int  star_x[NUM_STARS], star_y[NUM_STARS];
-        static bool stars_init = false;
-        if (!stars_init) {
-            const int min_x = UI_PAD_SM / 2;
-            const int max_x = gx * 2 - UI_PAD_MD;  // stop well before right panel
-            const int min_y = CONTENT_Y + UI_PAD_SM;
-            const int max_y = DISP_H - UI_PAD_SM;
-            const int clear = gr + UI_PAD_MD;
-            for (int i = 0; i < NUM_STARS; i++) {
-                int sx, sy;
-                do {
-                    sx = random(min_x, max_x);
-                    sy = random(min_y, max_y);
-                } while ((sx - gx) * (sx - gx) + (sy - gy) * (sy - gy) <
-                         clear * clear);
-                star_x[i] = sx;
-                star_y[i] = sy;
-            }
-            stars_init = true;
-        }
-        for (int i = 0; i < NUM_STARS; i++) {
-            float twinkle = anim_pulse(3000 + i * 200, (float)i / (float)NUM_STARS);
-            uint8_t b = (uint8_t)(100 + twinkle * 155);
-            uint16_t star_col = lgfx::color565(b, b, b);
-            spr.drawPixel(star_x[i], star_y[i], star_col);
-        }
-    }
-
-    // Solid BG fill so globe interior matches screen background
-    // (also erases any starfield pixel that would land inside the rim).
-    spr.fillCircle(gx, gy, gr, BG_COLOR);
-
-    // ─ Latitude circles (every 30°, 5 lines) ─
-    const float lats[] = { -60.0f, -30.0f, 0.0f, 30.0f, 60.0f };
-    for (int li = 0; li < 5; li++) {
-        float lat_r = radians(lats[li]);
-        float clat = cosf(lat_r), slat = sinf(lat_r);
-        bool  is_eq = (li == 2);
-        const int STEPS = 72;
-        int px0, py0, px1, py1;
-        float pz0 = proj(clat, slat, 0.0f, &px0, &py0);
-        for (int s = 1; s <= STEPS; s++) {
-            float lon = (float)s / STEPS * 2.0f * (float)M_PI;
-            float pz1 = proj(clat, slat, lon, &px1, &py1);
-            float avg_z = (pz0 + pz1) * 0.5f;
-            if (avg_z > 0.0f) {  // cull back-facing segments
-                float brt = avg_z * 0.45f + 0.55f;
-                uint16_t base = is_eq ? GPS_COLOR : HEADER_COLOR;
-                spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, base, brt));
-            }
-            px0 = px1; py0 = py1; pz0 = pz1;
-        }
-    }
-
-    // ─ Longitude lines (every 30°, 12 meridians) ─
-    const int N_MER = 12, M_STEPS = 48;
-    for (int m = 0; m < N_MER; m++) {
-        float lon = (float)m / N_MER * 2.0f * (float)M_PI;
-        int px0, py0, px1, py1;
-        float clat = cosf(-1.5707f), slat = sinf(-1.5707f);
-        float pz0 = proj(clat, slat, lon, &px0, &py0);
-        for (int s = 1; s <= M_STEPS; s++) {
-            float lat_r = -1.5707f + (float)s / M_STEPS * (float)M_PI;
-            clat = cosf(lat_r); slat = sinf(lat_r);
-            float pz1 = proj(clat, slat, lon, &px1, &py1);
-            float avg_z = (pz0 + pz1) * 0.5f;
-            if (avg_z > 0.0f) {  // cull back-facing segments
-                float brt = avg_z * 0.40f + 0.50f;
-                spr.drawLine(px0, py0, px1, py1, lerp_col16(DIM_COLOR, HEADER_COLOR, brt));
-            }
-            px0 = px1; py0 = py1; pz0 = pz1;
-        }
-    }
-
-    // Globe rim
-    uint16_t rim_col = stale ? CAUTION_COLOR
-                     : (has_loc ? GPS_COLOR : DIM_COLOR);
-    spr.drawCircle(gx, gy, gr,     rim_col);
-    spr.drawCircle(gx, gy, gr + 1, CARD_BORDER);
-
-    // ── Multi-plane orbital satellite animation ──────────────────────────────
-    // Skipped entirely when no GPS lock — the spinning globe alone reads as
-    // "searching" without the visual noise of orbiting placeholders.
-    if (sats > 0)
-    {
-        // 3 orbital planes: inclinations, radii, speeds, satellite counts
-        struct OrbPlane {
-            float inc;       // inclination (radians)
-            float radius;    // screen pixels from globe center
-            float speed;     // angular speed factor (applied to millis)
-            int   n_sats;    // satellites in this plane
-            float phase_off; // phase offset for plane
-        };
-        // Fewer satellites (5 total instead of 7), spread across 2 planes.
-        // Cleaner visual, bigger triangles have room to breathe.
-        const OrbPlane planes[2] = {
-            { radians(55.0f), (float)(gr + 14), 0.00015f, 3, 0.0f },
-            { radians(80.0f), (float)(gr + 10), 0.0002f,  2, 1.05f },
-        };
-
-        // Per-plane projection lambda — applies globe tilt/roll then inclination
-        for (int pi = 0; pi < 2; pi++) {
-            const OrbPlane& pl = planes[pi];
-            float ci = cosf(pl.inc), si2 = sinf(pl.inc);
-
-            auto orb_proj_p = [&](float ang, int* px, int* py) -> float {
-                // Orbit in tilted plane
-                float ox = cosf(ang);
-                float oy = sinf(ang) * ci;
-                float oz = sinf(ang) * si2;
-                // Apply globe rotation + tilt + roll (same transforms as globe wireframe)
-                float rx2 = ox * cr - oz * sr;
-                float ry2 = oy;
-                float rz2 = ox * sr + oz * cr;
-                float tx2 = rx2;
-                float ty2 = ry2 * ct - rz2 * st;
-                float tz2 = ry2 * st + rz2 * ct;
-                float ux  = tx2 * croll - ty2 * sroll;
-                float uy  = tx2 * sroll + ty2 * croll;
-                *px = gx + (int)(ux * pl.radius);
-                *py = gy - (int)(uy * pl.radius);
-                return tz2;
-            };
-
-            // Draw satellites as wireframe triangles tumbling around their
-            // own center. No trails — the tumble + depth scaling carries
-            // the motion. Acquired sats are brighter, unacquired dimmer.
-            float orbit_t = (float)frame_ms * pl.speed + pl.phase_off;
-            for (int si = 0; si < pl.n_sats; si++) {
-                float base_ang = orbit_t + (float)si / (float)pl.n_sats * 2.0f * (float)M_PI;
-
-                int dpx, dpy;
-                float tz2 = orb_proj_p(base_ang, &dpx, &dpy);
-                if (tz2 > -0.3f) {
-                    float depth_fade = (tz2 > 0.3f) ? 1.0f : (tz2 + 0.3f) / 0.6f;
-                    if (depth_fade < 0.0f) depth_fade = 0.0f;
-                    if (depth_fade > 1.0f) depth_fade = 1.0f;
-                    if (depth_fade < 0.05f) continue;
-
-                    bool acquired = (si < sats);
-                    uint16_t sat_col = acquired
-                        ? lerp_col16(BG_COLOR, GPS_COLOR, depth_fade)
-                        : lerp_col16(BG_COLOR, DIM_COLOR, depth_fade * 0.5f);
-
-                    // Depth-based size scaling — front-facing sats larger.
-                    float depth_scale = 0.5f + 0.5f * ((tz2 + 0.3f) / 1.3f);
-                    if (depth_scale < 0.4f) depth_scale = 0.4f;
-                    if (depth_scale > 1.0f) depth_scale = 1.0f;
-
-                    // Wireframe tetrahedron (4 verts, 6 edges) tumbling on
-                    // two axes with phases derived from base_ang so each
-                    // satellite spins independently. Reads as a real 3D
-                    // body in flight rather than a flat icon.
-                    const float sz = 5.0f * depth_scale;
-                    float tet_v[4][3] = {
-                        {  0.0f,    -sz * 1.2f,  0.0f      },  // top
-                        { -sz,       sz * 0.6f, -sz * 0.5f },  // base L-back
-                        {  sz,       sz * 0.6f, -sz * 0.5f },  // base R-back
-                        {  0.0f,     sz * 0.6f,  sz * 0.8f },  // base front
-                    };
-
-                    const float tumble_speed = 0.004f;
-                    float t1 = (float)frame_ms * tumble_speed       + base_ang * 3.0f;
-                    float t2 = (float)frame_ms * tumble_speed * 0.7f + base_ang * 2.0f;
-                    float c1 = cosf(t1), s1 = sinf(t1);
-                    float c2 = cosf(t2), s2 = sinf(t2);
-
-                    int sx[4], sy[4];
-                    for (int vi = 0; vi < 4; vi++) {
-                        float vx = tet_v[vi][0];
-                        float vy = tet_v[vi][1];
-                        float vz = tet_v[vi][2];
-                        // Y-axis roll
-                        float rx = vx * c1 - vz * s1;
-                        float ry = vy;
-                        float rz = vx * s1 + vz * c1;
-                        // X-axis pitch
-                        float px = rx;
-                        float py = ry * c2 - rz * s2;
-                        sx[vi] = dpx + (int)px;
-                        sy[vi] = dpy + (int)py;
-                    }
-
-                    // 6 edges: 0-1, 0-2, 0-3, 1-2, 2-3, 3-1
-                    spr.drawLine(sx[0], sy[0], sx[1], sy[1], sat_col);
-                    spr.drawLine(sx[0], sy[0], sx[2], sy[2], sat_col);
-                    spr.drawLine(sx[0], sy[0], sx[3], sy[3], sat_col);
-                    spr.drawLine(sx[1], sy[1], sx[2], sy[2], sat_col);
-                    spr.drawLine(sx[2], sy[2], sx[3], sy[3], sat_col);
-                    spr.drawLine(sx[3], sy[3], sx[1], sy[1], sat_col);
-                }
-            }
-        }
-    }
-
-    // ── Right panel: STATUS badge + key-value readouts ──────────────────────
-    const int RX = 122;
-    const int RW = DISP_W - RX - 4;  // right margin 4px
-    int ry = 25;
-
-    // STATUS badge
-    {
-        const char* status_base;
-        uint16_t    status_col;
-        bool        status_anim = false;
-        if      (has_loc && !stale) { status_base = "GPS LOCKED";    status_col = GPS_COLOR; }
-        else if (stale)             { status_base = "REATTEMPTING";  status_col = CAUTION_COLOR; status_anim = true; }
-        else                        { status_base = "GPS";           status_col = GPS_COLOR; status_anim = true; }
-        char status_str[22];
-        if (status_anim) {
-            char dots[4];
-            anim_ellipsis(dots, sizeof(dots));
-            snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
-        } else {
-            strncpy(status_str, status_base, sizeof(status_str) - 1);
-            status_str[sizeof(status_str) - 1] = '\0';
-        }
-        int bw = (int)strlen(status_base) * 7 + (status_anim ? 3 * 7 : 0) + 12;
-        if (bw > RW) bw = RW;
-        uint16_t sfill = lerp_col16(BG_COLOR, status_col, 0.22f);
-        spr.fillRoundRect(RX, ry, bw, 16, 5, sfill);
-        spr.drawRoundRect(RX, ry, bw, 16, 5, status_col);
-        spr.setTextColor(status_col, sfill); spr.setTextSize(TS_MICRO);
-        spr.setClipRect(RX + 1, ry + 1, bw - 2, 14);
-        spr.setCursor(RX + 6, ry + 4); kprint(spr, status_str);
-        spr.clearClipRect();
-    }
-
-    // Key-value readout rows — label left, value right-justified
-    ry += 22 + UI_PAD_SM;  // 6px standard gap between badge and data
-    const int KV_RIGHT = DISP_W - 6;  // right edge for value text
-
-    auto kv_row = [&](const char* label, const char* value, uint16_t val_col = TEXT_COLOR) {
-        // Label (accent, left-aligned)
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(TS_BODY);
-        spr.setCursor(RX, ry);
-        kprint(spr, label);
-
-        // Value (right-aligned)
-        int val_w = (int)strlen(value) * 7;
-        spr.setTextColor(val_col, BG_COLOR);
-        spr.setTextSize(TS_BODY);
-        spr.setCursor(KV_RIGHT - val_w, ry);
-        spr.print(value);
-
-        ry += 14;  // row height: 10px text + 4px gap
-    };
-
-    // LAT
-    {
-        char lat_buf[14];
-        snprintf(lat_buf, sizeof(lat_buf), "%.4f", has_loc ? d_lat : 0.0);
-        kv_row("LAT", lat_buf);
-    }
-
-    // LNG
-    {
-        char lng_buf[14];
-        snprintf(lng_buf, sizeof(lng_buf), "%.4f", has_loc ? d_lng : 0.0);
-        kv_row("LNG", lng_buf);
-    }
-
-    // SAT — X/12 format
-    {
-        char sat_buf[8];
-        snprintf(sat_buf, sizeof(sat_buf), "%d/12", sats);
-        kv_row("SAT", sat_buf);
-    }
-
-    // HDOP — horizontal dilution of precision
-    {
-        char hdop_buf[8];
-        snprintf(hdop_buf, sizeof(hdop_buf), "%.1f", f_hdop);
-        uint16_t hdop_col = (hdop_valid && f_hdop <= 2.0f) ? TEXT_COLOR
-                          : (hdop_valid && f_hdop <= 5.0f) ? CAUTION_COLOR
-                          : DIM_COLOR;
-        kv_row("HDOP", hdop_buf, hdop_col);
-    }
-
-    // TIME — UTC from GPS
-    {
-        char time_buf[12];
-        if (time_valid) {
-            snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d",
-                     gps_hour, gps_min, gps_sec);
-        } else {
-            strncpy(time_buf, "--:--:--", sizeof(time_buf));
-        }
-        kv_row("TIME", time_buf, DIM_COLOR);
-    }
-}
-
-// Draw a single stat card. Outlined only (no fill).
-// Label: TS_MICRO, DIM_COLOR, kprint with extra=2 letter-spacing — hugs top.
-// Value: TS_STRONG by default (TS_H2 for hero), TEXT_COLOR — hugs bottom.
-// prev_str / char_anim_ms (size STAT_MAX_CHARS each): per-character
-//   change tracking. The function compares value[ci] against prev_str[ci]
-//   and bumps char_anim_ms[ci] whenever a column's glyph changes, then
-//   draws each glyph at its own y so only the digits that flipped roll
-//   up — the rest stay perfectly still. Pass nullptr/nullptr to draw a
-//   static card with no roll.
-static void draw_stat_card(int x, int y, int w, int h,
-                           const char* label, const char* value,
-                           float value_size = TS_STRONG,
-                           char* prev_str = nullptr,
-                           unsigned long* char_anim_ms = nullptr) {
-    spr.drawRoundRect(x, y, w, h, 4, HEADER_COLOR);
-
-    // 8px inner inset (UI_PAD_SM + UI_PAD_XS) so glyphs aren't crowding
-    // the 1px outline. Same value used for label and value.
-    const int card_inset = UI_PAD_SM + UI_PAD_XS;
-
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(x + card_inset, y + UI_PAD_SM);
-    kprint(spr, label, 2);
-
-    int value_glyph_h  = (int)(value_size * 8.0f);
-    int char_w         = (int)(value_size * 6.0f);
-    int value_target_y = y + h - value_glyph_h - UI_PAD_SM;
-    int value_x        = x + card_inset;
-
-    int len = (int)strlen(value);
-    if (len > STAT_MAX_CHARS) len = STAT_MAX_CHARS;
-
-    unsigned long now = millis();
-
-    // Per-character change detection. Trailing slots compare against
-    // prev_str's matching position so a shrinking value (e.g. "10" → "9")
-    // also triggers a roll on the column that just dropped a digit.
-    if (prev_str && char_anim_ms) {
-        int prev_len = (int)strlen(prev_str);
-        for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
-            char curc  = (ci < len)      ? value[ci]    : '\0';
-            char prevc = (ci < prev_len) ? prev_str[ci] : '\0';
-            if (curc != prevc) {
-                char_anim_ms[ci] = now;
-            }
-        }
-        strncpy(prev_str, value, STAT_MAX_CHARS - 1);
-        prev_str[STAT_MAX_CHARS - 1] = '\0';
-    }
-
-    int clip_x = x + 1;
-    int clip_y = (y + 1 > CONTENT_Y) ? (y + 1) : CONTENT_Y;
-    int clip_right  = x + w - 1;
-    int clip_bottom = (y + h - 1 < CONTENT_Y + STATS_VIEW_H)
-                          ? (y + h - 1) : (CONTENT_Y + STATS_VIEW_H);
-    int clip_w = clip_right - clip_x;
-    int clip_h = clip_bottom - clip_y;
-    if (clip_w > 0 && clip_h > 0) {
-        spr.setClipRect(clip_x, clip_y, clip_w, clip_h);
-        spr.setTextColor(TEXT_COLOR, BG_COLOR);
-        spr.setTextSize(value_size);
-        for (int ci = 0; ci < len; ci++) {
-            int cx     = value_x + ci * char_w;
-            int draw_y = value_target_y;
-            if (char_anim_ms && char_anim_ms[ci] != 0) {
-                unsigned long elapsed = now - char_anim_ms[ci];
-                if (elapsed < UI_ANIM_QUICK) {
-                    draw_y = anim_slide_in(value_target_y, value_glyph_h,
-                                           char_anim_ms[ci], UI_ANIM_QUICK);
-                }
-            }
-            char ch[2] = { value[ci], '\0' };
-            spr.setCursor(cx, draw_y);
-            spr.print(ch);
-        }
-        spr.clearClipRect();
-    }
-}
-
-void draw_device_info_screen() {
-    unsigned long frame_ms = millis();
-
-    // Snapshot stats under mutex
-    long lt, sr, sw, sb, lb, lfw;
-    unsigned long l_sec;
-    if (!take_data_mutex()) return;
-    lt    = lifetime_flock_total;
-    sr    = session_raven;
-    sw    = session_flock_wifi;
-    sb    = session_flock_ble;
-    lb    = lifetime_boots;
-    lfw   = lifetime_flash_writes;
-    l_sec = lifetime_seconds;
-    give_data_mutex();
-
-    int32_t  bat_mv      = get_filtered_voltage();
-    size_t   free_heap   = esp_get_free_heap_size();
-    uint64_t sd_bytes    = sd_available ? SD.cardSize() : 0;
-    unsigned long sess_s = (frame_ms - session_start_time) / 1000;
-
-    // PACKETS throttle — ambient_packet_count churns every frame, which would
-    // strobe the roll-up animation. Only refresh the displayed value once per
-    // 3 s. The first sample populates immediately so the card isn't blank.
-    if (stats_pkt_last_update == 0 || frame_ms - stats_pkt_last_update >= 3000) {
-        stats_pkt_display     = ambient_packet_count;
-        stats_pkt_last_update = frame_ms;
-    }
-
-    spr.fillSprite(BG_COLOR);
-    draw_header_spr(4);
-
-    // ── Format value strings ──
-    char det_str[10];   snprintf(det_str,   sizeof(det_str),   "%ld", lt);
-    char wifi_str[10];  snprintf(wifi_str,  sizeof(wifi_str),  "%ld", sw);
-    char ble_str[10];   snprintf(ble_str,   sizeof(ble_str),   "%ld", sb);
-    char raven_str[10]; snprintf(raven_str, sizeof(raven_str), "%ld", sr);
-    char sess_str[10];  format_time_buf(sess_s, sess_str, sizeof(sess_str));
-    char life_str[10];  format_time_buf(l_sec, life_str, sizeof(life_str));
-    char volt_str[10];  snprintf(volt_str,  sizeof(volt_str),  "%.2fV", bat_mv / 1000.0f);
-    char heap_str[10];  snprintf(heap_str,  sizeof(heap_str),  "%uKB", (unsigned)(free_heap / 1024));
-    char pkt_str[12];   snprintf(pkt_str,   sizeof(pkt_str),   "%lu",  (unsigned long)stats_pkt_display);
-    char sd_str[10];
-    if (sd_available && sd_bytes > 0) {
-        snprintf(sd_str, sizeof(sd_str), "%.1fGB", (double)sd_bytes / (1024.0 * 1024.0 * 1024.0));
-    } else {
-        strncpy(sd_str, "--", sizeof(sd_str));
-    }
-    char boots_str[10]; snprintf(boots_str, sizeof(boots_str), "%ld", lb);
-    char flash_str[10]; snprintf(flash_str, sizeof(flash_str), "%ld", lfw);
-
-    // First-frame seed for per-character roll animation. Copy the freshly
-    // formatted strings into stats_prev_strings without stamping any
-    // char_anim slots, so the initial render doesn't fire 13 simultaneous
-    // rolls. Subsequent frames let draw_stat_card do the per-glyph
-    // comparison and timestamp bumping.
-    if (!stats_values_initialized) {
-        const char* seed[STATS_CARD_COUNT];
-        seed[SC_DETECTIONS] = det_str;
-        seed[SC_WIFI]       = wifi_str;
-        seed[SC_BLE]        = ble_str;
-        seed[SC_RAVEN]      = raven_str;
-        seed[SC_SESSION]    = sess_str;
-        seed[SC_LIFETIME]   = life_str;
-        seed[SC_BATTERY]    = volt_str;
-        seed[SC_HEAP]       = heap_str;
-        seed[SC_PACKETS]    = pkt_str;
-        seed[SC_SD]         = sd_str;
-        seed[SC_BOOTS]      = boots_str;
-        seed[SC_FLASH]      = flash_str;
-        seed[SC_VERSION]    = VERSION_SHORT;
-        for (int i = 0; i < STATS_CARD_COUNT; i++) {
-            strncpy(stats_prev_strings[i], seed[i], STAT_MAX_CHARS - 1);
-            stats_prev_strings[i][STAT_MAX_CHARS - 1] = '\0';
-            for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
-                stats_char_anim[i][ci] = 0;
-            }
-        }
-        stats_values_initialized = true;
-    }
-
-    // ── Smooth scroll easing ──
-    // Renderer eases stats_scroll_y_f toward stats_scroll_target each frame.
-    // Frame-rate independent via anim_filter; clamp dt after long gaps.
-    {
-        unsigned long now = millis();
-        float dt = (stats_last_frame_ms == 0) ? 16.0f
-                                              : (float)(now - stats_last_frame_ms);
-        if (dt > 100.0f) dt = 100.0f;
-        stats_last_frame_ms = now;
-        stats_scroll_y_f = anim_filter(stats_scroll_y_f, (float)stats_scroll_target,
-                                        STATS_SCROLL_TC, dt);
-    }
-    int scroll_y = (int)(stats_scroll_y_f + 0.5f);
-
-    // ── Layout: scroll-aware card grid ──
-    // Virtual coordinates (pre-scroll) → screen coordinates via:
-    //   screen_y = CONTENT_Y + virtual_y - scroll_y
-    // Cards entirely outside the viewport are skipped.
-    const int x_full   = 4;        // full-width card x
-    const int w_full   = 224;      // 240 - 8 (right edge at 228, scrollbar gutter 6 + track at 234)
-    const int x_t1     = 4;        // triple-card x positions
-    const int x_t2     = 80;       // x_t1 + 70 + 6 gap
-    const int x_t3     = 156;      // x_t2 + 70 + 6 gap
-    const int w_tA     = 70;       // first two triple widths
-    const int w_tC     = 72;       // last triple — absorbs the rounding
-    const int x_h1     = 4;        // half-card x positions
-    const int x_h2     = 119;      // x_h1 + 109 + 6 gap
-    const int w_half   = 109;
-    const int H_HERO   = 50;       // 6+8+14+16+6 — TS_H2 hero w/ generous gap
-    const int H_NORMAL = 36;       // 6+8+4+12+6 — TS_STRONG fits in tighter card
-
-    auto card = [&](int vx, int vy, int w, int h, const char* label, const char* value,
-                    int idx, float val_size = TS_STRONG) {
-        int sy = CONTENT_Y + vy - scroll_y;
-        if (sy + h <= CONTENT_Y) return;             // entirely above viewport
-        if (sy >= CONTENT_Y + STATS_VIEW_H) return;  // entirely below viewport
-        draw_stat_card(vx, sy, w, h, label, value, val_size,
-                       stats_prev_strings[idx], stats_char_anim[idx]);
-        // The helper's internal clip rect replaces the outer scroll clip;
-        // restore it so the next card's outline still gets viewport-clipped.
-        spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
-    };
-
-    // Clip drawing to the viewport so partially-visible cards don't bleed
-    // into the header strip or off the bottom edge.
-    spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
-
-    // Row 1 (vy = 0):   DETECTIONS hero, full width, 50px tall, TS_H2 value
-    card(x_full, 0,   w_full, H_HERO, "DETECTIONS", det_str, SC_DETECTIONS, TS_H2);
-
-    // Row 2 (vy = 56):  WIFI | BLE | RAVEN
-    card(x_t1, 56,  w_tA, H_NORMAL, "WIFI",  wifi_str,  SC_WIFI);
-    card(x_t2, 56,  w_tA, H_NORMAL, "BLE",   ble_str,   SC_BLE);
-    card(x_t3, 56,  w_tC, H_NORMAL, "RAVEN", raven_str, SC_RAVEN);
-
-    // Row 3 (vy = 98):  SESSION | LIFETIME
-    card(x_h1, 98,  w_half, H_NORMAL, "SESSION",  sess_str, SC_SESSION);
-    card(x_h2, 98,  w_half, H_NORMAL, "LIFETIME", life_str, SC_LIFETIME);
-
-    // Row 4 (vy = 140): BATTERY | HEAP
-    card(x_h1, 140, w_half, H_NORMAL, "BATTERY", volt_str, SC_BATTERY);
-    card(x_h2, 140, w_half, H_NORMAL, "HEAP",    heap_str, SC_HEAP);
-
-    // Row 5 (vy = 182): PACKETS | SD CARD
-    card(x_h1, 182, w_half, H_NORMAL, "PACKETS", pkt_str, SC_PACKETS);
-    card(x_h2, 182, w_half, H_NORMAL, "SD CARD", sd_str,  SC_SD);
-
-    // Row 6 (vy = 224): BOOTS | FLASH
-    card(x_h1, 224, w_half, H_NORMAL, "BOOTS", boots_str, SC_BOOTS);
-    card(x_h2, 224, w_half, H_NORMAL, "FLASH", flash_str, SC_FLASH);
-
-    // Row 7 (vy = 266): VERSION (half width, left only)
-    card(x_h1, 266, w_half, H_NORMAL, "VERSION", VERSION_SHORT, SC_VERSION);
-
-    spr.clearClipRect();
-
-    // ── Scroll fade hints ──
-    if (STATS_MAX_SCROLL > 0) {
-        if (scroll_y > 0)                draw_scroll_fade(CONTENT_Y, STATS_VIEW_H, 5, true);
-        if (scroll_y < STATS_MAX_SCROLL) draw_scroll_fade(CONTENT_Y, STATS_VIEW_H, 5, false);
-    }
-
-    // ── Scrollbar — only when content overflows. Tracks the eased value. ──
-    if (STATS_CONTENT_H > STATS_VIEW_H) {
-        spr.drawFastVLine(DISP_W - 4, CONTENT_Y, STATS_VIEW_H, CARD_BORDER);
-        int thumb_h = (STATS_VIEW_H * STATS_VIEW_H) / STATS_CONTENT_H;
-        if (thumb_h < 8) thumb_h = 8;
-        int thumb_y = CONTENT_Y + (scroll_y * (STATS_VIEW_H - thumb_h)) / STATS_MAX_SCROLL;
-        spr.fillRect(DISP_W - 5, thumb_y, 3, thumb_h, DIM_COLOR);
-    }
 }
 
 // ============================================================================
@@ -9725,11 +7576,10 @@ void loop() {
                 if (!stealth_mode && current_screen == 0) {
                     int prev_mode = scanner_viz_mode;
                     scanner_viz_mode = (scanner_viz_mode + 1) % SCANNER_VIZ_COUNT;
-                    viz_indicator_show_ms = millis();
                     screen_dirty = true;
                     menu_click();
 
-                    if (scanner_viz_mode == 0 && prev_mode != 0) {
+                    if (scanner_viz_mode == 1 && prev_mode != 1) {
                         for (int i = 0; i < NUM_WIFI_CHANNELS; i++) spectrum_smooth[i] = 0.0f;
                         spectrum_ghost_head   = 0;
                         spectrum_ghost_filled = false;
@@ -9737,7 +7587,7 @@ void loop() {
                         spectrum_last_frame   = 0;
                         scan_line_last_frame  = 0;
                     }
-                    if (scanner_viz_mode == 2 && prev_mode != 2) {
+                    if (scanner_viz_mode == 3 && prev_mode != 3) {
                         for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
                             tl_wifi_smooth[i] = (float)tl_bins[i].wifi;
                             tl_ble_smooth[i]  = (float)tl_bins[i].ble;
@@ -10232,10 +8082,10 @@ void loop() {
                 const int AR  = 52;
                 const int AR_INNER = 6;
 
-                float adt = (prox_last_frame_ms == 0) ? 16.0f
-                          : (float)(frame_ms - prox_last_frame_ms);
+                float adt = (scan_last_frame_ms == 0) ? 16.0f
+                          : (float)(frame_ms - scan_last_frame_ms);
                 if (adt > 100.0f) adt = 100.0f;
-                prox_last_frame_ms = frame_ms;
+                scan_last_frame_ms = frame_ms;
 
                 static float amb_sweep = 0.0f;
                 amb_sweep += adt * 0.001f * (PI2f / 5.0f);
@@ -10291,9 +8141,9 @@ void loop() {
 
                 // Refresh + update devices
                 prox_radar_refresh(frame_ms);
-                for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-                    if (!prox_devs[pi].occupied) continue;
-                    ProxRadarDevice& d = prox_devs[pi];
+                for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                    if (!scan_devs[pi].occupied) continue;
+                    ScanDevice& d = scan_devs[pi];
                     d.radius_f = anim_filter(d.radius_f, d.radius_target, 300.0f, adt);
 
                     float dev_behind = amb_sweep - d.angle;
@@ -10311,9 +8161,9 @@ void loop() {
                 }
 
                 // Render devices at ambient scale
-                for (int pi = 0; pi < PROX_RADAR_MAX_DEVICES; pi++) {
-                    if (!prox_devs[pi].occupied) continue;
-                    ProxRadarDevice& d = prox_devs[pi];
+                for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                    if (!scan_devs[pi].occupied) continue;
+                    ScanDevice& d = scan_devs[pi];
                     float draw_r = (float)AR_INNER + d.radius_f * (float)(AR - AR_INNER);
                     float ds, dc;
                     fast_sincos(d.angle, &ds, &dc);
@@ -10373,7 +8223,7 @@ void loop() {
             xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             det_total = session_flock_wifi + session_flock_ble + session_raven;
             xSemaphoreGiveRecursive(dataMutex);
-            uint16_t det_col = (radar_time_since_blip < 3000) ? ACCENT_COLOR : DIM_COLOR;
+            uint16_t det_col = (millis() - last_blip_time < 3000) ? ACCENT_COLOR : DIM_COLOR;
             char det_str[16];
             snprintf(det_str, sizeof(det_str), "D:%ld", det_total);
             int det_w = (int)strlen(det_str) * 6;  // TS_MICRO char width
