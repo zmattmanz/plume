@@ -51,6 +51,8 @@ void drawCard(int x, int y, int w, int h);
 static void drawPill(int x, int y, const char* text, uint16_t accent_col,
                      float bg_accent_pct = 0.18f, bool filled = false);
 void draw_current_screen();
+void draw_capture_history_screen();
+static void perform_detection_delete(int idx);
 void transition_screen(int new_screen, int dir);
 void play_escalated_alarm(int confidence, int source);
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
@@ -714,20 +716,49 @@ long next_detection_id = 1;
 // SD-backed detection history (recent detections screen)
 #define SD_HIST_SIZE 12
 struct SDHistEntry {
-    char type[16];
-    char mac[18];
-    char name[32];
-    int  rssi;
-    int  confidence;
-    char method[24];
-    char timestamp[9];
-    int  id;        // sequential detection number; 0 = loaded from old SD log
+    char     type[16];
+    char     mac[18];
+    char     name[32];
+    int      rssi;
+    int      confidence;
+    char     method[24];
+    char     timestamp[9];    // "HH:MM:SS" session uptime
+    int      id;              // sequential detection number; 0 = loaded from old SD log
+    char     datestamp[12];   // "MM/DD/YY" from GPS date, or "--/--/--"
+    double   lat;             // GPS latitude at detection time (0.0 if no fix)
+    double   lng;             // GPS longitude at detection time (0.0 if no fix)
+    uint32_t epoch_utc;       // Unix epoch seconds (0 if no GPS)
 };
 SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
-bool hist_detail_open   = false;
+bool hist_detail_open      = false;
+bool hist_delete_confirming = false;
 volatile bool sd_hist_dirty = false;
+
+#define MAX_DELETED_IDS    24
+#define DELETED_IDS_FILE   "/flock_deleted.dat"
+static int  deleted_ids[MAX_DELETED_IDS];
+static int  deleted_id_count = 0;
+
+static void add_deleted_id(int id) {
+    if (deleted_id_count >= MAX_DELETED_IDS) {
+        for (int i = 0; i < MAX_DELETED_IDS - 1; i++) deleted_ids[i] = deleted_ids[i + 1];
+        deleted_id_count = MAX_DELETED_IDS - 1;
+    }
+    deleted_ids[deleted_id_count++] = id;
+}
+
+static bool is_id_deleted(int id) {
+    if (id <= 0) return false;
+    for (int i = 0; i < deleted_id_count; i++) {
+        if (deleted_ids[i] == id) return true;
+    }
+    return false;
+}
+
+static void save_deleted_ids();   // forward decl
+static void load_deleted_ids();   // forward decl
 
 // Detections screen — selection ease + detail overlay open/close transition.
 // hist_sel_y_f follows the target row y via anim_filter for smooth motion.
@@ -740,6 +771,7 @@ static const float  HIST_SEL_TC      = 80.0f;     // snappy
 static float        hist_sel_y_f     = 0.0f;
 static unsigned long hist_last_frame_ms  = 0;
 static unsigned long hist_detail_open_ms = 0;
+static int          history_scroll_offset = 0;
 
 // Stats screen vertical scroll (Option D — uniform card grid, smoothed).
 // Keys set stats_scroll_target (instant). Renderer eases stats_scroll_y_f
@@ -1622,6 +1654,61 @@ void save_detections_to_flash() {
     f.close();
 }
 
+static void save_deleted_ids() {
+    if (!littlefs_available) return;
+    File f = LittleFS.open(DELETED_IDS_FILE, "w");
+    if (!f) return;
+    for (int i = 0; i < deleted_id_count; i++) f.printf("%d\n", deleted_ids[i]);
+    f.close();
+}
+
+static void load_deleted_ids() {
+    deleted_id_count = 0;
+    if (!littlefs_available || !LittleFS.exists(DELETED_IDS_FILE)) return;
+    File f = LittleFS.open(DELETED_IDS_FILE, "r");
+    if (!f) return;
+    while (f.available() && deleted_id_count < MAX_DELETED_IDS) {
+        String line = f.readStringUntil('\n');
+        if (line.length() > 0) {
+            int id = line.toInt();
+            if (id > 0) deleted_ids[deleted_id_count++] = id;
+        }
+    }
+    f.close();
+}
+
+static void perform_detection_delete(int idx) {
+    if (!take_data_mutex()) return;
+
+    if (sd_available && idx >= 0 && idx < sd_hist_count) {
+        int deleted_id = sd_hist[idx].id;
+
+        // Remove from sd_hist[] by shifting
+        for (int i = idx; i < sd_hist_count - 1; i++) sd_hist[i] = sd_hist[i + 1];
+        sd_hist_count--;
+
+        // Remove matching entry from capture_history[] if present
+        for (int i = 0; i < capture_history_count; i++) {
+            if (capture_history[i].id == deleted_id) {
+                for (int j = i; j < capture_history_count - 1; j++) {
+                    capture_history[j] = capture_history[j + 1];
+                }
+                capture_history_count--;
+                break;
+            }
+        }
+
+        if (deleted_id > 0) add_deleted_id(deleted_id);
+
+        if (history_selected_idx >= sd_hist_count)
+            history_selected_idx = max(0, sd_hist_count - 1);
+    }
+
+    give_data_mutex();
+    save_deleted_ids();
+    set_toast_direct("DETECTION DELETED", CAUTION_COLOR);
+}
+
 void load_detections_from_flash() {
     if (!littlefs_available || !LittleFS.exists(DETECT_FILE)) return;
     File f = LittleFS.open(DETECT_FILE, "r");
@@ -1788,6 +1875,37 @@ void load_sd_history() {
             unsigned long uptime = (unsigned long)strtoul(line + fs[0], NULL, 10);
             format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
         }
+        // Parse epoch, lat, lng if columns are present
+        e.epoch_utc = (fc >= 2) ? (uint32_t)strtoul(line + fs[1], NULL, 10) : 0;
+        e.lat = (fc >= 16) ? atof(line + fs[15]) : 0.0;
+        e.lng = (fc >= 17) ? atof(line + fs[16]) : 0.0;
+        // Derive datestamp from epoch if available
+        if (e.epoch_utc > 0) {
+            uint32_t ep = e.epoch_utc;
+            ep /= 86400UL;                   // days since 1970-01-01
+            // Rough Gregorian approximation — good enough for display
+            uint32_t y = 1970, m = 1, d = 1;
+            uint32_t days = ep;
+            while (true) {
+                bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+                uint32_t dy = leap ? 366 : 365;
+                if (days < dy) break;
+                days -= dy; y++;
+            }
+            static const uint8_t mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+            for (m = 1; m <= 12; m++) {
+                bool leap2 = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+                uint32_t md = mdays[m-1] + (m == 2 && leap2 ? 1 : 0);
+                if (days < md) { d = days + 1; break; }
+                days -= md;
+            }
+            snprintf(e.datestamp, sizeof(e.datestamp), "%02u/%02u/%02u",
+                     (unsigned)m, (unsigned)d, (unsigned)(y % 100));
+        } else {
+            safe_copy(e.datestamp, "--/--/--", sizeof(e.datestamp));
+        }
+        // Skip if this ID was deleted by the user
+        if (e.id > 0 && is_id_deleted(e.id)) continue;
         parsed_count++;
     }
 
@@ -2803,10 +2921,26 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         // Sequential ID — assigned to both the SD-history mirror and the
         // in-memory capture_history entry that add_to_capture_history just
         // pushed at index 0. Counter is persisted in PERSIST_FILE.
-        sd_hist[0].id          = (int)next_detection_id;
-        capture_history[0].id  = (int)next_detection_id;
+        sd_hist[0].id         = (int)next_detection_id;
+        capture_history[0].id = (int)next_detection_id;
         next_detection_id++;
         if (sd_hist_count < SD_HIST_SIZE) sd_hist_count++;
+        // New fields: datestamp, GPS coordinates, epoch
+        sd_hist[0].epoch_utc = ts_is_gps ? ts_epoch : 0;
+        if (gps.date.isValid() && gps.date.year() >= 2024) {
+            snprintf(sd_hist[0].datestamp, sizeof(sd_hist[0].datestamp),
+                     "%02d/%02d/%02d",
+                     gps.date.month(), gps.date.day(), gps.date.year() % 100);
+        } else {
+            safe_copy(sd_hist[0].datestamp, "--/--/--", sizeof(sd_hist[0].datestamp));
+        }
+        if (gps.location.isValid() && gps.location.age() < 2000) {
+            sd_hist[0].lat = gps.location.lat();
+            sd_hist[0].lng = gps.location.lng();
+        } else {
+            sd_hist[0].lat = 0.0;
+            sd_hist[0].lng = 0.0;
+        }
 
         // Leave sd_hist_dirty alone — the loop's was_dirty path becomes a
         // safety net rather than a normal-flow trigger. (Boot, screen
@@ -4759,6 +4893,10 @@ void handle_menu_select() {
             // (~200-800ms, longer on a slow card). schedule_persist
             // already no-ops if a write is in flight.
             schedule_persist();
+            deleted_id_count = 0;
+            if (littlefs_available && LittleFS.exists(DELETED_IDS_FILE)) {
+                LittleFS.remove(DELETED_IDS_FILE);
+            }
             set_toast_direct("STATS CLEARED", CAUTION_COLOR);
             screen_dirty = true;
             break;
@@ -6250,6 +6388,269 @@ void draw_feed_expanded_overlay() {
 }
 
 // ============================================================================
+// DETECTIONS SCREEN (screen 2)
+// ============================================================================
+void draw_capture_history_screen() {
+    unsigned long now = millis();
+
+    // Smooth selection cursor
+    float dt_f = (hist_last_frame_ms == 0) ? 16.0f : (float)(now - hist_last_frame_ms);
+    if (dt_f > 200.0f) dt_f = 200.0f;
+    hist_last_frame_ms = now;
+
+    int hist_total = sd_available ? sd_hist_count : capture_history_count;
+
+    int target_y = CONTENT_Y + (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
+    hist_sel_y_f = anim_filter(hist_sel_y_f, (float)target_y, HIST_SEL_TC, dt_f);
+
+    spr.fillSprite(BG_COLOR);
+    draw_header_spr(2);
+    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+
+    if (hist_detail_open && hist_total > 0) {
+        // ── Detail overlay ────────────────────────────────────────────────
+        int idx = history_selected_idx;
+        // Pull fields from sd_hist or capture_history
+        const char* d_type      = "";
+        const char* d_mac       = "";
+        const char* d_name      = "";
+        const char* d_method    = "";
+        const char* d_timestamp = "";
+        const char* d_datestamp = "--/--/--";
+        int          d_rssi     = 0;
+        int          d_conf     = 0;
+        int          d_id       = 0;
+        double       d_lat      = 0.0, d_lng = 0.0;
+
+        if (sd_available && idx < sd_hist_count) {
+            SDHistEntry& e = sd_hist[idx];
+            d_type = e.type; d_mac = e.mac; d_name = e.name;
+            d_method = e.method; d_timestamp = e.timestamp;
+            d_datestamp = e.datestamp;
+            d_rssi = e.rssi; d_conf = e.confidence; d_id = e.id;
+            d_lat = e.lat; d_lng = e.lng;
+        } else if (idx < capture_history_count) {
+            CaptureEntry& e = capture_history[idx];
+            d_type = e.type; d_mac = e.mac; d_name = e.name;
+            d_timestamp = e.time;
+            d_rssi = e.rssi; d_conf = e.confidence; d_id = e.id;
+        }
+
+        // Header row
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(4, CONTENT_Y + 5);
+        kprint(spr, "DETAILS");
+
+        if (d_id > 0) {
+            char id_str[8];
+            snprintf(id_str, sizeof(id_str), "#%03d", d_id);
+            uint16_t id_col = hist_delete_confirming ? CAUTION_COLOR : DIM_COLOR;
+            spr.setTextColor(id_col, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(56, CONTENT_Y + 7);
+            spr.print(id_str);
+        }
+
+        bool is_wifi = (strstr(d_type, "WIFI") != NULL || strstr(d_type, "WiFi") != NULL);
+        const char* proto_label = is_wifi ? "WiFi" : "BLE";
+        uint16_t proto_col = is_wifi ? HEADER_COLOR : PURPLE_COLOR;
+        int proto_w = (int)strlen(proto_label) * 7;
+        spr.setTextColor(proto_col, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(DISP_W - proto_w - 8, CONTENT_Y + 5);
+        spr.print(proto_label);
+
+        int sep_y = CONTENT_Y + 16;
+        spr.drawFastHLine(0, sep_y, DISP_W, CARD_BORDER);
+
+        int body_y = sep_y + UI_PAD_SM;
+
+        // Hero name
+        bool name_ok = (d_name[0] != '\0'
+                        && strcmp(d_name, "Hidden") != 0
+                        && strcmp(d_name, "Unknown") != 0);
+        char hero[24];
+        if (name_ok) {
+            strncpy(hero, d_name, 23);
+        } else {
+            const char* tail = (strlen(d_mac) > 8) ? d_mac + 9 : d_mac;
+            strncpy(hero, tail, 23);
+        }
+        hero[23] = '\0';
+        int max_hero = 224 / 9;
+        if ((int)strlen(hero) > max_hero) hero[max_hero] = '\0';
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_STRONG);
+        spr.setCursor(8, body_y);
+        spr.print(hero);
+
+        // Key-value rows
+        const int LABEL_X = 8, VALUE_X = 50, ROW_H = 12;
+        int ry = body_y + 16;
+        int max_val = (DISP_W - VALUE_X - 8) / 6;
+
+        auto detail_row = [&](const char* label, const char* value, uint16_t val_col) {
+            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(LABEL_X, ry);
+            kprint(spr, label);
+            char trunc[40];
+            int mv = max_val < (int)sizeof(trunc) - 1 ? max_val : (int)sizeof(trunc) - 1;
+            strncpy(trunc, value, mv);
+            trunc[mv] = '\0';
+            spr.setTextColor(val_col, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(VALUE_X, ry + 2);
+            spr.print(trunc);
+            ry += ROW_H;
+        };
+
+        // Row 1: MAC
+        detail_row("MAC", d_mac, TEXT_COLOR);
+
+        // Row 2: Signal
+        {
+            char sig_str[32];
+            const char* band;
+            uint16_t conf_col;
+            if      (d_conf >= CONFIDENCE_CERTAIN)         { band = "CERTAIN"; conf_col = ACCENT_COLOR; }
+            else if (d_conf >= CONFIDENCE_HIGH)            { band = "HIGH";    conf_col = ACCENT_COLOR; }
+            else if (d_conf >= CONFIDENCE_ALARM_THRESHOLD) { band = "MEDIUM";  conf_col = CAUTION_COLOR; }
+            else                                           { band = "LOW";     conf_col = DIM_COLOR; }
+            snprintf(sig_str, sizeof(sig_str), "%ddBm %d%% %s", d_rssi, d_conf, band);
+            detail_row("SIG", sig_str, conf_col);
+        }
+
+        // Row 3: Match method (max 2 methods)
+        {
+            char human[48];
+            methods_to_human(d_method, human, sizeof(human));
+            int commas = 0;
+            for (int i = 0; human[i]; i++) {
+                if (human[i] == ',') { commas++; if (commas >= 2) { human[i] = '\0'; break; } }
+            }
+            detail_row("MATCH", human, TEXT_COLOR);
+        }
+
+        // Row 4: Time + date
+        {
+            char time_str[28];
+            if (d_datestamp[0] != '-' || d_datestamp[2] != '/') {
+                snprintf(time_str, sizeof(time_str), "%s  %s", d_timestamp, d_datestamp);
+            } else {
+                snprintf(time_str, sizeof(time_str), "%s", d_timestamp);
+            }
+            detail_row("TIME", time_str, TEXT_COLOR);
+        }
+
+        // Row 5: GPS
+        if (d_lat != 0.0 || d_lng != 0.0) {
+            char gps_str[28];
+            snprintf(gps_str, sizeof(gps_str), "%.4f, %.4f", d_lat, d_lng);
+            detail_row("GPS", gps_str, TEXT_COLOR);
+        } else {
+            detail_row("GPS", "No fix", DIM_COLOR);
+        }
+
+        // Footer
+        uint16_t foot_col = hist_delete_confirming ? CAUTION_COLOR : DIM_COLOR;
+        spr.setTextColor(foot_col, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(8, DISP_H - 10);
+        spr.print(hist_delete_confirming ? "ENTER confirm  DEL cancel" : "d delete  DEL close");
+
+    } else {
+        // ── List view ─────────────────────────────────────────────────────
+        if (hist_total == 0) {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(8, CONTENT_Y + 30);
+            spr.print("No detections yet.");
+            return;
+        }
+
+        spr.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
+
+        for (int i = 0; i < HIST_VISIBLE_ROWS + 1 && i + history_scroll_offset < hist_total; i++) {
+            int real_idx = i + history_scroll_offset;
+            int row_y = (int)hist_sel_y_f
+                        + (real_idx - history_selected_idx) * HIST_ROW_H;
+
+            // Row background
+            bool selected = (real_idx == history_selected_idx);
+            uint16_t row_bg = selected ? lerp_col16(BG_COLOR, CARD_COLOR, 0.5f) : BG_COLOR;
+            spr.fillRect(0, row_y, DISP_W, HIST_ROW_H - 1, row_bg);
+            if (selected) {
+                spr.drawFastHLine(0, row_y,              DISP_W, ACCENT_COLOR);
+                spr.drawFastHLine(0, row_y + HIST_ROW_H - 2, DISP_W, ACCENT_COLOR);
+            }
+
+            const char* e_type = ""; const char* e_mac = ""; const char* e_name = "";
+            int e_rssi = 0, e_conf = 0; bool e_is_flock = false;
+
+            if (sd_available && real_idx < sd_hist_count) {
+                SDHistEntry& e = sd_hist[real_idx];
+                e_type = e.type; e_mac = e.mac; e_name = e.name;
+                e_rssi = e.rssi; e_conf = e.confidence;
+                e_is_flock = (strstr(e.type, "FLOCK") != NULL || strstr(e.type, "RAVEN") != NULL);
+            } else if (real_idx < capture_history_count) {
+                CaptureEntry& e = capture_history[real_idx];
+                e_type = e.type; e_mac = e.mac; e_name = e.name;
+                e_rssi = e.rssi; e_conf = e.confidence;
+                e_is_flock = (strstr(e.type, "FLOCK") != NULL || strstr(e.type, "RAVEN") != NULL);
+            }
+
+            bool is_w = (strstr(e_type, "WIFI") != NULL || strstr(e_type, "WiFi") != NULL);
+            uint16_t proto_col_r = is_w ? HEADER_COLOR : PURPLE_COLOR;
+            if (e_is_flock) proto_col_r = CAUTION_COLOR;
+
+            // Confidence bar (left edge)
+            int bar_h = (int)((float)(HIST_ROW_H - 4) * (float)e_conf / 100.0f);
+            spr.fillRect(0, row_y + 2, 3, bar_h, proto_col_r);
+
+            // Name
+            spr.setTextColor(proto_col_r, row_bg);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(6, row_y + 5);
+            char nd[20]; strncpy(nd, e_name[0] ? e_name : e_mac, 19); nd[19] = '\0';
+            spr.print(nd);
+
+            // RSSI right-aligned
+            char rssi_str[8];
+            snprintf(rssi_str, sizeof(rssi_str), "%d", e_rssi);
+            int rssi_w = (int)strlen(rssi_str) * 6;
+            spr.setTextColor(DIM_COLOR, row_bg);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(DISP_W - rssi_w - 4, row_y + 7);
+            spr.print(rssi_str);
+
+            // Type label
+            spr.setTextColor(DIM_COLOR, row_bg);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(6, row_y + 17);
+            // Shorten type string: strip "FLOCK_" prefix if present
+            const char* type_disp = e_type;
+            if (strncmp(type_disp, "FLOCK_", 6) == 0) type_disp += 6;
+            char td[14]; strncpy(td, type_disp, 13); td[13] = '\0';
+            spr.print(td);
+        }
+
+        spr.clearClipRect();
+
+        // Scroll indicator
+        if (hist_total > HIST_VISIBLE_ROWS) {
+            int bar_total = DISP_H - CONTENT_Y - 4;
+            int bar_h = bar_total * HIST_VISIBLE_ROWS / hist_total;
+            if (bar_h < 6) bar_h = 6;
+            int bar_y = CONTENT_Y + 2 + (bar_total - bar_h)
+                        * history_scroll_offset / max(1, hist_total - HIST_VISIBLE_ROWS);
+            spr.fillRect(DISP_W - 2, bar_y, 2, bar_h, DIM_COLOR);
+        }
+    }
+}
+
+// ============================================================================
 // MAIN UI CONTROLLER
 // ============================================================================
 void draw_current_screen() {
@@ -6284,8 +6685,9 @@ void transition_screen(int new_screen, int dir) {
     if (new_screen == 2) {
         history_scroll_offset = 0;
         history_selected_idx = 0;
-        hist_detail_open     = false;
-        hist_detail_open_ms  = 0;
+        hist_detail_open        = false;
+        hist_detail_open_ms     = 0;
+        hist_delete_confirming  = false;
         // Seed the eased selection at the first row so there's no fly-in
         // from a stale position when the user lands on the screen.
         hist_sel_y_f         = (float)CONTENT_Y;
@@ -7007,6 +7409,7 @@ void setup() {
     if (littlefs_available) {
         load_session_from_flash();
         load_wifi_credentials();
+        load_deleted_ids();
         load_detections_from_flash();
     }
     Serial.printf("[BOOT] Free heap after LittleFS: %u\n",
@@ -7460,6 +7863,15 @@ void loop() {
                 continue;  // swallow all keys while menu is open
             }
 
+            // Cancel delete-confirm on any key except 'd' (toggle) and ENTER (confirm)
+            if (hist_delete_confirming && current_screen == 2 && hist_detail_open
+                && c != 'd' && c != '\n' && c != '\r') {
+                hist_delete_confirming = false;
+                screen_dirty = true;
+                draw_current_screen(); spr.pushSprite(0, 0);
+                continue;
+            }
+
             if (c == 0x1B && !stealth_mode) {  // ASCII Escape
                 // Priority order: close overlays first, then navigate home.
                 if (show_feed_expanded) {
@@ -7473,6 +7885,7 @@ void loop() {
                     continue;
                 }
                 if (current_screen == 2 && hist_detail_open) {
+                    hist_delete_confirming = false;
                     hist_detail_open = false;
                     screen_dirty = true;
                     draw_current_screen(); spr.pushSprite(0, 0);
@@ -7593,6 +8006,20 @@ void loop() {
                             tl_ble_smooth[i]  = (float)tl_bins[i].ble;
                         }
                         tl_last_frame_ms = 0;
+                    }
+                }
+            }
+            else if (c == 'd') {
+                if (!stealth_mode && current_screen == 2 && hist_detail_open) {
+                    if (!hist_delete_confirming) {
+                        hist_delete_confirming = true;
+                        screen_dirty = true;
+                        draw_current_screen(); spr.pushSprite(0, 0);
+                    } else {
+                        // any key while confirming (other than ENTER) = cancel
+                        hist_delete_confirming = false;
+                        screen_dirty = true;
+                        draw_current_screen(); spr.pushSprite(0, 0);
                     }
                 }
             }
@@ -7830,11 +8257,17 @@ void loop() {
             } else if (current_screen == 2) {
                 int hist_total = sd_available ? sd_hist_count : capture_history_count;
                 if (hist_total > 0) {
-                    if (!hist_detail_open) {
+                    if (hist_detail_open && hist_delete_confirming) {
+                        // ENTER confirms delete
+                        perform_detection_delete(history_selected_idx);
+                        hist_delete_confirming = false;
+                        hist_detail_open       = false;
+                    } else if (!hist_detail_open) {
                         hist_detail_open    = true;
                         hist_detail_open_ms = millis();
                     } else {
                         hist_detail_open = false;
+                        hist_delete_confirming = false;
                     }
                     screen_dirty = true;
                     draw_current_screen(); spr.pushSprite(0, 0);
@@ -7869,7 +8302,11 @@ void loop() {
                 show_menu = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (current_screen == 2 && hist_detail_open) {
-                hist_detail_open = false;
+                if (hist_delete_confirming) {
+                    hist_delete_confirming = false;
+                } else {
+                    hist_detail_open = false;
+                }
                 screen_dirty = true;
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (current_screen != 0) {
