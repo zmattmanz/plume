@@ -5643,16 +5643,16 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         // Reads pixel from buffer, swaps to logical format if needed,
         // blends in logical RGB565 (where lerp_col16 works correctly),
         // swaps back, writes to buffer. Result: correct colors guaranteed.
-        if (d.sweep_bright > 0.15f) {
+        if (d.sweep_bright > 0.08f) {
             float glow_t = d.sweep_bright * d.sweep_bright
                          * (3.0f - 2.0f * d.sweep_bright);
 
             uint16_t* sbuf = (uint16_t*)spr.getBuffer();
             const int sbuf_w = DISP_W;
 
-            int   glow_r    = sz + 4;
+            int   glow_r    = sz + 6;
             float glow_r2   = (float)(glow_r * glow_r);
-            float glow_peak = glow_t * 0.22f;
+            float glow_peak = glow_t * 0.40f;
 
             int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
             int gx1 = dpx + glow_r; if (gx1 >= VIZ_X + VIZ_W) gx1 = VIZ_X + VIZ_W - 1;
@@ -9670,14 +9670,14 @@ void loop() {
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
 
                     // Sweep glow — byte-order-corrected blend (ambient)
-                    if (d.sweep_bright > 0.15f) {
+                    if (d.sweep_bright > 0.08f) {
                         float glow_t = d.sweep_bright * d.sweep_bright
                                      * (3.0f - 2.0f * d.sweep_bright);
                         uint16_t* sbuf = (uint16_t*)spr.getBuffer();
                         const int sbuf_w = DISP_W;
-                        int   glow_r  = DSZ + 4;
+                        int   glow_r  = DSZ + 6;
                         float glow_r2 = (float)(glow_r * glow_r);
-                        float glow_peak = glow_t * 0.20f;
+                        float glow_peak = glow_t * 0.35f;
 
                         int gx0 = dpx - glow_r; if (gx0 < 0) gx0 = 0;
                         int gx1 = dpx + glow_r; if (gx1 >= DISP_W) gx1 = DISP_W - 1;
