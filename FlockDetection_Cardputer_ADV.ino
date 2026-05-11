@@ -5409,6 +5409,44 @@ static void prox_radar_refresh(unsigned long frame_ms) {
             }
         }
     }
+
+    // Angular repulsion — push overlapping icons apart.
+    // Single pass: for each pair within MIN_ANGLE_SEP, split the difference.
+    // Stable because angles are hash-derived (don't drift) and the nudge
+    // is capped at MAX_NUDGE so icons can't migrate to the wrong quadrant.
+    {
+        const float MIN_ANGLE_SEP = 0.45f;  // ~26° — minimum angular gap
+        const float MAX_NUDGE     = 0.30f;  // ~17° — max displacement per frame
+        const float PI2f = 2.0f * (float)M_PI;
+
+        for (int i = 0; i < SCAN_MAX_DEVICES; i++) {
+            if (!scan_devs[i].occupied) continue;
+            for (int j = i + 1; j < SCAN_MAX_DEVICES; j++) {
+                if (!scan_devs[j].occupied) continue;
+
+                float dist_diff = fabsf(scan_devs[i].dist_smooth - scan_devs[j].dist_smooth);
+                if (dist_diff > 0.35f) continue;
+
+                float diff = scan_devs[i].angle - scan_devs[j].angle;
+                if (diff >  (float)M_PI) diff -= PI2f;
+                if (diff < -(float)M_PI) diff += PI2f;
+                float abs_diff = fabsf(diff);
+
+                if (abs_diff < MIN_ANGLE_SEP) {
+                    float push = (MIN_ANGLE_SEP - abs_diff) * 0.5f;
+                    if (push > MAX_NUDGE) push = MAX_NUDGE;
+                    float sign = (diff >= 0.0f) ? 1.0f : -1.0f;
+                    scan_devs[i].angle += sign * push;
+                    scan_devs[j].angle -= sign * push;
+
+                    if (scan_devs[i].angle < 0.0f)  scan_devs[i].angle += PI2f;
+                    if (scan_devs[i].angle >= PI2f)  scan_devs[i].angle -= PI2f;
+                    if (scan_devs[j].angle < 0.0f)  scan_devs[j].angle += PI2f;
+                    if (scan_devs[j].angle >= PI2f)  scan_devs[j].angle -= PI2f;
+                }
+            }
+        }
+    }
 }
 
 // ── Viz mode 0: SCAN (proximity radar) ────────────────────────────────────
@@ -5482,23 +5520,11 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         spr.drawCircle(CX, CY, R * i / 4, ring_col);
     }
 
-    // ── 3. Sweep line — gradient taper, bright center → dim tip ─────────
+    // ── 3. Sweep line (on top of rings) ──────────────────────────────────
     {
-        float sw_cos = cosf(scan_sweep_angle);
-        float sw_sin = sinf(scan_sweep_angle);
-        const int SEGS = 8;
-        for (int s = 0; s < SEGS; s++) {
-            float t0 = (float)s / (float)SEGS;
-            float t1 = (float)(s + 1) / (float)SEGS;
-            int x0 = CX + (int)((float)R * t0 * sw_cos);
-            int y0 = CY + (int)((float)R * t0 * sw_sin);
-            int x1 = CX + (int)((float)R * t1 * sw_cos);
-            int y1 = CY + (int)((float)R * t1 * sw_sin);
-            // Quadratic falloff: 0.75 at center → 0.12 at tip
-            float seg_t = (t0 + t1) * 0.5f;
-            float alpha = 0.75f * (1.0f - seg_t) * (1.0f - seg_t) + 0.12f * seg_t;
-            spr.drawLine(x0, y0, x1, y1, lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
-        }
+        int ex = CX + (int)((float)R * cosf(scan_sweep_angle));
+        int ey = CY + (int)((float)R * sinf(scan_sweep_angle));
+        spr.drawLine(CX, CY, ex, ey, lerp_col16(BG_COLOR, HEADER_COLOR, 0.70f));
     }
 
     // ── 4. Device icons ───────────────────────────────────────────────────
@@ -5578,20 +5604,25 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         }
         int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
 
-        // Sweep glow — soft radial bloom behind the icon on sweep contact
+        // Sweep glow — smooth radial bloom behind the icon on sweep contact
         if (d.sweep_bright > 0.08f) {
-            // Ease the glow: cubic ease-out so it ramps fast and fades slowly
             float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-            float glow_radius = (float)sz * 2.5f;
-            float glow_alpha  = glow_t * 0.20f;
-            // Draw as 3 concentric filled circles with decreasing alpha
-            // (cheaper than a real radial gradient on the sprite)
-            uint16_t g1 = lerp_col16(BG_COLOR, base_col, glow_alpha * 0.35f);
-            uint16_t g2 = lerp_col16(BG_COLOR, base_col, glow_alpha * 0.65f);
-            uint16_t g3 = lerp_col16(BG_COLOR, base_col, glow_alpha);
-            spr.fillCircle(dpx, dpy, (int)(glow_radius),       g1);
-            spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.6f), g2);
-            spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.3f), g3);
+            float glow_radius = (float)sz * 2.8f;
+            float glow_peak   = glow_t * 0.22f;
+            // 6 concentric fillCircle calls, outside-in. Each inner circle
+            // overwrites the center of the outer one, leaving a thin donut
+            // of the outer color visible. With 6 steps the donuts are narrow
+            // enough to read as a smooth gradient on the LCD.
+            const int GLOW_RINGS = 6;
+            for (int gi = 0; gi < GLOW_RINGS; gi++) {
+                float ring_t = (float)gi / (float)(GLOW_RINGS - 1);  // 0.0 → 1.0
+                float r = glow_radius * (1.0f - ring_t * 0.85f);     // outer → 15% of radius
+                float a = glow_peak * (0.15f + ring_t * 0.85f);      // 15% → 100% of peak
+                a *= (0.3f + 0.7f * ring_t);
+                int ri = (int)r;
+                if (ri < 2) continue;
+                spr.fillCircle(dpx, dpy, ri, lerp_col16(BG_COLOR, base_col, a));
+            }
         }
 
         // Flock icons get a semi-transparent fill — threat stands out from ambient traffic
@@ -9527,21 +9558,12 @@ void loop() {
                     }
                 }
 
-                // Sweep line — gradient taper
+                // Sweep line
                 {
-                    const int SEGS = 8;
-                    for (int s = 0; s < SEGS; s++) {
-                        float t0 = (float)s / (float)SEGS;
-                        float t1 = (float)(s + 1) / (float)SEGS;
-                        int x0 = ACX + (int)((float)AR * t0 * as_cos);
-                        int y0 = ACY + (int)((float)AR * t0 * as_sin);
-                        int x1 = ACX + (int)((float)AR * t1 * as_cos);
-                        int y1 = ACY + (int)((float)AR * t1 * as_sin);
-                        float seg_t = (t0 + t1) * 0.5f;
-                        float alpha = 0.55f * (1.0f - seg_t) * (1.0f - seg_t) + 0.10f * seg_t;
-                        spr.drawLine(x0, y0, x1, y1,
-                                     lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
-                    }
+                    int ex = ACX + (int)((float)AR * as_cos);
+                    int ey = ACY + (int)((float)AR * as_sin);
+                    spr.drawLine(ACX, ACY, ex, ey,
+                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f));
                 }
 
                 // Refresh + update devices
@@ -9594,14 +9616,18 @@ void loop() {
                     // Sweep glow — matches active scan radar
                     if (d.sweep_bright > 0.08f) {
                         float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-                        float glow_radius = (float)DSZ * 2.5f;
-                        float glow_alpha  = glow_t * 0.18f;
-                        uint16_t g1 = lerp_col16(BG_COLOR, bcol, glow_alpha * 0.35f);
-                        uint16_t g2 = lerp_col16(BG_COLOR, bcol, glow_alpha * 0.65f);
-                        uint16_t g3 = lerp_col16(BG_COLOR, bcol, glow_alpha);
-                        spr.fillCircle(dpx, dpy, (int)(glow_radius),       g1);
-                        spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.6f), g2);
-                        spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.3f), g3);
+                        float glow_radius = (float)DSZ * 2.8f;
+                        float glow_peak   = glow_t * 0.18f;
+                        const int GLOW_RINGS = 6;
+                        for (int gi = 0; gi < GLOW_RINGS; gi++) {
+                            float ring_t = (float)gi / (float)(GLOW_RINGS - 1);
+                            float r = glow_radius * (1.0f - ring_t * 0.85f);
+                            float a = glow_peak * (0.15f + ring_t * 0.85f);
+                            a *= (0.3f + 0.7f * ring_t);
+                            int ri = (int)r;
+                            if (ri < 2) continue;
+                            spr.fillCircle(dpx, dpy, ri, lerp_col16(BG_COLOR, bcol, a));
+                        }
                     }
 
                     // Flock fill — matches active scan
