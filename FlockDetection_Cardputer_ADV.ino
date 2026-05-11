@@ -810,7 +810,8 @@ enum StatsCardIdx {
     SC_SESSION, SC_LIFETIME,
     SC_BATTERY, SC_HEAP,
     SC_PACKETS, SC_SD,
-    SC_BOOTS, SC_FLASH, SC_VERSION,
+    SC_BOOTS, SC_FLASH,
+    SC_VERSION, SC_VOLTAGE,
     STATS_CARD_COUNT
 };
 // Per-character roll animation: comparing the formatted string per char
@@ -1123,6 +1124,38 @@ void update_load_sag() {
 
     // Update global state for the battery thread
     current_load_sag_mv = total_sag;
+}
+
+// Piecewise linear LiPo discharge curve — 9 breakpoints interpolated.
+// Replaces the linear (mv-3300)*100/900 mapping which is 10+ percentage
+// points off in the 3.5–3.7V danger zone where accuracy matters most.
+static int voltage_to_percent(int32_t mv) {
+    struct BP { int32_t mv; int pct; };
+    static const BP curve[] = {
+        {4200, 100},
+        {4100,  90},
+        {3950,  75},
+        {3830,  60},
+        {3740,  40},
+        {3680,  25},
+        {3600,  15},
+        {3500,   5},
+        {3300,   0},
+    };
+    static const int N = sizeof(curve) / sizeof(curve[0]);
+
+    if (mv >= curve[0].mv) return 100;
+    if (mv <= curve[N - 1].mv) return 0;
+
+    for (int i = 0; i < N - 1; i++) {
+        if (mv >= curve[i + 1].mv) {
+            int32_t range_mv  = curve[i].mv  - curve[i + 1].mv;
+            int     range_pct = curve[i].pct - curve[i + 1].pct;
+            return curve[i + 1].pct +
+                   (int)((mv - curve[i + 1].mv) * range_pct / range_mv);
+        }
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -4148,14 +4181,23 @@ void draw_header_spr(int screen_num) {
         icon_right -= ww + 2;
     }
 
-    // Battery percentage pill — leftmost, DIM_COLOR or CAUTION below 20%
+    // Battery percentage pill — with charging indicator
     {
         int32_t bat_mv = get_filtered_voltage();
-        int bat_pct = constrain((int)((bat_mv - 3300) * 100 / 900), 0, 100);
-        char bat_str[8];
-        snprintf(bat_str, sizeof(bat_str), "B%d%%", bat_pct);
+        int bat_pct = voltage_to_percent(bat_mv);
+        bool charging = M5Cardputer.Power.isCharging();
+
+        char bat_str[10];
+        if (charging) {
+            snprintf(bat_str, sizeof(bat_str), "%d%%+", bat_pct);
+        } else {
+            snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct);
+        }
         int pw = (int)strlen(bat_str) * 7 + 6;
-        uint16_t bat_col = (bat_pct <= 20) ? CAUTION_COLOR : DIM_COLOR;
+        uint16_t bat_col = charging    ? GPS_COLOR
+                         : (bat_pct <= 10) ? CAUTION_COLOR
+                         : (bat_pct <= 25) ? lerp_col16(DIM_COLOR, CAUTION_COLOR, 0.5f)
+                         :                   DIM_COLOR;
         drawPill(icon_right - pw, icon_y, bat_str, bat_col);
     }
 }
@@ -4460,6 +4502,7 @@ void draw_help_overlay() {
             {"BOOTS",    "boots"},
             {"FLASH",    "writes"},
             {"VERSION",  "firmware"},
+            {"VOLTAGE",  "raw mV"},
         };
         const int n_desc = sizeof(descs) / sizeof(descs[0]);
         const int rows   = (n_desc + 1) / 2;  // 7
@@ -5381,7 +5424,12 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     if (dt > 100.0f) dt = 100.0f;
     scan_last_frame_ms = frame_ms;
 
-    float swing = 1.0f + 0.15f * sinf(scan_sweep_angle * 0.7f);
+    // Two overlapping sine waves: primary at 0.7× rotation, secondary at 1.3×.
+    // The secondary adds asymmetry — the sweep doesn't just speed up and slow
+    // down symmetrically, it lingers in some quadrants more than others.
+    float swing = 1.0f
+                + 0.18f * sinf(scan_sweep_angle * 0.7f)
+                + 0.08f * sinf(scan_sweep_angle * 1.3f);
     scan_sweep_angle += 0.0012f * dt * swing;
     if (scan_sweep_angle >= PI2f) scan_sweep_angle -= PI2f;
 
@@ -5434,11 +5482,23 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         spr.drawCircle(CX, CY, R * i / 4, ring_col);
     }
 
-    // ── 3. Sweep line (on top of rings) ──────────────────────────────────
+    // ── 3. Sweep line — gradient taper, bright center → dim tip ─────────
     {
-        int ex = CX + (int)((float)R * cosf(scan_sweep_angle));
-        int ey = CY + (int)((float)R * sinf(scan_sweep_angle));
-        spr.drawLine(CX, CY, ex, ey, lerp_col16(BG_COLOR, HEADER_COLOR, 0.70f));
+        float sw_cos = cosf(scan_sweep_angle);
+        float sw_sin = sinf(scan_sweep_angle);
+        const int SEGS = 8;
+        for (int s = 0; s < SEGS; s++) {
+            float t0 = (float)s / (float)SEGS;
+            float t1 = (float)(s + 1) / (float)SEGS;
+            int x0 = CX + (int)((float)R * t0 * sw_cos);
+            int y0 = CY + (int)((float)R * t0 * sw_sin);
+            int x1 = CX + (int)((float)R * t1 * sw_cos);
+            int y1 = CY + (int)((float)R * t1 * sw_sin);
+            // Quadratic falloff: 0.75 at center → 0.12 at tip
+            float seg_t = (t0 + t1) * 0.5f;
+            float alpha = 0.75f * (1.0f - seg_t) * (1.0f - seg_t) + 0.12f * seg_t;
+            spr.drawLine(x0, y0, x1, y1, lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
+        }
     }
 
     // ── 4. Device icons ───────────────────────────────────────────────────
@@ -5508,9 +5568,31 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
                      : lerp_col16(BG_COLOR, base_col, age_af);
         }
 
-        // Size
+        // Size — flock icons pulse continuously, non-flock static
         int base_sz = d.is_flock ? 7 : 6;
-        int sz = (int)((float)base_sz * (1.0f + d.size_ease));
+        float pulse_factor = 0.0f;
+        if (d.is_flock) {
+            // Breathe at UI_PULSE_BREATHE (1200ms), ±8% size
+            float breath = 0.5f + 0.5f * sinf((float)frame_ms * 2.0f * (float)M_PI / 1200.0f);
+            pulse_factor = (breath - 0.5f) * 0.16f;  // maps [0,1] → [-0.08, +0.08]
+        }
+        int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
+
+        // Sweep glow — soft radial bloom behind the icon on sweep contact
+        if (d.sweep_bright > 0.08f) {
+            // Ease the glow: cubic ease-out so it ramps fast and fades slowly
+            float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
+            float glow_radius = (float)sz * 2.5f;
+            float glow_alpha  = glow_t * 0.20f;
+            // Draw as 3 concentric filled circles with decreasing alpha
+            // (cheaper than a real radial gradient on the sprite)
+            uint16_t g1 = lerp_col16(BG_COLOR, base_col, glow_alpha * 0.35f);
+            uint16_t g2 = lerp_col16(BG_COLOR, base_col, glow_alpha * 0.65f);
+            uint16_t g3 = lerp_col16(BG_COLOR, base_col, glow_alpha);
+            spr.fillCircle(dpx, dpy, (int)(glow_radius),       g1);
+            spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.6f), g2);
+            spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.3f), g3);
+        }
 
         // Flock icons get a semi-transparent fill — threat stands out from ambient traffic
         if (d.is_flock) {
@@ -7362,8 +7444,14 @@ void draw_device_info_screen() {
     char raven_str[10]; snprintf(raven_str, sizeof(raven_str), "%ld", sr);
     char sess_str[10];  format_time_buf(sess_s, sess_str, sizeof(sess_str));
     char life_str[10];  format_time_buf(l_sec, life_str, sizeof(life_str));
-    int bat_pct = constrain((int)((bat_mv - 3300) * 100 / 900), 0, 100);
-    char volt_str[10];  snprintf(volt_str,  sizeof(volt_str),  "%d%%", bat_pct);
+    int bat_pct = voltage_to_percent(bat_mv);
+    bool charging = M5Cardputer.Power.isCharging();
+    char volt_str[10];
+    if (charging) {
+        snprintf(volt_str, sizeof(volt_str), "%d%%+", bat_pct);
+    } else {
+        snprintf(volt_str, sizeof(volt_str), "%d%%", bat_pct);
+    }
     char heap_str[10];  snprintf(heap_str,  sizeof(heap_str),  "%uKB", (unsigned)(free_heap / 1024));
     char pkt_str[12];   snprintf(pkt_str,   sizeof(pkt_str),   "%lu",  (unsigned long)stats_pkt_display);
     char sd_str[10];
@@ -7372,8 +7460,9 @@ void draw_device_info_screen() {
     } else {
         strncpy(sd_str, "--", sizeof(sd_str));
     }
-    char boots_str[10]; snprintf(boots_str, sizeof(boots_str), "%ld", lb);
-    char flash_str[10]; snprintf(flash_str, sizeof(flash_str), "%ld", lfw);
+    char boots_str[10];   snprintf(boots_str,   sizeof(boots_str),   "%ld",   lb);
+    char flash_str[10];   snprintf(flash_str,   sizeof(flash_str),   "%ld",   lfw);
+    char voltage_str[10]; snprintf(voltage_str, sizeof(voltage_str), "%.2fV", bat_mv / 1000.0f);
 
     // First-frame seed for per-character roll animation. Copy the freshly
     // formatted strings into stats_prev_strings without stamping any
@@ -7395,6 +7484,7 @@ void draw_device_info_screen() {
         seed[SC_BOOTS]      = boots_str;
         seed[SC_FLASH]      = flash_str;
         seed[SC_VERSION]    = VERSION_SHORT;
+        seed[SC_VOLTAGE]    = voltage_str;
         for (int i = 0; i < STATS_CARD_COUNT; i++) {
             strncpy(stats_prev_strings[i], seed[i], STAT_MAX_CHARS - 1);
             stats_prev_strings[i][STAT_MAX_CHARS - 1] = '\0';
@@ -7476,8 +7566,9 @@ void draw_device_info_screen() {
     card(x_h1, 224, w_half, H_NORMAL, "BOOTS", boots_str, SC_BOOTS);
     card(x_h2, 224, w_half, H_NORMAL, "FLASH", flash_str, SC_FLASH);
 
-    // Row 7 (vy = 266): VERSION (half width, left only — compile-time constant, roll never fires)
+    // Row 7 (vy = 266): VERSION | VOLTAGE
     card(x_h1, 266, w_half, H_NORMAL, "VERSION", VERSION_SHORT, SC_VERSION);
+    card(x_h2, 266, w_half, H_NORMAL, "VOLTAGE", voltage_str,   SC_VOLTAGE);
 
     spr.clearClipRect();
 
@@ -9436,12 +9527,21 @@ void loop() {
                     }
                 }
 
-                // Sweep line
+                // Sweep line — gradient taper
                 {
-                    int ex = ACX + (int)((float)AR * as_cos);
-                    int ey = ACY + (int)((float)AR * as_sin);
-                    spr.drawLine(ACX, ACY, ex, ey,
-                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f));
+                    const int SEGS = 8;
+                    for (int s = 0; s < SEGS; s++) {
+                        float t0 = (float)s / (float)SEGS;
+                        float t1 = (float)(s + 1) / (float)SEGS;
+                        int x0 = ACX + (int)((float)AR * t0 * as_cos);
+                        int y0 = ACY + (int)((float)AR * t0 * as_sin);
+                        int x1 = ACX + (int)((float)AR * t1 * as_cos);
+                        int y1 = ACY + (int)((float)AR * t1 * as_sin);
+                        float seg_t = (t0 + t1) * 0.5f;
+                        float alpha = 0.55f * (1.0f - seg_t) * (1.0f - seg_t) + 0.10f * seg_t;
+                        spr.drawLine(x0, y0, x1, y1,
+                                     lerp_col16(BG_COLOR, HEADER_COLOR, alpha));
+                    }
                 }
 
                 // Refresh + update devices
@@ -9483,8 +9583,38 @@ void loop() {
                     }
 
                     uint16_t bcol = d.is_flock ? CAUTION_COLOR : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
-                    const int DSZ = 4;
+                    float pulse_factor = 0.0f;
+                    if (d.is_flock) {
+                        float breath = 0.5f + 0.5f * sinf((float)frame_ms * 2.0f * (float)M_PI / 1200.0f);
+                        pulse_factor = (breath - 0.5f) * 0.16f;
+                    }
+                    const int DSZ = (int)(4.0f * (1.0f + pulse_factor));
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
+
+                    // Sweep glow — matches active scan radar
+                    if (d.sweep_bright > 0.08f) {
+                        float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
+                        float glow_radius = (float)DSZ * 2.5f;
+                        float glow_alpha  = glow_t * 0.18f;
+                        uint16_t g1 = lerp_col16(BG_COLOR, bcol, glow_alpha * 0.35f);
+                        uint16_t g2 = lerp_col16(BG_COLOR, bcol, glow_alpha * 0.65f);
+                        uint16_t g3 = lerp_col16(BG_COLOR, bcol, glow_alpha);
+                        spr.fillCircle(dpx, dpy, (int)(glow_radius),       g1);
+                        spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.6f), g2);
+                        spr.fillCircle(dpx, dpy, (int)(glow_radius * 0.3f), g3);
+                    }
+
+                    // Flock fill — matches active scan
+                    if (d.is_flock) {
+                        uint16_t fill_col = lerp_col16(BG_COLOR, ec, 0.45f);
+                        if (d.proto == 0) {
+                            spr.fillTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy + DSZ, dpx + DSZ, dpy + DSZ, fill_col);
+                        } else {
+                            spr.fillTriangle(dpx, dpy - DSZ, dpx + DSZ, dpy, dpx, dpy + DSZ, fill_col);
+                            spr.fillTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy, dpx, dpy + DSZ, fill_col);
+                        }
+                    }
+
                     if (d.proto == 0) {
                         spr.drawTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy + DSZ, dpx + DSZ, dpy + DSZ, ec);
                     } else {
