@@ -5608,11 +5608,11 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         // Reads existing pixel, blends toward base_col, writes back.
         // Produces a smooth radial gradient that adds brightness to the
         // phosphor trail without erasing it.
-        if (d.sweep_bright > 0.10f) {
+        if (d.sweep_bright > 0.15f) {
             float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-            int gr = (int)((float)sz * 2.5f);
+            int gr = (int)((float)sz * 1.8f);
             float r2 = (float)(gr * gr);
-            float glow_peak = glow_t * 0.35f;
+            float glow_peak = glow_t * 0.18f;
 
             int y0 = max((int)(dpy - gr), (int)VIZ_Y);
             int y1 = min((int)(dpy + gr), (int)(VIZ_Y + VIZ_H - 1));
@@ -9627,11 +9627,11 @@ void loop() {
 
                     // Sweep glow — matches active scan radar
                     // Sweep glow — true alpha blend
-                    if (d.sweep_bright > 0.10f) {
+                    if (d.sweep_bright > 0.15f) {
                         float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-                        int gr = (int)((float)DSZ * 2.5f);
+                        int gr = (int)((float)DSZ * 1.8f);
                         float r2 = (float)(gr * gr);
-                        float glow_peak = glow_t * 0.30f;
+                        float glow_peak = glow_t * 0.15f;
 
                         int gy0 = max((int)(dpy - gr), 0);
                         int gy1 = min((int)(dpy + gr), (int)(DISP_H - 1));
