@@ -8632,11 +8632,12 @@ void loop() {
             }
         }
         size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        if (largest_block < 4096) {
-            static unsigned long last_frag_warn = 0;
-            if (millis() - last_frag_warn > 60000) {
-                last_frag_warn = millis();
-                set_toast_direct("HEAP FRAGMENTED", CAUTION_COLOR);
+        if (largest_block < 2048) {
+            static unsigned long last_frag_log = 0;
+            if (millis() - last_frag_log > 60000) {
+                last_frag_log = millis();
+                Serial.printf("[HEAP] Fragmented: largest block %u bytes (free: %u)\n",
+                              (unsigned)largest_block, (unsigned)free_heap);
             }
         }
     }
