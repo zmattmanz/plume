@@ -6108,13 +6108,13 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     // Static: avoid stack overflow — fully overwritten each frame, single-threaded.
     static float wifi_norm[TIMELINE_BIN_COUNT];
     static float ble_norm[TIMELINE_BIN_COUNT];
+    // Reverse so index 0 = newest (maps to origin at bottom-left)
     for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        wifi_norm[i] = tl_wifi_smooth[i];
-        ble_norm[i]  = tl_ble_smooth[i];
+        int ri = TIMELINE_BIN_COUNT - 1 - i;
+        wifi_norm[i] = tl_wifi_smooth[ri];
+        ble_norm[i]  = tl_ble_smooth[ri];
         if (wifi_norm[i] > 1.0f) wifi_norm[i] = 1.0f;
         if (ble_norm[i]  > 1.0f) ble_norm[i]  = 1.0f;
-        // sqrtf and box blur removed — they were flattening real variance.
-        // Catmull-Rom spline provides smoothness while preserving per-bin amplitude.
     }
 
     // Inline Catmull-Rom: for each span [i, i+1], emit TL_INTERP_FACTOR
@@ -6162,16 +6162,16 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     const float C30 = 0.866f;
     const float S30 = 0.5f;
 
-    const float ox = (float)(VIZ_X + VIZ_W - 12);  // 10px past clip edge — newest data bleeds in
+    const float ox = (float)(VIZ_X + 12);           // bottom-left — newest data enters here
     const float oy = (float)(VIZ_Y + VIZ_H - 6);
 
-    const float T_LEN = 130.0f;   // time span — far end bleeds past upper-left edge
+    const float T_LEN = 130.0f;   // time span — far end bleeds past upper-right edge
     const float D_LEN =  24.0f;   // depth span (just enough to separate ribbons)
     const float V_LEN =  42.0f;   // value span (max curve height)
 
-    const float TDX = -C30 * T_LEN;   // time   → upper-left
+    const float TDX = +C30 * T_LEN;   // time   → upper-right (old data recedes)
     const float TDY = -S30 * T_LEN;
-    const float DDX = +C30 * D_LEN;   // depth  → upper-right
+    const float DDX = -C30 * D_LEN;   // depth  → upper-left (iso perspective)
     const float DDY = -S30 * D_LEN;
     const float VDY = -V_LEN;         // value  → straight up (VDX = 0)
 
@@ -6331,8 +6331,9 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
             if (!tl_bins[i].has_flock) continue;
             if (tl_bins[i].flock_proto != R.flock_proto) continue;
 
-            // Map raw bin index to smoothed array index
-            int si = i * TL_INTERP_FACTOR;
+            // Map raw bin index to reversed smoothed array index
+            // (tl_bins[0]=oldest → smooth_pts[n-1], tl_bins[49]=newest → smooth_pts[0])
+            int si = (TIMELINE_BIN_COUNT - 1 - i) * TL_INTERP_FACTOR;
             if (si >= n) si = n - 1;
 
             float fade = tl_flock_fade[i];
