@@ -5604,34 +5604,40 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         }
         int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
 
-        // Sweep glow — true alpha blend via per-pixel read-modify-write.
-        // Reads existing pixel, blends toward base_col, writes back.
-        // Produces a smooth radial gradient that adds brightness to the
-        // phosphor trail without erasing it.
+        // ── Sweep glow: per-pixel alpha blend via readPixelValue ─────
+        // Reads each pixel in the glow radius, blends it toward the
+        // protocol color, writes it back. Produces a smooth radial
+        // gradient that adds brightness without erasing the phosphor
+        // trail or background.
+        //
+        // ~1000 pixels per icon at r=13px. At 160MHz with 5 icons
+        // glowing simultaneously, total cost is ~0.2ms per frame.
         if (d.sweep_bright > 0.15f) {
-            float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-            int gr = (int)((float)sz * 1.8f);
-            float r2 = (float)(gr * gr);
+            float glow_t = d.sweep_bright * d.sweep_bright
+                         * (3.0f - 2.0f * d.sweep_bright);
+
+            int   glow_r    = (int)((float)sz * 1.8f);
+            float glow_r2   = (float)(glow_r * glow_r);
             float glow_peak = glow_t * 0.18f;
 
-            int y0 = max((int)(dpy - gr), (int)VIZ_Y);
-            int y1 = min((int)(dpy + gr), (int)(VIZ_Y + VIZ_H - 1));
-            int x0 = max((int)(dpx - gr), (int)VIZ_X);
-            int x1 = min((int)(dpx + gr), (int)(VIZ_X + VIZ_W - 1));
+            int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
+            int gx1 = dpx + glow_r; if (gx1 >= VIZ_X + VIZ_W) gx1 = VIZ_X + VIZ_W - 1;
+            int gy0 = dpy - glow_r; if (gy0 < VIZ_Y) gy0 = VIZ_Y;
+            int gy1 = dpy + glow_r; if (gy1 >= VIZ_Y + VIZ_H) gy1 = VIZ_Y + VIZ_H - 1;
 
-            for (int gy = y0; gy <= y1; gy++) {
-                for (int gx = x0; gx <= x1; gx++) {
+            for (int gy = gy0; gy <= gy1; gy++) {
+                for (int gx = gx0; gx <= gx1; gx++) {
                     float dx = (float)(gx - dpx);
                     float dy = (float)(gy - dpy);
                     float dist2 = dx * dx + dy * dy;
-                    if (dist2 > r2) continue;
+                    if (dist2 >= glow_r2) continue;
 
-                    float dist_norm = dist2 / r2;
-                    float alpha = glow_peak * (1.0f - dist_norm);
-                    if (alpha < 0.02f) continue;
+                    float alpha = glow_peak * (1.0f - dist2 / glow_r2);
+                    if (alpha < 0.015f) continue;
 
-                    uint16_t existing = spr.readPixelValue(gx, gy);
-                    spr.drawPixel(gx, gy, lerp_col16(existing, base_col, alpha));
+                    uint16_t existing = (uint16_t)spr.readPixelValue(gx, gy);
+                    spr.drawPixel(gx, gy,
+                                  lerp_col16(existing, base_col, alpha));
                 }
             }
         }
@@ -9625,29 +9631,30 @@ void loop() {
                     const int DSZ = (int)(4.0f * (1.0f + pulse_factor));
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
 
-                    // Sweep glow — matches active scan radar
-                    // Sweep glow — true alpha blend
+                    // Sweep glow — per-pixel alpha blend (ambient)
                     if (d.sweep_bright > 0.15f) {
-                        float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-                        int gr = (int)((float)DSZ * 1.8f);
-                        float r2 = (float)(gr * gr);
+                        float glow_t = d.sweep_bright * d.sweep_bright
+                                     * (3.0f - 2.0f * d.sweep_bright);
+                        int   glow_r  = (int)((float)DSZ * 1.8f);
+                        float glow_r2 = (float)(glow_r * glow_r);
                         float glow_peak = glow_t * 0.15f;
 
-                        int gy0 = max((int)(dpy - gr), 0);
-                        int gy1 = min((int)(dpy + gr), (int)(DISP_H - 1));
-                        int gx0 = max((int)(dpx - gr), 0);
-                        int gx1 = min((int)(dpx + gr), (int)(DISP_W - 1));
+                        int gx0 = dpx - glow_r; if (gx0 < 0) gx0 = 0;
+                        int gx1 = dpx + glow_r; if (gx1 >= DISP_W) gx1 = DISP_W - 1;
+                        int gy0 = dpy - glow_r; if (gy0 < 0) gy0 = 0;
+                        int gy1 = dpy + glow_r; if (gy1 >= DISP_H) gy1 = DISP_H - 1;
 
                         for (int gy = gy0; gy <= gy1; gy++) {
                             for (int gx = gx0; gx <= gx1; gx++) {
                                 float dx = (float)(gx - dpx);
                                 float dy = (float)(gy - dpy);
                                 float dist2 = dx * dx + dy * dy;
-                                if (dist2 > r2) continue;
-                                float alpha = glow_peak * (1.0f - dist2 / r2);
-                                if (alpha < 0.02f) continue;
-                                uint16_t existing = spr.readPixelValue(gx, gy);
-                                spr.drawPixel(gx, gy, lerp_col16(existing, bcol, alpha));
+                                if (dist2 >= glow_r2) continue;
+                                float alpha = glow_peak * (1.0f - dist2 / glow_r2);
+                                if (alpha < 0.015f) continue;
+                                uint16_t existing = (uint16_t)spr.readPixelValue(gx, gy);
+                                spr.drawPixel(gx, gy,
+                                              lerp_col16(existing, bcol, alpha));
                             }
                         }
                     }
