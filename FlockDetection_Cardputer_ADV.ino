@@ -4993,17 +4993,30 @@ void handle_menu_select() {
 // ── Layout constants for the scanner screen ──
 // Viz panel fills the entire left side; W/B counts moved to header pills.
 // Feed runs full-height down the right side of the divider.
-static const int DIVIDER_X    = 140;
-static const int VIZ_X        = 4;
-static const int VIZ_Y        = 36;
-static const int VIZ_H        = DISP_H - VIZ_Y;           // 99 — below shared label row
-static const int VIZ_W        = DIVIDER_X - VIZ_X - 2;    // 134
-static const int VIZ_RIGHT    = VIZ_X + VIZ_W;             // 138
-static const int VIZ_BOTTOM   = VIZ_Y + VIZ_H;             // 135 (== DISP_H)
-static const int FEED_X       = 144;
-static const int FEED_LABEL_Y = 20 + UI_PAD_XS;
-static const int FEED_FIRST_Y = 34 + UI_PAD_XS;
-static const int FEED_RIGHT   = DISP_W - UI_PAD_SM;       // 234
+// ── Scanner screen layout ───────────────────────────────────────────
+// Every value derived from the spacing system. No magic numbers.
+//
+//   Screen edge margins:  UI_PAD_SM (6px) both sides
+//   Divider gutters:      UI_PAD_XS (2px) symmetric
+//   Label row inset:      UI_PAD_XS * 2 (4px) from CONTENT_Y
+//
+// Horizontal map (pixels):
+//   0  [6px margin]  6..137 viz  [2px] 140 div [2px] 143..233 feed  [6px margin] 240
+//
+static const int DIVIDER_X     = 140;
+static const int DIVIDER_GAP   = UI_PAD_XS;                          // 2 — gutter each side of divider
+static const int VIZ_X         = UI_PAD_SM;                           // 6 — left screen margin
+static const int VIZ_W         = DIVIDER_X - VIZ_X - DIVIDER_GAP;    // 132
+static const int VIZ_RIGHT     = VIZ_X + VIZ_W;                       // 138
+static const int FEED_X        = DIVIDER_X + 1 + DIVIDER_GAP;         // 143 — 1px line + gutter
+static const int FEED_RIGHT    = DISP_W - UI_PAD_SM;                  // 234 — right screen margin
+static const int LABEL_ROW_H   = 16;                                   // fits TS_BODY + vertical padding
+static const int LABEL_TEXT_Y  = CONTENT_Y + UI_PAD_XS * 2;           // 24 — text cursor y
+static const int LABEL_MICRO_Y = LABEL_TEXT_Y + UI_PAD_XS;            // 26 — TS_MICRO baseline-aligned
+static const int VIZ_Y         = CONTENT_Y + LABEL_ROW_H;              // 36 — viz/feed content top
+static const int VIZ_H         = DISP_H - VIZ_Y;                       // 99
+static const int VIZ_BOTTOM    = VIZ_Y + VIZ_H;                        // 135 (== DISP_H)
+static const int FEED_FIRST_Y  = VIZ_Y;                                // 36 — feed rows start here
 
 static inline void fast_sincos(float angle, float* s, float* c) {
     *s = sinf(angle);
@@ -5127,7 +5140,6 @@ void draw_scanner_screen() {
 
     // Step 3: shared label row — viz title (left) | N/4 right-aligned | FEED (right)
     {
-        const int LABEL_TEXT_Y = 24;
         static const char* viz_titles[] = {"SCAN", "LINE", "TIME"};
         const char* vt = viz_titles[scanner_viz_mode];
 
@@ -5145,7 +5157,7 @@ void draw_scanner_screen() {
             int ind_w = (int)strlen(ind_str) * 6;
             spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.setTextSize(TS_MICRO);
-            spr.setCursor(DIVIDER_X - UI_PAD_SM - ind_w - 2, LABEL_TEXT_Y + 2);
+            spr.setCursor(VIZ_RIGHT - UI_PAD_SM - ind_w, LABEL_MICRO_Y);
             spr.print(ind_str);
         }
 
@@ -5243,8 +5255,8 @@ void draw_scanner_screen() {
     }
     int slide_offset = (int)((1.0f - slide_t) * (float)feed_row_h);
 
-    spr.setClipRect(FEED_X + UI_PAD_SM, FEED_FIRST_Y,
-                    DISP_W - FEED_X - UI_PAD_SM, DISP_H - FEED_FIRST_Y);
+    spr.setClipRect(FEED_X, FEED_FIRST_Y,
+                    FEED_RIGHT - FEED_X, DISP_H - FEED_FIRST_Y);
 
     if (scan_local_count == 0) {
         char dots[4];
@@ -5253,7 +5265,7 @@ void draw_scanner_screen() {
         snprintf(scanning, sizeof(scanning), "Scanning%s", dots);
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_BODY);
-        spr.setCursor(FEED_X + UI_PAD_SM, FEED_FIRST_Y + 10);
+        spr.setCursor(FEED_X + UI_PAD_SM, FEED_FIRST_Y + UI_PAD_SM + UI_PAD_XS);
         spr.print(scanning);
     }
 
@@ -5290,7 +5302,7 @@ void draw_scanner_screen() {
             spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
         }
 
-        int name_x = FEED_X + UI_PAD_SM + 12;
+        int name_x = FEED_X + UI_PAD_SM + UI_PAD_MD;
 
         spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
         spr.setTextSize(TS_BODY);
@@ -5311,7 +5323,7 @@ void draw_scanner_screen() {
             else if (e.rssi > -75) dot_base = DIM_COLOR;
             else                   dot_base = CARD_BORDER;
 
-            int dot_x = name_x + (int)strlen(nd) * 7 + 4;
+            int dot_x = name_x + (int)strlen(nd) * 7 + UI_PAD_XS * 2;
             if (dot_x + 2 < FEED_RIGHT) {
                 spr.fillCircle(dot_x, ry + 6, 1, lerp_col16(BG_COLOR, dot_base, af));
             }
@@ -6064,7 +6076,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     // overlapping the shared label row at VIZ_Y - 10).
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(VIZ_X + VIZ_W - 30, VIZ_Y + 2);
+    spr.setCursor(VIZ_RIGHT - UI_PAD_SM - 24, VIZ_Y + UI_PAD_XS);
     spr.print("2.4GHz");
 }
 
