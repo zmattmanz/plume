@@ -2628,6 +2628,11 @@ static unsigned long scan_last_refresh_ms = 0;
 static unsigned long scan_last_frame_ms   = 0;
 static float         scan_sweep_angle     = 0.0f;
 
+// Byte order detection for direct sprite buffer access.
+// Set once on first call to draw_scanner_viz_scan.
+static bool g_buf_bytes_swapped      = false;
+static bool g_buf_byte_order_detected = false;
+
 static bool feed_recently_pushed(const char* mac) {
     unsigned long now = millis();
     for (int i = 0; i < feed_count; i++) {
@@ -5449,8 +5454,38 @@ static void prox_radar_refresh(unsigned long frame_ms) {
     }
 }
 
+// Detect whether the sprite buffer stores RGB565 byte-swapped.
+// Writes a known logical color via drawPixel, reads back the raw buffer.
+// If the raw value doesn't match what we wrote, bytes are swapped.
+static inline void detect_buffer_byte_order(M5Canvas& sprite) {
+    if (g_buf_byte_order_detected) return;
+    uint16_t* buf = (uint16_t*)sprite.getBuffer();
+    if (!buf) return;
+    uint16_t saved = buf[0];
+    sprite.drawPixel(0, 0, 0xF800);  // pure logical red
+    g_buf_bytes_swapped = (buf[0] != 0xF800);
+    buf[0] = saved;
+    g_buf_byte_order_detected = true;
+    Serial.printf("[GFX] Buffer bytes_swapped=%d\n", (int)g_buf_bytes_swapped);
+}
+
+// Read a pixel from the sprite buffer in LOGICAL RGB565 format.
+static inline uint16_t read_pixel_logical(const uint16_t* buf, int idx) {
+    uint16_t raw = buf[idx];
+    return g_buf_bytes_swapped ? (uint16_t)((raw >> 8) | (raw << 8)) : raw;
+}
+
+// Write a pixel to the sprite buffer from a LOGICAL RGB565 value.
+static inline void write_pixel_logical(uint16_t* buf, int idx, uint16_t logical) {
+    buf[idx] = g_buf_bytes_swapped
+             ? (uint16_t)((logical >> 8) | (logical << 8))
+             : logical;
+}
+
 // ── Viz mode 0: SCAN (proximity radar) ────────────────────────────────────
 static void draw_scanner_viz_scan(unsigned long frame_ms) {
+    detect_buffer_byte_order(spr);
+
     const float PI2f = 2.0f * (float)M_PI;
 
     const int CX = VIZ_X + VIZ_W / 2;
@@ -5604,32 +5639,42 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         }
         int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
 
-        // ── Sweep glow: layered icon outlines in protocol color ──────
-        // Draws the icon shape at sz+2 then sz+1, each in a dimmer
-        // version of the protocol color. The actual icon draws on top
-        // at sz. Result: a 2-pixel halo following the icon's shape,
-        // in the icon's own color. No pixel reading, no byte order,
-        // no possibility of wrong colors.
+        // ── Sweep glow: per-pixel alpha blend, byte-order-corrected ──
+        // Reads pixel from buffer, swaps to logical format if needed,
+        // blends in logical RGB565 (where lerp_col16 works correctly),
+        // swaps back, writes to buffer. Result: correct colors guaranteed.
         if (d.sweep_bright > 0.15f) {
             float glow_t = d.sweep_bright * d.sweep_bright
                          * (3.0f - 2.0f * d.sweep_bright);
 
-            for (int layer = 2; layer >= 1; layer--) {
-                int halo_sz = sz + layer;
-                float halo_alpha = glow_t * (0.60f - (float)layer * 0.15f);
-                uint16_t halo_col = lerp_col16(BG_COLOR, base_col, halo_alpha);
+            uint16_t* sbuf = (uint16_t*)spr.getBuffer();
+            const int sbuf_w = DISP_W;
 
-                if (d.proto == 0) {
-                    spr.drawTriangle(
-                        dpx,                              dpy - halo_sz,
-                        dpx - (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
-                        dpx + (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
-                        halo_col);
-                } else {
-                    spr.drawLine(dpx,           dpy - halo_sz, dpx + halo_sz, dpy,           halo_col);
-                    spr.drawLine(dpx + halo_sz, dpy,           dpx,           dpy + halo_sz,  halo_col);
-                    spr.drawLine(dpx,           dpy + halo_sz, dpx - halo_sz, dpy,           halo_col);
-                    spr.drawLine(dpx - halo_sz, dpy,           dpx,           dpy - halo_sz,  halo_col);
+            int   glow_r    = sz + 4;
+            float glow_r2   = (float)(glow_r * glow_r);
+            float glow_peak = glow_t * 0.22f;
+
+            int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
+            int gx1 = dpx + glow_r; if (gx1 >= VIZ_X + VIZ_W) gx1 = VIZ_X + VIZ_W - 1;
+            int gy0 = dpy - glow_r; if (gy0 < VIZ_Y) gy0 = VIZ_Y;
+            int gy1 = dpy + glow_r; if (gy1 >= VIZ_Y + VIZ_H) gy1 = VIZ_Y + VIZ_H - 1;
+
+            for (int gy = gy0; gy <= gy1; gy++) {
+                int row_off = gy * sbuf_w;
+                for (int gx = gx0; gx <= gx1; gx++) {
+                    float dx = (float)(gx - dpx);
+                    float dy = (float)(gy - dpy);
+                    float dist2 = dx * dx + dy * dy;
+                    if (dist2 >= glow_r2) continue;
+
+                    float alpha = glow_peak * (1.0f - dist2 / glow_r2);
+                    if (alpha < 0.015f) continue;
+
+                    int idx = row_off + gx;
+                    uint16_t existing_logical = read_pixel_logical(sbuf, idx);
+                    uint16_t blended_logical  = lerp_col16(existing_logical,
+                                                           base_col, alpha);
+                    write_pixel_logical(sbuf, idx, blended_logical);
                 }
             }
         }
@@ -9489,6 +9534,7 @@ void loop() {
         unsigned long now_amb = millis();
         if (now_amb - last_ambient_draw > 33) {  // ~30 fps
             spr.fillSprite(BG_COLOR);
+            detect_buffer_byte_order(spr);
 
             unsigned long frame_ms = now_amb;
             // Refresh the feed snapshot for the proximity radar
@@ -9623,25 +9669,34 @@ void loop() {
                     const int DSZ = (int)(4.0f * (1.0f + pulse_factor));
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
 
-                    // Sweep glow — layered icon outlines (ambient)
+                    // Sweep glow — byte-order-corrected blend (ambient)
                     if (d.sweep_bright > 0.15f) {
                         float glow_t = d.sweep_bright * d.sweep_bright
                                      * (3.0f - 2.0f * d.sweep_bright);
-                        for (int layer = 2; layer >= 1; layer--) {
-                            int halo_sz = DSZ + layer;
-                            float halo_alpha = glow_t * (0.55f - (float)layer * 0.15f);
-                            uint16_t halo_col = lerp_col16(BG_COLOR, bcol, halo_alpha);
-                            if (d.proto == 0) {
-                                spr.drawTriangle(
-                                    dpx,                              dpy - halo_sz,
-                                    dpx - (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
-                                    dpx + (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
-                                    halo_col);
-                            } else {
-                                spr.drawLine(dpx,           dpy - halo_sz, dpx + halo_sz, dpy,           halo_col);
-                                spr.drawLine(dpx + halo_sz, dpy,           dpx,           dpy + halo_sz,  halo_col);
-                                spr.drawLine(dpx,           dpy + halo_sz, dpx - halo_sz, dpy,           halo_col);
-                                spr.drawLine(dpx - halo_sz, dpy,           dpx,           dpy - halo_sz,  halo_col);
+                        uint16_t* sbuf = (uint16_t*)spr.getBuffer();
+                        const int sbuf_w = DISP_W;
+                        int   glow_r  = DSZ + 4;
+                        float glow_r2 = (float)(glow_r * glow_r);
+                        float glow_peak = glow_t * 0.20f;
+
+                        int gx0 = dpx - glow_r; if (gx0 < 0) gx0 = 0;
+                        int gx1 = dpx + glow_r; if (gx1 >= DISP_W) gx1 = DISP_W - 1;
+                        int gy0 = dpy - glow_r; if (gy0 < 0) gy0 = 0;
+                        int gy1 = dpy + glow_r; if (gy1 >= DISP_H) gy1 = DISP_H - 1;
+
+                        for (int gy = gy0; gy <= gy1; gy++) {
+                            int row_off = gy * sbuf_w;
+                            for (int gx = gx0; gx <= gx1; gx++) {
+                                float dx = (float)(gx - dpx);
+                                float dy = (float)(gy - dpy);
+                                float dist2 = dx * dx + dy * dy;
+                                if (dist2 >= glow_r2) continue;
+                                float alpha = glow_peak * (1.0f - dist2 / glow_r2);
+                                if (alpha < 0.015f) continue;
+                                int idx = row_off + gx;
+                                uint16_t existing_logical = read_pixel_logical(sbuf, idx);
+                                uint16_t blended_logical  = lerp_col16(existing_logical, bcol, alpha);
+                                write_pixel_logical(sbuf, idx, blended_logical);
                             }
                         }
                     }
