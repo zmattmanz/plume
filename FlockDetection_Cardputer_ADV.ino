@@ -5213,7 +5213,7 @@ void draw_scanner_screen() {
     }
     spr.clearClipRect();
 
-    if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
+    if (frame_ms - scan_feed_last_snapshot >= 1750 || scan_feed_last_snapshot == 0) {
         if (take_data_mutex()) {
             scan_local_count = feed_count;
             scan_local_head  = feed_head;
@@ -5500,10 +5500,13 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     // Two overlapping sine waves: primary at 0.7× rotation, secondary at 1.3×.
     // The secondary adds asymmetry — the sweep doesn't just speed up and slow
     // down symmetrically, it lingers in some quadrants more than others.
+    // Stronger swing: primary ±25%, secondary ±12%.
+    // The sweep visibly pauses in some quadrants and accelerates
+    // through others. Total range: ±37% at rare beat peaks.
     float swing = 1.0f
-                + 0.18f * sinf(scan_sweep_angle * 0.7f)
-                + 0.08f * sinf(scan_sweep_angle * 1.3f);
-    scan_sweep_angle += 0.0012f * dt * swing;
+                + 0.25f * sinf(scan_sweep_angle * 0.7f)
+                + 0.12f * sinf(scan_sweep_angle * 1.3f);
+    scan_sweep_angle += 0.0018f * dt * swing;
     if (scan_sweep_angle >= PI2f) scan_sweep_angle -= PI2f;
 
     // ── 1. Phosphor glow (lowest layer) ──────────────────────────────────
@@ -5585,7 +5588,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
             if (target > d.sweep_bright) d.sweep_bright = target;
             d.last_sweep_ms = frame_ms;
         } else if (frame_ms - d.last_sweep_ms > 1000) {
-            d.sweep_bright += (0.0f - d.sweep_bright) * 0.006f * dt;
+            d.sweep_bright *= powf(0.9975f, (float)dt);
             if (d.sweep_bright < 0.0f) d.sweep_bright = 0.0f;
         }
 
@@ -5644,8 +5647,9 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         // blends in logical RGB565 (where lerp_col16 works correctly),
         // swaps back, writes to buffer. Result: correct colors guaranteed.
         if (d.sweep_bright > 0.08f) {
-            float glow_t = d.sweep_bright * d.sweep_bright
-                         * (3.0f - 2.0f * d.sweep_bright);
+            // Asymmetric ease: fast snap-on at high sweep_bright,
+            // gentle tail at low sweep_bright.
+            float glow_t = powf(d.sweep_bright, 0.6f);
 
             uint16_t* sbuf = (uint16_t*)spr.getBuffer();
             const int sbuf_w = DISP_W;
@@ -5714,9 +5718,11 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
 
     // ── 5. Center dot in box frame (topmost) ─────────────────────────────
     {
-        const int box_sz = 6;
+        const int box_sz = 7;
         spr.drawRect(CX - box_sz, CY - box_sz, box_sz * 2, box_sz * 2,
                      lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
+        spr.drawRect(CX - box_sz + 1, CY - box_sz + 1, box_sz * 2 - 2, box_sz * 2 - 2,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
         spr.fillCircle(CX, CY, 2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f));
     }
 }
@@ -9538,7 +9544,7 @@ void loop() {
 
             unsigned long frame_ms = now_amb;
             // Refresh the feed snapshot for the proximity radar
-            if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
+            if (frame_ms - scan_feed_last_snapshot >= 1750 || scan_feed_last_snapshot == 0) {
                 if (take_data_mutex()) {
                     scan_local_count = feed_count;
                     scan_local_head  = feed_head;
@@ -9562,7 +9568,7 @@ void loop() {
                 scan_last_frame_ms = frame_ms;
 
                 static float amb_sweep = 0.0f;
-                amb_sweep += adt * 0.001f * (PI2f / 5.0f);
+                amb_sweep += adt * 0.0015f * (PI2f / 5.0f);
                 if (amb_sweep > PI2f) amb_sweep -= PI2f;
 
                 float as_sin, as_cos;
@@ -9639,7 +9645,7 @@ void loop() {
                         if (tsb > d.sweep_bright) d.sweep_bright = tsb;
                         else d.sweep_bright = anim_filter(d.sweep_bright, tsb, 300.0f, adt);
                     } else {
-                        d.sweep_bright = anim_filter(d.sweep_bright, 0.0f, 600.0f, adt);
+                        d.sweep_bright *= powf(0.9975f, (float)adt);
                     }
                 }
 
@@ -9671,8 +9677,7 @@ void loop() {
 
                     // Sweep glow — byte-order-corrected blend (ambient)
                     if (d.sweep_bright > 0.08f) {
-                        float glow_t = d.sweep_bright * d.sweep_bright
-                                     * (3.0f - 2.0f * d.sweep_bright);
+                        float glow_t = powf(d.sweep_bright, 0.6f);
                         uint16_t* sbuf = (uint16_t*)spr.getBuffer();
                         const int sbuf_w = DISP_W;
                         int   glow_r  = DSZ + 6;
@@ -9722,7 +9727,14 @@ void loop() {
                     }
                 }
 
-                // Center dot
+                // Center dot in double-stroke box
+                {
+                    const int box_sz = 7;
+                    spr.drawRect(ACX - box_sz, ACY - box_sz, box_sz * 2, box_sz * 2,
+                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
+                    spr.drawRect(ACX - box_sz + 1, ACY - box_sz + 1, box_sz * 2 - 2, box_sz * 2 - 2,
+                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
+                }
                 spr.fillCircle(ACX, ACY, 2, CENTER_DOT);
                 spr.drawPixel(ACX, ACY, CENTER_DOT_BRIGHT);
             }
