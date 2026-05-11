@@ -5528,6 +5528,25 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     }
 
     // ── 4. Device icons ───────────────────────────────────────────────────
+    // Glow buffer setup: convert protocol colors to raw format.
+    // drawPixel handles logical→raw conversion internally. Writing a
+    // known color then reading it back from the buffer gives us the raw
+    // representation. This sidesteps any byte-swap mismatch between
+    // lgfx::color565 and the sprite's internal storage format.
+    uint16_t* sprite_buf = (uint16_t*)spr.getBuffer();
+    const int sprite_stride = DISP_W;
+    uint16_t raw_header, raw_purple, raw_caution;
+    {
+        uint16_t saved_px = sprite_buf[0];
+        spr.drawPixel(0, 0, HEADER_COLOR);
+        raw_header = sprite_buf[0];
+        spr.drawPixel(0, 0, PURPLE_COLOR);
+        raw_purple = sprite_buf[0];
+        spr.drawPixel(0, 0, CAUTION_COLOR);
+        raw_caution = sprite_buf[0];
+        sprite_buf[0] = saved_px;
+    }
+
     prox_radar_refresh(frame_ms);
 
     for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
@@ -5604,20 +5623,18 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         }
         int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
 
-        // ── Sweep glow: per-pixel alpha blend via readPixelValue ─────
-        // Reads each pixel in the glow radius, blends it toward the
-        // protocol color, writes it back. Produces a smooth radial
-        // gradient that adds brightness without erasing the phosphor
-        // trail or background.
-        //
-        // ~1000 pixels per icon at r=13px. At 160MHz with 5 icons
-        // glowing simultaneously, total cost is ~0.2ms per frame.
+        // ── Sweep glow: direct buffer per-pixel blend ────────────────
+        // Both existing pixel and target color are in raw buffer format.
+        // No byte-order mismatch. No API calls in the hot loop.
         if (d.sweep_bright > 0.15f) {
             float glow_t = d.sweep_bright * d.sweep_bright
                          * (3.0f - 2.0f * d.sweep_bright);
 
-            int   glow_r    = (int)((float)sz * 1.8f);
-            float glow_r2   = (float)(glow_r * glow_r);
+            uint16_t raw_base = d.is_flock ? raw_caution
+                              : (d.proto == 0 ? raw_header : raw_purple);
+
+            int   glow_r  = sz + 3;
+            float glow_r2 = (float)(glow_r * glow_r);
             float glow_peak = glow_t * 0.18f;
 
             int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
@@ -5626,6 +5643,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
             int gy1 = dpy + glow_r; if (gy1 >= VIZ_Y + VIZ_H) gy1 = VIZ_Y + VIZ_H - 1;
 
             for (int gy = gy0; gy <= gy1; gy++) {
+                int row_off = gy * sprite_stride;
                 for (int gx = gx0; gx <= gx1; gx++) {
                     float dx = (float)(gx - dpx);
                     float dy = (float)(gy - dpy);
@@ -5635,9 +5653,9 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
                     float alpha = glow_peak * (1.0f - dist2 / glow_r2);
                     if (alpha < 0.015f) continue;
 
-                    uint16_t existing = (uint16_t)spr.readPixelValue(gx, gy);
-                    spr.drawPixel(gx, gy,
-                                  lerp_col16(existing, base_col, alpha));
+                    int idx = row_off + gx;
+                    sprite_buf[idx] = lerp_col16(sprite_buf[idx],
+                                                  raw_base, alpha);
                 }
             }
         }
@@ -9498,6 +9516,20 @@ void loop() {
         if (now_amb - last_ambient_draw > 33) {  // ~30 fps
             spr.fillSprite(BG_COLOR);
 
+            uint16_t* sprite_buf = (uint16_t*)spr.getBuffer();
+            const int sprite_stride = DISP_W;
+            uint16_t raw_header, raw_purple, raw_caution;
+            {
+                uint16_t saved_px = sprite_buf[0];
+                spr.drawPixel(0, 0, HEADER_COLOR);
+                raw_header = sprite_buf[0];
+                spr.drawPixel(0, 0, PURPLE_COLOR);
+                raw_purple = sprite_buf[0];
+                spr.drawPixel(0, 0, CAUTION_COLOR);
+                raw_caution = sprite_buf[0];
+                sprite_buf[0] = saved_px;
+            }
+
             unsigned long frame_ms = now_amb;
             // Refresh the feed snapshot for the proximity radar
             if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
@@ -9631,11 +9663,13 @@ void loop() {
                     const int DSZ = (int)(4.0f * (1.0f + pulse_factor));
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
 
-                    // Sweep glow — per-pixel alpha blend (ambient)
+                    // Sweep glow — direct buffer blend (ambient)
                     if (d.sweep_bright > 0.15f) {
                         float glow_t = d.sweep_bright * d.sweep_bright
                                      * (3.0f - 2.0f * d.sweep_bright);
-                        int   glow_r  = (int)((float)DSZ * 1.8f);
+                        uint16_t raw_base = d.is_flock ? raw_caution
+                                          : (d.proto == 0 ? raw_header : raw_purple);
+                        int   glow_r  = DSZ + 3;
                         float glow_r2 = (float)(glow_r * glow_r);
                         float glow_peak = glow_t * 0.15f;
 
@@ -9645,6 +9679,7 @@ void loop() {
                         int gy1 = dpy + glow_r; if (gy1 >= DISP_H) gy1 = DISP_H - 1;
 
                         for (int gy = gy0; gy <= gy1; gy++) {
+                            int row_off = gy * sprite_stride;
                             for (int gx = gx0; gx <= gx1; gx++) {
                                 float dx = (float)(gx - dpx);
                                 float dy = (float)(gy - dpy);
@@ -9652,9 +9687,9 @@ void loop() {
                                 if (dist2 >= glow_r2) continue;
                                 float alpha = glow_peak * (1.0f - dist2 / glow_r2);
                                 if (alpha < 0.015f) continue;
-                                uint16_t existing = (uint16_t)spr.readPixelValue(gx, gy);
-                                spr.drawPixel(gx, gy,
-                                              lerp_col16(existing, bcol, alpha));
+                                int idx = row_off + gx;
+                                sprite_buf[idx] = lerp_col16(sprite_buf[idx],
+                                                              raw_base, alpha);
                             }
                         }
                     }
