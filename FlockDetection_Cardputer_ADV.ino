@@ -5604,24 +5604,19 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         }
         int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
 
-        // Sweep glow — smooth radial bloom behind the icon on sweep contact
+        // Sweep glow — concentric outline rings that sit ON TOP of the
+        // phosphor trail without erasing it. drawCircle writes only the
+        // 1px circumference, not the filled interior. Ring alpha starts
+        // above the trail's PEAK (0.18) so every pixel is additive-bright.
         if (d.sweep_bright > 0.08f) {
             float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-            float glow_radius = (float)sz * 2.8f;
-            float glow_peak   = glow_t * 0.22f;
-            // 6 concentric fillCircle calls, outside-in. Each inner circle
-            // overwrites the center of the outer one, leaving a thin donut
-            // of the outer color visible. With 6 steps the donuts are narrow
-            // enough to read as a smooth gradient on the LCD.
-            const int GLOW_RINGS = 6;
-            for (int gi = 0; gi < GLOW_RINGS; gi++) {
-                float ring_t = (float)gi / (float)(GLOW_RINGS - 1);  // 0.0 → 1.0
-                float r = glow_radius * (1.0f - ring_t * 0.85f);     // outer → 15% of radius
-                float a = glow_peak * (0.15f + ring_t * 0.85f);      // 15% → 100% of peak
-                a *= (0.3f + 0.7f * ring_t);
-                int ri = (int)r;
-                if (ri < 2) continue;
-                spr.fillCircle(dpx, dpy, ri, lerp_col16(BG_COLOR, base_col, a));
+            int max_r = (int)((float)sz * 2.5f);
+            for (int gr = sz + 2; gr <= max_r; gr += 2) {
+                float ring_t = (float)(gr - sz) / (float)(max_r - sz);
+                float alpha = glow_t * (0.40f - ring_t * 0.20f);
+                if (alpha < 0.03f) continue;
+                spr.drawCircle(dpx, dpy, gr,
+                               lerp_col16(BG_COLOR, base_col, alpha));
             }
         }
 
@@ -9614,19 +9609,16 @@ void loop() {
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
 
                     // Sweep glow — matches active scan radar
+                    // Sweep glow — outline rings
                     if (d.sweep_bright > 0.08f) {
                         float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-                        float glow_radius = (float)DSZ * 2.8f;
-                        float glow_peak   = glow_t * 0.18f;
-                        const int GLOW_RINGS = 6;
-                        for (int gi = 0; gi < GLOW_RINGS; gi++) {
-                            float ring_t = (float)gi / (float)(GLOW_RINGS - 1);
-                            float r = glow_radius * (1.0f - ring_t * 0.85f);
-                            float a = glow_peak * (0.15f + ring_t * 0.85f);
-                            a *= (0.3f + 0.7f * ring_t);
-                            int ri = (int)r;
-                            if (ri < 2) continue;
-                            spr.fillCircle(dpx, dpy, ri, lerp_col16(BG_COLOR, bcol, a));
+                        int max_r = (int)((float)DSZ * 2.5f);
+                        for (int gr = DSZ + 2; gr <= max_r; gr += 2) {
+                            float ring_t = (float)(gr - DSZ) / (float)(max_r - DSZ);
+                            float alpha = glow_t * (0.35f - ring_t * 0.18f);
+                            if (alpha < 0.03f) continue;
+                            spr.drawCircle(dpx, dpy, gr,
+                                           lerp_col16(BG_COLOR, bcol, alpha));
                         }
                     }
 
