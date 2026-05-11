@@ -5813,7 +5813,8 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     // the rest of the spectrum renders against the same bounds.
     {
         uint16_t hatch_col = HATCH_COLOR;
-        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+        // Clip hatch to plot area only — channel labels below sit on clean BG
+        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, plot_bottom - VIZ_Y);
         for (int d = -VIZ_H; d < VIZ_W + VIZ_H; d += 8) {
             int x0 = VIZ_X + d;
             int y0 = VIZ_Y;
@@ -5822,7 +5823,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
             spr.drawLine(x0,     y0, x1,     y1, hatch_col);
             spr.drawLine(x0 + 1, y0, x1 + 1, y1, hatch_col);
         }
-        spr.setClipRect(0, VIZ_Y - 2, DIVIDER_X, VIZ_H + 4);
+        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
     }
 
     spr.drawFastHLine(plot_x, plot_bottom, plot_w, GRID_LINE_DIM);
@@ -5843,7 +5844,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         }
     }
 
-    const float MAX_HEIGHT = (float)plot_h * 0.80f;
+    const float MAX_HEIGHT = (float)plot_h * 0.70f;
     auto val_to_y = [&](float val) -> int {
         return plot_bottom - (int)(val * MAX_HEIGHT);
     };
@@ -5992,14 +5993,18 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
                         + SPECTRUM_GHOST_FRAMES) % SPECTRUM_GHOST_FRAMES;
         float ghost_alpha = 0.10f
                           + ((float)gi / (float)ghost_count) * 0.15f;
-        uint16_t ghost_col = lerp_col16(BG_COLOR, HEADER_COLOR, ghost_alpha);
+        uint16_t ghost_col_wifi = lerp_col16(BG_COLOR, HEADER_COLOR, ghost_alpha);
+        uint16_t ghost_col_ble  = lerp_col16(BG_COLOR, PURPLE_COLOR, ghost_alpha);
 
         int gp_prev_x = -1, gp_prev_y = -1;
         for (int px_col = 0; px_col <= plot_w; px_col++) {
             int gx = plot_x + px_col;
             int gy = (int)spectrum_ghost_y[ring_idx][px_col];
             if (gp_prev_x >= 0) {
-                spr.drawLine(gp_prev_x, gp_prev_y, gx, gy, ghost_col);
+                float ch_f = (float)px_col / (float)plot_w * 12.0f;
+                int ch_i = (int)ch_f;
+                uint16_t gc = (ble_active && ch_i <= 10) ? ghost_col_ble : ghost_col_wifi;
+                spr.drawLine(gp_prev_x, gp_prev_y, gx, gy, gc);
             }
             gp_prev_x = gx;
             gp_prev_y = gy;
@@ -6052,32 +6057,38 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 
         if (prev_px >= 0) {
             bool near_flock = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
-            uint16_t line_col = near_flock ? CAUTION_COLOR : HEADER_COLOR;
+            uint16_t line_col;
+            if (near_flock)                    line_col = CAUTION_COLOR;
+            else if (ble_active && ch_i <= 10) line_col = PURPLE_COLOR;
+            else                               line_col = HEADER_COLOR;
             spr.drawLine(prev_px, prev_py, cx, cy, line_col);
         }
         prev_px = cx;
         prev_py = cy;
     }
 
-    // Intersection dot — bright marker where the eased scan line meets
-    // the curve. Uses the same Catmull-Rom evaluator as the curve so
-    // the dot sits exactly on the rendered line.
+    // Intersection dot — color follows channel protocol
     {
-        int dot_col = scan_x - plot_x;
-        if (dot_col < 0)      dot_col = 0;
-        if (dot_col > plot_w) dot_col = plot_w;
-        float dot_val = curve_cache[dot_col];
+        int dot_col_px = scan_x - plot_x;
+        if (dot_col_px < 0)      dot_col_px = 0;
+        if (dot_col_px > plot_w) dot_col_px = plot_w;
+        float dot_val = curve_cache[dot_col_px];
         int dot_y = val_to_y(dot_val);
-        spr.fillCircle(scan_x, dot_y, 1, HEADER_COLOR);
-        spr.drawCircle(scan_x, dot_y, 2, HEADER_COLOR);
+        float dot_ch_f = (float)dot_col_px / (float)plot_w * 12.0f;
+        int dot_ch_i = (int)dot_ch_f;
+        uint16_t dot_c = (ble_active && dot_ch_i <= 10) ? PURPLE_COLOR : HEADER_COLOR;
+        spr.fillCircle(scan_x, dot_y, 1, dot_c);
+        spr.drawCircle(scan_x, dot_y, 2, dot_c);
     }
 
-    // Band label inside the viz, top-right (replaces CH overlay that was
-    // overlapping the shared label row at VIZ_Y - 10).
-    spr.setTextColor(DIM_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(VIZ_RIGHT - UI_PAD_SM - 24, VIZ_Y + UI_PAD_XS);
-    spr.print("2.4GHz");
+    // Band pill — top-right of viz area, consistent with header pill style
+    {
+        const char* band_label = "2.4GHz";
+        int pill_w = (int)strlen(band_label) * 7 + UI_PAD_SM;
+        int pill_x = VIZ_RIGHT - UI_PAD_SM - pill_w;
+        int pill_y = VIZ_Y + UI_PAD_XS;
+        drawPill(pill_x, pill_y, band_label, DIM_COLOR);
+    }
 }
 
 // ── Viz mode 3: LAYERED TIMELINE ─────────────────────────────────────────
