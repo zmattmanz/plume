@@ -5537,7 +5537,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     float swing = 1.0f
                 + 0.25f * sinf(scan_sweep_angle * 0.7f)
                 + 0.12f * sinf(scan_sweep_angle * 1.3f);
-    scan_sweep_angle += 0.0013f * dt * swing;
+    scan_sweep_angle += 0.0015f * dt * swing;
     if (scan_sweep_angle >= PI2f) scan_sweep_angle -= PI2f;
 
     // ── 1. Phosphor glow (lowest layer) ──────────────────────────────────
@@ -5993,18 +5993,14 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
                         + SPECTRUM_GHOST_FRAMES) % SPECTRUM_GHOST_FRAMES;
         float ghost_alpha = 0.10f
                           + ((float)gi / (float)ghost_count) * 0.15f;
-        uint16_t ghost_col_wifi = lerp_col16(BG_COLOR, HEADER_COLOR, ghost_alpha);
-        uint16_t ghost_col_ble  = lerp_col16(BG_COLOR, PURPLE_COLOR, ghost_alpha);
+        uint16_t ghost_col = lerp_col16(BG_COLOR, HEADER_COLOR, ghost_alpha);
 
         int gp_prev_x = -1, gp_prev_y = -1;
         for (int px_col = 0; px_col <= plot_w; px_col++) {
             int gx = plot_x + px_col;
             int gy = (int)spectrum_ghost_y[ring_idx][px_col];
             if (gp_prev_x >= 0) {
-                float ch_f = (float)px_col / (float)plot_w * 12.0f;
-                int ch_i = (int)ch_f;
-                uint16_t gc = (ble_active && ch_i <= 10) ? ghost_col_ble : ghost_col_wifi;
-                spr.drawLine(gp_prev_x, gp_prev_y, gx, gy, gc);
+                spr.drawLine(gp_prev_x, gp_prev_y, gx, gy, ghost_col);
             }
             gp_prev_x = gx;
             gp_prev_y = gy;
@@ -6057,28 +6053,22 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 
         if (prev_px >= 0) {
             bool near_flock = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
-            uint16_t line_col;
-            if (near_flock)                    line_col = CAUTION_COLOR;
-            else if (ble_active && ch_i <= 10) line_col = PURPLE_COLOR;
-            else                               line_col = HEADER_COLOR;
+            uint16_t line_col = near_flock ? CAUTION_COLOR : HEADER_COLOR;
             spr.drawLine(prev_px, prev_py, cx, cy, line_col);
         }
         prev_px = cx;
         prev_py = cy;
     }
 
-    // Intersection dot — color follows channel protocol
+    // Intersection dot
     {
         int dot_col_px = scan_x - plot_x;
         if (dot_col_px < 0)      dot_col_px = 0;
         if (dot_col_px > plot_w) dot_col_px = plot_w;
         float dot_val = curve_cache[dot_col_px];
         int dot_y = val_to_y(dot_val);
-        float dot_ch_f = (float)dot_col_px / (float)plot_w * 12.0f;
-        int dot_ch_i = (int)dot_ch_f;
-        uint16_t dot_c = (ble_active && dot_ch_i <= 10) ? PURPLE_COLOR : HEADER_COLOR;
-        spr.fillCircle(scan_x, dot_y, 1, dot_c);
-        spr.drawCircle(scan_x, dot_y, 2, dot_c);
+        spr.fillCircle(scan_x, dot_y, 1, HEADER_COLOR);
+        spr.drawCircle(scan_x, dot_y, 2, HEADER_COLOR);
     }
 
     // Band pill — top-right of viz area, consistent with header pill style
@@ -6365,14 +6355,14 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         for (int mi = 0; mi < 6; mi++) {
             float tt = -0.10f + marks[mi].t_norm * 1.30f;
             int mx = TMX(tt);
-            int my = TMY(tt);
+            int my = TMY(tt) + UI_PAD_SM;  // offset below ribbon baseline
             if (mx < VIZ_X || mx > VIZ_X + VIZ_W) continue;
-            if (my + 4 < VIZ_Y || my > VIZ_Y + VIZ_H - 2) continue;
-            spr.drawFastVLine(mx, my - 1, 3, DIM_COLOR);
+            if (my + UI_PAD_SM < VIZ_Y || my > VIZ_Y + VIZ_H - UI_PAD_XS) continue;
+            spr.drawFastVLine(mx, my, 3, DIM_COLOR);
             int label_w = (int)strlen(marks[mi].label) * 6;
             int lx = mx - label_w / 2;
             if (lx < VIZ_X) lx = VIZ_X;
-            spr.setCursor(lx, my + 4);
+            spr.setCursor(lx, my + UI_PAD_XS + 2);
             spr.print(marks[mi].label);
         }
     }
@@ -9611,7 +9601,7 @@ void loop() {
                 scan_last_frame_ms = frame_ms;
 
                 static float amb_sweep = 0.0f;
-                amb_sweep += adt * 0.0010f * (PI2f / 5.0f);
+                amb_sweep += adt * 0.0012f * (PI2f / 5.0f);
                 if (amb_sweep > PI2f) amb_sweep -= PI2f;
 
                 float as_sin, as_cos;
