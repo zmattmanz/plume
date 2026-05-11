@@ -5528,25 +5528,6 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     }
 
     // ── 4. Device icons ───────────────────────────────────────────────────
-    // Glow buffer setup: convert protocol colors to raw format.
-    // drawPixel handles logical→raw conversion internally. Writing a
-    // known color then reading it back from the buffer gives us the raw
-    // representation. This sidesteps any byte-swap mismatch between
-    // lgfx::color565 and the sprite's internal storage format.
-    uint16_t* sprite_buf = (uint16_t*)spr.getBuffer();
-    const int sprite_stride = DISP_W;
-    uint16_t raw_header, raw_purple, raw_caution;
-    {
-        uint16_t saved_px = sprite_buf[0];
-        spr.drawPixel(0, 0, HEADER_COLOR);
-        raw_header = sprite_buf[0];
-        spr.drawPixel(0, 0, PURPLE_COLOR);
-        raw_purple = sprite_buf[0];
-        spr.drawPixel(0, 0, CAUTION_COLOR);
-        raw_caution = sprite_buf[0];
-        sprite_buf[0] = saved_px;
-    }
-
     prox_radar_refresh(frame_ms);
 
     for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
@@ -5623,39 +5604,32 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         }
         int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
 
-        // ── Sweep glow: direct buffer per-pixel blend ────────────────
-        // Both existing pixel and target color are in raw buffer format.
-        // No byte-order mismatch. No API calls in the hot loop.
+        // ── Sweep glow: layered icon outlines in protocol color ──────
+        // Draws the icon shape at sz+2 then sz+1, each in a dimmer
+        // version of the protocol color. The actual icon draws on top
+        // at sz. Result: a 2-pixel halo following the icon's shape,
+        // in the icon's own color. No pixel reading, no byte order,
+        // no possibility of wrong colors.
         if (d.sweep_bright > 0.15f) {
             float glow_t = d.sweep_bright * d.sweep_bright
                          * (3.0f - 2.0f * d.sweep_bright);
 
-            uint16_t raw_base = d.is_flock ? raw_caution
-                              : (d.proto == 0 ? raw_header : raw_purple);
+            for (int layer = 2; layer >= 1; layer--) {
+                int halo_sz = sz + layer;
+                float halo_alpha = glow_t * (0.60f - (float)layer * 0.15f);
+                uint16_t halo_col = lerp_col16(BG_COLOR, base_col, halo_alpha);
 
-            int   glow_r  = sz + 3;
-            float glow_r2 = (float)(glow_r * glow_r);
-            float glow_peak = glow_t * 0.18f;
-
-            int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
-            int gx1 = dpx + glow_r; if (gx1 >= VIZ_X + VIZ_W) gx1 = VIZ_X + VIZ_W - 1;
-            int gy0 = dpy - glow_r; if (gy0 < VIZ_Y) gy0 = VIZ_Y;
-            int gy1 = dpy + glow_r; if (gy1 >= VIZ_Y + VIZ_H) gy1 = VIZ_Y + VIZ_H - 1;
-
-            for (int gy = gy0; gy <= gy1; gy++) {
-                int row_off = gy * sprite_stride;
-                for (int gx = gx0; gx <= gx1; gx++) {
-                    float dx = (float)(gx - dpx);
-                    float dy = (float)(gy - dpy);
-                    float dist2 = dx * dx + dy * dy;
-                    if (dist2 >= glow_r2) continue;
-
-                    float alpha = glow_peak * (1.0f - dist2 / glow_r2);
-                    if (alpha < 0.015f) continue;
-
-                    int idx = row_off + gx;
-                    sprite_buf[idx] = lerp_col16(sprite_buf[idx],
-                                                  raw_base, alpha);
+                if (d.proto == 0) {
+                    spr.drawTriangle(
+                        dpx,                              dpy - halo_sz,
+                        dpx - (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
+                        dpx + (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
+                        halo_col);
+                } else {
+                    spr.drawLine(dpx,           dpy - halo_sz, dpx + halo_sz, dpy,           halo_col);
+                    spr.drawLine(dpx + halo_sz, dpy,           dpx,           dpy + halo_sz,  halo_col);
+                    spr.drawLine(dpx,           dpy + halo_sz, dpx - halo_sz, dpy,           halo_col);
+                    spr.drawLine(dpx - halo_sz, dpy,           dpx,           dpy - halo_sz,  halo_col);
                 }
             }
         }
@@ -9516,20 +9490,6 @@ void loop() {
         if (now_amb - last_ambient_draw > 33) {  // ~30 fps
             spr.fillSprite(BG_COLOR);
 
-            uint16_t* sprite_buf = (uint16_t*)spr.getBuffer();
-            const int sprite_stride = DISP_W;
-            uint16_t raw_header, raw_purple, raw_caution;
-            {
-                uint16_t saved_px = sprite_buf[0];
-                spr.drawPixel(0, 0, HEADER_COLOR);
-                raw_header = sprite_buf[0];
-                spr.drawPixel(0, 0, PURPLE_COLOR);
-                raw_purple = sprite_buf[0];
-                spr.drawPixel(0, 0, CAUTION_COLOR);
-                raw_caution = sprite_buf[0];
-                sprite_buf[0] = saved_px;
-            }
-
             unsigned long frame_ms = now_amb;
             // Refresh the feed snapshot for the proximity radar
             if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
@@ -9663,33 +9623,25 @@ void loop() {
                     const int DSZ = (int)(4.0f * (1.0f + pulse_factor));
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
 
-                    // Sweep glow — direct buffer blend (ambient)
+                    // Sweep glow — layered icon outlines (ambient)
                     if (d.sweep_bright > 0.15f) {
                         float glow_t = d.sweep_bright * d.sweep_bright
                                      * (3.0f - 2.0f * d.sweep_bright);
-                        uint16_t raw_base = d.is_flock ? raw_caution
-                                          : (d.proto == 0 ? raw_header : raw_purple);
-                        int   glow_r  = DSZ + 3;
-                        float glow_r2 = (float)(glow_r * glow_r);
-                        float glow_peak = glow_t * 0.15f;
-
-                        int gx0 = dpx - glow_r; if (gx0 < 0) gx0 = 0;
-                        int gx1 = dpx + glow_r; if (gx1 >= DISP_W) gx1 = DISP_W - 1;
-                        int gy0 = dpy - glow_r; if (gy0 < 0) gy0 = 0;
-                        int gy1 = dpy + glow_r; if (gy1 >= DISP_H) gy1 = DISP_H - 1;
-
-                        for (int gy = gy0; gy <= gy1; gy++) {
-                            int row_off = gy * sprite_stride;
-                            for (int gx = gx0; gx <= gx1; gx++) {
-                                float dx = (float)(gx - dpx);
-                                float dy = (float)(gy - dpy);
-                                float dist2 = dx * dx + dy * dy;
-                                if (dist2 >= glow_r2) continue;
-                                float alpha = glow_peak * (1.0f - dist2 / glow_r2);
-                                if (alpha < 0.015f) continue;
-                                int idx = row_off + gx;
-                                sprite_buf[idx] = lerp_col16(sprite_buf[idx],
-                                                              raw_base, alpha);
+                        for (int layer = 2; layer >= 1; layer--) {
+                            int halo_sz = DSZ + layer;
+                            float halo_alpha = glow_t * (0.55f - (float)layer * 0.15f);
+                            uint16_t halo_col = lerp_col16(BG_COLOR, bcol, halo_alpha);
+                            if (d.proto == 0) {
+                                spr.drawTriangle(
+                                    dpx,                              dpy - halo_sz,
+                                    dpx - (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
+                                    dpx + (int)(halo_sz * 0.85f),    dpy + (int)(halo_sz * 0.65f),
+                                    halo_col);
+                            } else {
+                                spr.drawLine(dpx,           dpy - halo_sz, dpx + halo_sz, dpy,           halo_col);
+                                spr.drawLine(dpx + halo_sz, dpy,           dpx,           dpy + halo_sz,  halo_col);
+                                spr.drawLine(dpx,           dpy + halo_sz, dpx - halo_sz, dpy,           halo_col);
+                                spr.drawLine(dpx - halo_sz, dpy,           dpx,           dpy - halo_sz,  halo_col);
                             }
                         }
                     }
