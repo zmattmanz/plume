@@ -851,7 +851,7 @@ unsigned long last_blip_time = 0;
 // ── Live activity feed (scanner screen) ──
 #define FEED_SIZE 8
 #define FEED_DEDUP_WINDOW_MS   30000UL
-#define FEED_MIN_PUSH_INTERVAL_MS 800UL
+#define FEED_MIN_PUSH_INTERVAL_MS 1200UL
 
 struct FeedEntry {
     char     mac[18];
@@ -5213,7 +5213,7 @@ void draw_scanner_screen() {
     }
     spr.clearClipRect();
 
-    if (frame_ms - scan_feed_last_snapshot >= 1750 || scan_feed_last_snapshot == 0) {
+    if (frame_ms - scan_feed_last_snapshot >= 2500 || scan_feed_last_snapshot == 0) {
         if (take_data_mutex()) {
             scan_local_count = feed_count;
             scan_local_head  = feed_head;
@@ -5326,6 +5326,22 @@ void draw_scanner_screen() {
                                   FEED_RIGHT - FEED_X - UI_PAD_SM * 2, sep_col);
             }
         }
+
+        // ── Radar glow sync: if this device is lit on the scan radar,
+        // draw a faint accent bar on the left edge of the feed row ──
+        if (scanner_viz_mode == 0) {
+            for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                if (!scan_devs[pi].occupied) continue;
+                if (scan_devs[pi].sweep_bright < 0.10f) continue;
+                if (strncmp(scan_devs[pi].mac, e.mac, 17) != 0) continue;
+                float sync_alpha = scan_devs[pi].sweep_bright * af * 0.6f;
+                if (sync_alpha > 0.05f) {
+                    uint16_t sync_col = lerp_col16(BG_COLOR, base_proto_col, sync_alpha);
+                    spr.fillRect(FEED_X + UI_PAD_SM, ry, 2, feed_row_h - 1, sync_col);
+                }
+                break;
+            }
+        }
     }
 
     spr.clearClipRect();
@@ -5366,7 +5382,10 @@ static void prox_radar_refresh(unsigned long frame_ms) {
         float rssi_norm = (float)(e.rssi - (-95)) / (float)((-25) - (-95));
         if (rssi_norm < 0.0f) rssi_norm = 0.0f;
         if (rssi_norm > 1.0f) rssi_norm = 1.0f;
-        float target_dist = 1.0f - rssi_norm;  // strong=center, weak=edge
+        // Compress radial range so icons cluster toward center.
+        // sqrt curve means weak signals still spread out but strong
+        // signals group tightly near the center dot.
+        float target_dist = sqrtf(1.0f - rssi_norm) * 0.75f;
 
         if (slot >= 0) {
             scan_devs[slot].dist       = target_dist;
@@ -5420,8 +5439,8 @@ static void prox_radar_refresh(unsigned long frame_ms) {
     // Stable because angles are hash-derived (don't drift) and the nudge
     // is capped at MAX_NUDGE so icons can't migrate to the wrong quadrant.
     {
-        const float MIN_ANGLE_SEP = 0.45f;  // ~26° — minimum angular gap
-        const float MAX_NUDGE     = 0.30f;  // ~17° — max displacement per frame
+        const float MIN_ANGLE_SEP = 0.40f;  // ~23° — minimum angular gap
+        const float MAX_NUDGE     = 0.12f;  // ~7° — max displacement per frame
         const float PI2f = 2.0f * (float)M_PI;
 
         for (int i = 0; i < SCAN_MAX_DEVICES; i++) {
@@ -5506,7 +5525,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     float swing = 1.0f
                 + 0.25f * sinf(scan_sweep_angle * 0.7f)
                 + 0.12f * sinf(scan_sweep_angle * 1.3f);
-    scan_sweep_angle += 0.0018f * dt * swing;
+    scan_sweep_angle += 0.0013f * dt * swing;
     if (scan_sweep_angle >= PI2f) scan_sweep_angle -= PI2f;
 
     // ── 1. Phosphor glow (lowest layer) ──────────────────────────────────
@@ -5573,7 +5592,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         ScanDevice& d = scan_devs[pi];
 
         // Smooth radial motion
-        d.dist_smooth = anim_filter(d.dist_smooth, d.dist, 400.0f, dt);
+        d.dist_smooth = anim_filter(d.dist_smooth, d.dist, 900.0f, dt);
 
         // Sweep contact — signed angular diff; trigger on trailing side only
         float diff = scan_sweep_angle - d.angle;
@@ -5597,7 +5616,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         d.size_ease += (size_target - d.size_ease) * 0.12f;
 
         // Position
-        float draw_dist = 0.06f + d.dist_smooth * 0.90f;
+        float draw_dist = 0.10f + d.dist_smooth * 0.72f;
         float ds, dc;
         fast_sincos(d.angle, &ds, &dc);
         int dpx = CX + (int)(draw_dist * (float)R * dc);
@@ -5647,16 +5666,15 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         // blends in logical RGB565 (where lerp_col16 works correctly),
         // swaps back, writes to buffer. Result: correct colors guaranteed.
         if (d.sweep_bright > 0.08f) {
-            // Asymmetric ease: fast snap-on at high sweep_bright,
-            // gentle tail at low sweep_bright.
-            float glow_t = powf(d.sweep_bright, 0.6f);
+            // Eased glow: cubic ease-out — fast snap-on, long gentle tail.
+            float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
 
             uint16_t* sbuf = (uint16_t*)spr.getBuffer();
             const int sbuf_w = DISP_W;
 
-            int   glow_r    = sz + 6;
+            int   glow_r    = sz + 12;
             float glow_r2   = (float)(glow_r * glow_r);
-            float glow_peak = glow_t * 0.40f;
+            float glow_peak = glow_t * 0.50f;
 
             int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
             int gx1 = dpx + glow_r; if (gx1 >= VIZ_X + VIZ_W) gx1 = VIZ_X + VIZ_W - 1;
@@ -5671,7 +5689,8 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
                     float dist2 = dx * dx + dy * dy;
                     if (dist2 >= glow_r2) continue;
 
-                    float alpha = glow_peak * (1.0f - dist2 / glow_r2);
+                    float falloff = 1.0f - dist2 / glow_r2;
+                    float alpha = glow_peak * falloff * falloff;
                     if (alpha < 0.015f) continue;
 
                     int idx = row_off + gx;
@@ -9544,7 +9563,7 @@ void loop() {
 
             unsigned long frame_ms = now_amb;
             // Refresh the feed snapshot for the proximity radar
-            if (frame_ms - scan_feed_last_snapshot >= 1750 || scan_feed_last_snapshot == 0) {
+            if (frame_ms - scan_feed_last_snapshot >= 2500 || scan_feed_last_snapshot == 0) {
                 if (take_data_mutex()) {
                     scan_local_count = feed_count;
                     scan_local_head  = feed_head;
@@ -9568,7 +9587,7 @@ void loop() {
                 scan_last_frame_ms = frame_ms;
 
                 static float amb_sweep = 0.0f;
-                amb_sweep += adt * 0.0015f * (PI2f / 5.0f);
+                amb_sweep += adt * 0.0010f * (PI2f / 5.0f);
                 if (amb_sweep > PI2f) amb_sweep -= PI2f;
 
                 float as_sin, as_cos;
@@ -9653,7 +9672,7 @@ void loop() {
                 for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
                     if (!scan_devs[pi].occupied) continue;
                     ScanDevice& d = scan_devs[pi];
-                    float draw_dist = 0.06f + d.dist_smooth * 0.90f;
+                    float draw_dist = 0.10f + d.dist_smooth * 0.72f;
                     float ds, dc;
                     fast_sincos(d.angle, &ds, &dc);
                     int dpx = ACX + (int)(draw_dist * (float)AR * dc);
@@ -9677,12 +9696,12 @@ void loop() {
 
                     // Sweep glow — byte-order-corrected blend (ambient)
                     if (d.sweep_bright > 0.08f) {
-                        float glow_t = powf(d.sweep_bright, 0.6f);
+                        float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
                         uint16_t* sbuf = (uint16_t*)spr.getBuffer();
                         const int sbuf_w = DISP_W;
-                        int   glow_r  = DSZ + 6;
+                        int   glow_r  = DSZ + 12;
                         float glow_r2 = (float)(glow_r * glow_r);
-                        float glow_peak = glow_t * 0.35f;
+                        float glow_peak = glow_t * 0.45f;
 
                         int gx0 = dpx - glow_r; if (gx0 < 0) gx0 = 0;
                         int gx1 = dpx + glow_r; if (gx1 >= DISP_W) gx1 = DISP_W - 1;
@@ -9696,7 +9715,8 @@ void loop() {
                                 float dy = (float)(gy - dpy);
                                 float dist2 = dx * dx + dy * dy;
                                 if (dist2 >= glow_r2) continue;
-                                float alpha = glow_peak * (1.0f - dist2 / glow_r2);
+                                float falloff = 1.0f - dist2 / glow_r2;
+                                float alpha = glow_peak * falloff * falloff;
                                 if (alpha < 0.015f) continue;
                                 int idx = row_off + gx;
                                 uint16_t existing_logical = read_pixel_logical(sbuf, idx);
