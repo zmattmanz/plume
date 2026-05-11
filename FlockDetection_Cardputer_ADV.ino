@@ -5604,19 +5604,35 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         }
         int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
 
-        // Sweep glow — concentric outline rings that sit ON TOP of the
-        // phosphor trail without erasing it. drawCircle writes only the
-        // 1px circumference, not the filled interior. Ring alpha starts
-        // above the trail's PEAK (0.18) so every pixel is additive-bright.
-        if (d.sweep_bright > 0.08f) {
+        // Sweep glow — true alpha blend via per-pixel read-modify-write.
+        // Reads existing pixel, blends toward base_col, writes back.
+        // Produces a smooth radial gradient that adds brightness to the
+        // phosphor trail without erasing it.
+        if (d.sweep_bright > 0.10f) {
             float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-            int max_r = (int)((float)sz * 2.5f);
-            for (int gr = sz + 2; gr <= max_r; gr += 2) {
-                float ring_t = (float)(gr - sz) / (float)(max_r - sz);
-                float alpha = glow_t * (0.40f - ring_t * 0.20f);
-                if (alpha < 0.03f) continue;
-                spr.drawCircle(dpx, dpy, gr,
-                               lerp_col16(BG_COLOR, base_col, alpha));
+            int gr = (int)((float)sz * 2.5f);
+            float r2 = (float)(gr * gr);
+            float glow_peak = glow_t * 0.35f;
+
+            int y0 = max((int)(dpy - gr), (int)VIZ_Y);
+            int y1 = min((int)(dpy + gr), (int)(VIZ_Y + VIZ_H - 1));
+            int x0 = max((int)(dpx - gr), (int)VIZ_X);
+            int x1 = min((int)(dpx + gr), (int)(VIZ_X + VIZ_W - 1));
+
+            for (int gy = y0; gy <= y1; gy++) {
+                for (int gx = x0; gx <= x1; gx++) {
+                    float dx = (float)(gx - dpx);
+                    float dy = (float)(gy - dpy);
+                    float dist2 = dx * dx + dy * dy;
+                    if (dist2 > r2) continue;
+
+                    float dist_norm = dist2 / r2;
+                    float alpha = glow_peak * (1.0f - dist_norm);
+                    if (alpha < 0.02f) continue;
+
+                    uint16_t existing = spr.readPixelValue(gx, gy);
+                    spr.drawPixel(gx, gy, lerp_col16(existing, base_col, alpha));
+                }
             }
         }
 
@@ -9609,16 +9625,29 @@ void loop() {
                     uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
 
                     // Sweep glow — matches active scan radar
-                    // Sweep glow — outline rings
-                    if (d.sweep_bright > 0.08f) {
+                    // Sweep glow — true alpha blend
+                    if (d.sweep_bright > 0.10f) {
                         float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-                        int max_r = (int)((float)DSZ * 2.5f);
-                        for (int gr = DSZ + 2; gr <= max_r; gr += 2) {
-                            float ring_t = (float)(gr - DSZ) / (float)(max_r - DSZ);
-                            float alpha = glow_t * (0.35f - ring_t * 0.18f);
-                            if (alpha < 0.03f) continue;
-                            spr.drawCircle(dpx, dpy, gr,
-                                           lerp_col16(BG_COLOR, bcol, alpha));
+                        int gr = (int)((float)DSZ * 2.5f);
+                        float r2 = (float)(gr * gr);
+                        float glow_peak = glow_t * 0.30f;
+
+                        int gy0 = max((int)(dpy - gr), 0);
+                        int gy1 = min((int)(dpy + gr), (int)(DISP_H - 1));
+                        int gx0 = max((int)(dpx - gr), 0);
+                        int gx1 = min((int)(dpx + gr), (int)(DISP_W - 1));
+
+                        for (int gy = gy0; gy <= gy1; gy++) {
+                            for (int gx = gx0; gx <= gx1; gx++) {
+                                float dx = (float)(gx - dpx);
+                                float dy = (float)(gy - dpy);
+                                float dist2 = dx * dx + dy * dy;
+                                if (dist2 > r2) continue;
+                                float alpha = glow_peak * (1.0f - dist2 / r2);
+                                if (alpha < 0.02f) continue;
+                                uint16_t existing = spr.readPixelValue(gx, gy);
+                                spr.drawPixel(gx, gy, lerp_col16(existing, bcol, alpha));
+                            }
                         }
                     }
 
