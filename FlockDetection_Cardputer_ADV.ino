@@ -8943,16 +8943,6 @@ void loop() {
         // on firmwares that report ENTER in both places.
         bool enter_consumed = false;
 
-        // ── M key tap-vs-hold detection ──
-        {
-            bool m_pressed_now = false;
-            for (auto c : status.word) { if (c == 'm') m_pressed_now = true; }
-            if (m_pressed_now && !m_key_down) {
-                m_key_down    = true;
-                m_key_down_ms = millis();
-            }
-        }
-
         for (auto c : status.word) {
 
             if (c == '\n' || c == '\r') enter_consumed = true;
@@ -9065,9 +9055,7 @@ void loop() {
                     handle_menu_select();
                 } else if (c == 0x08 || c == 0x7F || c == 0x1B) {
                     dock_close();
-                } else if (c == 'm') {
-                    // consumed by tap/hold detector
-                }
+                } else if (c == 'm') { dock_close(); }
                 continue;  // swallow all keys while dock is open
             }
 
@@ -9106,7 +9094,7 @@ void loop() {
                 // Already on scanner with no overlays — nothing to do.
             }
             else if (c == 'm') {
-                // M tap/hold handled by detector below — skip direct handling here
+                if (!stealth_mode) { dock_open(false); }
             }
             else if (c == '`') {
                 if (is_muted) {
@@ -9441,22 +9429,6 @@ void loop() {
             }
         }
 
-        // ── M key-up and hold check ──
-        {
-            bool m_still_held = false;
-            for (auto c : status.word) { if (c == 'm') m_still_held = true; }
-            if (m_key_down && !m_still_held) {
-                if (millis() - m_key_down_ms < M_HOLD_MS) {
-                    if (dock.open) { dock_close(); }
-                    else if (!stealth_mode) { dock_open(false); }
-                }
-                m_key_down = false;
-            }
-            if (m_key_down && (millis() - m_key_down_ms >= M_HOLD_MS) && !dock.open) {
-                if (!stealth_mode) { dock_open(true); }
-                m_key_down = false;
-            }
-        }
 
         // Fallback ENTER check — some Cardputer ADV firmware doesn't put
         // ENTER in status.word. Check status.enter directly only when the
