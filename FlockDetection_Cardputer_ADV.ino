@@ -64,8 +64,9 @@ void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
 void beep(int frequency, int duration_ms);
 void apply_color_palette();
 void draw_help_overlay();
-void draw_menu_overlay();
 void handle_menu_select();
+static void dock_open(bool latched);
+static void dock_close();
 void save_stats_to_sd();
 void draw_feed_expanded_overlay();
 void draw_wifi_config_overlay();
@@ -138,17 +139,26 @@ static char wifi_config_pass_buf[65] = "";
 static int  wifi_config_cursor = 0;        // cursor position in active field
 static unsigned long wifi_config_open_ms = 0;
 
-// ── Menu overlay state ──
-static bool show_menu = false;
-static int  menu_selected = 0;
-static unsigned long menu_open_ms = 0;
+// ── Dock menu state ──
 static const int MENU_ITEM_COUNT = 12;
-static int   menu_scroll_offset = 0;        // kept for compat
+static int  menu_selected = 0;  // bridged into handle_menu_select()
 
-static float         menu_scroll_y      = 0.0f;
-static int           menu_scroll_target = 0;
-static unsigned long menu_last_frame_ms = 0;
-static float         menu_toggle_ease[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+struct DockState {
+    bool     open;
+    bool     latched;           // M held >300ms → stays open until DEL
+    bool     closing;           // true during close animation
+    uint8_t  selected;          // 0..MENU_ITEM_COUNT-1
+    unsigned long opened_at_ms;
+    unsigned long closed_at_ms;
+    unsigned long last_input_ms;
+};
+static DockState dock = {false, false, false, 0, 0, 0, 0};
+
+static bool          m_key_down    = false;
+static unsigned long m_key_down_ms = 0;
+static const unsigned long M_HOLD_MS = 300;
+
+static const int DOCK_LAYOUT = 0;  // 0 = C1 BASELINE, 1 = C6 STATUS
 
 // ── Menu section model ──
 struct MenuItem {
@@ -4449,7 +4459,7 @@ void draw_help_overlay() {
         {"v",   "cycle viz"},
         {"x",   "simulate"},
         {"t",   "locate"},
-        {"m",   "menu"},
+        {"m",   "dock"},
     };
     static const HelpKey locator_keys[] = {
         {"l",   "start/stop"},
@@ -4617,154 +4627,236 @@ static void menu_click() {
     M5Cardputer.Speaker.tone(660, 5);  // soft mechanical-keyboard tick
 }
 
-// ── Menu layout constants ──
-static const int MENU_ROW_H       = 14;
-static const int MENU_SECTION_H   = 12;
-static const int MENU_SECTION_GAP = 8;
-static const int MENU_TEXT_X      = 10;
-static const int MENU_LABEL_X     = 6;
+// ── Dock layout constants ──
+static const int DOCK_H_C1              = 22;
+static const int DOCK_H_C6              = 22;
+static const int DOCK_Y_C1              = DISP_H - DOCK_H_C1;
+static const int DOCK_Y_C6              = DISP_H - DOCK_H_C6;
+static const unsigned long DOCK_AUTO_DISMISS_MS = 3000;
+static const unsigned long DOCK_ANIM_OPEN_MS    = 120;
+static const unsigned long DOCK_ANIM_CLOSE_MS   = 180;
 
-static int compute_menu_item_y(int flat_idx) {
-    int y = 0, fi = 0;
+// ── Dock open / close ──
+static void dock_open(bool latched) {
+    dock.open          = true;
+    dock.closing       = false;
+    dock.latched       = latched;
+    dock.opened_at_ms  = millis();
+    dock.closed_at_ms  = 0;
+    dock.last_input_ms = millis();
+    menu_click();
+}
+
+static void dock_close() {
+    if (!dock.open) return;
+    dock.closing      = true;
+    dock.closed_at_ms = millis();
+}
+
+static bool dock_close_done() {
+    if (!dock.closing) return false;
+    return (millis() - dock.closed_at_ms) >= DOCK_ANIM_CLOSE_MS;
+}
+
+static void dock_finalize_close() {
+    dock.open    = false;
+    dock.closing = false;
+    dock.latched = false;
+}
+
+// ── Dock item helpers ──
+static const MenuItem* dock_get_item(int flat_idx) {
+    int fi = 0;
     for (int si = 0; si < MENU_SECTION_COUNT; si++) {
-        if (si > 0) y += MENU_SECTION_GAP;
-        y += MENU_SECTION_H;
         for (int ii = 0; ii < menu_sections[si].count; ii++) {
-            if (fi == flat_idx) return y;
-            y += MENU_ROW_H;
+            if (fi == flat_idx) return &menu_sections[si].items[ii];
             fi++;
         }
     }
-    return y;
+    return nullptr;
 }
 
-static int compute_menu_total_height() {
-    int y = 0;
+static const char* dock_get_section(int flat_idx) {
+    int fi = 0;
     for (int si = 0; si < MENU_SECTION_COUNT; si++) {
-        if (si > 0) y += MENU_SECTION_GAP;
-        y += MENU_SECTION_H;
-        y += menu_sections[si].count * MENU_ROW_H;
+        for (int ii = 0; ii < menu_sections[si].count; ii++) {
+            if (fi == flat_idx) return menu_sections[si].label;
+            fi++;
+        }
     }
-    return y;
+    return "";
 }
 
-static void draw_menu_toggle(int x, int y, float on_t, float alpha) {
-    uint16_t off_col  = lerp_col16(BG_COLOR, DIM_COLOR,    alpha * 0.20f);
-    uint16_t on_col   = lerp_col16(BG_COLOR, ACCENT_COLOR, alpha * 0.60f);
-    uint16_t track    = lerp_col16(off_col, on_col, on_t);
-    spr.fillRoundRect(x, y, 14, 7, 3, track);
-    int knob_x = x + 1 + (int)(on_t * 7.0f);
-    uint16_t knob_col = lerp_col16(BG_COLOR, TEXT_COLOR, alpha * 0.90f);
-    spr.fillRoundRect(knob_x, y + 1, 5, 5, 2, knob_col);
-}
+static void draw_dock_c1() {
+    const int dock_h = DOCK_H_C1;
+    int target_y = DOCK_Y_C1;
+    int y0;
+    if (dock.closing) {
+        float t = ui_progress(dock.closed_at_ms, DOCK_ANIM_CLOSE_MS);
+        float ease = t * t;
+        y0 = target_y + (int)(ease * (float)dock_h);
+    } else {
+        float t = ui_progress(dock.opened_at_ms, DOCK_ANIM_OPEN_MS);
+        y0 = target_y + (int)((1.0f - t) * (float)dock_h);
+    }
+    if (y0 >= DISP_H) return;
 
-void draw_menu_overlay() {
-    unsigned long now_ms = millis();
-    float dt = (menu_last_frame_ms == 0) ? 16.0f : (float)(now_ms - menu_last_frame_ms);
-    if (dt > 100.0f) dt = 100.0f;
-    menu_last_frame_ms = now_ms;
+    const MenuItem* item = dock_get_item(dock.selected);
+    if (!item) return;
+    bool is_caution = item->is_danger;
+    uint16_t accent = is_caution ? CAUTION_COLOR : HEADER_COLOR;
 
-    // Smooth scroll
-    menu_scroll_y = anim_filter(menu_scroll_y, (float)menu_scroll_target, 80.0f, dt);
-    int scroll_px = (int)(menu_scroll_y + 0.5f);
+    uint16_t dock_bg = lerp_col16(BG_COLOR, CARD_COLOR, 0.08f);
+    spr.fillRect(0, y0, DISP_W, dock_h, dock_bg);
+    spr.drawFastHLine(0, y0, DISP_W, accent);
 
-    float open_alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
+    // Prev / Next neighbor labels (4-char truncated)
+    {
+        int prev_idx = (dock.selected - 1 + MENU_ITEM_COUNT) % MENU_ITEM_COUNT;
+        int next_idx = (dock.selected + 1) % MENU_ITEM_COUNT;
+        const MenuItem* prev_item = dock_get_item(prev_idx);
+        const MenuItem* next_item = dock_get_item(next_idx);
 
-    // Backdrop
-    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
-
-    // Header override — "MENU" replaces screen name
-    spr.fillRect(0, 0, 90, CONTENT_Y, BG_COLOR);
-    spr.setTextColor(lerp_col16(BG_COLOR, HEADER_COLOR, open_alpha), BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(4, 5);
-    kprint(spr, "MENU");
-
-    // Clip to content area
-    spr.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
-
-    int flat_index   = 0;
-    int toggle_index = 0;
-    int y = CONTENT_Y - scroll_px;
-
-    for (int si = 0; si < MENU_SECTION_COUNT; si++) {
-        const MenuSection& section = menu_sections[si];
-
-        if (si > 0) y += MENU_SECTION_GAP;
-
-        // Section label — stagger per-section
-        float section_alpha = ui_progress(menu_open_ms + (unsigned long)(si * 60), 220);
-        float section_slide = (1.0f - section_alpha) * 12.0f;
-        spr.setTextColor(lerp_col16(BG_COLOR, DIM_COLOR, section_alpha * 0.40f), BG_COLOR);
+        spr.setTextColor(DIM_COLOR, dock_bg);
         spr.setTextSize(TS_MICRO);
-        spr.setCursor(MENU_LABEL_X + (int)section_slide, y + 2);
-        kprint(spr, section.label);
 
-        y += MENU_SECTION_H;
-
-        for (int ii = 0; ii < section.count; ii++) {
-            const MenuItem& item = section.items[ii];
-            unsigned long item_delay = (unsigned long)(si * 60 + 30 + ii * 40);
-            float item_alpha = ui_progress(menu_open_ms + item_delay, 180);
-            float item_slide = (1.0f - item_alpha) * 10.0f;
-            bool  is_sel     = (flat_index == menu_selected);
-
-            uint16_t name_col;
-            if (item.is_danger) {
-                name_col = lerp_col16(BG_COLOR, CAUTION_COLOR,
-                                      item_alpha * (is_sel ? 1.0f : 0.35f));
-            } else if (is_sel) {
-                name_col = lerp_col16(BG_COLOR, TEXT_COLOR, item_alpha);
-            } else {
-                name_col = lerp_col16(BG_COLOR, DIM_COLOR, item_alpha * 0.55f);
-            }
-
-            spr.setTextColor(name_col, BG_COLOR);
-            spr.setTextSize(TS_STRONG);
-            spr.setCursor(MENU_TEXT_X + (int)item_slide, y + 2);
-            spr.print(item.label);
-
-            if (item.is_toggle) {
-                bool cur_val = false;
-                switch (toggle_index) {
-                    case 0: cur_val = night_mode;           break;
-                    case 1: cur_val = low_power_mode;       break;
-                    case 2: cur_val = is_muted;             break;
-                    case 3: cur_val = boot_sound_enabled;   break;
-                }
-                menu_toggle_ease[toggle_index] = anim_filter(
-                    menu_toggle_ease[toggle_index],
-                    cur_val ? 1.0f : 0.0f, 120.0f, dt);
-                draw_menu_toggle(DISP_W - 24 + (int)item_slide, y + 3,
-                                 menu_toggle_ease[toggle_index], item_alpha);
-                toggle_index++;
-            }
-
-            y += MENU_ROW_H;
-            flat_index++;
+        if (prev_item) {
+            char prev_str[8];
+            snprintf(prev_str, sizeof(prev_str), "< %.4s", prev_item->label);
+            for (char* p = prev_str; *p; p++) *p = toupper((unsigned char)*p);
+            spr.setCursor(UI_PAD_SM, y0 + (dock_h - 8) / 2);
+            spr.print(prev_str);
+        }
+        if (next_item) {
+            char next_str[8];
+            snprintf(next_str, sizeof(next_str), "%.4s >", next_item->label);
+            for (char* p = next_str; *p; p++) *p = toupper((unsigned char)*p);
+            int nw = (int)strlen(next_str) * 6;
+            spr.setCursor(DISP_W - UI_PAD_SM - nw, y0 + (dock_h - 8) / 2);
+            spr.print(next_str);
         }
     }
 
-    spr.clearClipRect();
+    // Center: selected item name
+    {
+        char name[24];
+        safe_copy(name, item->label, sizeof(name));
+        for (char* p = name; *p; p++) *p = toupper((unsigned char)*p);
+        spr.setTextColor(accent, dock_bg);
+        spr.setTextSize(TS_BODY);
+        spr.setTextDatum(MC_DATUM);
+        spr.drawString(name, DISP_W / 2, y0 + dock_h / 2);
+        spr.setTextDatum(TL_DATUM);
+    }
 
-    // Scrollbar — only when content overflows the viewport
-    int total_h = compute_menu_total_height();
-    int view_h  = DISP_H - CONTENT_Y;
-    if (total_h > view_h) {
-        const int track_x = DISP_W - 4;
-        const int track_y = CONTENT_Y;
-        const int track_h = view_h;
+    // Auto-dismiss
+    if (dock.open && !dock.latched && !dock.closing) {
+        if (millis() - dock.last_input_ms > DOCK_AUTO_DISMISS_MS) {
+            dock_close();
+        }
+    }
+}
 
-        spr.drawFastVLine(track_x + 1, track_y, track_h,
-                          lerp_col16(BG_COLOR, CARD_BORDER, open_alpha * 0.30f));
+static void dock_status_string(int flat_idx, char* buf, size_t buf_len) {
+    switch (flat_idx) {
+        case 0: {
+            long sw, sb;
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            sw = session_flock_wifi; sb = session_flock_ble;
+            xSemaphoreGiveRecursive(dataMutex);
+            snprintf(buf, buf_len, "W%ld B%ld", sw, sb);
+            break;
+        }
+        case 1: {
+            if (locator_active && locator_has_estimate) {
+                snprintf(buf, buf_len, "%.0fFT", locator_est_distance * 3.28084f);
+            } else {
+                safe_copy(buf, "NO TARGET", buf_len);
+            }
+            break;
+        }
+        case 2: {
+            long lt;
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            lt = lifetime_flock_total;
+            xSemaphoreGiveRecursive(dataMutex);
+            snprintf(buf, buf_len, "%ld TOTAL", lt);
+            break;
+        }
+        case 3: {
+            int sats = 0;
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+            xSemaphoreGiveRecursive(dataMutex);
+            snprintf(buf, buf_len, "%d SATS", sats);
+            break;
+        }
+        case 4: {
+            int32_t mv = get_filtered_voltage();
+            int pct = voltage_to_percent(mv);
+            snprintf(buf, buf_len, "%d%%", pct);
+            break;
+        }
+        case 5:  safe_copy(buf, night_mode        ? "ON"  : "OFF",         buf_len); break;
+        case 6:  safe_copy(buf, low_power_mode     ? "ON"  : "OFF",         buf_len); break;
+        case 7:  safe_copy(buf, is_muted           ? "MUTED" : "ON",        buf_len); break;
+        case 8:  safe_copy(buf, strlen(export_ssid) > 0 ? "CONFIGURED" : "NOT SET", buf_len); break;
+        case 9:  safe_copy(buf, export_mode_active ? "ACTIVE" : "START",    buf_len); break;
+        case 10: safe_copy(buf, boot_sound_enabled ? "ON"  : "OFF",         buf_len); break;
+        case 11: safe_copy(buf, "CONFIRM?",                                 buf_len); break;
+        default: buf[0] = '\0'; break;
+    }
+}
 
-        int thumb_h = max(8, (track_h * view_h) / total_h);
-        int max_s   = total_h - view_h;
-        float scroll_t = (max_s > 0) ? menu_scroll_y / (float)max_s : 0.0f;
-        int thumb_y = track_y + (int)(scroll_t * (float)(track_h - thumb_h));
+static void draw_dock_c6() {
+    const int dock_h = DOCK_H_C6;
+    int target_y = DOCK_Y_C6;
+    int y0;
+    if (dock.closing) {
+        float t = ui_progress(dock.closed_at_ms, DOCK_ANIM_CLOSE_MS);
+        y0 = target_y + (int)((t * t) * (float)dock_h);
+    } else {
+        float t = ui_progress(dock.opened_at_ms, DOCK_ANIM_OPEN_MS);
+        y0 = target_y + (int)((1.0f - t) * (float)dock_h);
+    }
+    if (y0 >= DISP_H) return;
 
-        spr.fillRect(track_x, thumb_y, 3, thumb_h,
-                     lerp_col16(BG_COLOR, HEADER_COLOR, open_alpha));
+    const MenuItem* item = dock_get_item(dock.selected);
+    if (!item) return;
+    bool is_caution = item->is_danger;
+    uint16_t accent = is_caution ? CAUTION_COLOR : HEADER_COLOR;
+
+    uint16_t dock_bg = lerp_col16(BG_COLOR, CARD_COLOR, 0.08f);
+    spr.fillRect(0, y0, DISP_W, dock_h, dock_bg);
+    spr.drawFastHLine(0, y0, DISP_W, accent);
+
+    // Left: item name
+    {
+        char name[24];
+        safe_copy(name, item->label, sizeof(name));
+        for (char* p = name; *p; p++) *p = toupper((unsigned char)*p);
+        spr.setTextColor(accent, dock_bg);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(UI_PAD_SM, y0 + (dock_h - 10) / 2);
+        kprint(spr, name);
+    }
+
+    // Right: live status
+    {
+        char status_str[24];
+        dock_status_string(dock.selected, status_str, sizeof(status_str));
+        int sw = (int)strlen(status_str) * 6;
+        spr.setTextColor(DIM_COLOR, dock_bg);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(DISP_W - UI_PAD_SM - sw, y0 + (dock_h - 8) / 2);
+        spr.print(status_str);
+    }
+
+    // Auto-dismiss
+    if (dock.open && !dock.latched && !dock.closing) {
+        if (millis() - dock.last_input_ms > DOCK_AUTO_DISMISS_MS) {
+            dock_close();
+        }
     }
 }
 
@@ -4907,7 +4999,7 @@ void handle_menu_select() {
     switch (menu_selected) {
         case 0: case 1: case 2: case 3: case 4: {
             int target = menu_selected;
-            show_menu = false;
+            dock_finalize_close();
             transition_screen(target, (target >= current_screen) ? 1 : -1);
             break;
         }
@@ -4934,7 +5026,7 @@ void handle_menu_select() {
             screen_dirty = true;
             break;
         case 8:
-            show_menu = false;
+            dock_finalize_close();
             wifi_config_open = true;
             wifi_config_open_ms = millis();
             wifi_config_field = 0;
@@ -4954,11 +5046,11 @@ void handle_menu_select() {
                 set_toast_direct(ip_toast, ACCENT_COLOR);
                 screen_dirty = true;
             } else if (export_connecting) {
-                show_menu = false;
+                dock_finalize_close();
                 export_mode_stop();
                 screen_dirty = true;
             } else {
-                show_menu = false;
+                dock_finalize_close();
                 export_mode_start();
                 screen_dirty = true;
             }
@@ -5820,6 +5912,21 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         spectrum_display[i] = v;
     }
 
+    // BLE presence — checked once per second; used by fill gradient,
+    // baseline indicator, and channel label tinting.
+    static bool ble_active = false;
+    {
+        static unsigned long ble_check_ms = 0;
+        if (frame_ms - ble_check_ms > 1000) {
+            ble_check_ms = frame_ms;
+            ble_active = false;
+            for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
+                int idx2 = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+                if (scan_local_feed[idx2].proto == 1) { ble_active = true; break; }
+            }
+        }
+    }
+
     // Plot area — 8px reserved at bottom for channel labels (1, 6, 11, 13).
     const int plot_x      = VIZ_X + 2;
     const int plot_w      = VIZ_W - 4;
@@ -5936,19 +6043,6 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         spectrum_ghost_last_ms = frame_ms;
     }
 
-    // BLE presence — checked once per second; used to tint ch 1-11 fill
-    static bool ble_active = false;
-    {
-        static unsigned long ble_check_ms = 0;
-        if (frame_ms - ble_check_ms > 1000) {
-            ble_check_ms = frame_ms;
-            ble_active = false;
-            for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
-                int idx2 = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-                if (scan_local_feed[idx2].proto == 1) { ble_active = true; break; }
-            }
-        }
-    }
 
     // Gradient fill under the curve. Channels 1-11 blend toward PURPLE_COLOR
     // at the bottom when BLE devices are active, indicating band overlap.
@@ -7763,8 +7857,16 @@ void draw_current_screen() {
     if (show_feed_expanded) draw_feed_expanded_overlay();
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
-    if (show_menu) draw_menu_overlay();
     if (wifi_config_open) draw_wifi_config_overlay();
+    // Dock menu — non-modal, renders over live screen
+    if (dock.open || dock.closing) {
+        if (dock.closing && dock_close_done()) {
+            dock_finalize_close();
+        } else {
+            if (DOCK_LAYOUT == 0) draw_dock_c1();
+            else                  draw_dock_c6();
+        }
+    }
     draw_toast_spr();
 }
 
@@ -8803,10 +8905,8 @@ void loop() {
             // (often a UI click or alarm chime) doesn't hit a DMA assertion.
             M5Cardputer.Speaker.stop();
         }
-        if (show_menu) {
-            show_menu = false;
-            draw_current_screen();
-            spr.pushSprite(0, 0);
+        if (dock.open) {
+            dock_close();
         } else if (show_feed_expanded) {
             show_feed_expanded = false;
             draw_current_screen();
@@ -8842,6 +8942,16 @@ void loop() {
         // so the status.enter fallback below doesn't re-fire the same action
         // on firmwares that report ENTER in both places.
         bool enter_consumed = false;
+
+        // ── M key tap-vs-hold detection ──
+        {
+            bool m_pressed_now = false;
+            for (auto c : status.word) { if (c == 'm') m_pressed_now = true; }
+            if (m_pressed_now && !m_key_down) {
+                m_key_down    = true;
+                m_key_down_ms = millis();
+            }
+        }
 
         for (auto c : status.word) {
 
@@ -8940,50 +9050,25 @@ void loop() {
                 continue;  // swallow all keys while wifi config is open
             }
 
-            // ── Menu input intercept — when menu is open, swallow nav keys ──
-            // ; is up-arrow, . is down-arrow on the M5Cardputer keyboard.
-            if (show_menu) {
+            // ── Dock navigation — swallow all keys while dock is open ──
+            if (dock.open && !dock.closing) {
+                dock.last_input_ms = millis();
                 if (c == ';') {
-                    int prev = menu_selected;
-                    menu_selected--;
-                    if (menu_selected < 0) menu_selected = 0;
-                    if (menu_selected != prev) {
-                        menu_click();
-                        int sel_y  = compute_menu_item_y(menu_selected);
-                        int view_h = DISP_H - CONTENT_Y;
-                        if (sel_y < menu_scroll_target)
-                            menu_scroll_target = sel_y - 2;
-                        if (sel_y + MENU_ROW_H > menu_scroll_target + view_h)
-                            menu_scroll_target = sel_y + MENU_ROW_H - view_h + 2;
-                        if (menu_scroll_target < 0) menu_scroll_target = 0;
-                    }
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (c == '.') {
-                    int prev = menu_selected;
-                    menu_selected++;
-                    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
-                    if (menu_selected != prev) {
-                        menu_click();
-                        int sel_y  = compute_menu_item_y(menu_selected);
-                        int view_h = DISP_H - CONTENT_Y;
-                        if (sel_y < menu_scroll_target)
-                            menu_scroll_target = sel_y - 2;
-                        if (sel_y + MENU_ROW_H > menu_scroll_target + view_h)
-                            menu_scroll_target = sel_y + MENU_ROW_H - view_h + 2;
-                        if (menu_scroll_target < 0) menu_scroll_target = 0;
-                        int max_s = compute_menu_total_height() - view_h;
-                        if (max_s < 0) max_s = 0;
-                        if (menu_scroll_target > max_s) menu_scroll_target = max_s;
-                    }
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (c == '\n' || c == '\r') {
+                    dock.selected = (dock.selected - 1 + MENU_ITEM_COUNT) % MENU_ITEM_COUNT;
                     menu_click();
+                } else if (c == '.') {
+                    dock.selected = (dock.selected + 1) % MENU_ITEM_COUNT;
+                    menu_click();
+                } else if (c == '\n' || c == '\r') {
+                    menu_selected = dock.selected;
+                    dock_close();
                     handle_menu_select();
-                } else if (c == 0x1B || c == 'm') {
-                    show_menu = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (c == 0x08 || c == 0x7F || c == 0x1B) {
+                    dock_close();
+                } else if (c == 'm') {
+                    // consumed by tap/hold detector
                 }
-                continue;  // swallow all keys while menu is open
+                continue;  // swallow all keys while dock is open
             }
 
             // Cancel delete-confirm on any key except 'd' (toggle) and ENTER (confirm)
@@ -9021,23 +9106,7 @@ void loop() {
                 // Already on scanner with no overlays — nothing to do.
             }
             else if (c == 'm') {
-                if (!stealth_mode) {
-                    show_menu = !show_menu;
-                    if (show_menu) {
-                        menu_open_ms = millis();
-                        menu_scroll_offset = 0;
-                        menu_scroll_target = 0;
-                        menu_scroll_y = 0.0f;
-                        menu_last_frame_ms = 0;
-                        show_feed_expanded = false;
-                        show_help_overlay = false;
-                        menu_toggle_ease[0] = night_mode ? 1.0f : 0.0f;
-                        menu_toggle_ease[1] = low_power_mode ? 1.0f : 0.0f;
-                        menu_toggle_ease[2] = is_muted ? 1.0f : 0.0f;
-                        menu_toggle_ease[3] = boot_sound_enabled ? 1.0f : 0.0f;
-                    }
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                }
+                // M tap/hold handled by detector below — skip direct handling here
             }
             else if (c == '`') {
                 if (is_muted) {
@@ -9312,10 +9381,10 @@ void loop() {
             const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
 
             bool up_held = false, down_held = false;
-            // Skip hold-repeat when the menu is open — the menu's own
+            // Skip hold-repeat when the dock is open — the dock's own
             // input handler in the word loop already processed ;/. and
             // the hold-repeat would double-fire the navigation.
-            if (!show_menu && !wifi_config_open) {
+            if (!dock.open && !wifi_config_open) {
                 for (auto c : status.word) {
                     if (c == ';') up_held = true;
                     if (c == '.') down_held = true;
@@ -9327,14 +9396,13 @@ void loop() {
                 unsigned long hold_dur = millis() - arrow_hold_start;
                 if (hold_dur > HOLD_DELAY &&
                     (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
-                    if (show_menu) {
+                    if (dock.open && !dock.closing) {
                         if (cur_arrow == ';') {
-                            menu_selected--;
-                            if (menu_selected < 0) menu_selected = 0;
+                            dock.selected = (dock.selected - 1 + MENU_ITEM_COUNT) % MENU_ITEM_COUNT;
                         } else {
-                            menu_selected++;
-                            if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
+                            dock.selected = (dock.selected + 1) % MENU_ITEM_COUNT;
                         }
+                        menu_click();
                         screen_dirty = true;
                     } else if (current_screen == 2 && !hist_detail_open) {
                         if (cur_arrow == ';') {
@@ -9373,12 +9441,31 @@ void loop() {
             }
         }
 
+        // ── M key-up and hold check ──
+        {
+            bool m_still_held = false;
+            for (auto c : status.word) { if (c == 'm') m_still_held = true; }
+            if (m_key_down && !m_still_held) {
+                if (millis() - m_key_down_ms < M_HOLD_MS) {
+                    if (dock.open) { dock_close(); }
+                    else if (!stealth_mode) { dock_open(false); }
+                }
+                m_key_down = false;
+            }
+            if (m_key_down && (millis() - m_key_down_ms >= M_HOLD_MS) && !dock.open) {
+                if (!stealth_mode) { dock_open(true); }
+                m_key_down = false;
+            }
+        }
+
         // Fallback ENTER check — some Cardputer ADV firmware doesn't put
         // ENTER in status.word. Check status.enter directly only when the
         // loop above didn't already act on it (firmwares that report ENTER
         // in both places would otherwise toggle every action twice).
         if (status.enter && !enter_consumed && !stealth_mode) {
-            if (show_menu) {
+            if (dock.open && !dock.closing) {
+                menu_selected = dock.selected;
+                dock_close();
                 menu_click();
                 handle_menu_select();
             } else if (current_screen == 2) {
@@ -9425,9 +9512,8 @@ void loop() {
             } else if (show_help_overlay) {
                 show_help_overlay = false;
                 draw_current_screen(); spr.pushSprite(0, 0);
-            } else if (show_menu) {
-                show_menu = false;
-                draw_current_screen(); spr.pushSprite(0, 0);
+            } else if (dock.open) {
+                dock_close();
             } else if (current_screen == 2 && hist_detail_open) {
                 hist_delete_confirming = false;
                 hist_detail_open = false;
@@ -9685,7 +9771,8 @@ void loop() {
             hist_animating = sel_settling || open_running;
         }
 
-        if (current_screen == 0 || current_screen == 1 || current_screen == 3 ||
+        if (dock.open || dock.closing ||
+            current_screen == 0 || current_screen == 1 || current_screen == 3 ||
             show_vol_overlay || toast_active || stats_scrolling || stats_rolling ||
             hist_animating ||
             (now - last_fast_anim < 30)) {
