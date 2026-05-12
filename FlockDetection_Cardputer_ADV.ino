@@ -1786,6 +1786,18 @@ void load_detections_from_flash() {
 
 // Load last SD_HIST_SIZE detections from SD CSV (most recent first in sd_hist[])
 void load_sd_history() {
+    // On no-PSRAM boards, runtime heap is ~6KB after NimBLE init.
+    // The tail buffer needs 2-4KB contiguous. If heap is too low,
+    // preserve existing sd_hist (populated at boot or by log_detection
+    // in-memory pushes) rather than wiping it and failing the malloc.
+    if (esp_get_free_heap_size() < 10000) {
+        if (sd_hist_count > 0) {
+            Serial.printf("[SD] Skipping reload — heap low, keeping %d cached entries\n",
+                          sd_hist_count);
+            return;
+        }
+        // First load with no cached data — try with a minimal buffer below
+    }
     sd_hist_count = 0;
     if (!sd_available) return;
     File f = SD.open(current_log_file, FILE_READ);
@@ -1797,8 +1809,8 @@ void load_sd_history() {
     // Read the last TAIL_BYTES of the file. 4KB covers ~20 typical CSV lines
     // (~200 bytes each), well above the 12 we need. Constant-time regardless
     // of file size — eliminates the 10s+ freeze on large log files.
-    const size_t TAIL_BYTES_INITIAL = 4096;
-    const size_t TAIL_BYTES_MAX     = 8192;
+    const size_t TAIL_BYTES_INITIAL = 1536;
+    const size_t TAIL_BYTES_MAX     = 3072;
 
     size_t tail_bytes = TAIL_BYTES_INITIAL;
     if (tail_bytes > file_size) tail_bytes = file_size;
