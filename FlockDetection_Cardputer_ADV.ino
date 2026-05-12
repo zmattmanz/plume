@@ -5126,9 +5126,7 @@ void draw_wifi_config_overlay() {
     uint16_t ssid_border = ssid_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
     spr.drawRect(cx + 6, input_y, cw - 12, 16, ssid_border);
 
-    const char* ssid_display = (wifi_config_editing && ssid_selected)
-        ? wifi_config_ssid_buf
-        : export_ssid;
+    const char* ssid_display = wifi_config_ssid_buf;
     bool ssid_empty = (strlen(ssid_display) == 0);
 
     spr.setTextColor(ssid_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), BG_COLOR);
@@ -5162,9 +5160,7 @@ void draw_wifi_config_overlay() {
     uint16_t pass_border = pass_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
     spr.drawRect(cx + 6, input_y, cw - 12, 16, pass_border);
 
-    const char* pass_src = (wifi_config_editing && pass_selected)
-        ? wifi_config_pass_buf
-        : export_pass;
+    const char* pass_src = wifi_config_pass_buf;
     bool pass_empty = (strlen(pass_src) == 0);
 
     spr.setTextColor(pass_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), BG_COLOR);
@@ -9273,12 +9269,8 @@ void loop() {
                         if (wifi_config_field == 0 || wifi_config_field == 1) {
                             wifi_config_editing = true;
                             if (wifi_config_field == 0) {
-                                strncpy(wifi_config_ssid_buf, export_ssid, sizeof(wifi_config_ssid_buf) - 1);
-                                wifi_config_ssid_buf[sizeof(wifi_config_ssid_buf) - 1] = '\0';
                                 wifi_config_cursor = strlen(wifi_config_ssid_buf);
                             } else {
-                                strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
-                                wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
                                 wifi_config_cursor = strlen(wifi_config_pass_buf);
                             }
                             M5Cardputer.Speaker.tone(660, 5);
@@ -9743,12 +9735,8 @@ void loop() {
                     if (wifi_config_field == 0 || wifi_config_field == 1) {
                         wifi_config_editing = true;
                         if (wifi_config_field == 0) {
-                            strncpy(wifi_config_ssid_buf, export_ssid, sizeof(wifi_config_ssid_buf) - 1);
-                            wifi_config_ssid_buf[sizeof(wifi_config_ssid_buf) - 1] = '\0';
                             wifi_config_cursor = strlen(wifi_config_ssid_buf);
                         } else {
-                            strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
-                            wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
                             wifi_config_cursor = strlen(wifi_config_pass_buf);
                         }
                         menu_click();
