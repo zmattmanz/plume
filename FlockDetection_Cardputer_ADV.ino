@@ -4731,7 +4731,8 @@ void draw_help_overlay() {
     float alpha = ui_progress(help_ease_start, UI_FADE_IN_MS);
     if (alpha < 0.02f) return;
 
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+    bool fully_faded = (alpha >= 1.0f);
+    auto ea = [&](uint16_t c) -> uint16_t { return fully_faded ? c : lerp_col16(BG_COLOR, c, alpha); };
 
     // Solid backdrop below header (like expanded feed)
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
@@ -5022,8 +5023,9 @@ static void draw_menu_overlay() {
     float alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
     if (alpha < 0.02f) return;
 
+    bool fully_faded = (alpha >= 1.0f);
     auto ea = [&](uint16_t c) -> uint16_t {
-        return lerp_col16(BG_COLOR, c, alpha);
+        return fully_faded ? c : lerp_col16(BG_COLOR, c, alpha);
     };
 
     // Solid backdrop + header
@@ -5224,7 +5226,8 @@ static void draw_menu_overlay() {
 }
 void draw_wifi_config_overlay() {
     float alpha = ui_progress(wifi_config_open_ms, UI_FADE_IN_MS);
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+    bool fully_faded = (alpha >= 1.0f);
+    auto ea = [&](uint16_t c) -> uint16_t { return fully_faded ? c : lerp_col16(BG_COLOR, c, alpha); };
 
     // Solid backdrop
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
@@ -6962,7 +6965,8 @@ void draw_feed_expanded_overlay() {
     }
 
     float expand_alpha = ui_progress(feed_expand_ms, UI_FADE_OUT_MS);
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, expand_alpha); };
+    bool fully_faded = (expand_alpha >= 1.0f);
+    auto ea = [&](uint16_t c) -> uint16_t { return fully_faded ? c : lerp_col16(BG_COLOR, c, expand_alpha); };
 
     // Solid backdrop
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
@@ -9269,13 +9273,17 @@ void loop() {
     if (export_mode_active) {
         if (export_server) export_server->handleClient();
         if ((millis() - export_mode_started_at) > EXPORT_MODE_MAX_MS) {
-            WiFiClient check_client = export_server->client();
-            if (!check_client || !check_client.connected()) {
+            if (!export_server) {
                 export_mode_stop();
             } else {
-                // Extend 60s while a client is active; prevents premature
-                // server teardown during slow chunked transfers.
-                export_mode_started_at = millis() - EXPORT_MODE_MAX_MS + 60000UL;
+                WiFiClient check_client = export_server->client();
+                if (!check_client || !check_client.connected()) {
+                    export_mode_stop();
+                } else {
+                    // Extend 60s while a client is active; prevents premature
+                    // server teardown during slow chunked transfers.
+                    export_mode_started_at = millis() - EXPORT_MODE_MAX_MS + 60000UL;
+                }
             }
         }
     }
