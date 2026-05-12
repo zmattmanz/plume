@@ -175,24 +175,24 @@ struct MenuSection {
 };
 
 static const MenuItem nav_items[] = {
-    {"Scanner",     false, false, 0},
-    {"Locator",     false, false, 1},
-    {"Detections",  false, false, 2},
-    {"GPS",         false, false, 3},
-    {"Stats",       false, false, 4},
+    {"Scanner",          false, false, 0},
+    {"Locator",          false, false, 1},
+    {"Detections",       false, false, 2},
+    {"GPS Status",       false, false, 3},
+    {"Device Stats",     false, false, 4},
 };
 
 static const MenuItem settings_items[] = {
-    {"Night Mode",  true,  false, 5},
-    {"Low Power",   true,  false, 6},
-    {"Mute",        true,  false, 7},
+    {"Night Mode",       true,  false, 5},
+    {"Low Power Mode",   true,  false, 6},
+    {"Mute Beeps",       true,  false, 7},
 };
 
 static const MenuItem tools_items[] = {
-    {"WiFi Config", false, false, 8},
-    {"Export Data", false, false, 9},
-    {"Boot Sound",  true,  false, 10},
-    {"Clear Stats", false, true,  11},
+    {"WiFi Config",      false, false, 8},
+    {"Export Data",      false, false, 9},
+    {"Boot Sound",       true,  false, 10},
+    {"Clear All Stats",  false, true,  11},
 };
 
 static const MenuSection menu_sections[] = {
