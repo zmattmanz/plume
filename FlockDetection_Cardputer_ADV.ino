@@ -7191,7 +7191,7 @@ void draw_gps_screen() {
     // generated once with UI_PAD_MD clearance from the globe rim and bound
     // to the left panel so they never reach the right-side text column.
     {
-        #define NUM_STARS 30
+        #define NUM_STARS 18
         static int  star_x[NUM_STARS], star_y[NUM_STARS];
         static bool stars_init = false;
         if (!stars_init) {
@@ -7213,8 +7213,8 @@ void draw_gps_screen() {
             stars_init = true;
         }
         for (int i = 0; i < NUM_STARS; i++) {
-            float twinkle = anim_pulse(3000 + i * 200, (float)i / (float)NUM_STARS);
-            uint8_t b = (uint8_t)(100 + twinkle * 155);
+            float twinkle = anim_pulse(1600 + i * 280, (float)i / (float)NUM_STARS);
+            uint8_t b = (uint8_t)(30 + twinkle * 225);
             uint16_t star_col = lgfx::color565(b, b, b);
             spr.drawPixel(star_x[i], star_y[i], star_col);
         }
