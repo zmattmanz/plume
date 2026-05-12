@@ -1,5 +1,5 @@
 // ============================================================================
-// FLOCK DETECTOR v9.0-ADV — Tactical Edition (Build 2)
+// FLOCK FINDER v9.0-ADV — Tactical Edition (Build 2)
 // ============================================================================
 
 #include <M5Cardputer.h>
@@ -186,7 +186,7 @@ static const MenuItem settings_items[] = {
 
 static const MenuItem tools_items[] = {
     {"WiFi Config",      false, false, 8},
-    {"Export Data",      false, false, 9},
+    {"Export Mode",      false, false, 9},
     {"Clear All Stats",  false, true,  10},
 };
 
@@ -492,7 +492,7 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 
 // Version strings — update BOTH when bumping.
 // Also update: CHANGELOG.md, README.md badge
-#define VERSION_STRING "FLOCK DETECTOR v1.0-beta"
+#define VERSION_STRING "FLOCK FINDER v1.0-beta"
 #define VERSION_SHORT  "v1.0b"
 
 // Set to 1 to enable the 'x' key simulation trigger (development only).
@@ -1616,7 +1616,7 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
 static bool export_check_auth() {
     if (!export_server) return false;
     if (!export_server->authenticate(export_auth_user, export_auth_pass)) {
-        export_server->requestAuthentication(BASIC_AUTH, "Flock Detector");
+        export_server->requestAuthentication(BASIC_AUTH, "Flock Finder");
         return false;
     }
     return true;
@@ -5648,7 +5648,7 @@ static void draw_export_info() {
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(UI_PAD_SM, DISP_H - 10);
-    spr.print("M > Export Data to stop");
+    spr.print("M > Export Mode to stop");
 }
 
 void draw_scanner_screen() {
