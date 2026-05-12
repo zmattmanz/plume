@@ -9388,6 +9388,7 @@ void loop() {
         // so the status.enter fallback below doesn't re-fire the same action
         // on firmwares that report ENTER in both places.
         bool enter_consumed = false;
+        bool screen_transitioned = false;
 
         for (auto c : status.word) {
 
@@ -9590,19 +9591,21 @@ void loop() {
                 }
             }
             else if (IS_KEY_LEFT(c)) {
-                if (!stealth_mode) {
+                if (!stealth_mode && !screen_transitioned) {
                     int prev = current_screen - 1;
                     int d = (prev < 0) ? 1 : -1;
                     if (prev < 0) prev = NUM_SCREENS - 1;
                     transition_screen(prev, d);
+                    screen_transitioned = true;
                 }
             }
             else if (IS_KEY_RIGHT(c)) {
-                if (!stealth_mode) {
+                if (!stealth_mode && !screen_transitioned) {
                     int next = current_screen + 1;
                     int d = (next >= NUM_SCREENS) ? -1 : 1;
                     if (next >= NUM_SCREENS) next = 0;
                     transition_screen(next, d);
+                    screen_transitioned = true;
                 }
             }
             else if (c == '-') {
