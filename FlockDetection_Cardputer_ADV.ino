@@ -1628,25 +1628,49 @@ void export_server_setup_routes() {
     // Index: simple HTML file list
     export_server->on("/", HTTP_GET, []() {
         if (!export_check_auth()) return;
-        String html = "<!DOCTYPE html><html><head><title>Flock Detector Export</title>"
-                      "<style>body{font-family:monospace;background:#0a1430;color:#dce8ff;padding:20px;}"
-                      "a{color:#00d7eb;text-decoration:none;display:block;padding:8px 0;}"
-                      "a:hover{color:#32ff64;}h1{color:#32ff64;}"
-                      ".meta{color:#6490b4;font-size:0.9em;}</style></head><body>";
-        html += "<h1>FLOCK DETECTOR EXPORT</h1>";
-        html += "<p class='meta'>" + String(VERSION_STRING) + "</p>";
-        html += "<p class='meta'>User: <b>flock</b> &nbsp; Password shown on device</p>";
-        html += "<hr><h2>Files</h2>";
+        String html = "<!DOCTYPE html><html><head><title>Flock Finder Export</title>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<style>"
+            "body{font-family:'Courier New',monospace;background:#050A14;color:#E8EFFF;padding:24px;margin:0;}"
+            ".card{background:#1D3258;border:1px solid #2E4670;border-radius:8px;padding:16px 20px;margin:16px 0;}"
+            "h1{color:#4DDBC2;font-size:1.4em;letter-spacing:2px;margin:0 0 4px;}"
+            ".ver{color:#95A5B8;font-size:0.8em;letter-spacing:1px;}"
+            "a{color:#4DDBC2;text-decoration:none;display:flex;align-items:center;gap:8px;"
+            "padding:10px 14px;border:1px solid #2E4670;border-radius:6px;margin:8px 0;"
+            "transition:border-color 0.2s;}"
+            "a:hover{border-color:#4DDBC2;background:rgba(77,219,194,0.06);}"
+            ".tag{font-size:0.75em;color:#95A5B8;}"
+            ".purple{color:#8B7CDB;}"
+            ".dim{color:#95A5B8;font-size:0.8em;}"
+            ".pill{display:inline-block;border:1px solid #4DDBC2;color:#4DDBC2;"
+            "border-radius:10px;padding:2px 10px;font-size:0.75em;letter-spacing:1px;}"
+            "hr{border:none;border-top:1px solid #2E4670;margin:16px 0;}"
+            ".cred{display:flex;gap:24px;margin:8px 0;}"
+            ".cred span{color:#95A5B8;font-size:0.85em;}"
+            ".cred b{color:#E8EFFF;}"
+            "</style></head><body>";
+        html += "<h1>FLOCK FINDER</h1>";
+        html += "<span class='ver'>" + String(VERSION_STRING) + "</span>";
+        html += "<div class='card'>";
+        html += "<div style='color:#95A5B8;font-size:0.8em;letter-spacing:1px;margin-bottom:8px;'>CREDENTIALS</div>";
+        html += "<div class='cred'><span>User: <b>" + String(export_auth_user) + "</b></span>";
+        html += "<span>Pass: <b>" + String(export_auth_pass) + "</b></span></div>";
+        html += "</div>";
+        html += "<div class='card'>";
+        html += "<div style='color:#95A5B8;font-size:0.8em;letter-spacing:1px;margin-bottom:12px;'>FILES</div>";
         if (sd_available) {
-            html += "<a href='/FlockLog.csv'>FlockLog.csv &nbsp; <span class='meta'>detections CSV</span></a>";
-            html += "<a href='/Threats.pcap'>Threats.pcap &nbsp; <span class='meta'>WiFi capture</span></a>";
-            html += "<a href='/BLE_Threats.pcap'>BLE_Threats.pcap &nbsp; <span class='meta'>BLE capture</span></a>";
+            html += "<a href='/FlockLog.csv'>FlockLog.csv <span class='tag'>detections CSV</span></a>";
+            html += "<a href='/Threats.pcap' class='purple'>Threats.pcap <span class='tag'>WiFi capture</span></a>";
+            html += "<a href='/BLE_Threats.pcap' class='purple'>BLE_Threats.pcap <span class='tag'>BLE capture</span></a>";
         } else {
-            html += "<p class='meta'>SD unavailable</p>";
+            html += "<span class='dim'>SD card unavailable</span>";
         }
-        html += "<hr><p class='meta'>Auto-exit in ";
-        unsigned long remaining = EXPORT_MODE_MAX_MS - (millis() - export_mode_started_at);
-        html += String(remaining / 60000UL) + "m " + String((remaining / 1000UL) % 60) + "s</p>";
+        html += "</div>";
+        unsigned long remaining = 0;
+        if (millis() - export_mode_started_at < EXPORT_MODE_MAX_MS)
+            remaining = EXPORT_MODE_MAX_MS - (millis() - export_mode_started_at);
+        html += "<div class='dim' style='margin-top:16px;'>Auto-exit in ";
+        html += String(remaining / 60000UL) + "m " + String((remaining / 1000UL) % 60) + "s</div>";
         html += "</body></html>";
         export_server->sendHeader("Connection", "close");
         export_server->send(200, "text/html", html);
@@ -1685,7 +1709,7 @@ void export_server_setup_routes() {
         export_server->send(200, mime, "");
 
         WiFiClient client = export_server->client();
-        uint8_t buf[1024];
+        static uint8_t buf[512];
         size_t offset = 0;
 
         // Phase 2: stream in 1KB chunks, acquiring sdMutex only for each
@@ -1750,9 +1774,20 @@ static void export_restore_promiscuous() {
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
-    // Resume scanner task — BLE scanning restarts naturally on next cycle
+
+    // Reinitialize NimBLE (was deinited in export_mode_start to free heap)
+    NimBLEDevice::init("");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+    pBLEScan->setActiveScan(false);
+    apply_ble_scan_params();
+    pBLEScan->setMaxResults(0);
+    last_ble_restart_ms = millis();
+
+    // Resume scanner task
     if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
-    last_ble_scan = millis();  // reset so BLE doesn't fire immediately
+    last_ble_scan = millis();
 }
 
 // Finish the connect sequence once WiFi.status() == WL_CONNECTED.
@@ -1806,6 +1841,16 @@ bool export_mode_start() {
         pBLEScan->stop();
         pBLEScan->clearResults();
     }
+
+    // Free NimBLE heap (~20-30KB) for WiFi TCP stack
+    xQueueReset(ble_event_queue);
+    for (int i = 0; i < BLE_POOL_SIZE; i++) {
+        __atomic_store_n(&ble_pool[i].in_use, 0u, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&ble_pool_write, 0u, __ATOMIC_RELEASE);
+    NimBLEDevice::deinit(true);
+    pBLEScan = nullptr;
+
     WiFi.disconnect(true);
     delay(100);
     WiFi.mode(WIFI_STA);
@@ -10078,7 +10123,10 @@ void loop() {
 
     // Periodic BLE stack health restart — prevents NimBLE internal state
     // corruption that can build up during multi-hour continuous scanning.
-    if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
+    // Skip when export is active: NimBLE is already deinited then.
+    if (export_mode_active || export_connecting) {
+        last_ble_restart_ms = millis();  // skip this cycle
+    } else if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
         last_ble_restart_ms = millis();
 
         // 1. Stop scanning so the callback stops producing new events.
