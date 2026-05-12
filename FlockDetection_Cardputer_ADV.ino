@@ -3532,7 +3532,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
     const wifi_promiscuous_pkt_t* ppkt = (wifi_promiscuous_pkt_t*)buff;
     if (ppkt->rx_ctrl.sig_len < 24) return;
-    ambient_packet_count++;
+    __atomic_fetch_add(&ambient_packet_count, 1, __ATOMIC_RELAXED);
 
     // Per-channel histogram for the SPECTRUM viz on the scanner screen.
     {
@@ -3580,8 +3580,8 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
         __atomic_store_n(&ev->ready, 0u, __ATOMIC_RELEASE);
         return;
     }
-    if (sig_len > 512) sig_len = 512;
     ev->orig_len         = sig_len;
+    if (sig_len > 512) sig_len = 512;
     ev->payload_snap_len = (sig_len < 256) ? sig_len : 256;
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
 
@@ -3783,7 +3783,7 @@ void process_wifi_event_queue() {
 
             if (!addr1_multicast && !addr1_random && !addr1_broadcast) {
                 int addr1_mac_score = check_mac_prefix_tiered(local.addr1);
-                if (addr1_mac_score > 0 && confidence == 0) {
+                if (addr1_mac_score > 0 && mac_score == 0) {
                     // addr1 matched but addr2 didn't — sleeping-device hit.
                     if (addr1_mac_score == 1) {
                         confidence = SCORE_STRONG;
@@ -6185,9 +6185,11 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     {
         bool ble_scanning = (pBLEScan && pBLEScan->isScanning());
         float ble_target = ble_scanning ? 1.0f : 0.0f;
-        float sdt = (spectrum_last_frame == 0) ? 16.0f
-                  : (float)(frame_ms - spectrum_last_frame);
+        static unsigned long ble_blend_last_frame = 0;
+        float sdt = (ble_blend_last_frame == 0) ? 16.0f
+                  : (float)(frame_ms - ble_blend_last_frame);
         if (sdt > 100.0f) sdt = 100.0f;
+        ble_blend_last_frame = frame_ms;
         spectrum_ble_blend = anim_filter(spectrum_ble_blend, ble_target, 250.0f, sdt);
     }
 
@@ -9531,8 +9533,30 @@ void loop() {
                 }
             }
 #endif // DEBUG_KEYS
-            else if (c == 't') { 
-                if (!stealth_mode && capture_history_count > 0) {
+            else if (c == 't') {
+                if (!stealth_mode && current_screen == 2 && hist_detail_open) {
+                    // Target the detection currently shown in detail view
+                    const char* t_mac = "";
+                    const char* t_name = "";
+                    const char* t_type = "";
+                    int t_id = 0;
+                    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                    int idx = history_selected_idx;
+                    if (sd_available && idx < sd_hist_count) {
+                        t_mac = sd_hist[idx].mac; t_name = sd_hist[idx].name;
+                        t_type = sd_hist[idx].type; t_id = sd_hist[idx].id;
+                    } else if (idx < capture_history_count) {
+                        t_mac = capture_history[idx].mac; t_name = capture_history[idx].name;
+                        t_type = capture_history[idx].type; t_id = capture_history[idx].id;
+                    }
+                    xSemaphoreGiveRecursive(dataMutex);
+                    if (strlen(t_mac) > 0) {
+                        locator_start(t_mac, t_name, t_type, t_id);
+                        trigger_toast("TARGET", t_name, 0);
+                        hist_detail_open = false;
+                        transition_screen(1, 1);
+                    }
+                } else if (!stealth_mode && capture_history_count > 0) {
                     static int target_select_idx = -1;
                     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                     int current_hist_count = capture_history_count;
