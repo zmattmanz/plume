@@ -7455,10 +7455,10 @@ void draw_gps_screen() {
         kv_row("LNG", lng_buf);
     }
 
-    // SAT — X/12 format
+    // SAT — count only (NEO-6M tracks up to 12 but the cap is implicit)
     {
         char sat_buf[8];
-        snprintf(sat_buf, sizeof(sat_buf), "%d/12", sats);
+        snprintf(sat_buf, sizeof(sat_buf), "%d", sats);
         kv_row("SAT", sat_buf);
     }
 
