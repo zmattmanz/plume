@@ -6091,24 +6091,19 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 
         bool in_ble_band = (ch_i >= 0 && ch_i <= 10);
         if (in_ble_band && ble_active && !flock_fill) {
+            // BLE band: solid purple fill so the section reads as "shared with BLE"
             int fy = cy + 1;
             while (fy < plot_bottom) {
                 float fill_t = (float)(fy - cy) / (float)(plot_bottom - cy);
                 float fill_alpha = (1.0f - fill_t * fill_t) * 0.30f;
                 if (fill_alpha < 0.01f) break;
-                uint16_t band_col = (fill_t > 0.6f)
-                    ? lerp_col16(HEADER_COLOR, PURPLE_COLOR, (fill_t - 0.6f) / 0.4f)
-                    : HEADER_COLOR;
-                uint16_t col = lerp_col16(BG_COLOR, band_col, fill_alpha);
+                uint16_t col = lerp_col16(BG_COLOR, PURPLE_COLOR, fill_alpha);
                 int run_end = fy + 1;
                 while (run_end < plot_bottom) {
                     float ft2 = (float)(run_end - cy) / (float)(plot_bottom - cy);
                     float fa2 = (1.0f - ft2 * ft2) * 0.30f;
                     if (fa2 < 0.01f) break;
-                    uint16_t bc2 = (ft2 > 0.6f)
-                        ? lerp_col16(HEADER_COLOR, PURPLE_COLOR, (ft2 - 0.6f) / 0.4f)
-                        : HEADER_COLOR;
-                    if (lerp_col16(BG_COLOR, bc2, fa2) != col) break;
+                    if (lerp_col16(BG_COLOR, PURPLE_COLOR, fa2) != col) break;
                     run_end++;
                 }
                 spr.fillRect(cx, fy, 1, run_end - fy, col);
