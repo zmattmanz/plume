@@ -153,6 +153,8 @@ static unsigned long menu_open_ms = 0;
 static int   menu_scroll_offset = 0;
 static float menu_scroll_y_f    = 0.0f;
 static unsigned long menu_last_frame_ms = 0;
+static float menu_sel_y_f      = 0.0f;   // eased Y position of selection highlight
+static bool  menu_sel_y_seeded = false;   // prevents first-frame pop
 
 // ── Menu section model ──
 struct MenuItem {
@@ -4880,74 +4882,74 @@ static void menu_click() {
     M5Cardputer.Speaker.tone(660, 5);  // soft mechanical-keyboard tick
 }
 
-// ── Menu icon primitives (7px tall, drawn at ix, iy) ────────────────
+// ── Menu icon primitives (10px cell, drawn at ix, iy) ───────────────
 
 static void menu_icon_scanner(int x, int y, uint16_t col) {
-    spr.drawTriangle(x, y+6, x+6, y+6, x+3, y, col);
+    spr.drawTriangle(x, y+9, x+9, y+9, x+4, y, col);
 }
 
 static void menu_icon_locator(int x, int y, uint16_t col) {
-    spr.drawFastHLine(x, y+3, 7, col);
-    spr.drawFastVLine(x+3, y, 7, col);
-    spr.drawPixel(x+1, y+1, col); spr.drawPixel(x+5, y+1, col);
-    spr.drawPixel(x+1, y+5, col); spr.drawPixel(x+5, y+5, col);
+    spr.drawFastHLine(x, y+4, 10, col);
+    spr.drawFastVLine(x+4, y, 10, col);
+    spr.drawPixel(x+1, y+1, col); spr.drawPixel(x+7, y+1, col);
+    spr.drawPixel(x+1, y+7, col); spr.drawPixel(x+7, y+7, col);
 }
 
 static void menu_icon_detections(int x, int y, uint16_t col) {
-    spr.fillRect(x,   y+4, 2, 3, col);
-    spr.fillRect(x+2, y+2, 2, 5, col);
-    spr.fillRect(x+4, y,   2, 7, col);
+    spr.fillRect(x,   y+6, 3, 4,  col);
+    spr.fillRect(x+3, y+3, 3, 7,  col);
+    spr.fillRect(x+7, y,   3, 10, col);
 }
 
 static void menu_icon_gps(int x, int y, uint16_t col) {
-    spr.drawCircle(x+3, y+2, 2, col);
-    spr.drawLine(x+1, y+4, x+3, y+6, col);
-    spr.drawLine(x+5, y+4, x+3, y+6, col);
+    spr.drawCircle(x+4, y+3, 3, col);
+    spr.drawLine(x+1, y+6, x+4, y+9, col);
+    spr.drawLine(x+7, y+6, x+4, y+9, col);
 }
 
 static void menu_icon_stats(int x, int y, uint16_t col) {
-    spr.fillRect(x,   y,   3, 3, col);
-    spr.fillRect(x+4, y,   3, 3, col);
-    spr.fillRect(x,   y+4, 3, 3, col);
-    spr.fillRect(x+4, y+4, 3, 3, col);
+    spr.fillRect(x,   y,   4, 4, col);
+    spr.fillRect(x+5, y,   4, 4, col);
+    spr.fillRect(x,   y+5, 4, 4, col);
+    spr.fillRect(x+5, y+5, 4, 4, col);
 }
 
 static void menu_icon_night(int x, int y, uint16_t col) {
-    spr.drawCircle(x+3, y+3, 3, col);
-    spr.fillCircle(x+4, y+2, 3, BG_COLOR);
+    spr.drawCircle(x+4, y+4, 4, col);
+    spr.fillCircle(x+6, y+3, 4, BG_COLOR);
 }
 
 static void menu_icon_power(int x, int y, uint16_t col) {
-    spr.drawCircle(x+3, y+3, 3, col);
-    spr.fillRect(x+2, y, 3, 2, BG_COLOR);
-    spr.drawFastVLine(x+3, y, 4, col);
+    spr.drawCircle(x+4, y+4, 4, col);
+    spr.fillRect(x+3, y, 3, 3, BG_COLOR);
+    spr.drawFastVLine(x+4, y, 5, col);
 }
 
 static void menu_icon_mute(int x, int y, uint16_t col) {
-    spr.fillRect(x, y+2, 2, 3, col);
-    spr.drawLine(x+2, y, x+2, y+6, col);
-    spr.drawLine(x+4, y+1, x+6, y+5, col);
-    spr.drawLine(x+4, y+5, x+6, y+1, col);
+    spr.fillRect(x, y+3, 3, 4, col);
+    spr.drawLine(x+3, y+1, x+3, y+8, col);
+    spr.drawLine(x+5, y+1, x+8, y+7, col);
+    spr.drawLine(x+5, y+7, x+8, y+1, col);
 }
 
 static void menu_icon_wifi(int x, int y, uint16_t col) {
-    spr.drawPixel(x+3, y+6, col);
-    spr.drawPixel(x+2, y+4, col); spr.drawPixel(x+4, y+4, col);
-    spr.drawPixel(x+1, y+2, col); spr.drawPixel(x+5, y+2, col);
-    spr.drawPixel(x, y, col);     spr.drawPixel(x+6, y, col);
+    spr.drawPixel(x+4, y+9, col);
+    spr.drawPixel(x+2, y+7, col); spr.drawPixel(x+6, y+7, col);
+    spr.drawPixel(x+1, y+4, col); spr.drawPixel(x+7, y+4, col);
+    spr.drawPixel(x,   y+1, col); spr.drawPixel(x+8, y+1, col);
 }
 
 static void menu_icon_export(int x, int y, uint16_t col) {
-    spr.drawLine(x+3, y, x, y+3, col);
-    spr.drawLine(x+3, y, x+6, y+3, col);
-    spr.drawFastVLine(x+3, y+1, 5, col);
+    spr.drawLine(x+4, y, x, y+4, col);
+    spr.drawLine(x+4, y, x+8, y+4, col);
+    spr.drawFastVLine(x+4, y+1, 8, col);
 }
 
 static void menu_icon_trash(int x, int y, uint16_t col) {
-    spr.drawFastHLine(x, y, 7, col);
-    spr.fillRect(x+1, y+1, 5, 5, col);
-    spr.drawFastVLine(x+2, y+2, 3, BG_COLOR);
-    spr.drawFastVLine(x+4, y+2, 3, BG_COLOR);
+    spr.drawFastHLine(x, y, 10, col);
+    spr.fillRect(x+1, y+2, 8, 7, col);
+    spr.drawFastVLine(x+3, y+3, 5, BG_COLOR);
+    spr.drawFastVLine(x+6, y+3, 5, BG_COLOR);
 }
 
 static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
@@ -4985,16 +4987,16 @@ static void draw_menu_overlay() {
     drawPill(DISP_W - 40, 4, VERSION_SHORT, ea(DIM_COLOR), 0.0f, false);
 
     // Layout
-    const int ROW_H    = 14;
+    const int ROW_H    = 17;
     const int VIEW_TOP = CONTENT_Y;
     const int FOOTER_H = 12;
     const int VIEW_H   = DISP_H - VIEW_TOP - FOOTER_H;
     const int ICON_X   = UI_PAD_SM + 2;
-    const int LABEL_X  = ICON_X + 12;
+    const int LABEL_X  = ICON_X + 16;
     const int ROW_LEFT = UI_PAD_SM - 2;
     const int ROW_W    = DISP_W - UI_PAD_SM * 2 + 4;
-    const int SECT_H   = 12;
-    const int GAP_H    = 4;
+    const int SECT_H   = 15;
+    const int GAP_H    = 5;
 
     // Row map: type 0=section header, 1=item, 2=gap
     struct MRow { int type; int idx; const char* text; };
@@ -5013,7 +5015,7 @@ static void draw_menu_overlay() {
         {2, -1, ""},
         {0, -1, "ACTIONS"},
         {1,  8, "WiFi Config"},
-        {1,  9, "Export Data"},
+        {1,  9, "Export Mode"},
         {1, 10, "Clear All"},
     };
     const int NROWS = 16;
@@ -5029,7 +5031,7 @@ static void draw_menu_overlay() {
     }
     int total_h = cy;
 
-    // Smooth scroll easing
+    // Smooth scroll easing + eased selection highlight
     {
         unsigned long now = millis();
         float dt = (menu_last_frame_ms == 0) ? 16.0f
@@ -5038,6 +5040,17 @@ static void draw_menu_overlay() {
         menu_last_frame_ms = now;
         menu_scroll_y_f = anim_filter(menu_scroll_y_f,
                                       (float)menu_scroll_offset, 80.0f, dt);
+        // Find selected item's virtual Y and ease highlight toward it
+        int sel_virt_y = 0;
+        for (int i = 0; i < NROWS; i++) {
+            if (mrows[i].type == 1 && mrows[i].idx == menu_selected) {
+                sel_virt_y = virt_y[i];
+                break;
+            }
+        }
+        int cur_scroll_y = (int)(menu_scroll_y_f + 0.5f);
+        float sel_target_y = (float)(VIEW_TOP + sel_virt_y - cur_scroll_y);
+        menu_sel_y_f = anim_filter_seed(menu_sel_y_f, sel_target_y, 80.0f, dt, &menu_sel_y_seeded);
     }
     int scroll_y = (int)(menu_scroll_y_f + 0.5f);
 
@@ -5081,28 +5094,22 @@ static void draw_menu_overlay() {
             int idx = mrows[i].idx;
             bool sel = (menu_selected == idx);
             bool danger = (idx == 10);
-            uint16_t accent = danger ? CAUTION_COLOR : HEADER_COLOR;
-
-            // Selection: outline only + left accent bar
-            if (sel) {
-                spr.drawRect(ROW_LEFT, ry, ROW_W, ROW_H, ea(accent));
-                spr.fillRect(ROW_LEFT, ry, 2, ROW_H, ea(accent));
-            }
+            bool export_active_row = (idx == 9 && (export_mode_active || export_connecting));
 
             // Icon
-            uint16_t icon_col = ea(danger ? CAUTION_COLOR
-                               : (sel ? HEADER_COLOR : DIM_COLOR));
+            uint16_t icon_col = ea(export_active_row ? CAUTION_COLOR
+                               : danger             ? CAUTION_COLOR
+                               : sel                ? HEADER_COLOR : DIM_COLOR);
             menu_draw_icon(idx, ICON_X, ry + 3, icon_col);
 
             // Label — dynamic for export toggle
             const char* label_text = mrows[i].text;
-            if (idx == 9 && (export_mode_active || export_connecting)) {
-                label_text = "Stop Export";
-            }
-            uint16_t text_col = ea(danger ? CAUTION_COLOR
-                               : (sel ? TEXT_COLOR : DIM_COLOR));
+            if (export_active_row) label_text = "Stop Export";
+            uint16_t text_col = ea(export_active_row ? CAUTION_COLOR
+                               : danger             ? CAUTION_COLOR
+                               : sel                ? TEXT_COLOR : DIM_COLOR);
             spr.setTextColor(text_col, BG_COLOR);
-            spr.setTextSize(TS_BODY);
+            spr.setTextSize(TS_STRONG);
             spr.setCursor(LABEL_X, ry + 2);
             spr.print(label_text);
 
@@ -5114,18 +5121,18 @@ static void draw_menu_overlay() {
                 if (on) {
                     int pw = 14, ph = 9;
                     int px = DISP_W - pw - UI_PAD_SM - 4;
-                    spr.fillRoundRect(px, ry + 2, pw, ph, 2, ea(HEADER_COLOR));
+                    spr.fillRoundRect(px, ry + 4, pw, ph, 2, ea(HEADER_COLOR));
                     spr.setTextColor(BG_COLOR, ea(HEADER_COLOR));
                     spr.setTextSize(TS_MICRO);
-                    spr.setCursor(px + 2, ry + 3);
+                    spr.setCursor(px + 2, ry + 5);
                     spr.print("ON");
                 } else {
                     int pw = 18, ph = 9;
                     int px = DISP_W - pw - UI_PAD_SM - 4;
-                    spr.drawRoundRect(px, ry + 2, pw, ph, 2, ea(DIM_COLOR));
+                    spr.drawRoundRect(px, ry + 4, pw, ph, 2, ea(DIM_COLOR));
                     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
                     spr.setTextSize(TS_MICRO);
-                    spr.setCursor(px + 2, ry + 3);
+                    spr.setCursor(px + 2, ry + 5);
                     spr.print("OFF");
                 }
             }
@@ -5133,6 +5140,20 @@ static void draw_menu_overlay() {
     }
 
     spr.clearClipRect();
+
+    // ── Eased selection highlight (drawn on top of all rows) ──
+    {
+        int sel_draw_y = (int)(menu_sel_y_f + 0.5f);
+        if (sel_draw_y + ROW_H > VIEW_TOP && sel_draw_y < VIEW_TOP + VIEW_H) {
+            spr.setClipRect(0, VIEW_TOP, DISP_W, VIEW_H);
+            bool danger = (menu_selected == 10);
+            bool export_active_sel = (menu_selected == 9 && (export_mode_active || export_connecting));
+            uint16_t accent = (danger || export_active_sel) ? CAUTION_COLOR : HEADER_COLOR;
+            spr.drawRect(ROW_LEFT, sel_draw_y, ROW_W, ROW_H, ea(accent));
+            spr.fillRect(ROW_LEFT, sel_draw_y, 2, ROW_H, ea(accent));
+            spr.clearClipRect();
+        }
+    }
 
     // Scrollbar (matches stats screen style)
     if (total_h > VIEW_H) {
@@ -9516,6 +9537,7 @@ void loop() {
                         menu_scroll_offset = 0;
                         menu_scroll_y_f    = 0.0f;
                         menu_last_frame_ms = 0;
+                        menu_sel_y_seeded  = false;
                         menu_click();
                     }
                     screen_dirty = true;
