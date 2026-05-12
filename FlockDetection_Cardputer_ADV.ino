@@ -1748,6 +1748,9 @@ static void export_restore_promiscuous() {
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+    // Resume scanner task — BLE scanning restarts naturally on next cycle
+    if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
+    last_ble_scan = millis();  // reset so BLE doesn't fire immediately
 }
 
 // Finish the connect sequence once WiFi.status() == WL_CONNECTED.
@@ -1794,8 +1797,13 @@ bool export_mode_start() {
         return false;
     }
 
-    // Shut down promiscuous sniffing before joining a network
+    // Shut down all scanning before joining a network
     esp_wifi_set_promiscuous(false);
+    if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
+    if (pBLEScan && pBLEScan->isScanning()) {
+        pBLEScan->stop();
+        pBLEScan->clearResults();
+    }
     WiFi.disconnect(true);
     delay(100);
     WiFi.mode(WIFI_STA);
@@ -5568,7 +5576,7 @@ static void draw_export_info() {
     spr.setTextColor(CAUTION_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(LBL_X, ry);
-    spr.print("WiFi scanning paused");
+    spr.print("All scanning paused");
 
     // Footer
     spr.setTextColor(DIM_COLOR, BG_COLOR);
