@@ -8658,7 +8658,7 @@ void setup() {
     {
         auto spk_cfg = M5Cardputer.Speaker.config();
         spk_cfg.dma_buf_count = 3;     // default 8
-        spk_cfg.dma_buf_len   = 256;   // default 512
+        spk_cfg.dma_buf_len   = 128;   // default 512; simple sine tones don't need more
         M5Cardputer.Speaker.config(spk_cfg);
     }
 
@@ -8815,7 +8815,7 @@ void setup() {
     delay(100);
     // NMEA sentences max ~82 chars — 1024-byte default RX is 2× too big.
     // setRxBufferSize must be called BEFORE begin() to take effect.
-    SerialGPS.setRxBufferSize(512);
+    SerialGPS.setRxBufferSize(256);  // NMEA max sentence is 82 bytes; 256 is sufficient
     SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     delay(100);
     WiFi.mode(WIFI_STA); delay(50);
