@@ -5489,7 +5489,105 @@ static void timeline_init(unsigned long frame_ms) {
     tl_initialized = true;
 }
 
+// ── Export mode info display — replaces scanner content while active ──
+static void draw_export_info() {
+    spr.fillSprite(BG_COLOR);
+    draw_header_spr(0);
+    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+
+    const int LBL_X = UI_PAD_SM + 2;
+    const int VAL_X = 46;
+    int ry = CONTENT_Y + UI_PAD_SM;
+
+    // Status badge
+    {
+        const char* status_str = "EXPORT ACTIVE";
+        int bw = (int)strlen(status_str) * 7 + 12;
+        uint16_t sfill = lerp_col16(BG_COLOR, HEADER_COLOR, 0.22f);
+        spr.fillRoundRect(LBL_X, ry, bw, 16, 5, sfill);
+        spr.drawRoundRect(LBL_X, ry, bw, 16, 5, HEADER_COLOR);
+        spr.setTextColor(HEADER_COLOR, sfill);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(LBL_X + 6, ry + 4);
+        kprint(spr, status_str);
+    }
+    ry += 24;
+
+    // URL
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(LBL_X, ry);
+    kprint(spr, "URL");
+    ry += 11;
+
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(LBL_X, ry);
+    {
+        char url[32];
+        snprintf(url, sizeof(url), "http://%s", export_ip_str);
+        kprint(spr, url);
+    }
+    ry += 16;
+
+    // User + Password side by side
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(LBL_X, ry);
+    kprint(spr, "USER");
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setCursor(VAL_X, ry);
+    spr.print(export_auth_user);
+
+    int pass_x = 120;
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+    spr.setCursor(pass_x, ry);
+    kprint(spr, "PASS");
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setCursor(pass_x + 36, ry);
+    spr.print(export_auth_pass);
+    ry += 16;
+
+    // Time remaining
+    {
+        unsigned long elapsed = millis() - export_mode_started_at;
+        unsigned long remaining_ms = (elapsed < EXPORT_MODE_MAX_MS)
+                                   ? (EXPORT_MODE_MAX_MS - elapsed) : 0;
+        unsigned int rm = (unsigned int)(remaining_ms / 60000UL);
+        unsigned int rs = (unsigned int)((remaining_ms / 1000UL) % 60);
+
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, ry);
+        kprint(spr, "TIME");
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(VAL_X, ry);
+        char time_buf[12];
+        snprintf(time_buf, sizeof(time_buf), "%um %02us", rm, rs);
+        spr.print(time_buf);
+    }
+    ry += 16;
+
+    // WiFi scanning paused notice
+    spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(LBL_X, ry);
+    spr.print("WiFi scanning paused");
+
+    // Footer
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
+    spr.print("M > Export Data to stop");
+}
+
 void draw_scanner_screen() {
+    // Show connection details instead of scanner while export is active
+    if (export_mode_active) {
+        draw_export_info();
+        return;
+    }
+
     unsigned long frame_ms = millis();
 
     // Keep timeline bins populated regardless of which viz is active
