@@ -74,7 +74,7 @@ static void load_wifi_credentials();
 void draw_gps_screen();
 void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
-static void set_toast_direct(const char* text, uint16_t accent);
+static void set_toast_direct(const char* text, uint16_t accent, bool is_info = true);
 static void apply_ble_scan_params();
 struct WifiEvent;
 static void parse_wifi_event(struct WifiEvent* ev);
@@ -112,6 +112,11 @@ uint16_t SCALE_LABEL_COLOR;    // lerp(BG, DIM, 0.80) — dBm scale tick labels
 // Use ACCENT_COLOR for interactive highlights (selection bars, scrollbar thumbs).
 // They are and will always be the same color — the distinction is semantic only.
 #define ACCENT_COLOR HEADER_COLOR
+
+// Toast severity tiers
+#define TOAST_SUCCESS  HEADER_COLOR   // positive confirmations
+#define TOAST_WARNING  CAUTION_COLOR  // errors, warnings, destructive actions
+#define TOAST_NEUTRAL  DIM_COLOR      // informational, dismissed, hints
 bool night_mode = false;
 bool show_help_overlay = false;
 static unsigned long help_ease_start = 0;
@@ -1756,7 +1761,7 @@ static bool export_finalize_connect() {
 
     export_server = new(std::nothrow) WebServer(80);
     if (!export_server) {
-        set_toast_direct("EXPORT ALLOC FAIL", CAUTION_COLOR);
+        set_toast_direct("EXPORT ALLOC FAIL", TOAST_WARNING, false);
         export_restore_promiscuous();
         return false;
     }
@@ -1771,7 +1776,7 @@ static bool export_finalize_connect() {
     char ip_toast[32];
     snprintf(ip_toast, sizeof(ip_toast), "http://%s pw:%s",
              export_ip_str, export_auth_pass);
-    set_toast_direct(ip_toast, ACCENT_COLOR);
+    set_toast_direct(ip_toast, TOAST_SUCCESS);
     return true;
 }
 
@@ -1781,11 +1786,11 @@ static bool export_finalize_connect() {
 bool export_mode_start() {
     if (export_mode_active || export_connecting) return true;
     if (strlen(export_ssid) == 0) {
-        set_toast_direct("NO WIFI CONFIGURED", CAUTION_COLOR);
+        set_toast_direct("NO WIFI CONFIGURED", TOAST_WARNING, false);
         return false;
     }
     if (esp_get_free_heap_size() < 15000) {
-        set_toast_direct("LOW MEMORY", CAUTION_COLOR);
+        set_toast_direct("LOW MEMORY", TOAST_WARNING, false);
         return false;
     }
 
@@ -1798,7 +1803,7 @@ bool export_mode_start() {
 
     export_connecting = true;
     export_connect_start_ms = millis();
-    set_toast_direct("CONNECTING...", GPS_COLOR);
+    set_toast_direct("CONNECTING...", TOAST_SUCCESS);
     return true;
 }
 
@@ -1813,7 +1818,7 @@ void export_tick_connect() {
     }
     if (millis() - export_connect_start_ms >= EXPORT_CONNECT_TIMEOUT_MS) {
         export_connecting = false;
-        set_toast_direct("WIFI CONNECT FAIL", CAUTION_COLOR);
+        set_toast_direct("WIFI CONNECT FAIL", TOAST_WARNING, false);
         export_restore_promiscuous();
     }
 }
@@ -1823,7 +1828,7 @@ void export_mode_stop() {
     if (export_connecting) {
         export_connecting = false;
         export_restore_promiscuous();
-        set_toast_direct("EXPORT CANCELLED", DIM_COLOR);
+        set_toast_direct("EXPORT CANCELLED", TOAST_NEUTRAL);
         return;
     }
     if (!export_mode_active) return;
@@ -1834,7 +1839,7 @@ void export_mode_stop() {
     }
     export_restore_promiscuous();
     export_mode_active = false;
-    set_toast_direct("EXPORT MODE OFF", DIM_COLOR);
+    set_toast_direct("EXPORT MODE OFF", TOAST_NEUTRAL);
 }
 
 // ============================================================================
@@ -1915,7 +1920,7 @@ static void perform_detection_delete(int idx) {
 
     give_data_mutex();
     save_deleted_ids();
-    set_toast_direct("DETECTION DELETED", CAUTION_COLOR);
+    set_toast_direct("DETECTION DELETED", TOAST_WARNING, false);
 }
 
 void load_detections_from_flash() {
@@ -2244,14 +2249,14 @@ static void save_session_to_flash() {
         // Wear toasts: once at 80K (warning) and once at 100K (critical).
         // Equality checks fire exactly once per crossing.
         if (l_writes == 80000) {
-            set_toast_direct("FLASH WEAR HIGH", CAUTION_COLOR);
+            set_toast_direct("FLASH WEAR HIGH", TOAST_WARNING, false);
         } else if (l_writes == 100000) {
-            set_toast_direct("FLASH WEAR CRIT", CAUTION_COLOR);
+            set_toast_direct("FLASH WEAR CRIT", TOAST_WARNING, false);
         }
     } else {
         flash_write_fail_count++;
         if (flash_write_fail_count >= FLASH_FAIL_TOAST_THRESHOLD) {
-            set_toast_direct("FLASH WRITE FAIL", CAUTION_COLOR);
+            set_toast_direct("FLASH WRITE FAIL", TOAST_WARNING, false);
             last_persist_save = millis();
         }
     }
@@ -2397,7 +2402,7 @@ static void sd_check_hotplug() {
             }
 
             sd_was_available = true;
-            set_toast_direct("SD CARD MOUNTED", ACCENT_COLOR);
+            set_toast_direct("SD CARD MOUNTED", TOAST_SUCCESS);
             Serial.println("[SD] Hot-plug mount succeeded");
             return;
         }
@@ -2409,7 +2414,7 @@ static void sd_check_hotplug() {
         if (SD.cardType() == CARD_NONE && sd_was_available) {
             sd_available = false;
             SD.end();
-            set_toast_direct("SD CARD REMOVED", CAUTION_COLOR);
+            set_toast_direct("SD CARD REMOVED", TOAST_WARNING, false);
             Serial.println("[SD] Card removal detected");
         }
     }
@@ -2933,7 +2938,7 @@ void flush_sd_buffer() {
                 size_t written = file.println(local_log_buf[i]);
                 if (written == 0 && !sd_full_warned) {
                     sd_full_warned = true;
-                    set_toast_direct("SD CARD FULL", CAUTION_COLOR);
+                    set_toast_direct("SD CARD FULL", TOAST_WARNING, false);
                 }
             }
             file.close();
@@ -2941,7 +2946,7 @@ void flush_sd_buffer() {
             // Soft failure: controller may be doing GC or a brief voltage dip.
             // Don't tear down the SD connection — the 5s hot-plug probe owns the
             // real removal check, and this write will retry on the next flush.
-            set_toast_direct("SD WRITE FAIL", CAUTION_COLOR);
+            set_toast_direct("SD WRITE FAIL", TOAST_WARNING, false);
             Serial.println("[SD] Write failed — retrying next flush cycle");
         }
     }
@@ -2989,7 +2994,7 @@ void flush_sd_buffer() {
 // Thread-safe direct toast setter. Used for single-message notifications
 // (battery warnings, flash errors, export-mode messages) that bypass the queue.
 // Does NOT touch the queue — it only sets the currently-displayed toast.
-static void set_toast_direct(const char* text, uint16_t accent) {
+static void set_toast_direct(const char* text, uint16_t accent, bool is_info) {
     if (!take_data_mutex()) return;
     if (toast_active && toast_queue_count > 0) {
         // Replace the head entry so the expiry handler in draw_toast_spr
@@ -2998,7 +3003,7 @@ static void set_toast_direct(const char* text, uint16_t accent) {
                 sizeof(toast_queue[toast_queue_head].text) - 1);
         toast_queue[toast_queue_head].text[sizeof(toast_queue[toast_queue_head].text) - 1] = '\0';
         toast_queue[toast_queue_head].accent    = accent;
-        toast_queue[toast_queue_head].is_action = true;
+        toast_queue[toast_queue_head].is_action = is_info;
     } else {
         // No active toast — push as a new queue entry so expiry accounting
         // matches. Covers both the toast_queue_count == 0 case and the
@@ -3013,7 +3018,7 @@ static void set_toast_direct(const char* text, uint16_t accent) {
         strncpy(toast_queue[slot].text, text, sizeof(toast_queue[slot].text) - 1);
         toast_queue[slot].text[sizeof(toast_queue[slot].text) - 1] = '\0';
         toast_queue[slot].accent    = accent;
-        toast_queue[slot].is_action = true;
+        toast_queue[slot].is_action = is_info;
         toast_queue_count++;
         // Advance head to the just-pushed entry so the legacy mirror and
         // expiry pop refer to the same slot we're about to display.
@@ -3022,7 +3027,7 @@ static void set_toast_direct(const char* text, uint16_t accent) {
     strncpy(toast_text, text, sizeof(toast_text) - 1);
     toast_text[sizeof(toast_text) - 1] = '\0';
     toast_accent_color = accent;
-    toast_is_action    = true;
+    toast_is_action    = is_info;
     toast_start        = millis();
     toast_active       = true;
     screen_dirty       = true;
@@ -3031,8 +3036,9 @@ static void set_toast_direct(const char* text, uint16_t accent) {
 
 void trigger_toast(const char* type, const char* name, int confidence) {
     uint16_t accent;
-    if (strcmp(type, "TARGET") == 0) accent = HEADER_COLOR;  // informational — teal
-    else                             accent = CAUTION_COLOR;  // all detections — amber
+    if (strcmp(type, "TARGET") == 0) accent = TOAST_SUCCESS;
+    else if (confidence == 0)        accent = TOAST_NEUTRAL;
+    else                             accent = TOAST_WARNING;
 
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
     bool is_action = (confidence == 0);
@@ -4432,15 +4438,12 @@ void draw_header_spr(int screen_num) {
 }
 
 void draw_toast_spr() {
-    // Snapshot all toast state under mutex before rendering. Producer tasks
-    // on either core can write toast_text mid-strncpy; rendering from live
-    // globals would read torn data and crash spr.print() when it walks past
-    // a missing null terminator.
+    // Snapshot all toast state under mutex before rendering.
     bool          active_snap;
     char          text_snap[32];
-    uint16_t      accent_snap    = 0;
-    bool          is_action_snap = false;
-    unsigned long start_snap     = 0;
+    uint16_t      accent_snap      = 0;
+    bool          is_info_snap     = true;
+    unsigned long start_snap       = 0;
     int           queue_count_snap = 0;
 
     if (!take_data_mutex()) return;
@@ -4449,7 +4452,7 @@ void draw_toast_spr() {
         strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
         text_snap[sizeof(text_snap) - 1] = '\0';
         accent_snap      = toast_accent_color;
-        is_action_snap   = toast_is_action;
+        is_info_snap     = toast_is_action;
         start_snap       = toast_start;
         queue_count_snap = toast_queue_count;
     }
@@ -4459,7 +4462,7 @@ void draw_toast_spr() {
 
     unsigned long elapsed = millis() - start_snap;
 
-    // Expiration handling — advance queue or clear under mutex
+    // Expiration — advance queue or clear under mutex
     if (elapsed > TOAST_DURATION_MS) {
         if (!take_data_mutex()) return;
         if (toast_queue_count > 0) {
@@ -4480,10 +4483,7 @@ void draw_toast_spr() {
         return;
     }
 
-    // Render from snapshot — no global toast_* access below this point.
-    int y_pos = DISP_H - 34;
-
-    // Fade in over UI_FADE_IN_MS, hold, fade out over UI_FADE_OUT_MS.
+    // Fade alpha
     float toast_alpha;
     if (elapsed < UI_FADE_IN_MS) {
         toast_alpha = ui_ease((float)elapsed / (float)UI_FADE_IN_MS);
@@ -4499,37 +4499,62 @@ void draw_toast_spr() {
 
     uint16_t accent = accent_snap ? accent_snap : CAUTION_COLOR;
 
-    // Full-width toast with 4px side margins, 3px left accent bar
-    int t_x = 4;
-    int t_w = DISP_W - 8;
-    int t_h = 22;
+    // ── Centered pip+pill layout ──
+    int text_len = (int)strlen(text_snap);
+    int char_w   = 7;
+    int text_w   = text_len * char_w;
+    int pip_w    = 7;
+    int gap      = 3;
+    int pad_lr   = 8;
+    int th       = 16;
 
-    // Card background and border
-    spr.fillRect(t_x, y_pos, t_w, t_h, ta(CARD_COLOR));
-    spr.drawRect(t_x, y_pos, t_w, t_h, ta(CARD_BORDER));
+    char queue_str[6] = "";
+    int queue_w = 0;
+    if (queue_count_snap > 1) {
+        snprintf(queue_str, sizeof(queue_str), " +%d", queue_count_snap - 1);
+        queue_w = (int)strlen(queue_str) * char_w;
+    }
 
-    // Left accent bar — 3px wide, inset by 1px from card edge
-    spr.fillRect(t_x, y_pos, 3, t_h, ta(accent));
+    int content_w = pip_w + gap + text_w + queue_w;
+    int tw = content_w + pad_lr * 2;
+    int tx = (DISP_W - tw) / 2;
+    int ty = DISP_H - 26;
+    int tr = th / 2;
 
-    // Sentinel: [i] or [!]
-    int text_y = y_pos + (t_h - 8) / 2;  // vertically center 8px text
-    spr.setTextColor(ta(accent), ta(CARD_COLOR));
+    uint16_t pill_bg = ta(lerp_col16(BG_COLOR, accent, 0.15f));
+    spr.fillRoundRect(tx, ty, tw, th, tr, pill_bg);
+    spr.drawRoundRect(tx, ty, tw, th, tr, ta(accent));
+
+    // Pip
+    int content_start = tx + pad_lr;
+    int pip_cx = content_start + pip_w / 2;
+    int pip_cy = ty + th / 2;
+
+    if (!is_info_snap) {
+        // Warning: filled triangle pointing up
+        spr.fillTriangle(
+            pip_cx,      pip_cy - 3,
+            pip_cx + 3,  pip_cy + 2,
+            pip_cx - 3,  pip_cy + 2,
+            ta(accent));
+    } else {
+        // Info/success: filled circle
+        spr.fillCircle(pip_cx, pip_cy, 2, ta(accent));
+    }
+
+    // Text
+    spr.setTextColor(ta(TEXT_COLOR), pill_bg);
     spr.setTextSize(TS_BODY);
-    spr.setCursor(t_x + 7, text_y);
-    spr.print(is_action_snap ? "[i]" : "[!]");
-
-    // Toast text
-    spr.setTextColor(ta(TEXT_COLOR), ta(CARD_COLOR));
-    spr.setCursor(t_x + 30, text_y);
+    int text_x = content_start + pip_w + gap;
+    spr.setCursor(text_x, ty + 4);
     spr.print(text_snap);
 
-    // Queue count
-    if (queue_count_snap > 1) {
-        char qnum[6];
-        snprintf(qnum, sizeof(qnum), "+%d", queue_count_snap - 1);
-        spr.setTextColor(ta(DIM_COLOR), ta(CARD_COLOR));
-        spr.setCursor(t_x + t_w - 24, text_y);
-        spr.print(qnum);
+    // Queue suffix
+    if (queue_w > 0) {
+        spr.setTextColor(ta(DIM_COLOR), pill_bg);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(text_x + text_w + 2, ty + 5);
+        spr.print(queue_str);
     }
 }
 
@@ -4552,45 +4577,70 @@ void draw_vol_overlay() {
 
     auto va = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    // Pill geometry — matches the boot bar: thin fill inside a generous
-    // rounded outline, centered on the screen.
-    const int bar_w = 130;
-    const int bar_h = 20;
-    const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = DISP_H / 2 + 8;
-    const int bar_r = bar_h / 2;
-
-    int vol_pct = is_muted ? 0 : map(current_volume, 0, 255, 0, 100);
-    char vol_str[12];
-    if (is_muted) {
-        snprintf(vol_str, sizeof(vol_str), "MUTED");
-    } else {
-        snprintf(vol_str, sizeof(vol_str), "VOL %d%%", vol_pct);
+    // ── Dimmed backdrop below header ──
+    {
+        float dim_strength = 0.45f * alpha;
+        int dim_alpha_i = (int)(dim_strength * 256.0f);
+        uint16_t* sbuf = (uint16_t*)spr.getBuffer();
+        if (sbuf) {
+            for (int py = 18; py < DISP_H; py++) {
+                int row = py * DISP_W;
+                for (int px = 0; px < DISP_W; px++) {
+                    int idx = row + px;
+                    uint16_t existing = read_pixel_logical(sbuf, idx);
+                    uint16_t dimmed   = lerp_col16_i(existing, BG_COLOR, dim_alpha_i);
+                    write_pixel_logical(sbuf, idx, dimmed);
+                }
+            }
+        }
     }
-    spr.setTextColor(va(is_muted ? DIM_COLOR : TEXT_COLOR), BG_COLOR);
+
+    // ── Pill layout ──
+    uint16_t accent = is_muted ? DIM_COLOR : HEADER_COLOR;
+    int vol_pct = is_muted ? 0 : (int)map(current_volume, 0, 255, 0, 100);
+
+    char label[12];
+    if (is_muted) {
+        snprintf(label, sizeof(label), "MUTED");
+    } else {
+        snprintf(label, sizeof(label), "VOL %d%%", vol_pct);
+    }
+
+    int char_w   = 7;
+    int label_w  = (int)strlen(label) * char_w;
+    int pad_lr   = 8;
+    int th       = 16;
+    int bar_gap  = 5;
+    int bar_w    = 50;
+    int bar_h    = 4;
+    bool show_bar = !is_muted;
+
+    int tw = pad_lr + label_w + (show_bar ? bar_gap + bar_w : 0) + pad_lr;
+    int tx = (DISP_W - tw) / 2;
+    int ty = DISP_H / 2 - 1;
+    int tr = th / 2;
+
+    uint16_t pill_bg = va(lerp_col16(BG_COLOR, accent, 0.15f));
+    spr.fillRoundRect(tx, ty, tw, th, tr, pill_bg);
+    spr.drawRoundRect(tx, ty, tw, th, tr, va(accent));
+
+    int label_x = tx + pad_lr;
+    spr.setTextColor(va(is_muted ? DIM_COLOR : TEXT_COLOR), pill_bg);
     spr.setTextSize(TS_BODY);
-    spr.setTextDatum(TC_DATUM);
-    spr.drawString(vol_str, DISP_W / 2, bar_y - 20);
-    spr.setTextDatum(TL_DATUM);
+    spr.setCursor(label_x, ty + 4);
+    spr.print(label);
 
-    // Outer outline — single 1px rounded rect.
-    spr.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, va(HEADER_COLOR));
-
-    // Inner fill — thin 4px pill, vertically centered, inset by the
-    // outline radius so it never enters the rounded corner zone.
-    const int fill_h = 4;
-    const int fill_y = bar_y + (bar_h - fill_h) / 2;
-    const int fill_max_w = bar_w - bar_h;
-    const int fill_x = bar_x + bar_h / 2;
-    int fill_w = is_muted ? 0 : (current_volume * fill_max_w) / 255;
-
-    if (fill_w > 0) {
-        int fill_r = fill_h / 2;
-        if (fill_r < 1) fill_r = 1;
-        if (fill_w < fill_r * 2) {
-            spr.fillRect(fill_x, fill_y, fill_w, fill_h, va(HEADER_COLOR));
-        } else {
-            spr.fillRoundRect(fill_x, fill_y, fill_w, fill_h, fill_r, va(HEADER_COLOR));
+    if (show_bar) {
+        int bar_x = tx + pad_lr + label_w + bar_gap;
+        int bar_y = ty + (th - bar_h) / 2;
+        int fill_w = (vol_pct * bar_w) / 100;
+        spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, 2, va(CARD_BORDER));
+        if (fill_w > 0) {
+            if (fill_w < 4) {
+                spr.fillRect(bar_x, bar_y, fill_w, bar_h, va(accent));
+            } else {
+                spr.fillRoundRect(bar_x, bar_y, fill_w, bar_h, 2, va(accent));
+            }
         }
     }
 }
@@ -5237,10 +5287,10 @@ void handle_menu_select() {
             low_power_mode = !low_power_mode;
             if (low_power_mode) {
                 setCpuFrequencyMhz(80);
-                set_toast_direct("LOW POWER ON", ACCENT_COLOR);
+                set_toast_direct("LOW POWER ON", TOAST_SUCCESS);
             } else {
                 setCpuFrequencyMhz(160);
-                set_toast_direct("LOW POWER OFF", DIM_COLOR);
+                set_toast_direct("LOW POWER OFF", TOAST_NEUTRAL);
             }
             apply_ble_scan_params();
             schedule_persist();
@@ -5270,7 +5320,7 @@ void handle_menu_select() {
                 char ip_toast[32];
                 snprintf(ip_toast, sizeof(ip_toast), "http://%s pw:%s",
                          export_ip_str, export_auth_pass);
-                set_toast_direct(ip_toast, ACCENT_COLOR);
+                set_toast_direct(ip_toast, TOAST_SUCCESS);
                 screen_dirty = true;
             } else if (export_connecting) {
                 export_mode_stop();
@@ -5302,7 +5352,7 @@ void handle_menu_select() {
             if (littlefs_available && LittleFS.exists(DELETED_IDS_FILE)) {
                 LittleFS.remove(DELETED_IDS_FILE);
             }
-            set_toast_direct("STATS CLEARED", CAUTION_COLOR);
+            set_toast_direct("STATS CLEARED", TOAST_WARNING, false);
             screen_dirty = true;
             break;
         }
@@ -8907,7 +8957,7 @@ void setup() {
 
     lifetime_boots++;
     if (lifetime_boots == 1) {
-        set_toast_direct("TAB for help  M for menu", DIM_COLOR);
+        set_toast_direct("TAB for help  M for menu", TOAST_NEUTRAL);
     }
     if (littlefs_available) {
         save_session_to_flash();
@@ -9075,10 +9125,10 @@ void loop() {
     {
         static int32_t last_battery_warning_mv = 9999;
         if (loop_mv <= 3500 && last_battery_warning_mv > 3500) {
-            set_toast_direct("BATT CRITICAL 3.5V", CAUTION_COLOR);
+            set_toast_direct("BATT CRITICAL 3.5V", TOAST_WARNING, false);
             last_battery_warning_mv = 3500;
         } else if (loop_mv <= 3700 && last_battery_warning_mv > 3700) {
-            set_toast_direct("BATT LOW 3.7V", CAUTION_COLOR);
+            set_toast_direct("BATT LOW 3.7V", TOAST_WARNING, false);
             last_battery_warning_mv = 3700;
         } else if (last_battery_warning_mv < 9999
                    && loop_mv >= last_battery_warning_mv + 100) {
@@ -9128,7 +9178,7 @@ void loop() {
             if (millis() - last_heap_warn > 30000) {
                 Serial.printf("[HEAP] CRITICAL: %u bytes free (min: %u)\n",
                               (unsigned)free_heap, (unsigned)min_heap_seen);
-                set_toast_direct("LOW MEMORY", CAUTION_COLOR);
+                set_toast_direct("LOW MEMORY", TOAST_WARNING, false);
                 last_heap_warn = millis();
             }
         }
@@ -9284,7 +9334,7 @@ void loop() {
                             export_pass[sizeof(export_pass) - 1] = '\0';
                             save_wifi_credentials();
                             if (!persist_in_flight) schedule_persist();
-                            set_toast_direct("WIFI SAVED", ACCENT_COLOR);
+                            set_toast_direct("WIFI SAVED", TOAST_SUCCESS);
                             wifi_config_open = false;
                         } else if (wifi_config_field == 3) {
                             // Clear
@@ -9294,7 +9344,7 @@ void loop() {
                             wifi_config_pass_buf[0] = '\0';
                             save_wifi_credentials();
                             if (!persist_in_flight) schedule_persist();
-                            set_toast_direct("WIFI CLEARED", CAUTION_COLOR);
+                            set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
                             wifi_config_open = false;
                         }
                     } else if (c == 0x1B) {
@@ -9370,16 +9420,16 @@ void loop() {
             }
             else if (c == '`') {
                 if (is_muted) {
-                    // Unmute — restore to a reasonable default if volume was zeroed
                     is_muted = false;
                     if (current_volume == 0) current_volume = 75;
                     M5Cardputer.Speaker.setVolume(current_volume);
                     beep(600, 50);
+                    set_toast_direct("UNMUTED", TOAST_SUCCESS);
                 } else {
-                    // Mute — zero out volume
                     is_muted = true;
                     current_volume = 0;
                     M5Cardputer.Speaker.setVolume(0);
+                    set_toast_direct("MUTED", TOAST_NEUTRAL);
                 }
                 screen_dirty = true;
             }
@@ -9497,11 +9547,11 @@ void loop() {
                             save_whitelist();
                             char wl_toast[32];
                             snprintf(wl_toast, sizeof(wl_toast), "WHITELISTED %d/%d", mac_whitelist_count, MAX_WHITELIST);
-                            set_toast_direct(wl_toast, ACCENT_COLOR);
+                            set_toast_direct(wl_toast, TOAST_SUCCESS);
                         } else if (is_mac_whitelisted(mac_to_wl)) {
-                            set_toast_direct("ALREADY WHITELISTED", DIM_COLOR);
+                            set_toast_direct("ALREADY WHITELISTED", TOAST_NEUTRAL);
                         } else {
-                            set_toast_direct("WHITELIST FULL", CAUTION_COLOR);
+                            set_toast_direct("WHITELIST FULL", TOAST_WARNING, false);
                         }
                         screen_dirty = true;
                     }
@@ -9604,7 +9654,11 @@ void loop() {
                     apply_color_palette();
                     screen_dirty = true;
                     schedule_persist();
-                    set_toast_direct(night_mode ? "NIGHT MODE" : "DAY MODE", HEADER_COLOR);
+                    if (night_mode) {
+                        set_toast_direct("NIGHT MODE", TOAST_SUCCESS);
+                    } else {
+                        set_toast_direct("DAY MODE", TOAST_NEUTRAL);
+                    }
                 }
             }
             else if (c == 'l') {
@@ -9777,7 +9831,7 @@ void loop() {
                         export_pass[sizeof(export_pass) - 1] = '\0';
                         save_wifi_credentials();
                         if (!persist_in_flight) schedule_persist();
-                        set_toast_direct("WIFI SAVED", ACCENT_COLOR);
+                        set_toast_direct("WIFI SAVED", TOAST_SUCCESS);
                         wifi_config_open = false;
                     } else if (wifi_config_field == 3) {
                         export_ssid[0] = '\0';
@@ -9786,7 +9840,7 @@ void loop() {
                         wifi_config_pass_buf[0] = '\0';
                         save_wifi_credentials();
                         if (!persist_in_flight) schedule_persist();
-                        set_toast_direct("WIFI CLEARED", CAUTION_COLOR);
+                        set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
                         wifi_config_open = false;
                     }
                 }
