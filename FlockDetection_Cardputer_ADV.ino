@@ -7101,10 +7101,15 @@ void draw_capture_history_screen() {
         }
 
         // ── Footer ──
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
         spr.setCursor(LBL_X, DISP_H - 10);
-        spr.print("d del  t locate  w wl  DEL close");
+        if (hist_delete_confirming) {
+            spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+            spr.print("DELETE? ENT/d yes  DEL cancel");
+        } else {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.print("d del  t locate  w wl  DEL close");
+        }
 
     } else {
         // ── List view ─────────────────────────────────────────────────────
@@ -9463,9 +9468,14 @@ void loop() {
             }
             else if (c == 'd') {
                 if (!stealth_mode && current_screen == 2 && hist_detail_open) {
-                    perform_detection_delete(history_selected_idx);
-                    hist_delete_confirming = false;
-                    hist_detail_open       = false;
+                    if (hist_delete_confirming) {
+                        // Second press of 'd' also confirms (alternative to ENTER)
+                        perform_detection_delete(history_selected_idx);
+                        hist_delete_confirming = false;
+                        hist_detail_open       = false;
+                    } else {
+                        hist_delete_confirming = true;
+                    }
                     screen_dirty = true;
                     draw_current_screen(); spr.pushSprite(0, 0);
                 }
