@@ -9924,19 +9924,17 @@ void loop() {
             const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
             const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
 
-            bool up_held = false, down_held = false, left_held = false, right_held = false;
+            bool up_held = false, down_held = false;
             // Skip hold-repeat when the menu is open — the menu's own
             // input handler already processed the arrows and the hold-repeat
             // would double-fire navigation.
             if (!menu_open && !wifi_config_open) {
                 for (auto c : status.word) {
-                    if (IS_KEY_UP(c))    up_held    = true;
-                    if (IS_KEY_DOWN(c))  down_held  = true;
-                    if (IS_KEY_LEFT(c))  left_held  = true;
-                    if (IS_KEY_RIGHT(c)) right_held = true;
+                    if (IS_KEY_UP(c))   up_held   = true;
+                    if (IS_KEY_DOWN(c)) down_held = true;
                 }
             }
-            char cur_arrow = up_held ? ';' : (down_held ? '.' : (left_held ? ',' : (right_held ? '/' : 0)));
+            char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
 
             if (cur_arrow && cur_arrow == arrow_held_key) {
                 unsigned long hold_dur = millis() - arrow_hold_start;
