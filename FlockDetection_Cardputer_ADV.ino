@@ -8266,22 +8266,25 @@ void draw_device_info_screen() {
 // MAIN UI CONTROLLER
 // ============================================================================
 void draw_current_screen() {
-    switch (current_screen) {
-        case 0: draw_scanner_screen();         break;
-        case 1: draw_locator_screen();         break;
-        case 2: draw_capture_history_screen(); break;
-        case 3: draw_gps_screen();             break;
-        case 4: draw_device_info_screen();     break;
+    // Fullscreen opaque overlays completely occlude the screen beneath.
+    // Skip the expensive underlying render when one is active.
+    bool fullscreen_overlay = menu_open || show_help_overlay || wifi_config_open;
+
+    if (!fullscreen_overlay) {
+        switch (current_screen) {
+            case 0: draw_scanner_screen();         break;
+            case 1: draw_locator_screen();         break;
+            case 2: draw_capture_history_screen(); break;
+            case 3: draw_gps_screen();             break;
+            case 4: draw_device_info_screen();     break;
+        }
+        if (show_feed_expanded) draw_feed_expanded_overlay();
     }
-    
-    if (show_feed_expanded) draw_feed_expanded_overlay();
+
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
     if (wifi_config_open) draw_wifi_config_overlay();
-    // Fullscreen menu overlay
-    if (menu_open) {
-        draw_menu_overlay();
-    }
+    if (menu_open) draw_menu_overlay();
     draw_toast_spr();
 }
 
