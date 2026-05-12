@@ -9393,10 +9393,14 @@ void loop() {
                         draw_current_screen(); spr.pushSprite(0, 0);
                     }
                 } else if (current_screen == 4) {
-                    // Target only — render loop eases via anim_filter
                     stats_scroll_target -= STATS_SCROLL_STEP;
                     if (stats_scroll_target < 0) stats_scroll_target = 0;
                     screen_dirty = true;
+                } else if (!stealth_mode) {
+                    int prev = current_screen - 1;
+                    int d = (prev < 0) ? 1 : -1;
+                    if (prev < 0) prev = NUM_SCREENS - 1;
+                    transition_screen(prev, d);
                 }
             }
             else if (IS_KEY_DOWN(c)) {
@@ -9411,11 +9415,15 @@ void loop() {
                         draw_current_screen(); spr.pushSprite(0, 0);
                     }
                 } else if (current_screen == 4) {
-                    // Target only — render loop eases via anim_filter
                     stats_scroll_target += STATS_SCROLL_STEP;
                     if (stats_scroll_target > STATS_MAX_SCROLL)
                         stats_scroll_target = STATS_MAX_SCROLL;
                     screen_dirty = true;
+                } else if (!stealth_mode) {
+                    int next = current_screen + 1;
+                    int d = (next >= NUM_SCREENS) ? -1 : 1;
+                    if (next >= NUM_SCREENS) next = 0;
+                    transition_screen(next, d);
                 }
             }
             else if (c == '-') {
@@ -9537,24 +9545,6 @@ void loop() {
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
                     trigger_toast("INFO", "No targets yet", 0);
-                }
-            }
-            else if (IS_KEY_DOWN(c)) {
-                // Arrow down on screens without scroll — next screen
-                if (!stealth_mode) {
-                    int next = current_screen + 1;
-                    int d = (next >= NUM_SCREENS) ? -1 : 1;
-                    if (next >= NUM_SCREENS) next = 0;
-                    transition_screen(next, d);
-                }
-            }
-            else if (IS_KEY_UP(c)) {
-                // Arrow up on screens without scroll — prev screen
-                if (!stealth_mode) {
-                    int prev = current_screen - 1;
-                    int d = (prev < 0) ? 1 : -1;
-                    if (prev < 0) prev = NUM_SCREENS - 1;
-                    transition_screen(prev, d);
                 }
             }
             else if (c == 'b') {
