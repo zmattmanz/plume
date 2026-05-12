@@ -5267,7 +5267,7 @@ void draw_wifi_config_overlay() {
     if (wifi_config_editing) {
         spr.print("type to edit  ENT done  DEL bksp");
     } else {
-        spr.print("ENT edit  ^/v field  DEL close");
+        spr.print("ENT edit  ^/v field  ESC close");
     }
 }
 
@@ -9888,9 +9888,18 @@ void loop() {
                         }
                         wifi_config_cursor--;
                     }
-                } else {
-                    wifi_config_open = false;
+                } else if (wifi_config_field <= 1) {
+                    // On a text field — enter editing mode and backspace the last char
+                    char* buf = (wifi_config_field == 0) ? wifi_config_ssid_buf : wifi_config_pass_buf;
+                    int cur_len = strlen(buf);
+                    if (cur_len > 0) {
+                        wifi_config_editing = true;
+                        wifi_config_cursor  = cur_len;
+                        buf[--wifi_config_cursor] = '\0';
+                    }
+                    // Empty field: no-op — use ESC to close
                 }
+                // DEL never closes the overlay; use ESC for that
                 draw_current_screen(); spr.pushSprite(0, 0);
             } else if (show_feed_expanded) {
                 show_feed_expanded = false;
