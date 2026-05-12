@@ -9463,7 +9463,45 @@ void loop() {
         // loop above didn't already act on it (firmwares that report ENTER
         // in both places would otherwise toggle every action twice).
         if (status.enter && !enter_consumed && !stealth_mode) {
-            if (dock.open && !dock.closing) {
+            if (wifi_config_open) {
+                if (wifi_config_editing) {
+                    wifi_config_editing = false;
+                    menu_click();
+                } else {
+                    if (wifi_config_field == 0 || wifi_config_field == 1) {
+                        wifi_config_editing = true;
+                        if (wifi_config_field == 0) {
+                            strncpy(wifi_config_ssid_buf, export_ssid, sizeof(wifi_config_ssid_buf) - 1);
+                            wifi_config_ssid_buf[sizeof(wifi_config_ssid_buf) - 1] = '\0';
+                            wifi_config_cursor = strlen(wifi_config_ssid_buf);
+                        } else {
+                            strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
+                            wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
+                            wifi_config_cursor = strlen(wifi_config_pass_buf);
+                        }
+                        menu_click();
+                    } else if (wifi_config_field == 2) {
+                        strncpy(export_ssid, wifi_config_ssid_buf, sizeof(export_ssid) - 1);
+                        export_ssid[sizeof(export_ssid) - 1] = '\0';
+                        strncpy(export_pass, wifi_config_pass_buf, sizeof(export_pass) - 1);
+                        export_pass[sizeof(export_pass) - 1] = '\0';
+                        save_wifi_credentials();
+                        if (!persist_in_flight) schedule_persist();
+                        set_toast_direct("WIFI SAVED", ACCENT_COLOR);
+                        wifi_config_open = false;
+                    } else if (wifi_config_field == 3) {
+                        export_ssid[0] = '\0';
+                        export_pass[0] = '\0';
+                        wifi_config_ssid_buf[0] = '\0';
+                        wifi_config_pass_buf[0] = '\0';
+                        save_wifi_credentials();
+                        if (!persist_in_flight) schedule_persist();
+                        set_toast_direct("WIFI CLEARED", CAUTION_COLOR);
+                        wifi_config_open = false;
+                    }
+                }
+                draw_current_screen(); spr.pushSprite(0, 0);
+            } else if (dock.open && !dock.closing) {
                 menu_selected = dock.selected;
                 dock_close();
                 menu_click();
