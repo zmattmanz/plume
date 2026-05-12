@@ -499,11 +499,11 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define DEBUG_KEYS 0
 
 // Arrow key characters — differ between standard Cardputer and ADV variant.
-// ADV 4-key arrow diamond: , = up, / = down, ; = left, . = right
-#define IS_KEY_UP(c)    ((c) == ',')
-#define IS_KEY_DOWN(c)  ((c) == '/')
-#define IS_KEY_LEFT(c)  ((c) == ';')
-#define IS_KEY_RIGHT(c) ((c) == '.')
+// Standard: ';' (up) / '.' (down)
+// ADV:      ',' (up) / '/' (down)
+// Check both so the firmware works on either hardware.
+#define IS_KEY_UP(c)   ((c) == ';' || (c) == ',')
+#define IS_KEY_DOWN(c) ((c) == '.' || (c) == '/')
 
 // Pre-configure WiFi credentials for export mode. User edits these in source
 // once, then they're saved to flash on first boot. To change later, edit
@@ -9434,49 +9434,37 @@ void loop() {
                 screen_dirty = true;
             }
             else if (IS_KEY_UP(c)) {
-                if (current_screen == 2) {
-                    if (hist_detail_open) { /* no nav while detail is open */ }
-                    else {
-                        history_selected_idx--;
-                        if (history_selected_idx < 0) history_selected_idx = 0;
-                        if (history_selected_idx < history_scroll_offset)
-                            history_scroll_offset = history_selected_idx;
-                        draw_current_screen(); spr.pushSprite(0, 0);
-                    }
+                if (current_screen == 2 && !hist_detail_open) {
+                    history_selected_idx--;
+                    if (history_selected_idx < 0) history_selected_idx = 0;
+                    if (history_selected_idx < history_scroll_offset)
+                        history_scroll_offset = history_selected_idx;
+                    draw_current_screen(); spr.pushSprite(0, 0);
                 } else if (current_screen == 4) {
                     stats_scroll_target -= STATS_SCROLL_STEP;
                     if (stats_scroll_target < 0) stats_scroll_target = 0;
                     screen_dirty = true;
-                }
-            }
-            else if (IS_KEY_DOWN(c)) {
-                if (current_screen == 2) {
-                    if (hist_detail_open) { /* no nav while detail is open */ }
-                    else {
-                        int hist_total = sd_available ? sd_hist_count : capture_history_count;
-                        history_selected_idx++;
-                        if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
-                        if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
-                            history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
-                        draw_current_screen(); spr.pushSprite(0, 0);
-                    }
-                } else if (current_screen == 4) {
-                    stats_scroll_target += STATS_SCROLL_STEP;
-                    if (stats_scroll_target > STATS_MAX_SCROLL)
-                        stats_scroll_target = STATS_MAX_SCROLL;
-                    screen_dirty = true;
-                }
-            }
-            else if (IS_KEY_LEFT(c)) {
-                if (!stealth_mode) {
+                } else if (!stealth_mode) {
                     int prev = current_screen - 1;
                     int d = (prev < 0) ? 1 : -1;
                     if (prev < 0) prev = NUM_SCREENS - 1;
                     transition_screen(prev, d);
                 }
             }
-            else if (IS_KEY_RIGHT(c)) {
-                if (!stealth_mode) {
+            else if (IS_KEY_DOWN(c)) {
+                if (current_screen == 2 && !hist_detail_open) {
+                    int hist_total = sd_available ? sd_hist_count : capture_history_count;
+                    history_selected_idx++;
+                    if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
+                    if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+                        history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (current_screen == 4) {
+                    stats_scroll_target += STATS_SCROLL_STEP;
+                    if (stats_scroll_target > STATS_MAX_SCROLL)
+                        stats_scroll_target = STATS_MAX_SCROLL;
+                    screen_dirty = true;
+                } else if (!stealth_mode) {
                     int next = current_screen + 1;
                     int d = (next >= NUM_SCREENS) ? -1 : 1;
                     if (next >= NUM_SCREENS) next = 0;
@@ -9754,7 +9742,7 @@ void loop() {
                     if (IS_KEY_DOWN(c)) down_held = true;
                 }
             }
-            char cur_arrow = up_held ? ',' : (down_held ? '/' : 0);
+            char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
 
             if (cur_arrow && cur_arrow == arrow_held_key) {
                 unsigned long hold_dur = millis() - arrow_hold_start;
