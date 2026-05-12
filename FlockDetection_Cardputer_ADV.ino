@@ -494,11 +494,11 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define DEBUG_KEYS 0
 
 // Arrow key characters — differ between standard Cardputer and ADV variant.
-// Standard: ';' (up) / '.' (down)
-// ADV:      ',' (up) / '/' (down)
-// Check both so the firmware works on either hardware.
-#define IS_KEY_UP(c)   ((c) == ';' || (c) == ',')
-#define IS_KEY_DOWN(c) ((c) == '.' || (c) == '/')
+// ADV 4-key arrow diamond: , = up, / = down, ; = left, . = right
+#define IS_KEY_UP(c)    ((c) == ',')
+#define IS_KEY_DOWN(c)  ((c) == '/')
+#define IS_KEY_LEFT(c)  ((c) == ';')
+#define IS_KEY_RIGHT(c) ((c) == '.')
 
 // Pre-configure WiFi credentials for export mode. User edits these in source
 // once, then they're saved to flash on first boot. To change later, edit
@@ -9397,11 +9397,6 @@ void loop() {
                     stats_scroll_target -= STATS_SCROLL_STEP;
                     if (stats_scroll_target < 0) stats_scroll_target = 0;
                     screen_dirty = true;
-                } else if (!stealth_mode) {
-                    int prev = current_screen - 1;
-                    int d = (prev < 0) ? 1 : -1;
-                    if (prev < 0) prev = NUM_SCREENS - 1;
-                    transition_screen(prev, d);
                 }
             }
             else if (IS_KEY_DOWN(c)) {
@@ -9420,7 +9415,18 @@ void loop() {
                     if (stats_scroll_target > STATS_MAX_SCROLL)
                         stats_scroll_target = STATS_MAX_SCROLL;
                     screen_dirty = true;
-                } else if (!stealth_mode) {
+                }
+            }
+            else if (IS_KEY_LEFT(c)) {
+                if (!stealth_mode) {
+                    int prev = current_screen - 1;
+                    int d = (prev < 0) ? 1 : -1;
+                    if (prev < 0) prev = NUM_SCREENS - 1;
+                    transition_screen(prev, d);
+                }
+            }
+            else if (IS_KEY_RIGHT(c)) {
+                if (!stealth_mode) {
                     int next = current_screen + 1;
                     int d = (next >= NUM_SCREENS) ? -1 : 1;
                     if (next >= NUM_SCREENS) next = 0;
@@ -9685,16 +9691,16 @@ void loop() {
             const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
 
             bool up_held = false, down_held = false;
-            // Skip hold-repeat when the dock is open — the dock's own
-            // input handler in the word loop already processed ;/. and
-            // the hold-repeat would double-fire the navigation.
+            // Skip hold-repeat when the menu is open — the menu's own
+            // input handler already processed ,// and the hold-repeat
+            // would double-fire the navigation.
             if (!menu_open && !wifi_config_open) {
                 for (auto c : status.word) {
                     if (IS_KEY_UP(c)) up_held = true;
                     if (IS_KEY_DOWN(c)) down_held = true;
                 }
             }
-            char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
+            char cur_arrow = up_held ? ',' : (down_held ? '/' : 0);
 
             if (cur_arrow && cur_arrow == arrow_held_key) {
                 unsigned long hold_dur = millis() - arrow_hold_start;
