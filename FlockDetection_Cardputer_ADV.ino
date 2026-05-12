@@ -5400,7 +5400,7 @@ static void prox_radar_refresh(unsigned long frame_ms) {
         // Compress radial range so icons cluster toward center.
         // sqrt curve means weak signals still spread out but strong
         // signals group tightly near the center dot.
-        float target_dist = sqrtf(1.0f - rssi_norm) * 0.75f;
+        float target_dist = sqrtf(1.0f - rssi_norm) * 0.55f;
 
         if (slot >= 0) {
             scan_devs[slot].dist       = target_dist;
@@ -5443,7 +5443,7 @@ static void prox_radar_refresh(unsigned long frame_ms) {
 
     for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
         if (scan_devs[pi].occupied && !matched[pi]) {
-            if ((frame_ms - scan_devs[pi].last_seen_ms) > 60000UL) {
+            if ((frame_ms - scan_devs[pi].last_seen_ms) > 22000UL) {
                 scan_devs[pi].occupied = false;
             }
         }
@@ -5631,7 +5631,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         d.size_ease += (size_target - d.size_ease) * 0.12f;
 
         // Position
-        float draw_dist = 0.10f + d.dist_smooth * 0.72f;
+        float draw_dist = 0.12f + d.dist_smooth * 0.58f;
         float ds, dc;
         fast_sincos(d.angle, &ds, &dc);
         int dpx = CX + (int)(draw_dist * (float)R * dc);
@@ -5644,13 +5644,20 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         if (dpy < VIZ_Y + MARGIN)          dpy = VIZ_Y + MARGIN;
         if (dpy > VIZ_Y + VIZ_H - MARGIN)  dpy = VIZ_Y + VIZ_H - MARGIN;
 
-        // Age fade
+        // Age fade — three phases: hold → fade → flicker out
         float age_af = 1.0f;
         unsigned long age = frame_ms - d.last_seen_ms;
-        if (age > 10000UL) {
-            float t = (float)(age - 10000UL) / 50000.0f;
-            if (t > 0.7f) t = 0.7f;
-            age_af = 1.0f - t;
+        if (age > 15000UL) {
+            // Phase 3 (15–20s): flicker — rapid sin oscillation on fading alpha
+            float exit_t = (float)(age - 15000UL) / 5000.0f;  // 0→1 over 5s
+            if (exit_t > 1.0f) exit_t = 1.0f;
+            float fade = 0.3f * (1.0f - exit_t);  // 0.3 → 0
+            float flicker = 0.5f + 0.5f * sinf((float)frame_ms * 0.025f);  // ~6 Hz
+            age_af = fade * flicker;
+        } else if (age > 8000UL) {
+            // Phase 2 (8–15s): smooth fade from 1.0 → 0.3
+            float fade_t = (float)(age - 8000UL) / 7000.0f;
+            age_af = 1.0f - fade_t * 0.7f;
         }
 
         // Color — on sweep contact, outline shifts toward white
@@ -5680,16 +5687,15 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         // Reads pixel from buffer, swaps to logical format if needed,
         // blends in logical RGB565 (where lerp_col16 works correctly),
         // swaps back, writes to buffer. Result: correct colors guaranteed.
-        if (d.sweep_bright > 0.08f) {
-            // Eased glow: cubic ease-out — fast snap-on, long gentle tail.
+        if (d.sweep_bright > 0.10f) {
             float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
 
             uint16_t* sbuf = (uint16_t*)spr.getBuffer();
             const int sbuf_w = DISP_W;
 
-            int   glow_r    = sz + 12;
+            int   glow_r    = sz + 8;
             float glow_r2   = (float)(glow_r * glow_r);
-            float glow_peak = glow_t * 0.50f;
+            float glow_peak = glow_t * 0.22f;
 
             int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
             int gx1 = dpx + glow_r; if (gx1 >= VIZ_X + VIZ_W) gx1 = VIZ_X + VIZ_W - 1;
@@ -5831,9 +5837,15 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
 
     spr.drawFastHLine(plot_x, plot_bottom, plot_w, GRID_LINE_DIM);
 
+    // BLE band baseline indicator — purple line under channels 1–11
+    if (ble_active) {
+        int ble_x0 = plot_x;
+        int ble_x1 = plot_x + (10 * plot_w) / 12;  // ch 11 = index 10
+        spr.drawFastHLine(ble_x0, plot_bottom, ble_x1 - ble_x0, PURPLE_COLOR);
+    }
+
     // Channel labels below baseline: 1, 6, 11, 13
     {
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
         const int label_chs[] = {1, 6, 11, 13};
         for (int li = 0; li < 4; li++) {
@@ -5842,12 +5854,14 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
             char ch_label[4];
             snprintf(ch_label, sizeof(ch_label), "%d", label_chs[li]);
             int label_w = (int)strlen(ch_label) * 6;
-            spr.setCursor(lx - label_w / 2, plot_bottom + 1);
+            bool in_ble = (label_chs[li] <= 11);
+            spr.setTextColor((ble_active && in_ble) ? PURPLE_COLOR : DIM_COLOR, BG_COLOR);
+            spr.setCursor(lx - label_w / 2, plot_bottom + 2);
             spr.print(ch_label);
         }
     }
 
-    const float MAX_HEIGHT = (float)plot_h * 0.70f;
+    const float MAX_HEIGHT = (float)plot_h * 0.58f;
     auto val_to_y = [&](float val) -> int {
         return plot_bottom - (int)(val * MAX_HEIGHT);
     };
@@ -6078,8 +6092,8 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     {
         const char* band_label = "2.4GHz";
         int pill_w = (int)strlen(band_label) * 7 + UI_PAD_SM;
-        int pill_x = TEXT_LEFT;
-        int pill_y = VIZ_Y + UI_PAD_XS;
+        int pill_x = TEXT_LEFT + UI_PAD_XS;
+        int pill_y = VIZ_Y + UI_PAD_SM;
         int pill_h = 11;
         spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, 3, BG_COLOR);
         spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, 3,
