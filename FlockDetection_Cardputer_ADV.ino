@@ -348,6 +348,7 @@ static const int UI_PAD_LG  = 18;
 
 // Content area starts at this Y on every screen. Header = 0..CONTENT_Y-1.
 static const int CONTENT_Y  = 20;
+static const int TEXT_LEFT   = 4;   // left text margin — aligns header + viz titles + pills
 
 // ui_ease — the single curve we use for every UI animation
 // (ease_out_quad). Decelerating motion: fast start, soft landing.
@@ -5003,7 +5004,6 @@ void handle_menu_select() {
 // Horizontal map (pixels):
 //   0  [6px margin]  6..137 viz  [2px] 140 div [2px] 143..233 feed  [6px margin] 240
 //
-static const int TEXT_LEFT     = 4;                                    // left text margin — aligns header + viz titles
 static const int DIVIDER_X     = 140;
 static const int DIVIDER_GAP   = UI_PAD_XS;                          // 2 — gutter each side of divider
 static const int VIZ_X         = UI_PAD_SM;                           // 6 — left screen margin
