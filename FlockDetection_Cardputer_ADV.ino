@@ -2633,7 +2633,8 @@ void rssi_track_expire() {
 
 struct ScanDevice {
     char     mac[18];
-    float    angle;           // hash-derived, stable
+    float    angle;           // repulsion-adjusted target angle
+    float    angle_smooth;    // eased display angle — prevents angular jumps
     float    dist;            // RSSI-derived target, 0=center 1=edge
     float    dist_smooth;     // eased distance for smooth radial motion
     float    sweep_bright;    // 0..1 brightness from sweep contact
@@ -2644,6 +2645,8 @@ struct ScanDevice {
     int8_t   rssi;
     bool     occupied;
     unsigned long last_seen_ms;
+    unsigned long appear_ms;  // timestamp of first appearance — drives fade-in
+    float    opacity;         // 0..1 master opacity — eased on appear + exit
 };
 
 static ScanDevice    scan_devs[SCAN_MAX_DEVICES] = {};
@@ -5469,7 +5472,7 @@ void draw_scanner_screen() {
 
 // ── SCAN viz: device-list refresh (also used by ambient radar) ────────────
 static void prox_radar_refresh(unsigned long frame_ms) {
-    if (frame_ms - scan_last_refresh_ms < 500 && scan_last_refresh_ms != 0) return;
+    if (frame_ms - scan_last_refresh_ms < 200 && scan_last_refresh_ms != 0) return;
     scan_last_refresh_ms = frame_ms;
 
     const float PI2f = 2.0f * (float)M_PI;
@@ -5540,7 +5543,10 @@ static void prox_radar_refresh(unsigned long frame_ms) {
             d.size_ease    = 0.0f;
             d.last_sweep_ms = 0;
             uint32_t h = hash_mac(e.mac);
-            d.angle = ((float)(h % 10000) / 10000.0f) * PI2f;
+            d.angle        = ((float)(h % 10000) / 10000.0f) * PI2f;
+            d.angle_smooth = d.angle;
+            d.appear_ms    = frame_ms;
+            d.opacity      = 0.0f;    // starts invisible — eases in
             matched[slot] = true;
         }
     }
@@ -5710,8 +5716,19 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         if (!scan_devs[pi].occupied) continue;
         ScanDevice& d = scan_devs[pi];
 
-        // Smooth radial motion
-        d.dist_smooth = anim_filter(d.dist_smooth, d.dist, 900.0f, dt);
+        // Smooth radial + angular motion
+        d.dist_smooth = anim_filter(d.dist_smooth, d.dist, 800.0f, dt);
+
+        // Ease the display angle toward the repulsion-adjusted target.
+        // Wraps correctly around 0/2π so icons don't spin the long way.
+        {
+            float diff = d.angle - d.angle_smooth;
+            if (diff >  (float)M_PI) diff -= PI2f;
+            if (diff < -(float)M_PI) diff += PI2f;
+            d.angle_smooth += diff * (1.0f - expf(-dt / 400.0f));
+            if (d.angle_smooth < 0.0f)  d.angle_smooth += PI2f;
+            if (d.angle_smooth >= PI2f) d.angle_smooth -= PI2f;
+        }
 
         // Sweep contact — signed angular diff; trigger on trailing side only
         float diff = scan_sweep_angle - d.angle;
@@ -5734,10 +5751,10 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         float size_target = d.sweep_bright * 0.07f;
         d.size_ease += (size_target - d.size_ease) * 0.12f;
 
-        // Position
+        // Position — uses eased angle for smooth angular motion
         float draw_dist = 0.12f + d.dist_smooth * 0.58f;
         float ds, dc;
-        fast_sincos(d.angle, &ds, &dc);
+        fast_sincos(d.angle_smooth, &ds, &dc);
         int dpx = CX + (int)(draw_dist * (float)R * dc);
         int dpy = CY + (int)(draw_dist * (float)R * ds);
 
@@ -5748,21 +5765,35 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         if (dpy < VIZ_Y + MARGIN)          dpy = VIZ_Y + MARGIN;
         if (dpy > VIZ_Y + VIZ_H - MARGIN)  dpy = VIZ_Y + VIZ_H - MARGIN;
 
-        // Age fade — three phases: hold → fade → flicker out
-        float age_af = 1.0f;
+        // Master opacity — handles appear fade-in and exit fade-out.
+        // Target is 1.0 while alive, decays through exit phases.
+        float opacity_target = 1.0f;
         unsigned long age = frame_ms - d.last_seen_ms;
         if (age > 15000UL) {
-            // Phase 3 (15–20s): flicker — rapid sin oscillation on fading alpha
-            float exit_t = (float)(age - 15000UL) / 5000.0f;  // 0→1 over 5s
+            // Phase 3 (15–22s): flicker — rapid oscillation on fading alpha
+            float exit_t = (float)(age - 15000UL) / 7000.0f;
             if (exit_t > 1.0f) exit_t = 1.0f;
-            float fade = 0.3f * (1.0f - exit_t);  // 0.3 → 0
-            float flicker = 0.5f + 0.5f * sinf((float)frame_ms * 0.025f);  // ~6 Hz
-            age_af = fade * flicker;
+            float fade = 0.3f * (1.0f - exit_t);
+            float flicker = 0.5f + 0.5f * sinf((float)frame_ms * 0.02f);
+            opacity_target = fade * flicker;
         } else if (age > 8000UL) {
             // Phase 2 (8–15s): smooth fade from 1.0 → 0.3
             float fade_t = (float)(age - 8000UL) / 7000.0f;
-            age_af = 1.0f - fade_t * 0.7f;
+            opacity_target = 1.0f - fade_t * 0.7f;
         }
+
+        // Appear: ease opacity from 0→target over 400ms
+        float appear_t = (d.appear_ms > 0)
+            ? (float)(frame_ms - d.appear_ms) / 400.0f
+            : 1.0f;
+        if (appear_t > 1.0f) appear_t = 1.0f;
+        float appear_ease = appear_t * appear_t * (3.0f - 2.0f * appear_t);
+        opacity_target *= appear_ease;
+
+        // Smooth opacity changes so even sudden RSSI drops don't pop
+        d.opacity = anim_filter(d.opacity, opacity_target, 200.0f, dt);
+        float age_af = d.opacity;
+        if (age_af < 0.02f) continue;  // skip drawing invisible icons
 
         // Color — on sweep contact, outline shifts toward white
         uint16_t base_col = d.is_flock ? CAUTION_COLOR
@@ -5777,15 +5808,17 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
                      : lerp_col16(BG_COLOR, base_col, age_af);
         }
 
-        // Size — flock icons pulse continuously, non-flock static
+        // Size — flock icons pulse continuously, non-flock static.
+        // Appear animation scales from 0 → full over the first 400ms.
         int base_sz = d.is_flock ? 7 : 6;
         float pulse_factor = 0.0f;
         if (d.is_flock) {
-            // Breathe at UI_PULSE_BREATHE (1200ms), ±8% size
             float breath = 0.5f + 0.5f * sinf((float)frame_ms * 2.0f * (float)M_PI / 1200.0f);
-            pulse_factor = (breath - 0.5f) * 0.16f;  // maps [0,1] → [-0.08, +0.08]
+            pulse_factor = (breath - 0.5f) * 0.16f;
         }
-        int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor));
+        float appear_scale = appear_ease;  // 0→1 smoothstep from opacity block
+        int sz = (int)((float)base_sz * (1.0f + d.size_ease + pulse_factor) * appear_scale);
+        if (sz < 1) sz = 1;
 
         // ── Sweep glow: per-pixel alpha blend, byte-order-corrected ──
         // Reads pixel from buffer, swaps to logical format if needed,
