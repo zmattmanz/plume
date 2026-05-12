@@ -144,7 +144,10 @@ static int  menu_selected = 0;  // bridged into handle_menu_select()
 
 // ── Fullscreen menu state ──
 static bool menu_open = false;
-static unsigned long menu_open_ms = 0;  // for fade-in animation
+static unsigned long menu_open_ms = 0;
+static int   menu_scroll_offset = 0;
+static float menu_scroll_y_f    = 0.0f;
+static unsigned long menu_last_frame_ms = 0;
 
 // ── Menu section model ──
 struct MenuItem {
@@ -4818,7 +4821,93 @@ static void menu_click() {
     M5Cardputer.Speaker.tone(660, 5);  // soft mechanical-keyboard tick
 }
 
-// ── Fullscreen two-column menu ──────────────────────────────────────
+// ── Menu icon primitives (7px tall, drawn at ix, iy) ────────────────
+
+static void menu_icon_scanner(int x, int y, uint16_t col) {
+    spr.drawTriangle(x, y+6, x+6, y+6, x+3, y, col);
+}
+
+static void menu_icon_locator(int x, int y, uint16_t col) {
+    spr.drawFastHLine(x, y+3, 7, col);
+    spr.drawFastVLine(x+3, y, 7, col);
+    spr.drawPixel(x+1, y+1, col); spr.drawPixel(x+5, y+1, col);
+    spr.drawPixel(x+1, y+5, col); spr.drawPixel(x+5, y+5, col);
+}
+
+static void menu_icon_detections(int x, int y, uint16_t col) {
+    spr.fillRect(x,   y+4, 2, 3, col);
+    spr.fillRect(x+2, y+2, 2, 5, col);
+    spr.fillRect(x+4, y,   2, 7, col);
+}
+
+static void menu_icon_gps(int x, int y, uint16_t col) {
+    spr.drawCircle(x+3, y+2, 2, col);
+    spr.drawLine(x+1, y+4, x+3, y+6, col);
+    spr.drawLine(x+5, y+4, x+3, y+6, col);
+}
+
+static void menu_icon_stats(int x, int y, uint16_t col) {
+    spr.fillRect(x,   y,   3, 3, col);
+    spr.fillRect(x+4, y,   3, 3, col);
+    spr.fillRect(x,   y+4, 3, 3, col);
+    spr.fillRect(x+4, y+4, 3, 3, col);
+}
+
+static void menu_icon_night(int x, int y, uint16_t col) {
+    spr.drawCircle(x+3, y+3, 3, col);
+    spr.fillCircle(x+4, y+2, 3, BG_COLOR);
+}
+
+static void menu_icon_power(int x, int y, uint16_t col) {
+    spr.drawCircle(x+3, y+3, 3, col);
+    spr.fillRect(x+2, y, 3, 2, BG_COLOR);
+    spr.drawFastVLine(x+3, y, 4, col);
+}
+
+static void menu_icon_mute(int x, int y, uint16_t col) {
+    spr.fillRect(x, y+2, 2, 3, col);
+    spr.drawLine(x+2, y, x+2, y+6, col);
+    spr.drawLine(x+4, y+1, x+6, y+5, col);
+    spr.drawLine(x+4, y+5, x+6, y+1, col);
+}
+
+static void menu_icon_wifi(int x, int y, uint16_t col) {
+    spr.drawPixel(x+3, y+6, col);
+    spr.drawPixel(x+2, y+4, col); spr.drawPixel(x+4, y+4, col);
+    spr.drawPixel(x+1, y+2, col); spr.drawPixel(x+5, y+2, col);
+    spr.drawPixel(x, y, col);     spr.drawPixel(x+6, y, col);
+}
+
+static void menu_icon_export(int x, int y, uint16_t col) {
+    spr.drawLine(x+3, y, x, y+3, col);
+    spr.drawLine(x+3, y, x+6, y+3, col);
+    spr.drawFastVLine(x+3, y+1, 5, col);
+}
+
+static void menu_icon_trash(int x, int y, uint16_t col) {
+    spr.drawFastHLine(x, y, 7, col);
+    spr.fillRect(x+1, y+1, 5, 5, col);
+    spr.drawFastVLine(x+2, y+2, 3, BG_COLOR);
+    spr.drawFastVLine(x+4, y+2, 3, BG_COLOR);
+}
+
+static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
+    switch (flat_idx) {
+        case 0:  menu_icon_scanner(x, y, col);    break;
+        case 1:  menu_icon_locator(x, y, col);    break;
+        case 2:  menu_icon_detections(x, y, col); break;
+        case 3:  menu_icon_gps(x, y, col);        break;
+        case 4:  menu_icon_stats(x, y, col);      break;
+        case 5:  menu_icon_night(x, y, col);      break;
+        case 6:  menu_icon_power(x, y, col);      break;
+        case 7:  menu_icon_mute(x, y, col);       break;
+        case 8:  menu_icon_wifi(x, y, col);       break;
+        case 9:  menu_icon_export(x, y, col);     break;
+        case 10: menu_icon_trash(x, y, col);      break;
+    }
+}
+
+// ── Fullscreen single-column scrollable menu ────────────────────────
 static void draw_menu_overlay() {
     float alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
     if (alpha < 0.02f) return;
@@ -4827,135 +4916,179 @@ static void draw_menu_overlay() {
         return lerp_col16(BG_COLOR, c, alpha);
     };
 
-    // Solid backdrop
+    // Solid backdrop + header
     spr.fillRect(0, 0, DISP_W, DISP_H, BG_COLOR);
-
-    // Header — matches app header style
     spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
     spr.setTextSize(TS_BODY);
     spr.setCursor(TEXT_LEFT, 5);
     kprint(spr, "MENU");
     spr.drawFastHLine(0, 18, DISP_W, ea(CARD_BORDER));
-
-    // Version pill right-aligned
     drawPill(DISP_W - 40, 4, VERSION_SHORT, ea(DIM_COLOR), 0.0f, false);
 
-    // Layout constants
-    const int DIV_X   = 120;        // column divider x
-    const int L_X     = 6;          // left column content x
-    const int R_X     = DIV_X + 4;  // right column content x
-    const int ROW_H   = 12;         // row height
-    const int LABEL_Y = 22;         // section label y
+    // Layout
+    const int ROW_H    = 14;
+    const int VIEW_TOP = CONTENT_Y;
+    const int FOOTER_H = 12;
+    const int VIEW_H   = DISP_H - VIEW_TOP - FOOTER_H;
+    const int ICON_X   = UI_PAD_SM + 2;
+    const int LABEL_X  = ICON_X + 12;
+    const int ROW_LEFT = UI_PAD_SM - 2;
+    const int ROW_W    = DISP_W - UI_PAD_SM * 2 + 4;
+    const int SECT_H   = 12;
+    const int GAP_H    = 4;
 
-    // Column divider
-    spr.drawFastVLine(DIV_X, 22, 95, ea(CARD_BORDER));
+    // Row map: type 0=section header, 1=item, 2=gap
+    struct MRow { int type; int idx; const char* text; };
+    static const MRow mrows[] = {
+        {0, -1, "SCREENS"},
+        {1,  0, "Scanner"},
+        {1,  1, "Locator"},
+        {1,  2, "Detections"},
+        {1,  3, "GPS"},
+        {1,  4, "Stats"},
+        {2, -1, ""},
+        {0, -1, "SETTINGS"},
+        {1,  5, "Night Mode"},
+        {1,  6, "Low Power"},
+        {1,  7, "Mute Beeps"},
+        {2, -1, ""},
+        {0, -1, "ACTIONS"},
+        {1,  8, "WiFi Config"},
+        {1,  9, "Export Data"},
+        {1, 10, "Clear All"},
+    };
+    const int NROWS = 16;
 
-    // ── Left column: SCREENS ──
-    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(L_X, LABEL_Y);
-    kprint(spr, "SCREENS");
-    spr.drawFastHLine(L_X, LABEL_Y + 9, DIV_X - L_X - 4, ea(CARD_BORDER));
+    // Compute virtual y for each row
+    int virt_y[16];
+    int cy = 0;
+    for (int i = 0; i < NROWS; i++) {
+        virt_y[i] = cy;
+        if      (mrows[i].type == 0) cy += SECT_H;
+        else if (mrows[i].type == 2) cy += GAP_H;
+        else                         cy += ROW_H;
+    }
+    int total_h = cy;
 
-    int y = LABEL_Y + 13;
-    for (int i = 0; i < 5; i++) {
-        bool sel = (menu_selected == i);
-        if (sel) {
-            spr.fillRect(L_X - 2, y - 1, DIV_X - L_X, ROW_H, ea(CARD_COLOR));
-            spr.drawFastVLine(L_X - 2, y - 1, ROW_H, ea(HEADER_COLOR));
-            spr.drawFastHLine(L_X - 2, y - 1, DIV_X - L_X, ea(HEADER_COLOR));
-            spr.drawFastHLine(L_X - 2, y + ROW_H - 2, DIV_X - L_X, ea(HEADER_COLOR));
+    // Smooth scroll easing
+    {
+        unsigned long now = millis();
+        float dt = (menu_last_frame_ms == 0) ? 16.0f
+                 : (float)(now - menu_last_frame_ms);
+        if (dt > 100.0f) dt = 100.0f;
+        menu_last_frame_ms = now;
+        menu_scroll_y_f = anim_filter(menu_scroll_y_f,
+                                      (float)menu_scroll_offset, 80.0f, dt);
+    }
+    int scroll_y = (int)(menu_scroll_y_f + 0.5f);
+
+    // Auto-scroll to keep selection visible
+    {
+        int sel_y = 0;
+        for (int i = 0; i < NROWS; i++) {
+            if (mrows[i].type == 1 && mrows[i].idx == menu_selected) {
+                sel_y = virt_y[i]; break;
+            }
         }
-        spr.setTextColor(ea(sel ? TEXT_COLOR : DIM_COLOR), sel ? ea(CARD_COLOR) : BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(L_X + 4, y + 2);
-        spr.print(nav_items[i].label);
-        y += ROW_H;
+        if (sel_y < menu_scroll_offset)
+            menu_scroll_offset = sel_y;
+        if (sel_y + ROW_H > menu_scroll_offset + VIEW_H)
+            menu_scroll_offset = sel_y + ROW_H - VIEW_H;
+        int max_scroll = total_h - VIEW_H;
+        if (max_scroll < 0) max_scroll = 0;
+        if (menu_scroll_offset < 0) menu_scroll_offset = 0;
+        if (menu_scroll_offset > max_scroll) menu_scroll_offset = max_scroll;
     }
 
-    // ── Right column: SETTINGS ──
-    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(R_X, LABEL_Y);
-    kprint(spr, "SETTINGS");
-    spr.drawFastHLine(R_X, LABEL_Y + 9, DISP_W - R_X - 6, ea(CARD_BORDER));
+    // Render rows (clipped to view area)
+    spr.setClipRect(0, VIEW_TOP, DISP_W, VIEW_H);
 
-    y = LABEL_Y + 13;
-    for (int i = 0; i < 3; i++) {
-        int flat_idx = 5 + i;
-        bool sel = (menu_selected == flat_idx);
-        if (sel) {
-            spr.fillRect(R_X - 2, y - 1, DISP_W - R_X - 2, ROW_H, ea(CARD_COLOR));
-            spr.drawFastVLine(R_X - 2, y - 1, ROW_H, ea(HEADER_COLOR));
-            spr.drawFastHLine(R_X - 2, y - 1, DISP_W - R_X - 2, ea(HEADER_COLOR));
-            spr.drawFastHLine(R_X - 2, y + ROW_H - 2, DISP_W - R_X - 2, ea(HEADER_COLOR));
-        }
-        spr.setTextColor(ea(sel ? TEXT_COLOR : DIM_COLOR), sel ? ea(CARD_COLOR) : BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(R_X + 2, y + 2);
-        spr.print(settings_items[i].label);
+    for (int i = 0; i < NROWS; i++) {
+        int ry = VIEW_TOP + virt_y[i] - scroll_y;
+        int rh = (mrows[i].type == 0) ? SECT_H
+               : (mrows[i].type == 2) ? GAP_H : ROW_H;
 
-        // Toggle state pill — right-aligned
-        bool toggle_on = false;
-        if (flat_idx == 5) toggle_on = night_mode;
-        if (flat_idx == 6) toggle_on = low_power_mode;
-        if (flat_idx == 7) toggle_on = is_muted;
+        if (ry + rh < VIEW_TOP || ry > VIEW_TOP + VIEW_H) continue;
+        if (mrows[i].type == 2) continue;
 
-        if (toggle_on) {
-            int pw = 14, ph = 9;
-            int px = DISP_W - pw - 8;
-            spr.fillRoundRect(px, y, pw, ph, 2, ea(HEADER_COLOR));
-            spr.setTextColor(ea(BG_COLOR), ea(HEADER_COLOR));
-            spr.setCursor(px + 2, y + 1);
-            spr.print("ON");
+        if (mrows[i].type == 0) {
+            spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(UI_PAD_SM, ry + 1);
+            kprint(spr, mrows[i].text);
+            spr.drawFastHLine(UI_PAD_SM, ry + SECT_H - 2,
+                              DISP_W - UI_PAD_SM * 2, ea(CARD_BORDER));
         } else {
-            int pw = 18, ph = 9;
-            int px = DISP_W - pw - 8;
-            spr.drawRoundRect(px, y, pw, ph, 2, ea(DIM_COLOR));
-            spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-            spr.setCursor(px + 2, y + 1);
-            spr.print("OFF");
-        }
+            int idx = mrows[i].idx;
+            bool sel = (menu_selected == idx);
+            bool danger = (idx == 10);
+            uint16_t accent = danger ? CAUTION_COLOR : HEADER_COLOR;
 
-        y += ROW_H;
+            // Selection: outline only + left accent bar
+            if (sel) {
+                spr.drawRect(ROW_LEFT, ry, ROW_W, ROW_H, ea(accent));
+                spr.fillRect(ROW_LEFT, ry, 2, ROW_H, ea(accent));
+            }
+
+            // Icon
+            uint16_t icon_col = ea(danger ? CAUTION_COLOR
+                               : (sel ? HEADER_COLOR : DIM_COLOR));
+            menu_draw_icon(idx, ICON_X, ry + 3, icon_col);
+
+            // Label
+            uint16_t text_col = ea(danger ? CAUTION_COLOR
+                               : (sel ? TEXT_COLOR : DIM_COLOR));
+            spr.setTextColor(text_col, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(LABEL_X, ry + 2);
+            spr.print(mrows[i].text);
+
+            // Toggle pills for settings (idx 5-7)
+            if (idx >= 5 && idx <= 7) {
+                bool on = (idx == 5) ? night_mode
+                        : (idx == 6) ? low_power_mode
+                        : is_muted;
+                if (on) {
+                    int pw = 14, ph = 9;
+                    int px = DISP_W - pw - UI_PAD_SM - 4;
+                    spr.fillRoundRect(px, ry + 2, pw, ph, 2, ea(HEADER_COLOR));
+                    spr.setTextColor(BG_COLOR, ea(HEADER_COLOR));
+                    spr.setTextSize(TS_MICRO);
+                    spr.setCursor(px + 2, ry + 3);
+                    spr.print("ON");
+                } else {
+                    int pw = 18, ph = 9;
+                    int px = DISP_W - pw - UI_PAD_SM - 4;
+                    spr.drawRoundRect(px, ry + 2, pw, ph, 2, ea(DIM_COLOR));
+                    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+                    spr.setTextSize(TS_MICRO);
+                    spr.setCursor(px + 2, ry + 3);
+                    spr.print("OFF");
+                }
+            }
+        }
     }
 
-    // ── Right column: ACTIONS ──
-    y += 4;
-    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(R_X, y);
-    kprint(spr, "ACTIONS");
-    spr.drawFastHLine(R_X, y + 9, DISP_W - R_X - 6, ea(CARD_BORDER));
-    y += 13;
+    spr.clearClipRect();
 
-    for (int i = 0; i < 3; i++) {
-        int flat_idx = 8 + i;
-        bool sel = (menu_selected == flat_idx);
-        bool is_danger = tools_items[i].is_danger;
-        uint16_t item_col = is_danger ? CAUTION_COLOR : (sel ? TEXT_COLOR : DIM_COLOR);
-        uint16_t accent = is_danger ? CAUTION_COLOR : HEADER_COLOR;
-
-        if (sel) {
-            spr.fillRect(R_X - 2, y - 1, DISP_W - R_X - 2, ROW_H, ea(CARD_COLOR));
-            spr.drawFastVLine(R_X - 2, y - 1, ROW_H, ea(accent));
-            spr.drawFastHLine(R_X - 2, y - 1, DISP_W - R_X - 2, ea(accent));
-            spr.drawFastHLine(R_X - 2, y + ROW_H - 2, DISP_W - R_X - 2, ea(accent));
-        }
-        spr.setTextColor(ea(item_col), sel ? ea(CARD_COLOR) : BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(R_X + 2, y + 2);
-        spr.print(tools_items[i].label);
-        y += ROW_H;
+    // Scrollbar (matches stats screen style)
+    if (total_h > VIEW_H) {
+        int sb_x = DISP_W - 4;
+        spr.drawFastVLine(sb_x, VIEW_TOP, VIEW_H, ea(CARD_BORDER));
+        int thumb_h = (VIEW_H * VIEW_H) / total_h;
+        if (thumb_h < 8) thumb_h = 8;
+        int max_scr = total_h - VIEW_H;
+        if (max_scr < 1) max_scr = 1;
+        int thumb_y = VIEW_TOP + (scroll_y * (VIEW_H - thumb_h)) / max_scr;
+        spr.fillRect(sb_x - 1, thumb_y, 3, thumb_h, ea(DIM_COLOR));
     }
 
     // Footer
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(L_X, DISP_H - 10);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
     spr.print("arrows  ENT select  M close");
 }
-
 void draw_wifi_config_overlay() {
     float alpha = ui_progress(wifi_config_open_ms, UI_FADE_IN_MS);
     auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
@@ -5794,9 +5927,8 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     // Ring radii sized to fit the panel — outermost ring is a complete circle.
     // R stays large for sweep/glow/device math; rings are visual guides only.
     uint16_t ring_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.30f);
-    int max_ring_r = VIZ_W / 2 - 4;  // 62 — fills the panel, clips slightly top/bottom
-    for (int i = 1; i <= 3; i++) {
-        spr.drawCircle(CX, CY, max_ring_r * i / 3, ring_col);
+    for (int i = 1; i <= 4; i++) {
+        spr.drawCircle(CX, CY, R * i / 4, ring_col);
     }
 
     // ── 3. Sweep line (on top of rings) ──────────────────────────────────
@@ -9227,6 +9359,9 @@ void loop() {
                     menu_open = !menu_open;
                     if (menu_open) {
                         menu_open_ms = millis();
+                        menu_scroll_offset = 0;
+                        menu_scroll_y_f    = 0.0f;
+                        menu_last_frame_ms = 0;
                         menu_click();
                     }
                     screen_dirty = true;
