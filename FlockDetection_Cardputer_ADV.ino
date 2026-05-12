@@ -4632,6 +4632,8 @@ void draw_vol_overlay() {
 
     auto va = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
+    detect_buffer_byte_order(spr);
+
     // ── Dimmed backdrop below header ──
     {
         float dim_strength = 0.45f * alpha;
@@ -7429,8 +7431,6 @@ void draw_locator_screen() {
     float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
     bool has_loc   = gps.location.isValid();
-    float gps_course = gps.course.deg();
-    int sample_count = locator_sample_count;
     int target_rssi = 0; bool has_rssi = false;
     if (locator_tracker_idx >= 0 && locator_tracker_idx < rssi_tracker_count
         && rssi_tracker[locator_tracker_idx].sample_count > 0) {
@@ -7539,10 +7539,6 @@ void draw_locator_screen() {
         spr.drawCircle(cx, cy, 2, DIM_COLOR);
     }
 
-    // (Sample-acquisition boxes removed — the status badge already
-    // communicates LOCKED vs SEARCHING and the box count was an
-    // implementation detail.)
-    (void)sample_count;
 
     // ── Right panel ──
     int rx = 82;
@@ -7689,10 +7685,9 @@ void draw_gps_screen() {
     draw_header_spr(3);
     unsigned long frame_ms = millis();
 
-    bool has_loc, stale, speed_valid;
+    bool has_loc, stale;
     int sats;
     double d_lat, d_lng;
-    float f_spd;
     float f_hdop;
     bool hdop_valid, time_valid;
     int gps_hour, gps_min, gps_sec;
@@ -7703,8 +7698,6 @@ void draw_gps_screen() {
     sats        = gps.satellites.isValid() ? gps.satellites.value() : 0;
     d_lat       = gps.location.lat();
     d_lng       = gps.location.lng();
-    speed_valid = gps.speed.isValid();
-    f_spd       = gps.speed.mph();
     hdop_valid  = gps.hdop.isValid();
     f_hdop      = hdop_valid ? gps.hdop.hdop() : 0.0f;
     time_valid  = gps.time.isValid();
@@ -9471,7 +9464,9 @@ void loop() {
                         }
                         wifi_config_editing = false;
                         wifi_config_cursor = 0;
-                    } else if (c >= 32 && c <= 126 && cur_len < max_len) {
+                    } else if (c >= 32 && c <= 126 && cur_len < max_len
+                               && !IS_KEY_UP(c) && !IS_KEY_DOWN(c)
+                               && !IS_KEY_LEFT(c) && !IS_KEY_RIGHT(c)) {
                         // Insert at cursor
                         for (int i = cur_len + 1; i > wifi_config_cursor; i--) {
                             buf[i] = buf[i - 1];
@@ -9964,16 +9959,8 @@ void loop() {
                                 stats_scroll_target = STATS_MAX_SCROLL;
                         }
                         screen_dirty = true;
-                    } else if (IS_KEY_LEFT(cur_arrow) && !stealth_mode) {
-                        int prev = current_screen - 1;
-                        int d = (prev < 0) ? 1 : -1;
-                        if (prev < 0) prev = NUM_SCREENS - 1;
-                        transition_screen(prev, d);
-                    } else if (IS_KEY_RIGHT(cur_arrow) && !stealth_mode) {
-                        int next = current_screen + 1;
-                        int d = (next >= NUM_SCREENS) ? -1 : 1;
-                        if (next >= NUM_SCREENS) next = 0;
-                        transition_screen(next, d);
+                    // LEFT/RIGHT omitted: screen transitions don't benefit from
+                    // auto-repeat and would oscillate due to animation overlap.
                     }
                     arrow_last_repeat = millis();
                 }
