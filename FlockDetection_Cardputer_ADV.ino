@@ -5086,13 +5086,17 @@ static void draw_menu_overlay() {
                                : (sel ? HEADER_COLOR : DIM_COLOR));
             menu_draw_icon(idx, ICON_X, ry + 3, icon_col);
 
-            // Label
+            // Label — dynamic for export toggle
+            const char* label_text = mrows[i].text;
+            if (idx == 9 && (export_mode_active || export_connecting)) {
+                label_text = "Stop Export";
+            }
             uint16_t text_col = ea(danger ? CAUTION_COLOR
                                : (sel ? TEXT_COLOR : DIM_COLOR));
             spr.setTextColor(text_col, BG_COLOR);
             spr.setTextSize(TS_BODY);
             spr.setCursor(LABEL_X, ry + 2);
-            spr.print(mrows[i].text);
+            spr.print(label_text);
 
             // Toggle pills for settings (idx 5-7)
             if (idx >= 5 && idx <= 7) {
@@ -5316,20 +5320,12 @@ void handle_menu_select() {
             draw_current_screen(); spr.pushSprite(0, 0);
             break;
         case 9:
-            if (export_mode_active) {
-                // First tap while active: show IP + password reminder
-                char ip_toast[32];
-                snprintf(ip_toast, sizeof(ip_toast), "http://%s pw:%s",
-                         export_ip_str, export_auth_pass);
-                set_toast_direct(ip_toast, TOAST_SUCCESS);
-                screen_dirty = true;
-            } else if (export_connecting) {
+            if (export_mode_active || export_connecting) {
                 export_mode_stop();
-                screen_dirty = true;
             } else {
                 export_mode_start();
-                screen_dirty = true;
             }
+            screen_dirty = true;
             break;
         case 10: {
             // Clear all stats — session and lifetime
