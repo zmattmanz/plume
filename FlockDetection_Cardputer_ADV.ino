@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // FLOCK DETECTOR v9.0-ADV — Tactical Edition (Build 2)
 // ============================================================================
 
@@ -4098,7 +4098,7 @@ void draw_header_spr(int screen_num) {
 
     spr.fillRect(0, 0, DISP_W, 20, BG_COLOR);
     spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
-    spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
+    spr.setCursor(TEXT_LEFT, 5); kprint(spr, screen_names[screen_num]);
 
     // ── Status pill row ─────────────────────────────────────────────────────
     // Right-aligned pills: mode badges, counts, status indicators.
@@ -5003,6 +5003,7 @@ void handle_menu_select() {
 // Horizontal map (pixels):
 //   0  [6px margin]  6..137 viz  [2px] 140 div [2px] 143..233 feed  [6px margin] 240
 //
+static const int TEXT_LEFT     = 4;                                    // left text margin — aligns header + viz titles
 static const int DIVIDER_X     = 140;
 static const int DIVIDER_GAP   = UI_PAD_XS;                          // 2 — gutter each side of divider
 static const int VIZ_X         = UI_PAD_SM;                           // 6 — left screen margin
@@ -5143,10 +5144,10 @@ void draw_scanner_screen() {
         static const char* viz_titles[] = {"SCAN", "LINE", "TIME"};
         const char* vt = viz_titles[scanner_viz_mode];
 
-        // Viz title — left of viz panel
+        // Viz title — aligned with header text
         spr.setTextColor(HEADER_COLOR, BG_COLOR);
         spr.setTextSize(TS_BODY);
-        spr.setCursor(VIZ_X + UI_PAD_SM, LABEL_TEXT_Y);
+        spr.setCursor(TEXT_LEFT, LABEL_TEXT_Y);
         kprint(spr, vt);
 
         // N/4 indicator — right-aligned within viz panel
@@ -5161,10 +5162,10 @@ void draw_scanner_screen() {
             spr.print(ind_str);
         }
 
-        // FEED label — right column
+        // FEED label — right column, aligned with content left edge
         spr.setTextColor(HEADER_COLOR, BG_COLOR);
         spr.setTextSize(TS_BODY);
-        spr.setCursor(FEED_X + UI_PAD_SM, LABEL_TEXT_Y);
+        spr.setCursor(FEED_X + DIVIDER_GAP + 1, LABEL_TEXT_Y);
         kprint(spr, "FEED");
     }
 
@@ -5255,8 +5256,9 @@ void draw_scanner_screen() {
     }
     int slide_offset = (int)((1.0f - slide_t) * (float)feed_row_h);
 
-    spr.setClipRect(FEED_X, FEED_FIRST_Y,
-                    FEED_RIGHT - FEED_X, DISP_H - FEED_FIRST_Y);
+    int feed_clip_x = FEED_X + DIVIDER_GAP + 1;
+    spr.setClipRect(feed_clip_x, FEED_FIRST_Y,
+                    FEED_RIGHT - feed_clip_x, DISP_H - FEED_FIRST_Y);
 
     if (scan_local_count == 0) {
         char dots[4];
@@ -5265,7 +5267,7 @@ void draw_scanner_screen() {
         snprintf(scanning, sizeof(scanning), "Scanning%s", dots);
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_BODY);
-        spr.setCursor(FEED_X + UI_PAD_SM, FEED_FIRST_Y + UI_PAD_SM + UI_PAD_XS);
+        spr.setCursor(FEED_X + DIVIDER_GAP + 1, FEED_FIRST_Y + UI_PAD_SM + UI_PAD_XS);
         spr.print(scanning);
     }
 
@@ -5282,7 +5284,7 @@ void draw_scanner_screen() {
         if (af < 0.1f) continue;
 
         // Symbol — shape=protocol, color=threat status (amber if flock)
-        int sym_x = FEED_X + UI_PAD_SM;
+        int sym_x = FEED_X + DIVIDER_GAP + 1;
         int sym_y = ry + 3;
         uint16_t base_proto_col = e.is_flock  ? CAUTION_COLOR
                                 : (e.proto == 0) ? HEADER_COLOR
@@ -5302,7 +5304,7 @@ void draw_scanner_screen() {
             spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
         }
 
-        int name_x = FEED_X + UI_PAD_SM + UI_PAD_MD;
+        int name_x = sym_x + UI_PAD_MD;
 
         spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
         spr.setTextSize(TS_BODY);
@@ -5334,8 +5336,9 @@ void draw_scanner_screen() {
             uint16_t sep_col = lerp_col16(BG_COLOR, CARD_BORDER, af * 0.25f);
             int sep_y2 = ry + feed_row_h - 1;
             if (sep_y2 < DISP_H) {
-                spr.drawFastHLine(FEED_X + UI_PAD_SM, sep_y2,
-                                  FEED_RIGHT - FEED_X - UI_PAD_SM * 2, sep_col);
+                int sep_x = FEED_X + DIVIDER_GAP + 1;
+                spr.drawFastHLine(sep_x, sep_y2,
+                                  FEED_RIGHT - sep_x, sep_col);
             }
         }
 
@@ -6071,13 +6074,20 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
         spr.drawCircle(scan_x, dot_y, 2, HEADER_COLOR);
     }
 
-    // Band pill — top-right of viz area, consistent with header pill style
+    // Band pill — below LINE title, dark background over hatch
     {
         const char* band_label = "2.4GHz";
         int pill_w = (int)strlen(band_label) * 7 + UI_PAD_SM;
-        int pill_x = VIZ_RIGHT - UI_PAD_SM - pill_w;
+        int pill_x = TEXT_LEFT;
         int pill_y = VIZ_Y + UI_PAD_XS;
-        drawPill(pill_x, pill_y, band_label, DIM_COLOR);
+        int pill_h = 11;
+        spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, 3, BG_COLOR);
+        spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, 3,
+                          lerp_col16(BG_COLOR, DIM_COLOR, 0.40f));
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(pill_x + 3, pill_y + 2);
+        spr.print(band_label);
     }
 }
 
@@ -7754,14 +7764,18 @@ void transition_screen(int new_screen, int dir) {
         // from a stale position when the user lands on the screen.
         hist_sel_y_f         = (float)CONTENT_Y;
         hist_last_frame_ms   = 0;
-        // Short timed take so a stuck PersistTask can't freeze the screen
-        // transition. If we miss this window, the screen renders with the
-        // previous snapshot — sd_hist_dirty stays set so the next loop
-        // iteration retries once the bus frees up.
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-            load_sd_history();
-            xSemaphoreGive(sdMutex);
-            sd_hist_dirty = false;
+        // Reload SD history on every screen entry. 2s timeout matches the
+        // sd_hist_dirty path in loop(). If this still fails, sd_hist retains
+        // whatever was loaded at boot or from the last successful load —
+        // better than showing an empty screen.
+        if (sd_available) {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                load_sd_history();
+                xSemaphoreGive(sdMutex);
+                sd_hist_dirty = false;
+            } else {
+                Serial.println("[SD] sdMutex timeout on screen 2 entry — using cached history");
+            }
         }
     }
     if (new_screen == 4) {
@@ -8401,6 +8415,15 @@ void setup() {
     // Seed hot-plug state so the first poll doesn't fire a spurious "mounted" toast
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
+
+    // Load detection history from SD so the Detections screen has data
+    // immediately. No mutex needed — tasks haven't been spawned yet.
+    if (sd_available) {
+        load_sd_history();
+        if (sd_hist_count > 0) {
+            Serial.printf("[SD] Loaded %d detections from history\n", sd_hist_count);
+        }
+    }
 
     delay(100);
     // NMEA sentences max ~82 chars — 1024-byte default RX is 2× too big.
@@ -9567,229 +9590,18 @@ void loop() {
     }
 
     if (ambient_mode) {
-        // Fullscreen ambient radar — same cylinder vocabulary as the
-        // scanner viz, just larger and centred with a detection counter.
+        // Render the normal scanner screen at reduced framerate (~15 fps).
+        // Same layout, same feed, same viz — just dimmed via backlight.
         static unsigned long last_ambient_draw = 0;
         unsigned long now_amb = millis();
-        if (now_amb - last_ambient_draw > 33) {  // ~30 fps
-            spr.fillSprite(BG_COLOR);
-            detect_buffer_byte_order(spr);
-
-            unsigned long frame_ms = now_amb;
-            // Refresh the feed snapshot for the proximity radar
-            if (frame_ms - scan_feed_last_snapshot >= 2500 || scan_feed_last_snapshot == 0) {
-                if (take_data_mutex()) {
-                    scan_local_count = feed_count;
-                    scan_local_head  = feed_head;
-                    for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
-                    give_data_mutex();
-                    scan_feed_last_snapshot = frame_ms;
-                }
+        if (now_amb - last_ambient_draw > 66) {
+            // Force scanner screen if user idled on another screen
+            if (current_screen != 0) {
+                current_screen = 0;
+                feed_anim_prev_head = -1;
+                feed_anim_shift_ms  = 0;
             }
-
-            // Draw proximity radar at ambient scale
-            {
-                const float PI2f = 2.0f * (float)M_PI;
-                const int ACX = DISP_W / 2;
-                const int ACY = DISP_H / 2;
-                const int AR  = 62;
-                const int AR_INNER = 6;
-
-                float adt = (scan_last_frame_ms == 0) ? 16.0f
-                          : (float)(frame_ms - scan_last_frame_ms);
-                if (adt > 100.0f) adt = 100.0f;
-                scan_last_frame_ms = frame_ms;
-
-                static float amb_sweep = 0.0f;
-                amb_sweep += adt * 0.0012f * (PI2f / 5.0f);
-                if (amb_sweep > PI2f) amb_sweep -= PI2f;
-
-                float as_sin, as_cos;
-                fast_sincos(amb_sweep, &as_sin, &as_cos);
-
-                // Range rings
-                spr.drawCircle(ACX, ACY, (int)(0.33f * AR), RING_COLOR);
-                spr.drawCircle(ACX, ACY, (int)(0.66f * AR), RING_COLOR);
-                spr.drawCircle(ACX, ACY, AR, RING_COLOR);
-
-                // Phosphor glow — per-pixel Gaussian, matching the active scan radar
-                {
-                    const float SIGMA  = 0.9f;
-                    const float PEAK   = 0.18f;
-                    const float denom  = 2.0f * SIGMA * SIGMA;
-                    const float R2_max = (float)(AR * AR) * 1.05f;
-                    const float GAP    = 0.03f;
-
-                    const int AMB_LUT_SIZE = 32;
-                    uint16_t amb_lut[AMB_LUT_SIZE];
-                    for (int i = 0; i < AMB_LUT_SIZE; i++) {
-                        amb_lut[i] = lerp_col16(BG_COLOR, HEADER_COLOR,
-                                                PEAK * (float)i / (float)(AMB_LUT_SIZE - 1));
-                    }
-
-                    for (int py = ACY - AR; py <= ACY + AR; py += 3) {
-                        for (int px = ACX - AR; px <= ACX + AR; px += 3) {
-                            float dx = (float)(px - ACX);
-                            float dy = (float)(py - ACY);
-                            if (dx * dx + dy * dy > R2_max) continue;
-
-                            float diff = amb_sweep - fast_atan2f(dy, dx);
-                            if (diff >  (float)M_PI) diff -= PI2f;
-                            if (diff < -(float)M_PI) diff += PI2f;
-
-                            if (diff <= 0.0f) continue;
-                            float behind = diff;
-                            if (behind > 4.0f) continue;
-                            if (behind < GAP)  continue;
-                            float adj = behind - GAP;
-
-                            float brightness = PEAK * fast_expf_neg(-adj * adj / denom);
-                            if (brightness < 0.001f) continue;
-
-                            int lut_idx = (int)(brightness * (float)(AMB_LUT_SIZE - 1) / PEAK);
-                            if (lut_idx >= AMB_LUT_SIZE) lut_idx = AMB_LUT_SIZE - 1;
-                            spr.fillRect(px, py, 3, 3, amb_lut[lut_idx]);
-                        }
-                    }
-                }
-
-                // Sweep line
-                {
-                    int ex = ACX + (int)((float)AR * as_cos);
-                    int ey = ACY + (int)((float)AR * as_sin);
-                    spr.drawLine(ACX, ACY, ex, ey,
-                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.55f));
-                }
-
-                // Refresh + update devices
-                prox_radar_refresh(frame_ms);
-                for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
-                    if (!scan_devs[pi].occupied) continue;
-                    ScanDevice& d = scan_devs[pi];
-                    d.dist_smooth = anim_filter(d.dist_smooth, d.dist, 400.0f, adt);
-
-                    float dev_behind = amb_sweep - d.angle;
-                    if (dev_behind < 0.0f) dev_behind += PI2f;
-                    if (dev_behind >= PI2f) dev_behind -= PI2f;
-                    float sz = PI2f * 0.12f;
-                    if (dev_behind < sz) {
-                        float t = dev_behind / sz;
-                        float tsb = (1.0f - t) * (1.0f - t) * (1.0f - t);
-                        if (tsb > d.sweep_bright) d.sweep_bright = tsb;
-                        else d.sweep_bright = anim_filter(d.sweep_bright, tsb, 300.0f, adt);
-                    } else {
-                        d.sweep_bright *= powf(0.9975f, (float)adt);
-                    }
-                }
-
-                // Render devices at ambient scale
-                for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
-                    if (!scan_devs[pi].occupied) continue;
-                    ScanDevice& d = scan_devs[pi];
-                    float draw_dist = 0.10f + d.dist_smooth * 0.72f;
-                    float ds, dc;
-                    fast_sincos(d.angle, &ds, &dc);
-                    int dpx = ACX + (int)(draw_dist * (float)AR * dc);
-                    int dpy = ACY + (int)(draw_dist * (float)AR * ds);
-
-                    float af = 1.0f;
-                    unsigned long age = frame_ms - d.last_seen_ms;
-                    if (age > 10000UL) {
-                        af = 1.0f - 0.7f * (float)(age - 10000UL) / 50000.0f;
-                        if (af < 0.3f) af = 0.3f;
-                    }
-
-                    uint16_t bcol = d.is_flock ? CAUTION_COLOR : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
-                    float pulse_factor = 0.0f;
-                    if (d.is_flock) {
-                        float breath = 0.5f + 0.5f * sinf((float)frame_ms * 2.0f * (float)M_PI / 1200.0f);
-                        pulse_factor = (breath - 0.5f) * 0.16f;
-                    }
-                    const int DSZ = (int)(4.0f * (1.0f + pulse_factor));
-                    uint16_t ec = (af >= 1.0f) ? bcol : lerp_col16(BG_COLOR, bcol, af);
-
-                    // Sweep glow — byte-order-corrected blend (ambient)
-                    if (d.sweep_bright > 0.08f) {
-                        float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
-                        uint16_t* sbuf = (uint16_t*)spr.getBuffer();
-                        const int sbuf_w = DISP_W;
-                        int   glow_r  = DSZ + 12;
-                        float glow_r2 = (float)(glow_r * glow_r);
-                        float glow_peak = glow_t * 0.45f;
-
-                        int gx0 = dpx - glow_r; if (gx0 < 0) gx0 = 0;
-                        int gx1 = dpx + glow_r; if (gx1 >= DISP_W) gx1 = DISP_W - 1;
-                        int gy0 = dpy - glow_r; if (gy0 < 0) gy0 = 0;
-                        int gy1 = dpy + glow_r; if (gy1 >= DISP_H) gy1 = DISP_H - 1;
-
-                        for (int gy = gy0; gy <= gy1; gy++) {
-                            int row_off = gy * sbuf_w;
-                            for (int gx = gx0; gx <= gx1; gx++) {
-                                float dx = (float)(gx - dpx);
-                                float dy = (float)(gy - dpy);
-                                float dist2 = dx * dx + dy * dy;
-                                if (dist2 >= glow_r2) continue;
-                                float falloff = 1.0f - dist2 / glow_r2;
-                                float alpha = glow_peak * falloff * falloff;
-                                if (alpha < 0.015f) continue;
-                                int idx = row_off + gx;
-                                uint16_t existing_logical = read_pixel_logical(sbuf, idx);
-                                uint16_t blended_logical  = lerp_col16(existing_logical, bcol, alpha);
-                                write_pixel_logical(sbuf, idx, blended_logical);
-                            }
-                        }
-                    }
-
-                    // Flock fill — matches active scan
-                    if (d.is_flock) {
-                        uint16_t fill_col = lerp_col16(BG_COLOR, ec, 0.45f);
-                        if (d.proto == 0) {
-                            spr.fillTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy + DSZ, dpx + DSZ, dpy + DSZ, fill_col);
-                        } else {
-                            spr.fillTriangle(dpx, dpy - DSZ, dpx + DSZ, dpy, dpx, dpy + DSZ, fill_col);
-                            spr.fillTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy, dpx, dpy + DSZ, fill_col);
-                        }
-                    }
-
-                    if (d.proto == 0) {
-                        spr.drawTriangle(dpx, dpy - DSZ, dpx - DSZ, dpy + DSZ, dpx + DSZ, dpy + DSZ, ec);
-                    } else {
-                        spr.drawLine(dpx, dpy - DSZ, dpx + DSZ, dpy, ec);
-                        spr.drawLine(dpx + DSZ, dpy, dpx, dpy + DSZ, ec);
-                        spr.drawLine(dpx, dpy + DSZ, dpx - DSZ, dpy, ec);
-                        spr.drawLine(dpx - DSZ, dpy, dpx, dpy - DSZ, ec);
-                    }
-                }
-
-                // Center dot in double-stroke box
-                {
-                    const int box_sz = 7;
-                    spr.drawRect(ACX - box_sz, ACY - box_sz, box_sz * 2, box_sz * 2,
-                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
-                    spr.drawRect(ACX - box_sz + 1, ACY - box_sz + 1, box_sz * 2 - 2, box_sz * 2 - 2,
-                                 lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
-                }
-                spr.fillCircle(ACX, ACY, 2, CENTER_DOT);
-                spr.drawPixel(ACX, ACY, CENTER_DOT_BRIGHT);
-            }
-
-            // Detection counter (bottom-right, flashes ACCENT after a blip)
-            long det_total;
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            det_total = session_flock_wifi + session_flock_ble + session_raven;
-            xSemaphoreGiveRecursive(dataMutex);
-            uint16_t det_col = (millis() - last_blip_time < 3000) ? ACCENT_COLOR : DIM_COLOR;
-            char det_str[16];
-            snprintf(det_str, sizeof(det_str), "D:%ld", det_total);
-            int det_w = (int)strlen(det_str) * 6;  // TS_MICRO char width
-            spr.setTextColor(det_col, BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            spr.setCursor(DISP_W - det_w - 4, DISP_H - 9);
-            spr.print(det_str);
-
-            // Toast still shows on top so alerts surface in ambient mode.
-            draw_toast_spr();
-
+            draw_current_screen();
             M5Cardputer.Display.startWrite();
             spr.pushSprite(0, 0);
             M5Cardputer.Display.endWrite();
