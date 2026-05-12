@@ -1628,6 +1628,7 @@ void export_server_setup_routes() {
     // Index: simple HTML file list
     export_server->on("/", HTTP_GET, []() {
         if (!export_check_auth()) return;
+        export_mode_started_at = millis();
         String html = "<!DOCTYPE html><html><head><title>Flock Finder Export</title>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<style>"
@@ -1678,6 +1679,7 @@ void export_server_setup_routes() {
 
     auto serve_sd_file = [](const char* path, const char* mime) {
         if (!export_check_auth()) return;
+        export_mode_started_at = millis();
         if (!sd_available) { export_server->sendHeader("Connection", "close"); export_server->send(503, "text/plain", "SD unavailable"); return; }
 
         // Phase 1: stat the file under mutex to get size and confirm existence.
@@ -5345,7 +5347,7 @@ void draw_wifi_config_overlay() {
     spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, cy + ch - 11);
     if (wifi_config_editing) {
-        spr.print("type to edit  ENT done  DEL bksp");
+        spr.print("type  <> move  ENT done  DEL bksp");
     } else {
         spr.print("ENT edit  ^/v field  ESC close");
     }
@@ -9121,9 +9123,6 @@ void setup() {
     boot_animate(82 + random(0, 3), "reading credentials");
 
     lifetime_boots++;
-    if (lifetime_boots == 1) {
-        set_toast_direct("TAB for help  M for menu", TOAST_NEUTRAL);
-    }
     if (littlefs_available) {
         save_session_to_flash();
     }
@@ -9464,6 +9463,14 @@ void loop() {
                         }
                         wifi_config_editing = false;
                         wifi_config_cursor = 0;
+                    } else if (IS_KEY_LEFT(c)) {
+                        if (wifi_config_cursor > 0) wifi_config_cursor--;
+                    } else if (IS_KEY_RIGHT(c)) {
+                        if (wifi_config_cursor < cur_len) wifi_config_cursor++;
+                    } else if (IS_KEY_UP(c)) {
+                        wifi_config_cursor = 0;
+                    } else if (IS_KEY_DOWN(c)) {
+                        wifi_config_cursor = cur_len;
                     } else if (c >= 32 && c <= 126 && cur_len < max_len
                                && !IS_KEY_UP(c) && !IS_KEY_DOWN(c)
                                && !IS_KEY_LEFT(c) && !IS_KEY_RIGHT(c)) {
