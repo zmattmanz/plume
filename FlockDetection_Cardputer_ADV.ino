@@ -498,12 +498,12 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 // entries in the SD log and fires real detection alarms.
 #define DEBUG_KEYS 0
 
-// Arrow key characters — differ between standard Cardputer and ADV variant.
-// Standard: ';' (up) / '.' (down)
-// ADV:      ',' (up) / '/' (down)
-// Check both so the firmware works on either hardware.
-#define IS_KEY_UP(c)   ((c) == ';' || (c) == ',')
-#define IS_KEY_DOWN(c) ((c) == '.' || (c) == '/')
+// Arrow key characters — ADV Cardputer 4-key diamond layout:
+// ';' = up, '.' = down, ',' = left, '/' = right
+#define IS_KEY_UP(c)    ((c) == ';')
+#define IS_KEY_DOWN(c)  ((c) == '.')
+#define IS_KEY_LEFT(c)  ((c) == ',')
+#define IS_KEY_RIGHT(c) ((c) == '/')
 
 // Pre-configure WiFi credentials for export mode. User edits these in source
 // once, then they're saved to flash on first boot. To change later, edit
@@ -4689,6 +4689,7 @@ void draw_help_overlay() {
     int key_count;
 
     static const HelpKey global_keys[] = {
+        {"</>",  "screens"},
         {"-/+",  "volume"},
         {"`",    "mute"},
         {"n",    "night"},
@@ -4711,7 +4712,7 @@ void draw_help_overlay() {
         {"n",   "north"},
     };
     static const HelpKey detections_keys[] = {
-        {";/.", "navigate"},
+        {"^/v", "navigate"},
         {"ENT", "detail"},
         {"d",   "delete"},
     };
@@ -4719,7 +4720,7 @@ void draw_help_overlay() {
         {"",    "no keys"},
     };
     static const HelpKey devinfo_keys[] = {
-        {";/.", "scroll"},
+        {"^/v", "scroll"},
         {"m",   "menu (clear)"},
     };
 
@@ -5266,7 +5267,7 @@ void draw_wifi_config_overlay() {
     if (wifi_config_editing) {
         spr.print("type to edit  ENT done  DEL bksp");
     } else {
-        spr.print("ENT edit  ;/. field  DEL close");
+        spr.print("ENT edit  ^/v field  DEL close");
     }
 }
 
@@ -9347,7 +9348,7 @@ void loop() {
                             set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
                             wifi_config_open = false;
                         }
-                    } else if (c == 0x1B) {
+                    } else if (c == 0x1B || IS_KEY_LEFT(c)) {
                         wifi_config_open = false;
                     }
                 }
@@ -9366,7 +9367,7 @@ void loop() {
                 } else if (c == '\n' || c == '\r') {
                     menu_open = false;
                     handle_menu_select();
-                } else if (c == 0x08 || c == 0x7F || c == 0x1B || c == 'm') {
+                } else if (c == 0x08 || c == 0x7F || c == 0x1B || c == 'm' || IS_KEY_LEFT(c)) {
                     menu_open = false;
                     screen_dirty = true;
                 }
@@ -9444,11 +9445,6 @@ void loop() {
                     stats_scroll_target -= STATS_SCROLL_STEP;
                     if (stats_scroll_target < 0) stats_scroll_target = 0;
                     screen_dirty = true;
-                } else if (!stealth_mode) {
-                    int prev = current_screen - 1;
-                    int d = (prev < 0) ? 1 : -1;
-                    if (prev < 0) prev = NUM_SCREENS - 1;
-                    transition_screen(prev, d);
                 }
             }
             else if (IS_KEY_DOWN(c)) {
@@ -9464,7 +9460,18 @@ void loop() {
                     if (stats_scroll_target > STATS_MAX_SCROLL)
                         stats_scroll_target = STATS_MAX_SCROLL;
                     screen_dirty = true;
-                } else if (!stealth_mode) {
+                }
+            }
+            else if (IS_KEY_LEFT(c)) {
+                if (!stealth_mode) {
+                    int prev = current_screen - 1;
+                    int d = (prev < 0) ? 1 : -1;
+                    if (prev < 0) prev = NUM_SCREENS - 1;
+                    transition_screen(prev, d);
+                }
+            }
+            else if (IS_KEY_RIGHT(c)) {
+                if (!stealth_mode) {
                     int next = current_screen + 1;
                     int d = (next >= NUM_SCREENS) ? -1 : 1;
                     if (next >= NUM_SCREENS) next = 0;
@@ -9732,17 +9739,19 @@ void loop() {
             const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
             const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
 
-            bool up_held = false, down_held = false;
+            bool up_held = false, down_held = false, left_held = false, right_held = false;
             // Skip hold-repeat when the menu is open — the menu's own
-            // input handler already processed ,// and the hold-repeat
-            // would double-fire the navigation.
+            // input handler already processed the arrows and the hold-repeat
+            // would double-fire navigation.
             if (!menu_open && !wifi_config_open) {
                 for (auto c : status.word) {
-                    if (IS_KEY_UP(c)) up_held = true;
-                    if (IS_KEY_DOWN(c)) down_held = true;
+                    if (IS_KEY_UP(c))    up_held    = true;
+                    if (IS_KEY_DOWN(c))  down_held  = true;
+                    if (IS_KEY_LEFT(c))  left_held  = true;
+                    if (IS_KEY_RIGHT(c)) right_held = true;
                 }
             }
-            char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
+            char cur_arrow = up_held ? ';' : (down_held ? '.' : (left_held ? ',' : (right_held ? '/' : 0)));
 
             if (cur_arrow && cur_arrow == arrow_held_key) {
                 unsigned long hold_dur = millis() - arrow_hold_start;
@@ -9770,8 +9779,7 @@ void loop() {
                                 history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
                         }
                         screen_dirty = true;
-                    } else if (current_screen == 4) {
-                        // Target only — render loop eases via anim_filter
+                    } else if (current_screen == 4 && (IS_KEY_UP(cur_arrow) || IS_KEY_DOWN(cur_arrow))) {
                         if (IS_KEY_UP(cur_arrow)) {
                             stats_scroll_target -= STATS_SCROLL_STEP;
                             if (stats_scroll_target < 0) stats_scroll_target = 0;
@@ -9781,6 +9789,16 @@ void loop() {
                                 stats_scroll_target = STATS_MAX_SCROLL;
                         }
                         screen_dirty = true;
+                    } else if (IS_KEY_LEFT(cur_arrow) && !stealth_mode) {
+                        int prev = current_screen - 1;
+                        int d = (prev < 0) ? 1 : -1;
+                        if (prev < 0) prev = NUM_SCREENS - 1;
+                        transition_screen(prev, d);
+                    } else if (IS_KEY_RIGHT(cur_arrow) && !stealth_mode) {
+                        int next = current_screen + 1;
+                        int d = (next >= NUM_SCREENS) ? -1 : 1;
+                        if (next >= NUM_SCREENS) next = 0;
+                        transition_screen(next, d);
                     }
                     arrow_last_repeat = millis();
                 }
