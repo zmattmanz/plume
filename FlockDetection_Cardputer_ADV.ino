@@ -1083,6 +1083,8 @@ static float         loc_trace_smooth[LOC_TRACE_SIZE];
 static int           last_rendered_trace_head  = -1;
 static int           last_rendered_trace_count = 0;
 static unsigned long loc_trace_last_frame_ms = 0;
+static float         signal_bar_smooth = 0.0f;
+static bool          signal_bar_seeded = false;
 
 // ── Peak GPS bookmark ──
 static double locator_peak_lat     = 0.0;
@@ -3752,6 +3754,8 @@ void locator_start(const char* mac, const char* name, const char* type = "", int
     loc_trace_last_frame_ms = 0;
     last_rendered_trace_head  = -1;
     last_rendered_trace_count = 0;
+    signal_bar_smooth = 0.0f;
+    signal_bar_seeded = false;
 
     locator_peak_rssi = -120;
     locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
@@ -3793,6 +3797,8 @@ void locator_stop() {
     loc_trace_last_frame_ms = 0;
     last_rendered_trace_head  = -1;
     last_rendered_trace_count = 0;
+    signal_bar_smooth = 0.0f;
+    signal_bar_seeded = false;
 
     xSemaphoreGiveRecursive(dataMutex);
     screen_dirty = true;
@@ -7659,39 +7665,38 @@ void draw_signal_screen() {
 
     const int TL = TEXT_LEFT;  // 4
 
-    // ── Status pill (right-aligned, capsule) ──
+    // ── Status badge (right-aligned, matches GPS screen style) ──
     {
         bool is_flock = (strncmp(target_type, "FLOCK", 5) == 0
                       || strncmp(target_type, "RAVEN", 5) == 0);
-        const char* pill_text;
-        uint16_t    pill_color;
-        if (!active) { pill_text = "No Target"; pill_color = DIM_COLOR; }
-        else         { pill_text = is_flock ? "Hunting" : "Tracking";
-                       pill_color = is_flock ? HEADER_COLOR : CAUTION_COLOR; }
-        int pill_w = (int)strlen(pill_text) * (ts_char_w(TS_MICRO) + 1) + 12;
-        int pill_h = 11;
-        int pill_x = DISP_W - TL - pill_w;
-        int pill_y = CONTENT_Y;
-        int pill_r = pill_h / 2;
-        uint16_t pill_bg = lerp_col16(BG_COLOR, pill_color, 0.15f);
-        spr.fillRoundRect(pill_x + 1, pill_y + 1, pill_w - 2, pill_h - 2, pill_r, pill_bg);
-        spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, pill_color);
-        spr.setTextColor(pill_color, pill_bg);
+        const char* badge_text;
+        uint16_t    badge_col;
+        if (!active) { badge_text = "No Target"; badge_col = DIM_COLOR; }
+        else         { badge_text = is_flock ? "Hunting" : "Tracking";
+                       badge_col = is_flock ? HEADER_COLOR : CAUTION_COLOR; }
+        int bw = (int)strlen(badge_text) * (ts_char_w(TS_MICRO) + 1) + 12;
+        int bh = 16;
+        int bx = DISP_W - TL - bw;
+        int by = CONTENT_Y;
+        uint16_t sfill = lerp_col16(BG_COLOR, badge_col, 0.22f);
+        spr.fillRoundRect(bx, by, bw, bh, 5, sfill);
+        spr.drawRoundRect(bx, by, bw, bh, 5, badge_col);
+        spr.setTextColor(badge_col, sfill);
         spr.setTextSize(TS_MICRO);
-        spr.setCursor(pill_x + 6, pill_y + 2);
-        spr.print(pill_text);
+        spr.setCursor(bx + 6, by + 4);
+        kprint(spr, badge_text);
     }
 
-    // ── TARGET label ──
+    // ── TARGET label (left, shares row with badge) ──
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(TL, CONTENT_Y + 2);
+    spr.setCursor(TL, CONTENT_Y + 4);
     kprint(spr, "TARGET");
 
-    // ── Target name (TS_BODY) ──
+    // ── Target name (TS_BODY, below badge) ──
     {
         spr.setTextSize(TS_BODY);
-        spr.setCursor(TL, CONTENT_Y + 16);
+        spr.setCursor(TL, CONTENT_Y + 18);
         if (!active) {
             spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.print("No Target");
@@ -7724,7 +7729,7 @@ void draw_signal_screen() {
         const char* hint = "open feed [f] and press [t] to target";
         int hint_w = (int)strlen(hint) * (ts_char_w(TS_MICRO) + 1);
         int hint_x = (DISP_W - hint_w) / 2;
-        int hint_y = CONTENT_Y + 16 + (DISP_H - CONTENT_Y - 16) / 2;
+        int hint_y = CONTENT_Y + 18 + (DISP_H - CONTENT_Y - 18) / 2;
         spr.setTextSize(TS_MICRO);
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setCursor(hint_x, hint_y);
@@ -7732,34 +7737,59 @@ void draw_signal_screen() {
         return;
     }
 
-    // ── LIVE SIGNAL label (y = CONTENT_Y + 32) ──
+    // ── LIVE SIGNAL label (y = CONTENT_Y + 40) ──
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(TL, CONTENT_Y + 32);
+    spr.setCursor(TL, CONTENT_Y + 40);
     kprint(spr, "LIVE SIGNAL");
 
-    // ── Signal bar — full width, no dBm text (y = CONTENT_Y + 44) ──
+    // ── Signal bar — full width, 6px tall, smoothed + glow (y = CONTENT_Y + 50) ──
     {
         int bar_x = TL;
-        int bar_y = CONTENT_Y + 44;
+        int bar_y = CONTENT_Y + 50;
         int bar_w = DISP_W - TL * 2;
-        spr.fillRoundRect(bar_x, bar_y, bar_w, 4, 2, CARD_COLOR);
+        int bar_h = 6;
+        int bar_r = 3;
+
         if (has_rssi) {
-            float pct = (float)(target_rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
-            if (pct < 0.0f) pct = 0.0f;
-            if (pct > 1.0f) pct = 1.0f;
-            int fill_w = (int)(pct * (float)bar_w);
-            if (fill_w > 0) {
-                int fr = fill_w / 2 < 2 ? fill_w / 2 : 2;
-                spr.fillRoundRect(bar_x, bar_y, fill_w, 4, fr, HEADER_COLOR);
+            float raw_pct = (float)(target_rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
+            if (raw_pct < 0.0f) raw_pct = 0.0f;
+            if (raw_pct > 1.0f) raw_pct = 1.0f;
+            float dt = (loc_trace_last_frame_ms == 0) ? 16.0f
+                     : (float)(frame_ms - loc_trace_last_frame_ms);
+            if (dt > 100.0f) dt = 100.0f;
+            signal_bar_smooth = anim_filter_seed(signal_bar_smooth, raw_pct,
+                                                 120.0f, dt, &signal_bar_seeded);
+
+            // Glow halo behind bar
+            if (signal_bar_smooth > 0.05f) {
+                float pulse = anim_pulse(UI_PULSE_MEDIUM);
+                float glow_alpha = 0.08f + pulse * 0.07f;
+                int glow_fill_w = (int)(signal_bar_smooth * (float)bar_w);
+                int glow_w = glow_fill_w + 8;
+                if (glow_w > bar_w) glow_w = bar_w;
+                spr.fillRoundRect(bar_x, bar_y - 1, glow_w, bar_h + 2, bar_r + 1,
+                                  lerp_col16(BG_COLOR, HEADER_COLOR, glow_alpha));
             }
+
+            spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, CARD_COLOR);
+
+            int fill_w = (int)(signal_bar_smooth * (float)bar_w);
+            if (fill_w > 0) {
+                int fr = fill_w / 2 < bar_r ? fill_w / 2 : bar_r;
+                spr.fillRoundRect(bar_x, bar_y, fill_w, bar_h, fr, HEADER_COLOR);
+            }
+        } else {
+            signal_bar_smooth = 0.0f;
+            signal_bar_seeded = false;
+            spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, CARD_COLOR);
         }
     }
 
-    // ── Trace area (y = CONTENT_Y + 54 to DISP_H - 2) ──
+    // ── Trace area (y = CONTENT_Y + 60 to DISP_H - 2) ──
     const int plot_left   = TL;
     const int plot_right  = DISP_W - TL;
-    const int plot_top    = CONTENT_Y + 54;
+    const int plot_top    = CONTENT_Y + 60;
     const int plot_bottom = DISP_H - 2;
     const int plot_w      = plot_right - plot_left;
     const int plot_h      = plot_bottom - plot_top;
