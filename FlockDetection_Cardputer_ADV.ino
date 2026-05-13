@@ -844,7 +844,7 @@ bool hist_detail_open      = false;
 bool hist_delete_confirming = false;
 volatile bool sd_hist_dirty = false;
 
-#define MAX_DELETED_IDS    24
+#define MAX_DELETED_IDS    64
 #define DELETED_IDS_FILE   "/flock_deleted.dat"
 static int  deleted_ids[MAX_DELETED_IDS];
 static int  deleted_id_count = 0;
@@ -863,6 +863,85 @@ static bool is_id_deleted(int id) {
         if (deleted_ids[i] == id) return true;
     }
     return false;
+}
+
+// FNV-1a over (mac, epoch_utc, uptime_ms, rssi) → stable synthetic ID for
+// legacy CSV lines that lack a DetID column. Result forced into
+// 0x40000000..0x7FFFFFFF so it never collides with the sequential counter.
+static int synthesize_detection_id(const char* mac, uint32_t epoch,
+                                   unsigned long uptime_ms, int rssi) {
+    uint32_t h = 2166136261u;
+    if (mac) {
+        for (const char* p = mac; *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
+    }
+    h ^= epoch;               h *= 16777619u;
+    h ^= (uint32_t)uptime_ms; h *= 16777619u;
+    h ^= (uint32_t)rssi;      h *= 16777619u;
+    return (int)((h & 0x3FFFFFFFu) | 0x40000000u);
+}
+
+#define MAX_DELETED_MACS 24
+struct DeletedMacEntry {
+    char mac[18];
+    int  before_id;   // suppress CSV lines with id <= before_id for this MAC
+};
+static DeletedMacEntry deleted_macs[MAX_DELETED_MACS];
+static int deleted_mac_count = 0;
+static const char DELETED_MACS_FILE[] = "/flock_deleted_macs.dat";
+
+static void deleted_macs_add(const char* mac, int before_id) {
+    for (int i = 0; i < deleted_mac_count; i++) {
+        if (strncmp(deleted_macs[i].mac, mac, 17) == 0) {
+            if (before_id > deleted_macs[i].before_id)
+                deleted_macs[i].before_id = before_id;
+            return;
+        }
+    }
+    if (deleted_mac_count >= MAX_DELETED_MACS) {
+        for (int i = 0; i < MAX_DELETED_MACS - 1; i++)
+            deleted_macs[i] = deleted_macs[i + 1];
+        deleted_mac_count = MAX_DELETED_MACS - 1;
+    }
+    strncpy(deleted_macs[deleted_mac_count].mac, mac, 17);
+    deleted_macs[deleted_mac_count].mac[17] = '\0';
+    deleted_macs[deleted_mac_count].before_id = before_id;
+    deleted_mac_count++;
+}
+
+static bool deleted_macs_suppresses(const char* mac, int id) {
+    for (int i = 0; i < deleted_mac_count; i++) {
+        if (strncmp(deleted_macs[i].mac, mac, 17) == 0)
+            return id <= deleted_macs[i].before_id;
+    }
+    return false;
+}
+
+static void deleted_macs_save() {
+    if (!littlefs_available) return;
+    File f = LittleFS.open(DELETED_MACS_FILE, "w");
+    if (!f) return;
+    for (int i = 0; i < deleted_mac_count; i++)
+        f.printf("%s,%d\n", deleted_macs[i].mac, deleted_macs[i].before_id);
+    f.close();
+}
+
+static void deleted_macs_load() {
+    deleted_mac_count = 0;
+    if (!littlefs_available || !LittleFS.exists(DELETED_MACS_FILE)) return;
+    File f = LittleFS.open(DELETED_MACS_FILE, "r");
+    if (!f) return;
+    while (f.available() && deleted_mac_count < MAX_DELETED_MACS) {
+        String ln = f.readStringUntil('\n');
+        int comma = ln.indexOf(',');
+        if (comma < 17) continue;
+        String mac_s = ln.substring(0, 17);
+        int bid = ln.substring(comma + 1).toInt();
+        strncpy(deleted_macs[deleted_mac_count].mac, mac_s.c_str(), 17);
+        deleted_macs[deleted_mac_count].mac[17] = '\0';
+        deleted_macs[deleted_mac_count].before_id = bid;
+        deleted_mac_count++;
+    }
+    f.close();
 }
 
 static void save_deleted_ids();   // forward decl
@@ -2259,7 +2338,10 @@ static void perform_detection_delete(int idx) {
             }
         }
 
-        if (deleted_id > 0) add_deleted_id(deleted_id);
+        if (deleted_id != 0) {
+            add_deleted_id(deleted_id);
+            if (deleted_mac[0] != '\0') deleted_macs_add(deleted_mac, deleted_id);
+        }
 
         if (history_selected_idx >= sd_hist_count)
             history_selected_idx = max(0, sd_hist_count - 1);
@@ -2278,7 +2360,10 @@ static void perform_detection_delete(int idx) {
             capture_history[i] = capture_history[i + 1];
         capture_history_count--;
 
-        if (deleted_id > 0) add_deleted_id(deleted_id);
+        if (deleted_id != 0) {
+            add_deleted_id(deleted_id);
+            if (deleted_mac[0] != '\0') deleted_macs_add(deleted_mac, deleted_id);
+        }
 
         if (history_selected_idx >= capture_history_count)
             history_selected_idx = max(0, capture_history_count - 1);
@@ -2295,6 +2380,7 @@ static void perform_detection_delete(int idx) {
 
     give_data_mutex();
     save_deleted_ids();
+    deleted_macs_save();
     set_toast_direct("DETECTION DELETED", TOAST_WARNING, false);
 }
 
@@ -2509,8 +2595,15 @@ void load_sd_history() {
         } else {
             safe_copy(e.datestamp, "--/--/--", sizeof(e.datestamp));
         }
-        // Skip if this ID was deleted by the user
-        if (e.id > 0 && is_id_deleted(e.id)) continue;
+        // Legacy lines missing DetID column get a deterministic synthetic ID
+        // so the deleted_ids / deleted_macs filters can hold them down across loads.
+        if (e.id == 0) {
+            unsigned long uptime_ms = (unsigned long)strtoul(line + fs[0], NULL, 10);
+            e.id = synthesize_detection_id(e.mac, e.epoch_utc, uptime_ms, e.rssi);
+        }
+        // Skip if this ID (real or synthetic) was deleted by the user
+        if (is_id_deleted(e.id)) continue;
+        if (deleted_macs_suppresses(e.mac, e.id)) continue;
         parsed_count++;
     }
 
@@ -9420,6 +9513,7 @@ void setup() {
         load_session_from_flash();
         load_wifi_credentials();
         load_deleted_ids();
+        deleted_macs_load();
         load_detections_from_flash();
         load_whitelist();
     }
