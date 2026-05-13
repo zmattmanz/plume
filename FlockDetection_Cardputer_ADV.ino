@@ -1545,6 +1545,8 @@ bool has_tn_serial(const uint8_t* mfg_data, size_t mfg_len) {
 
 // Convert a UTC Y/M/D h:m:s to Unix epoch seconds without depending on
 // the system timezone. Valid for years 1970..2099.
+// Uses int64_t for the final multiplication to avoid the 32-bit
+// overflow at days ≈ 24855 (early 2038).
 static uint32_t utc_to_epoch(int year, int mon, int day,
                              int hour, int min, int sec) {
     static const int days_before_month[12] = {
@@ -1559,7 +1561,11 @@ static uint32_t utc_to_epoch(int year, int mon, int day,
     bool is_leap = ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
     if (is_leap && mon > 2) days += 1;
     days += (day - 1);
-    return (uint32_t)(days * 86400L + hour * 3600L + min * 60L + sec);
+    int64_t total = (int64_t)days * 86400LL
+                  + (int64_t)hour * 3600LL
+                  + (int64_t)min * 60LL
+                  + (int64_t)sec;
+    return (uint32_t)total;
 }
 
 void format_time_buf(unsigned long total_sec, char* buf, size_t buf_len) {
@@ -10624,8 +10630,9 @@ void loop() {
         }
     }
 
-    // Fire pending '\' single-press action if double-tap window expired
-    if (bs_pending_exists && millis() >= bs_pending_until) {
+    // Fire pending '\' single-press action if double-tap window expired.
+    // Signed-diff compare handles the 49-day millis() wraparound edge case.
+    if (bs_pending_exists && (long)(millis() - bs_pending_until) >= 0) {
         bs_pending_exists = false;
         bs_pending_until = 0;
         led_breathing_on = !led_breathing_on;
