@@ -460,7 +460,11 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define BLE_SCAN_DURATION 2
 #define BLE_SCAN_INTERVAL      3000   // normal inter-scan gap (ms)
 #define BLE_SCAN_INTERVAL_LOCK  800   // boosted gap during 10s channel lock window
-#define BUZZER_COOLDOWN 60000
+// Brief global cooldown — prevents two alarms firing in the same audio
+// envelope when multiple detections from different devices arrive in the
+// same scanner tick. The 5-minute seen-MAC dedup is the real repeat
+// suppression; this is just envelope spacing.
+#define BUZZER_COOLDOWN 1500
 #define IGNORE_WEAK_RSSI -80
 
 #define MAX_LOG_BUFFER 4
@@ -692,10 +696,12 @@ static bool whitelist_add(const char* mac) {
 
 static void save_whitelist() {
     if (!littlefs_available) return;
-    File f = LittleFS.open(WHITELIST_FILE, "w");
-    if (!f) return;
-    for (int i = 0; i < mac_whitelist_count; i++) f.println(mac_whitelist[i]);
-    f.close();
+    littlefs_atomic_write(WHITELIST_FILE, [&](File& f) -> bool {
+        for (int i = 0; i < mac_whitelist_count; i++) {
+            if (f.println(mac_whitelist[i]) <= 0) return false;
+        }
+        return true;
+    });
 }
 
 static void load_whitelist() {
@@ -918,11 +924,13 @@ static bool deleted_macs_suppresses(const char* mac, int id) {
 
 static void deleted_macs_save() {
     if (!littlefs_available) return;
-    File f = LittleFS.open(DELETED_MACS_FILE, "w");
-    if (!f) return;
-    for (int i = 0; i < deleted_mac_count; i++)
-        f.printf("%s,%d\n", deleted_macs[i].mac, deleted_macs[i].before_id);
-    f.close();
+    littlefs_atomic_write(DELETED_MACS_FILE, [&](File& f) -> bool {
+        for (int i = 0; i < deleted_mac_count; i++) {
+            if (f.printf("%s,%d\n", deleted_macs[i].mac, deleted_macs[i].before_id) <= 0)
+                return false;
+        }
+        return true;
+    });
 }
 
 static void deleted_macs_load() {
@@ -998,8 +1006,9 @@ static uint32_t stats_pkt_display       = 0;
 static unsigned long stats_pkt_last_update = 0;
 
 #define TOAST_QUEUE_SIZE 3
+#define TOAST_TEXT_LEN   48
 struct ToastEntry {
-    char text[32];
+    char text[TOAST_TEXT_LEN];
     uint16_t accent;
     bool is_action;
 };
@@ -1010,7 +1019,7 @@ static unsigned long toast_start = 0;
 static bool toast_active = false;
 
 // Compatibility shims for direct-write sites (battery warnings, flash errors)
-static char toast_text[32] = "";
+static char toast_text[TOAST_TEXT_LEN] = "";
 static uint16_t toast_accent_color = 0;
 static bool toast_is_action = false;
 
@@ -2189,8 +2198,8 @@ static bool export_finalize_connect() {
     export_mode_started_at = millis();
 
     // Show IP + password so the user can authenticate from their browser.
-    // Format: "http://192.168.1.5 pw:A3F2" — fits in 32-char toast buffer.
-    char ip_toast[32];
+    // Format: "http://192.168.1.5 pw:A3F2"
+    char ip_toast[TOAST_TEXT_LEN];
     snprintf(ip_toast, sizeof(ip_toast), "http://%s pw:%s",
              export_ip_str, export_auth_pass);
     set_toast_direct(ip_toast, TOAST_SUCCESS);
@@ -2280,6 +2289,46 @@ void export_mode_stop() {
 // ============================================================================
 // PERSISTENCE & TRACKING
 // ============================================================================
+
+// Atomic write: write content via the callback to a temp file, then rename
+// over the target. Caller's lambda gets the open File and returns true on
+// success. If the lambda returns false, or any FS step fails, the previous
+// good file is left intact.
+//
+// Returns true if the target file now contains the new content.
+template<typename WriteFn>
+static bool littlefs_atomic_write(const char* target_path, WriteFn write_fn) {
+    if (!littlefs_available) return false;
+
+    char tmp_path[64];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
+
+    if (LittleFS.exists(tmp_path)) LittleFS.remove(tmp_path);
+
+    File f = LittleFS.open(tmp_path, "w");
+    if (!f) {
+        Serial.printf("[FS] atomic_write: open '%s' failed\n", tmp_path);
+        return false;
+    }
+
+    bool ok = write_fn(f);
+    f.close();
+
+    if (!ok) {
+        Serial.printf("[FS] atomic_write: writer returned false for '%s'\n", target_path);
+        LittleFS.remove(tmp_path);
+        return false;
+    }
+
+    if (!LittleFS.rename(tmp_path, target_path)) {
+        Serial.printf("[FS] atomic_write: rename '%s' -> '%s' failed\n",
+                      tmp_path, target_path);
+        LittleFS.remove(tmp_path);
+        return false;
+    }
+    return true;
+}
+
 void save_detections_to_flash() {
     if (!littlefs_available) return;
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
@@ -2287,22 +2336,26 @@ void save_detections_to_flash() {
     CaptureEntry local_hist[CAPTURE_HISTORY_SIZE];
     for (int i = 0; i < cnt; i++) local_hist[i] = capture_history[i];
     xSemaphoreGiveRecursive(dataMutex);
-    File f = LittleFS.open(DETECT_FILE, "w");
-    if (!f) return;
-    for (int i = 0; i < cnt; i++) {
-        f.printf("%s|%s|%s|%d|%.6f|%.6f\n",
-            local_hist[i].type, local_hist[i].mac, local_hist[i].name,
-            local_hist[i].confidence, local_hist[i].lat, local_hist[i].lng);
-    }
-    f.close();
+
+    littlefs_atomic_write(DETECT_FILE, [&](File& f) -> bool {
+        for (int i = 0; i < cnt; i++) {
+            int r = f.printf("%s|%s|%s|%d|%.6f|%.6f\n",
+                local_hist[i].type, local_hist[i].mac, local_hist[i].name,
+                local_hist[i].confidence, local_hist[i].lat, local_hist[i].lng);
+            if (r <= 0) return false;
+        }
+        return true;
+    });
 }
 
 static void save_deleted_ids() {
     if (!littlefs_available) return;
-    File f = LittleFS.open(DELETED_IDS_FILE, "w");
-    if (!f) return;
-    for (int i = 0; i < deleted_id_count; i++) f.printf("%d\n", deleted_ids[i]);
-    f.close();
+    littlefs_atomic_write(DELETED_IDS_FILE, [&](File& f) -> bool {
+        for (int i = 0; i < deleted_id_count; i++) {
+            if (f.printf("%d\n", deleted_ids[i]) <= 0) return false;
+        }
+        return true;
+    });
 }
 
 static void load_deleted_ids() {
@@ -2718,40 +2771,36 @@ static void save_session_to_flash() {
 
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
-        File f = LittleFS.open(PERSIST_FILE, "w");
-        if (!f) {
-            Serial.printf("[FS] PERSIST_FILE open failed (attempt %d)\n", attempt);
-            delay(5);
-            continue;
-        }
         size_t written = 0;
         bool any_short = false;
-        auto wp = [&](int r) -> size_t {
-            if (r <= 0) { any_short = true; return 0; }
-            written += (size_t)r;
-            return (size_t)r;
-        };
-        wp(f.printf("wifi=%ld\n",       l_wifi));
-        wp(f.printf("ble=%ld\n",        l_ble));
-        wp(f.printf("seconds=%lu\n",    l_sec));
-        wp(f.printf("flock=%ld\n",      l_flock));
-        wp(f.printf("volume=%d\n",      l_vol));
-        wp(f.printf("boots=%ld\n",      l_boots));
-        wp(f.printf("writes=%ld\n",     l_writes));
-        wp(f.printf("ssid=%s\n",        export_ssid));
-        wp(f.printf("pass=%s\n",        export_pass));
-        wp(f.printf("next_id=%ld\n",    l_next_id));
-        wp(f.printf("night=%d\n",       l_night ? 1 : 0));
-        wp(f.printf("brightness=%d\n",  l_brightness));
-        wp(f.printf("low_power=%d\n",   l_low_power ? 1 : 0));
-        wp(f.printf("stealth=%d\n",     l_stealth ? 1 : 0));
-        wp(f.printf("muted=%d\n",       l_muted ? 1 : 0));
-        f.close();
-        if (!any_short && written >= PERSIST_MIN_BYTES) {
+        bool atomic_ok = littlefs_atomic_write(PERSIST_FILE, [&](File& f) -> bool {
+            auto wp = [&](int r) {
+                if (r <= 0) { any_short = true; return; }
+                written += (size_t)r;
+            };
+            wp(f.printf("wifi=%ld\n",       l_wifi));
+            wp(f.printf("ble=%ld\n",        l_ble));
+            wp(f.printf("seconds=%lu\n",    l_sec));
+            wp(f.printf("flock=%ld\n",      l_flock));
+            wp(f.printf("volume=%d\n",      l_vol));
+            wp(f.printf("boots=%ld\n",      l_boots));
+            wp(f.printf("writes=%ld\n",     l_writes));
+            wp(f.printf("ssid=%s\n",        export_ssid));
+            wp(f.printf("pass=%s\n",        export_pass));
+            wp(f.printf("next_id=%ld\n",    l_next_id));
+            wp(f.printf("night=%d\n",       l_night ? 1 : 0));
+            wp(f.printf("brightness=%d\n",  l_brightness));
+            wp(f.printf("low_power=%d\n",   l_low_power ? 1 : 0));
+            wp(f.printf("stealth=%d\n",     l_stealth ? 1 : 0));
+            wp(f.printf("muted=%d\n",       l_muted ? 1 : 0));
+            return !any_short && written >= PERSIST_MIN_BYTES;
+        });
+        if (atomic_ok) {
             write_ok = true;
         } else {
-            Serial.printf("[FS] Write truncated: %u bytes (attempt %d, any_short=%d)\n",
+            Serial.printf("[FS] Write failed: %u bytes (attempt %d, any_short=%d)\n",
                           (unsigned)written, attempt, any_short ? 1 : 0);
+            delay(5);
         }
     }
 
@@ -3107,13 +3156,13 @@ static void save_wifi_credentials() {
     mbedtls_aes_free(&aes);
 
     // Write: [16 bytes IV] [2 bytes padded_len LE] [ciphertext]
-    File f = LittleFS.open(WIFI_CRED_FILE, "w");
-    if (!f) { memset(plain, 0, sizeof(plain)); memset(key, 0, sizeof(key)); return; }
-    f.write(iv, 16);
     uint8_t len_bytes[2] = { (uint8_t)(padded_len & 0xFF), (uint8_t)(padded_len >> 8) };
-    f.write(len_bytes, 2);
-    f.write(plain, padded_len);
-    f.close();
+    littlefs_atomic_write(WIFI_CRED_FILE, [&](File& f) -> bool {
+        if (f.write(iv, 16) != 16) return false;
+        if (f.write(len_bytes, 2) != 2) return false;
+        if (f.write(plain, padded_len) != padded_len) return false;
+        return true;
+    });
 
     memset(plain, 0, sizeof(plain));
     memset(key, 0, sizeof(key));
@@ -3562,13 +3611,17 @@ void trigger_toast(const char* type, const char* name, int confidence) {
 
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
     bool is_action = (confidence == 0);
-    char full_text[32];
+    char full_text[TOAST_TEXT_LEN];
     if (is_action) {
-        snprintf(full_text, sizeof(full_text), "%.30s", src);
+        snprintf(full_text, sizeof(full_text), "%.*s",
+                 (int)sizeof(full_text) - 1, src);
     } else {
         char pct_str[6];
         snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
-        snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
+        int src_budget = (int)sizeof(full_text) - 1 - (int)strlen(pct_str);
+        if (src_budget < 1) src_budget = 1;
+        snprintf(full_text, sizeof(full_text), "%.*s%s",
+                 src_budget, src, pct_str);
     }
 
     if (!take_data_mutex()) return;
@@ -4796,7 +4849,7 @@ void draw_header_spr(int screen_num) {
 void draw_toast_spr() {
     // Snapshot all toast state under mutex before rendering.
     bool          active_snap;
-    char          text_snap[32];
+    char          text_snap[TOAST_TEXT_LEN];
     uint16_t      accent_snap      = 0;
     bool          is_info_snap     = true;
     unsigned long start_snap       = 0;
@@ -10265,7 +10318,7 @@ void loop() {
 
                         if (whitelist_add(mac_to_wl)) {
                             save_whitelist();
-                            char wl_toast[32];
+                            char wl_toast[TOAST_TEXT_LEN];
                             snprintf(wl_toast, sizeof(wl_toast), "WHITELISTED %d/%d", mac_whitelist_count, MAX_WHITELIST);
                             set_toast_direct(wl_toast, TOAST_SUCCESS);
                         } else if (is_mac_whitelisted(mac_to_wl)) {
