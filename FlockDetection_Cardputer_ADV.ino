@@ -84,7 +84,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms);
 static void draw_scanner_viz_timeline(unsigned long frame_ms);
 static void timeline_init(unsigned long frame_ms);
 static void timeline_shift_bins(unsigned long frame_ms);
-static inline void fast_sincos(float angle, float* s, float* c);
+static inline void compute_sincos(float angle, float* s, float* c);
 void draw_signal_screen();
 void draw_device_info_screen();
 
@@ -5885,7 +5885,11 @@ static void scan_angle_lut_build() {
                   SCAN_LUT_SIZE, (unsigned)SCAN_LUT_SIZE);
 }
 
-static inline void fast_sincos(float angle, float* s, float* c) {
+// Compute sine and cosine of the same angle. Currently just calls sinf
+// and cosf separately — the name reflects what it does, not a promise
+// of optimization. If this becomes a hot path, consider a sin LUT plus
+// cos derived from sqrtf(1 - sin²) with sign tracking.
+static inline void compute_sincos(float angle, float* s, float* c) {
     *s = sinf(angle);
     *c = cosf(angle);
 }
@@ -6632,7 +6636,7 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         // Position — uses eased angle for smooth angular motion
         float draw_dist = 0.05f + d.dist_smooth * 0.70f;
         float ds, dc;
-        fast_sincos(d.angle_smooth, &ds, &dc);
+        compute_sincos(d.angle_smooth, &ds, &dc);
         int dpx = CX + (int)(draw_dist * (float)R * dc);
         int dpy = CY + (int)(draw_dist * (float)R * ds);
 
@@ -9874,28 +9878,84 @@ void loop() {
         }
     }
 
-    // One-time stack usage diagnostic — logs after 60s when all code paths
-    // (WiFi events, BLE scans, GPS parsing, SD flushes, alarms) have fired
-    // at least once. Values are in bytes of unused stack (high-water mark).
-    // If any value is >1500, the task's stack can be safely reduced by that
-    // amount minus a 256-byte safety margin.
+    // Stack health monitoring — three layers:
+    //   1. One-shot 60s baseline log (initial usage after all code paths hit).
+    //   2. Periodic hourly re-log (catches slow growth under sustained load).
+    //   3. Per-second critical-low check (toasts if any task is near overflow).
+    //
+    // Watermark values are bytes of *unused* stack. Once under STACK_CRITICAL_BYTES,
+    // the task is one bad call away from corrupting whatever sits below its stack —
+    // typically another task's stack or FreeRTOS internal state.
     {
-        static bool stack_reported = false;
-        if (!stack_reported && millis() > 60000) {
-            stack_reported = true;
-            UBaseType_t scan_hw = uxTaskGetStackHighWaterMark(ScannerTaskHandle);
-            UBaseType_t gps_hw  = uxTaskGetStackHighWaterMark(GPSTaskHandle);
-            UBaseType_t ble_hw  = BLEWorkerHandle ? uxTaskGetStackHighWaterMark(BLEWorkerHandle) : 0;
-            UBaseType_t led_hw  = LedTaskHandle ? uxTaskGetStackHighWaterMark(LedTaskHandle) : 0;
-            UBaseType_t loop_hw = uxTaskGetStackHighWaterMark(NULL);  // NULL = calling task (loop)
-            Serial.printf("[STACK] High-water marks (bytes remaining):\n");
-            Serial.printf("  Scanner: %u / 1584\n", (unsigned)scan_hw);
-            Serial.printf("  GPS:     %u / 1336\n", (unsigned)gps_hw);
-            Serial.printf("  BLE:     %u / 2352\n", (unsigned)ble_hw);
-            Serial.printf("  LED:     %u / 1536\n", (unsigned)led_hw);
-            Serial.printf("  Loop:    %u / 5120\n", (unsigned)loop_hw);
+        static const UBaseType_t STACK_CRITICAL_BYTES = 256;
+        static const unsigned long STACK_REPORT_INTERVAL_MS = 60UL * 60UL * 1000UL;
+        static const unsigned long STACK_CRITICAL_CHECK_MS  = 1000UL;
+        static const unsigned long STACK_TOAST_COOLDOWN_MS  = 60UL * 1000UL;
+
+        static bool stack_baseline_reported = false;
+        static unsigned long stack_last_report_ms = 0;
+        static unsigned long stack_last_critical_check_ms = 0;
+        static unsigned long stack_last_toast_ms[5] = {0};
+
+        unsigned long stack_now = millis();
+
+        auto gather_watermarks = [&](UBaseType_t out[5]) {
+            out[0] = ScannerTaskHandle ? uxTaskGetStackHighWaterMark(ScannerTaskHandle) : (UBaseType_t)-1;
+            out[1] = GPSTaskHandle     ? uxTaskGetStackHighWaterMark(GPSTaskHandle)     : (UBaseType_t)-1;
+            out[2] = BLEWorkerHandle   ? uxTaskGetStackHighWaterMark(BLEWorkerHandle)   : (UBaseType_t)-1;
+            out[3] = LedTaskHandle     ? uxTaskGetStackHighWaterMark(LedTaskHandle)     : (UBaseType_t)-1;
+            out[4] = uxTaskGetStackHighWaterMark(NULL);
+        };
+
+        auto log_watermarks = [&](const char* tag, const UBaseType_t hw[5]) {
+            Serial.printf("[STACK] %s — bytes remaining:\n", tag);
+            Serial.printf("  Scanner: %u / 1584\n", (unsigned)hw[0]);
+            Serial.printf("  GPS:     %u / 1336\n", (unsigned)hw[1]);
+            Serial.printf("  BLE:     %u / 2352\n", (unsigned)hw[2]);
+            Serial.printf("  LED:     %u / 1536\n", (unsigned)hw[3]);
+            Serial.printf("  Loop:    %u / 5120\n", (unsigned)hw[4]);
+        };
+
+        // Layer 1: baseline log at 60 seconds.
+        if (!stack_baseline_reported && stack_now > 60000) {
+            stack_baseline_reported = true;
+            UBaseType_t hw[5];
+            gather_watermarks(hw);
+            log_watermarks("baseline @ 60s", hw);
             Serial.printf("[STACK] Safe to reduce any task where remaining > 512 bytes.\n");
             Serial.printf("  Recommended: new_stack = current - (remaining - 256)\n");
+            stack_last_report_ms = stack_now;
+        }
+
+        // Layer 2: periodic re-log every hour after baseline.
+        if (stack_baseline_reported &&
+            (stack_now - stack_last_report_ms) >= STACK_REPORT_INTERVAL_MS) {
+            stack_last_report_ms = stack_now;
+            UBaseType_t hw[5];
+            gather_watermarks(hw);
+            log_watermarks("hourly check", hw);
+        }
+
+        // Layer 3: critical-low check every second. Five register reads — negligible cost.
+        if ((stack_now - stack_last_critical_check_ms) >= STACK_CRITICAL_CHECK_MS) {
+            stack_last_critical_check_ms = stack_now;
+            UBaseType_t hw[5];
+            gather_watermarks(hw);
+            static const char* task_names[5] = { "SCANNER", "GPS", "BLE", "LED", "LOOP" };
+            for (int i = 0; i < 5; i++) {
+                if (hw[i] == (UBaseType_t)-1) continue;
+                if (hw[i] < STACK_CRITICAL_BYTES) {
+                    Serial.printf("[STACK] CRITICAL: %s task has %u bytes free\n",
+                                  task_names[i], (unsigned)hw[i]);
+                    if ((stack_now - stack_last_toast_ms[i]) >= STACK_TOAST_COOLDOWN_MS) {
+                        stack_last_toast_ms[i] = stack_now;
+                        char toast_buf[TOAST_TEXT_LEN];
+                        snprintf(toast_buf, sizeof(toast_buf),
+                                 "STACK LOW: %s %uB", task_names[i], (unsigned)hw[i]);
+                        set_toast_direct(toast_buf, TOAST_WARNING, false);
+                    }
+                }
+            }
         }
     }
 
