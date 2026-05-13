@@ -5857,7 +5857,7 @@ void draw_scanner_screen() {
     }
     spr.clearClipRect();
 
-    if (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0) {
+    if (!show_feed_expanded && (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0)) {
         if (take_data_mutex()) {
             scan_local_count = feed_count;
             scan_local_head  = feed_head;
