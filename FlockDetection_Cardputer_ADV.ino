@@ -4839,12 +4839,14 @@ void draw_help_overlay() {
 #if DEBUG_KEYS
         {"x",   "simulate"},
 #endif
+        {"f",   "expand feed"},
         {"t",   "locate"},
         {"m",   "dock"},
     };
-    static const HelpKey locator_keys[] = {
-        {"l",   "start/stop"},
-        {"t",   "target"},
+    static const HelpKey signal_keys[] = {
+        {"f",   "feed / select target"},
+        {"t",   "target device"},
+        {"l",   "stop tracking"},
     };
     static const HelpKey detections_keys[] = {
         {"^/v", "navigate"},
@@ -4861,7 +4863,7 @@ void draw_help_overlay() {
 
     switch (current_screen) {
         case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys)/sizeof(scanner_keys[0]);       break;
-        case 1: keys = locator_keys;    key_count = sizeof(locator_keys)/sizeof(locator_keys[0]);       break;
+        case 1: keys = signal_keys;     key_count = sizeof(signal_keys)/sizeof(signal_keys[0]);         break;
         case 2: keys = detections_keys; key_count = sizeof(detections_keys)/sizeof(detections_keys[0]); break;
         case 3: keys = gps_keys;        key_count = sizeof(gps_keys)/sizeof(gps_keys[0]);               break;
         case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys)/sizeof(devinfo_keys[0]);       break;
@@ -8854,6 +8856,20 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         if (t >= 1.0f) boot_status_settled_drawn = true;
     }
 
+    // ── Version tag — bottom-right corner, drawn once ──
+    static bool boot_ver_drawn = false;
+    if (!boot_ver_drawn) {
+        const char* ver = VERSION_SHORT;
+        int ver_w = (int)strlen(ver) * 6;  // textSize(1) = 6px/char
+        lcd.startWrite();
+        lcd.setTextSize(1);
+        lcd.setTextColor(dim, bg);
+        lcd.setTextDatum(TL_DATUM);
+        lcd.drawString(ver, DISP_W - ver_w - 4, DISP_H - 10);
+        lcd.endWrite();
+        boot_ver_drawn = true;
+    }
+
     lcd.setTextDatum(TL_DATUM);
 }
 
@@ -10025,11 +10041,11 @@ void loop() {
                 }
             }
             else if (c == 'l') {
-                // Instant locator stop from any screen. No-op when inactive.
-                if (locator_active) {
+                if (locator_active && !stealth_mode) {
                     locator_stop();
-                    trigger_toast("INFO", "Locator stopped", 0);
+                    trigger_toast("SIGNAL", "Target cleared", 0);
                     beep(500, 60);
+                    screen_dirty = true;
                 }
             }
             else if (c == '\\') {
