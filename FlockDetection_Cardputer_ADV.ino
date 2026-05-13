@@ -724,6 +724,45 @@ static bool whitelist_add(const char* mac) {
     return true;
 }
 
+// Atomic write: write content via the callback to a temp file, then rename
+// over the target. Caller's lambda gets the open File and returns true on
+// success. If the lambda returns false, or any FS step fails, the previous
+// good file is left intact.
+//
+// Returns true if the target file now contains the new content.
+template<typename WriteFn>
+static bool littlefs_atomic_write(const char* target_path, WriteFn write_fn) {
+    if (!littlefs_available) return false;
+
+    char tmp_path[64];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
+
+    if (LittleFS.exists(tmp_path)) LittleFS.remove(tmp_path);
+
+    File f = LittleFS.open(tmp_path, "w");
+    if (!f) {
+        Serial.printf("[FS] atomic_write: open '%s' failed\n", tmp_path);
+        return false;
+    }
+
+    bool ok = write_fn(f);
+    f.close();
+
+    if (!ok) {
+        Serial.printf("[FS] atomic_write: writer returned false for '%s'\n", target_path);
+        LittleFS.remove(tmp_path);
+        return false;
+    }
+
+    if (!LittleFS.rename(tmp_path, target_path)) {
+        Serial.printf("[FS] atomic_write: rename '%s' -> '%s' failed\n",
+                      tmp_path, target_path);
+        LittleFS.remove(tmp_path);
+        return false;
+    }
+    return true;
+}
+
 static void save_whitelist() {
     if (!littlefs_available) return;
     littlefs_atomic_write(WHITELIST_FILE, [&](File& f) -> bool {
@@ -2314,45 +2353,6 @@ void export_mode_stop() {
 // ============================================================================
 // PERSISTENCE & TRACKING
 // ============================================================================
-
-// Atomic write: write content via the callback to a temp file, then rename
-// over the target. Caller's lambda gets the open File and returns true on
-// success. If the lambda returns false, or any FS step fails, the previous
-// good file is left intact.
-//
-// Returns true if the target file now contains the new content.
-template<typename WriteFn>
-static bool littlefs_atomic_write(const char* target_path, WriteFn write_fn) {
-    if (!littlefs_available) return false;
-
-    char tmp_path[64];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
-
-    if (LittleFS.exists(tmp_path)) LittleFS.remove(tmp_path);
-
-    File f = LittleFS.open(tmp_path, "w");
-    if (!f) {
-        Serial.printf("[FS] atomic_write: open '%s' failed\n", tmp_path);
-        return false;
-    }
-
-    bool ok = write_fn(f);
-    f.close();
-
-    if (!ok) {
-        Serial.printf("[FS] atomic_write: writer returned false for '%s'\n", target_path);
-        LittleFS.remove(tmp_path);
-        return false;
-    }
-
-    if (!LittleFS.rename(tmp_path, target_path)) {
-        Serial.printf("[FS] atomic_write: rename '%s' -> '%s' failed\n",
-                      tmp_path, target_path);
-        LittleFS.remove(tmp_path);
-        return false;
-    }
-    return true;
-}
 
 void save_detections_to_flash() {
     if (!littlefs_available) return;
