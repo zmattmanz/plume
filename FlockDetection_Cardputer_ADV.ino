@@ -5849,7 +5849,7 @@ static void draw_export_info() {
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(UI_PAD_SM, DISP_H - 10);
-    spr.print("M > Export Mode to stop");
+    spr.print("M menu  ESC home");
 }
 
 void draw_scanner_screen() {
@@ -9734,7 +9734,7 @@ void loop() {
                             set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
                             wifi_config_open = false;
                         }
-                    } else if (c == 0x1B || IS_KEY_LEFT(c)) {
+                    } else if (c == 0x1B) {
                         wifi_config_open = false;
                     }
                 }
