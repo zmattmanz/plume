@@ -2702,6 +2702,20 @@ static void save_session_to_flash() {
     l_muted      = is_muted;
     xSemaphoreGiveRecursive(dataMutex);
 
+    // Minimum acceptable byte count for a complete write. Computed from
+    // the 15 lines below assuming empty ssid/pass strings: each line
+    // contributes at least its key + '=' + minimum value + '\n'. A real
+    // write with non-empty fields runs ~180-220 bytes. Anything below
+    // this floor means the write truncated mid-stream.
+    //
+    //   wifi=0\n       (7)   ble=0\n        (6)   seconds=0\n    (10)
+    //   flock=0\n      (8)   volume=0\n     (9)   boots=0\n      (8)
+    //   writes=0\n     (9)   ssid=\n        (6)   pass=\n        (6)
+    //   next_id=0\n    (10)  night=0\n      (8)   brightness=0\n (13)
+    //   low_power=0\n  (12)  stealth=0\n    (10)  muted=0\n      (8)
+    //   Sum: 130 bytes (empty-field floor)
+    static const size_t PERSIST_MIN_BYTES = 130;
+
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
         File f = LittleFS.open(PERSIST_FILE, "w");
@@ -2711,27 +2725,33 @@ static void save_session_to_flash() {
             continue;
         }
         size_t written = 0;
-        written += f.printf("wifi=%ld\n",       l_wifi);
-        written += f.printf("ble=%ld\n",        l_ble);
-        written += f.printf("seconds=%lu\n",    l_sec);
-        written += f.printf("flock=%ld\n",      l_flock);
-        written += f.printf("volume=%d\n",      l_vol);
-        written += f.printf("boots=%ld\n",      l_boots);
-        written += f.printf("writes=%ld\n",     l_writes);
-        written += f.printf("ssid=%s\n",        export_ssid);
-        written += f.printf("pass=%s\n",        export_pass);
-        written += f.printf("next_id=%ld\n",    l_next_id);
-        written += f.printf("night=%d\n",       l_night ? 1 : 0);
-        written += f.printf("brightness=%d\n",  l_brightness);
-        written += f.printf("low_power=%d\n",   l_low_power ? 1 : 0);
-        written += f.printf("stealth=%d\n",     l_stealth ? 1 : 0);
-        written += f.printf("muted=%d\n",       l_muted ? 1 : 0);
+        bool any_short = false;
+        auto wp = [&](int r) -> size_t {
+            if (r <= 0) { any_short = true; return 0; }
+            written += (size_t)r;
+            return (size_t)r;
+        };
+        wp(f.printf("wifi=%ld\n",       l_wifi));
+        wp(f.printf("ble=%ld\n",        l_ble));
+        wp(f.printf("seconds=%lu\n",    l_sec));
+        wp(f.printf("flock=%ld\n",      l_flock));
+        wp(f.printf("volume=%d\n",      l_vol));
+        wp(f.printf("boots=%ld\n",      l_boots));
+        wp(f.printf("writes=%ld\n",     l_writes));
+        wp(f.printf("ssid=%s\n",        export_ssid));
+        wp(f.printf("pass=%s\n",        export_pass));
+        wp(f.printf("next_id=%ld\n",    l_next_id));
+        wp(f.printf("night=%d\n",       l_night ? 1 : 0));
+        wp(f.printf("brightness=%d\n",  l_brightness));
+        wp(f.printf("low_power=%d\n",   l_low_power ? 1 : 0));
+        wp(f.printf("stealth=%d\n",     l_stealth ? 1 : 0));
+        wp(f.printf("muted=%d\n",       l_muted ? 1 : 0));
         f.close();
-        if (written > 20) {
+        if (!any_short && written >= PERSIST_MIN_BYTES) {
             write_ok = true;
         } else {
-            Serial.printf("[FS] Write truncated: %u bytes (attempt %d)\n",
-                          (unsigned)written, attempt);
+            Serial.printf("[FS] Write truncated: %u bytes (attempt %d, any_short=%d)\n",
+                          (unsigned)written, attempt, any_short ? 1 : 0);
         }
     }
 
