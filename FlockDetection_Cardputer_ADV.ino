@@ -880,7 +880,7 @@ static int          history_scroll_offset = 0;
 static int   stats_scroll_target  = 0;
 static float stats_scroll_y_f     = 0.0f;
 static unsigned long stats_last_frame_ms = 0;
-static const int STATS_CONTENT_H   = 302;  // hero 50 + 6×36 + 6×6 gaps
+static const int STATS_CONTENT_H   = 288;  // 7×36 + 7×6 gaps (no hero)
 static const int STATS_VIEW_H      = 115;  // DISP_H - CONTENT_Y
 static const int STATS_SCROLL_STEP = 42;   // one standard card (36) + gap (6)
 static const int STATS_MAX_SCROLL  = STATS_CONTENT_H - STATS_VIEW_H;
@@ -891,7 +891,7 @@ static const float STATS_SCROLL_TC = 80.0f;   // ms — snappier; 120 felt slugg
 // kicks off an anim_slide_in() roll for UI_ANIM_QUICK ms. PACKETS is
 // additionally throttled to a 3 s update cadence so it doesn't churn.
 enum StatsCardIdx {
-    SC_DETECTIONS = 0, SC_WIFI, SC_BLE, SC_RAVEN,
+    SC_DET_SESSION = 0, SC_DET_LIFETIME, SC_WIFI, SC_BLE, SC_RAVEN,
     SC_SESSION, SC_LIFETIME,
     SC_BATTERY, SC_HEAP,
     SC_PACKETS, SC_SD,
@@ -1782,7 +1782,7 @@ void export_server_setup_routes() {
         export_mode_started_at = millis();
 
         // ── Build the dynamic file-rows block ──
-        char file_rows[512] = "";
+        char file_rows[2048] = "";
         int foff = 0;
         if (sd_available) {
             foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
@@ -1810,7 +1810,7 @@ void export_server_setup_routes() {
 
         // ── Render into a heap buffer ──
         // Template is ~3.5KB, dynamic content adds ~500B, total < 5KB.
-        const size_t PAGE_BUF_SIZE = 5120;
+        const size_t PAGE_BUF_SIZE = 8192;
         char* page = (char*)malloc(PAGE_BUF_SIZE);
         if (!page) {
             export_server->send(503, "text/plain", "Low memory");
@@ -1921,27 +1921,147 @@ void export_server_setup_routes() {
     });
 }
 
+// ── BLE pool — moved above export functions so export_mode_start and
+// export_restore_promiscuous can reference ble_cb_singleton and the pool.
+struct BleEventData {
+    uint8_t  mac[6];
+    uint8_t  addr_type;
+    int8_t   rssi;
+    int8_t   tx_power;
+    bool     have_tx_power;
+    char     dev_name[65];
+    bool     have_name;
+    uint8_t  mfg_data[64];
+    uint8_t  mfg_data_len;
+    bool     have_mfg;
+    char     service_uuids[8][37];
+    uint8_t  uuid_count;
+    uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
+    volatile uint32_t in_use;  // pool slot occupancy flag (0 = free, 1 = occupied)
+};
+
+// Static pool — eliminates all malloc/free from the BLE advertisement
+// hot path. 6 slots × ~380 bytes ≈ 2.3KB static cost, zero fragmentation.
+#define BLE_POOL_SIZE 4
+static BleEventData ble_pool[BLE_POOL_SIZE];
+// Written only from NimBLE's scan callback (single FreeRTOS task context,
+// never re-entrant). Atomic store ensures the cursor advance is visible
+// to ble_worker_task on Core 1 after the pool slot's in_use flag is set.
+static volatile uint32_t ble_pool_write = 0;
+
+class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+        // Claim a pool slot. If the slot is still being processed by the
+        // worker task, drop this advertisement — better than heap-allocating.
+        uint32_t slot = __atomic_load_n(&ble_pool_write, __ATOMIC_ACQUIRE);
+        uint32_t next = (slot + 1) % BLE_POOL_SIZE;
+
+        // Atomically claim this slot by advancing the write cursor.
+        // If another callback already advanced it, CAS fails — drop this ad.
+        if (!__atomic_compare_exchange_n(&ble_pool_write, &slot, next,
+                                          false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            return;
+        }
+
+        // We now own 'slot' exclusively. If the worker hasn't drained it yet,
+        // drop the advertisement — don't revert the cursor.
+        if (__atomic_load_n(&ble_pool[slot].in_use, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+
+        BleEventData* ev = &ble_pool[slot];
+        memset(ev, 0, sizeof(BleEventData));
+
+        NimBLEAddress addr = advertisedDevice->getAddress();
+        // NimBLE stores addresses little-endian; we display big-endian.
+        // Pulling the raw bytes avoids a heap-allocated std::string and a
+        // sscanf round-trip on every advertisement (50–200/sec under
+        // typical urban traffic — the steady alloc churn was the most
+        // consistent heap-fragmentation source in the code).
+        const uint8_t* native = addr.getNative();
+        for (int i = 0; i < 6; i++) ev->mac[i] = native[5 - i];
+        ev->addr_type = addr.getType();
+
+        ev->rssi          = (int8_t)advertisedDevice->getRSSI();
+        ev->have_tx_power = advertisedDevice->haveTXPower();
+        ev->tx_power      = ev->have_tx_power ? (int8_t)advertisedDevice->getTXPower() : 0;
+
+        ev->have_name = advertisedDevice->haveName();
+        if (ev->have_name) {
+            strncpy(ev->dev_name, advertisedDevice->getName().c_str(), 64);
+            ev->dev_name[64] = '\0';
+        } else {
+            strcpy(ev->dev_name, "Unknown");
+        }
+
+        ev->have_mfg = advertisedDevice->haveManufacturerData();
+        if (ev->have_mfg) {
+            std::string mfg = advertisedDevice->getManufacturerData();
+            ev->mfg_data_len = (uint8_t)(mfg.size() > 64 ? 64 : mfg.size());
+            memcpy(ev->mfg_data, mfg.data(), ev->mfg_data_len);
+        }
+
+        if (advertisedDevice->haveServiceUUID()) {
+            int count = advertisedDevice->getServiceUUIDCount();
+            ev->uuid_count = (uint8_t)(count > 8 ? 8 : count);
+            for (int i = 0; i < ev->uuid_count; i++) {
+                std::string uuid = advertisedDevice->getServiceUUID(i).toString();
+                strncpy(ev->service_uuids[i], uuid.c_str(), 36);
+                ev->service_uuids[i][36] = '\0';
+            }
+        }
+
+        // NimBLE does not reliably expose advertising channel on ESP32.
+        ev->adv_channel = 0;
+
+        // Mark slot as occupied — cursor was already advanced by the CAS above.
+        __atomic_store_n(&ev->in_use, 1u, __ATOMIC_RELEASE);
+
+        // Queue the slot index. If the queue is full, release the slot.
+        uint8_t idx = (uint8_t)slot;
+        if (xQueueSend(ble_event_queue, &idx, 0) != pdTRUE) {
+            __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE);
+        }
+    }
+};
+
+// Single shared instance — passed to setAdvertisedDeviceCallbacks at boot
+// and on every periodic NimBLE restart. Avoids the slow heap leak that
+// `new AdvertisedDeviceCallbacks()` produced every restart cycle.
+static AdvertisedDeviceCallbacks ble_cb_singleton;
+
 // Restore the promiscuous sniffer after export mode is finished or aborted.
 static void export_restore_promiscuous() {
+    // Fully release WiFi resources before NimBLE init — the WiFi station
+    // + TCP stack fragments heap; turning WiFi OFF lets the allocator
+    // coalesce free blocks so NimBLE can get its contiguous 20-30KB.
     WiFi.disconnect(true);
-    delay(100);
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+
+    // Reinitialize NimBLE while WiFi is off (maximum heap available)
+    NimBLEDevice::init("");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    pBLEScan = NimBLEDevice::getScan();
+    if (pBLEScan) {
+        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+        pBLEScan->setActiveScan(false);
+        apply_ble_scan_params();
+        pBLEScan->setMaxResults(0);
+    } else {
+        Serial.println("[BLE] getScan() returned null after reinit — BLE unavailable");
+    }
+    last_ble_restart_ms = millis();
+
+    // Now restart WiFi for promiscuous scanning
     WiFi.mode(WIFI_STA);
+    delay(50);
     wifi_promiscuous_filter_t pf_restore;
     pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&pf_restore);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
-
-    // Reinitialize NimBLE (was deinited in export_mode_start to free heap)
-    NimBLEDevice::init("");
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    pBLEScan = NimBLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
-    pBLEScan->setActiveScan(false);
-    apply_ble_scan_params();
-    pBLEScan->setMaxResults(0);
-    last_ble_restart_ms = millis();
 
     // Resume scanner task and re-subscribe to WDT
     if (ScannerTaskHandle) {
@@ -3403,7 +3523,10 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         sd_hist[0].id         = (int)next_detection_id;
         capture_history[0].id = (int)next_detection_id;
         next_detection_id++;
-        if (next_detection_id > 999999) next_detection_id = 1;
+        if (next_detection_id > 999999) {
+            next_detection_id = 1;
+            deleted_id_count = 0;  // clear deletion list — old IDs no longer in use
+        }
         if (sd_hist_count < SD_HIST_SIZE) sd_hist_count++;
         // New fields: datestamp (local time), GPS coordinates, epoch (always UTC)
         sd_hist[0].epoch_utc = ts_is_gps ? ts_epoch : 0;
@@ -4034,9 +4157,7 @@ void process_wifi_event_queue() {
         }
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            channel_lock_until = millis() + 10000;
-            xSemaphoreGiveRecursive(dataMutex);
+            __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_str, local.rssi);
             if (rssi_track_is_stationary(mac_str)) confidence += SCORE_BONUS_STAT;
             if (confidence > 100) confidence = 100;
@@ -4081,31 +4202,9 @@ void process_wifi_event_queue() {
 // ============================================================================
 // BLE CALLBACK — STACK-SAFE DEFERRED PROCESSING
 // ============================================================================
-struct BleEventData {
-    uint8_t  mac[6];
-    uint8_t  addr_type;
-    int8_t   rssi;
-    int8_t   tx_power;
-    bool     have_tx_power;
-    char     dev_name[65];
-    bool     have_name;
-    uint8_t  mfg_data[64];
-    uint8_t  mfg_data_len;
-    bool     have_mfg;
-    char     service_uuids[8][37];
-    uint8_t  uuid_count;
-    uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
-    volatile uint32_t in_use;  // pool slot occupancy flag (0 = free, 1 = occupied)
-};
-
-// Static pool — eliminates all malloc/free from the BLE advertisement
-// hot path. 6 slots × ~380 bytes ≈ 2.3KB static cost, zero fragmentation.
-#define BLE_POOL_SIZE 4
-static BleEventData ble_pool[BLE_POOL_SIZE];
-// Written only from NimBLE's scan callback (single FreeRTOS task context,
-// never re-entrant). Atomic store ensures the cursor advance is visible
-// to ble_worker_task on Core 1 after the pool slot's in_use flag is set.
-static volatile uint32_t ble_pool_write = 0;
+// (BleEventData struct, BLE_POOL_SIZE, ble_pool, ble_pool_write,
+//  AdvertisedDeviceCallbacks, and ble_cb_singleton are declared above the
+//  export server functions so export_mode_start can reference them.)
 
 static void ble_worker_task(void* pvParameters) {
     bool wdt_subscribed = false;
@@ -4212,9 +4311,7 @@ static void ble_worker_task(void* pvParameters) {
             ev->mac[3], ev->mac[4], ev->mac[5]);
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            channel_lock_until = millis() + 10000;
-            xSemaphoreGiveRecursive(dataMutex);
+            __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_string, ev->rssi);
             if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
             locator_add_sample(mac_string, ev->rssi);
@@ -4306,87 +4403,6 @@ static void ble_worker_task(void* pvParameters) {
     }
 }
 
-class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-        // Claim a pool slot. If the slot is still being processed by the
-        // worker task, drop this advertisement — better than heap-allocating.
-        uint32_t slot = __atomic_load_n(&ble_pool_write, __ATOMIC_ACQUIRE);
-        uint32_t next = (slot + 1) % BLE_POOL_SIZE;
-
-        // Atomically claim this slot by advancing the write cursor.
-        // If another callback already advanced it, CAS fails — drop this ad.
-        if (!__atomic_compare_exchange_n(&ble_pool_write, &slot, next,
-                                          false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            return;
-        }
-
-        // We now own 'slot' exclusively. If the worker hasn't drained it yet,
-        // drop the advertisement — don't revert the cursor.
-        if (__atomic_load_n(&ble_pool[slot].in_use, __ATOMIC_ACQUIRE)) {
-            return;
-        }
-
-        BleEventData* ev = &ble_pool[slot];
-        memset(ev, 0, sizeof(BleEventData));
-
-        NimBLEAddress addr = advertisedDevice->getAddress();
-        // NimBLE stores addresses little-endian; we display big-endian.
-        // Pulling the raw bytes avoids a heap-allocated std::string and a
-        // sscanf round-trip on every advertisement (50–200/sec under
-        // typical urban traffic — the steady alloc churn was the most
-        // consistent heap-fragmentation source in the code).
-        const uint8_t* native = addr.getNative();
-        for (int i = 0; i < 6; i++) ev->mac[i] = native[5 - i];
-        ev->addr_type = addr.getType();
-
-        ev->rssi          = (int8_t)advertisedDevice->getRSSI();
-        ev->have_tx_power = advertisedDevice->haveTXPower();
-        ev->tx_power      = ev->have_tx_power ? (int8_t)advertisedDevice->getTXPower() : 0;
-
-        ev->have_name = advertisedDevice->haveName();
-        if (ev->have_name) {
-            strncpy(ev->dev_name, advertisedDevice->getName().c_str(), 64);
-            ev->dev_name[64] = '\0';
-        } else {
-            strcpy(ev->dev_name, "Unknown");
-        }
-
-        ev->have_mfg = advertisedDevice->haveManufacturerData();
-        if (ev->have_mfg) {
-            std::string mfg = advertisedDevice->getManufacturerData();
-            ev->mfg_data_len = (uint8_t)(mfg.size() > 64 ? 64 : mfg.size());
-            memcpy(ev->mfg_data, mfg.data(), ev->mfg_data_len);
-        }
-
-        if (advertisedDevice->haveServiceUUID()) {
-            int count = advertisedDevice->getServiceUUIDCount();
-            ev->uuid_count = (uint8_t)(count > 8 ? 8 : count);
-            for (int i = 0; i < ev->uuid_count; i++) {
-                std::string uuid = advertisedDevice->getServiceUUID(i).toString();
-                strncpy(ev->service_uuids[i], uuid.c_str(), 36);
-                ev->service_uuids[i][36] = '\0';
-            }
-        }
-
-        // NimBLE does not reliably expose advertising channel on ESP32.
-        ev->adv_channel = 0;
-
-        // Mark slot as occupied — cursor was already advanced by the CAS above.
-        __atomic_store_n(&ev->in_use, 1u, __ATOMIC_RELEASE);
-
-        // Queue the slot index. If the queue is full, release the slot.
-        uint8_t idx = (uint8_t)slot;
-        if (xQueueSend(ble_event_queue, &idx, 0) != pdTRUE) {
-            __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE);
-        }
-    }
-};
-
-// Single shared instance — passed to setAdvertisedDeviceCallbacks at boot
-// and on every periodic NimBLE restart. Avoids the slow heap leak that
-// `new AdvertisedDeviceCallbacks()` produced every restart cycle.
-static AdvertisedDeviceCallbacks ble_cb_singleton;
-
 // ============================================================================
 // DEDICATED TASKS (DUAL CORE)
 // ============================================================================
@@ -4400,18 +4416,19 @@ void ScannerLoopTask(void* pvParameters) {
         }
         if (wdt_subscribed) esp_task_wdt_reset();
         unsigned long now = millis();
-        if ((long)(now - channel_lock_until) > 0) {
+        unsigned long lock_until = __atomic_load_n(&channel_lock_until, __ATOMIC_RELAXED);
+        if ((long)(now - lock_until) > 0) {
             unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
             if (now - last_channel_hop > dwell) {
-                current_channel++; 
+                current_channel++;
                 if (current_channel > MAX_CHANNEL) current_channel = 1;
-                esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); 
+                esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
                 last_channel_hop = now;
             }
         }
 
         unsigned long base_interval = low_power_mode ? 6000UL : BLE_SCAN_INTERVAL;
-        unsigned long ble_interval = ((long)(now - channel_lock_until) < 0)
+        unsigned long ble_interval = ((long)(now - lock_until) < 0)
             ? BLE_SCAN_INTERVAL_LOCK
             : base_interval;
 
@@ -4985,10 +5002,11 @@ void draw_help_overlay() {
         }
         y += 2;
 
-        // Stat guide — two columns, 7 rows × 2 = 13 cells (last cell blank).
+        // Stat guide — two columns, 8 rows × 2 = 15 cells (last cell blank).
         struct Desc { const char* name; const char* desc; };
         static const Desc descs[] = {
-            {"DETECT",   "total"},
+            {"SESS DET", "session"},
+            {"LIFE DET", "lifetime"},
             {"WIFI",     "wifi"},
             {"BLE",      "ble"},
             {"RAVEN",    "raven"},
@@ -5329,6 +5347,13 @@ static void draw_menu_overlay() {
             spr.setTextSize(TS_STRONG);
             spr.setCursor(LABEL_X, ry + 2);
             spr.print(label_text);
+
+            // Current screen indicator — small filled circle after label
+            if (idx >= 0 && idx <= 4 && idx == current_screen) {
+                int label_len = (int)strlen(label_text);
+                int dot_x = LABEL_X + label_len * 7 + 6;
+                spr.fillCircle(dot_x, ry + ROW_H / 2, 2, ea(HEADER_COLOR));
+            }
 
             // Toggle pills for settings (idx 5-7)
             if (idx >= 5 && idx <= 7) {
@@ -5892,6 +5917,7 @@ void draw_scanner_screen() {
                   : (float)(frame_ms - spectrum_last_frame);
         if (sdt > 100.0f) sdt = 100.0f;
         spectrum_last_frame = frame_ms;
+        scan_line_last_frame = frame_ms;  // keep scan line timestamp warm across viz modes
         for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
             float target = (channel_peak > 0 && channel_pkt_display[i] > 0)
                           ? (float)channel_pkt_display[i] / (float)channel_peak
@@ -6741,7 +6767,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     float scan_dt = (scan_line_last_frame == 0) ? 16.0f
                   : (float)(frame_ms - scan_line_last_frame);
     if (scan_dt > 100.0f) scan_dt = 100.0f;
-    scan_line_last_frame = frame_ms;
+    // scan_line_last_frame updated in draw_scanner_screen() warm-keep block
     scan_line_x_f = anim_filter(scan_line_x_f, scan_target_x, 120.0f, scan_dt);
     int scan_x = (int)(scan_line_x_f + 0.5f);
 
@@ -7390,9 +7416,9 @@ void draw_capture_history_screen() {
         }
 
         // ── Separator ──
-        ry += 13;
+        ry += 15;
         spr.drawFastHLine(LBL_X, ry, DISP_W - LBL_X * 2, CARD_BORDER);
-        ry += 6;
+        ry += 7;
 
         // ── Row 2: MAC (left, white) .................. #ID (right, white) ──
         spr.setTextColor(TEXT_COLOR, BG_COLOR);
@@ -8311,6 +8337,8 @@ void draw_device_info_screen() {
     l_sec = lifetime_seconds;
     give_data_mutex();
 
+    long session_det_total = sw + sb + sr;
+
     int32_t  bat_mv      = get_filtered_voltage();
     size_t   free_heap   = esp_get_free_heap_size();
     uint64_t sd_bytes    = sd_available ? SD.cardSize() : 0;
@@ -8328,7 +8356,8 @@ void draw_device_info_screen() {
     draw_header_spr(4);
 
     // ── Format value strings ──
-    char det_str[10];   snprintf(det_str,   sizeof(det_str),   "%ld", lt);
+    char det_sess_str[10]; snprintf(det_sess_str, sizeof(det_sess_str), "%ld", session_det_total);
+    char det_life_str[10]; snprintf(det_life_str, sizeof(det_life_str), "%ld", lt);
     char wifi_str[10];  snprintf(wifi_str,  sizeof(wifi_str),  "%ld", sw);
     char ble_str[10];   snprintf(ble_str,   sizeof(ble_str),   "%ld", sb);
     char raven_str[10]; snprintf(raven_str, sizeof(raven_str), "%ld", sr);
@@ -8361,7 +8390,8 @@ void draw_device_info_screen() {
     // comparison and timestamp bumping.
     if (!stats_values_initialized) {
         const char* seed[STATS_CARD_COUNT];
-        seed[SC_DETECTIONS] = det_str;
+        seed[SC_DET_SESSION] = det_sess_str;
+        seed[SC_DET_LIFETIME] = det_life_str;
         seed[SC_WIFI]       = wifi_str;
         seed[SC_BLE]        = ble_str;
         seed[SC_RAVEN]      = raven_str;
@@ -8432,33 +8462,34 @@ void draw_device_info_screen() {
     // into the header strip or off the bottom edge.
     spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
 
-    // Row 1 (vy = 0):   DETECTIONS hero, full width, 50px tall, TS_H2 value
-    card(x_full, 0,   w_full, H_HERO, "DETECTIONS", det_str, SC_DETECTIONS, TS_H2);
+    // Row 1 (vy = 0):   SESS DET | LIFE DET
+    card(x_h1, 0,   w_half, H_NORMAL, "SESS DET", det_sess_str, SC_DET_SESSION);
+    card(x_h2, 0,   w_half, H_NORMAL, "LIFE DET", det_life_str, SC_DET_LIFETIME);
 
-    // Row 2 (vy = 56):  WIFI | BLE | RAVEN
-    card(x_t1, 56,  w_tA, H_NORMAL, "WIFI",  wifi_str,  SC_WIFI);
-    card(x_t2, 56,  w_tA, H_NORMAL, "BLE",   ble_str,   SC_BLE);
-    card(x_t3, 56,  w_tC, H_NORMAL, "RAVEN", raven_str, SC_RAVEN);
+    // Row 2 (vy = 42):  WIFI | BLE | RAVEN
+    card(x_t1, 42,  w_tA, H_NORMAL, "WIFI",  wifi_str,  SC_WIFI);
+    card(x_t2, 42,  w_tA, H_NORMAL, "BLE",   ble_str,   SC_BLE);
+    card(x_t3, 42,  w_tC, H_NORMAL, "RAVEN", raven_str, SC_RAVEN);
 
-    // Row 3 (vy = 98):  SESSION | LIFETIME
-    card(x_h1, 98,  w_half, H_NORMAL, "SESSION",  sess_str, SC_SESSION);
-    card(x_h2, 98,  w_half, H_NORMAL, "LIFETIME", life_str, SC_LIFETIME);
+    // Row 3 (vy = 84):  SESSION | LIFETIME
+    card(x_h1, 84,  w_half, H_NORMAL, "SESSION",  sess_str, SC_SESSION);
+    card(x_h2, 84,  w_half, H_NORMAL, "LIFETIME", life_str, SC_LIFETIME);
 
-    // Row 4 (vy = 140): BATTERY | HEAP
-    card(x_h1, 140, w_half, H_NORMAL, "BATTERY", volt_str, SC_BATTERY);
-    card(x_h2, 140, w_half, H_NORMAL, "HEAP",    heap_str, SC_HEAP);
+    // Row 4 (vy = 126): BATTERY | HEAP
+    card(x_h1, 126, w_half, H_NORMAL, "BATTERY", volt_str, SC_BATTERY);
+    card(x_h2, 126, w_half, H_NORMAL, "HEAP",    heap_str, SC_HEAP);
 
-    // Row 5 (vy = 182): PACKETS | SD CARD
-    card(x_h1, 182, w_half, H_NORMAL, "PACKETS", pkt_str, SC_PACKETS);
-    card(x_h2, 182, w_half, H_NORMAL, "SD CARD", sd_str,  SC_SD);
+    // Row 5 (vy = 168): PACKETS | SD CARD
+    card(x_h1, 168, w_half, H_NORMAL, "PACKETS", pkt_str, SC_PACKETS);
+    card(x_h2, 168, w_half, H_NORMAL, "SD CARD", sd_str,  SC_SD);
 
-    // Row 6 (vy = 224): BOOTS | FLASH
-    card(x_h1, 224, w_half, H_NORMAL, "BOOTS", boots_str, SC_BOOTS);
-    card(x_h2, 224, w_half, H_NORMAL, "FLASH", flash_str, SC_FLASH);
+    // Row 6 (vy = 210): BOOTS | FLASH
+    card(x_h1, 210, w_half, H_NORMAL, "BOOTS", boots_str, SC_BOOTS);
+    card(x_h2, 210, w_half, H_NORMAL, "FLASH", flash_str, SC_FLASH);
 
-    // Row 7 (vy = 266): VERSION | VOLTAGE
-    card(x_h1, 266, w_half, H_NORMAL, "VERSION", VERSION_SHORT, SC_VERSION);
-    card(x_h2, 266, w_half, H_NORMAL, "VOLTAGE", voltage_str,   SC_VOLTAGE);
+    // Row 7 (vy = 252): VERSION | VOLTAGE
+    card(x_h1, 252, w_half, H_NORMAL, "VERSION", VERSION_SHORT, SC_VERSION);
+    card(x_h2, 252, w_half, H_NORMAL, "VOLTAGE", voltage_str,   SC_VOLTAGE);
 
     spr.clearClipRect();
 
@@ -9788,31 +9819,69 @@ void loop() {
                 screen_dirty = true;
             }
             else if (IS_KEY_UP(c)) {
-                if (current_screen == 2 && !hist_detail_open) {
-                    history_selected_idx--;
-                    if (history_selected_idx < 0) history_selected_idx = 0;
-                    if (history_selected_idx < history_scroll_offset)
-                        history_scroll_offset = history_selected_idx;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                if (current_screen == 2) {
+                    if (hist_detail_open) { /* no nav while detail is open */ }
+                    else {
+                        if (history_selected_idx <= 0) {
+                            int prev = current_screen - 1;
+                            if (prev < 0) prev = NUM_SCREENS - 1;
+                            transition_screen(prev, -1);
+                        } else {
+                            history_selected_idx--;
+                            if (history_selected_idx < history_scroll_offset)
+                                history_scroll_offset = history_selected_idx;
+                            draw_current_screen(); spr.pushSprite(0, 0);
+                        }
+                    }
                 } else if (current_screen == 4) {
-                    stats_scroll_target -= STATS_SCROLL_STEP;
-                    if (stats_scroll_target < 0) stats_scroll_target = 0;
-                    screen_dirty = true;
+                    if (stats_scroll_target <= 0) {
+                        int prev = current_screen - 1;
+                        if (prev < 0) prev = NUM_SCREENS - 1;
+                        transition_screen(prev, -1);
+                    } else {
+                        stats_scroll_target -= STATS_SCROLL_STEP;
+                        if (stats_scroll_target < 0) stats_scroll_target = 0;
+                        screen_dirty = true;
+                    }
+                } else if (!stealth_mode) {
+                    int prev = current_screen - 1;
+                    int d = (prev < 0) ? 1 : -1;
+                    if (prev < 0) prev = NUM_SCREENS - 1;
+                    transition_screen(prev, d);
                 }
             }
             else if (IS_KEY_DOWN(c)) {
-                if (current_screen == 2 && !hist_detail_open) {
-                    int hist_total = sd_available ? sd_hist_count : capture_history_count;
-                    history_selected_idx++;
-                    if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
-                    if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
-                        history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                if (current_screen == 2) {
+                    if (hist_detail_open) { /* no nav while detail is open */ }
+                    else {
+                        int hist_total = sd_available ? sd_hist_count : capture_history_count;
+                        if (history_selected_idx >= hist_total - 1) {
+                            int next = current_screen + 1;
+                            if (next >= NUM_SCREENS) next = 0;
+                            transition_screen(next, 1);
+                        } else {
+                            history_selected_idx++;
+                            if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+                                history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                            draw_current_screen(); spr.pushSprite(0, 0);
+                        }
+                    }
                 } else if (current_screen == 4) {
-                    stats_scroll_target += STATS_SCROLL_STEP;
-                    if (stats_scroll_target > STATS_MAX_SCROLL)
-                        stats_scroll_target = STATS_MAX_SCROLL;
-                    screen_dirty = true;
+                    if (stats_scroll_target >= STATS_MAX_SCROLL) {
+                        int next = current_screen + 1;
+                        if (next >= NUM_SCREENS) next = 0;
+                        transition_screen(next, 1);
+                    } else {
+                        stats_scroll_target += STATS_SCROLL_STEP;
+                        if (stats_scroll_target > STATS_MAX_SCROLL)
+                            stats_scroll_target = STATS_MAX_SCROLL;
+                        screen_dirty = true;
+                    }
+                } else if (!stealth_mode) {
+                    int next = current_screen + 1;
+                    int d = (next >= NUM_SCREENS) ? -1 : 1;
+                    if (next >= NUM_SCREENS) next = 0;
+                    transition_screen(next, d);
                 }
             }
             else if (IS_KEY_LEFT(c)) {
@@ -10223,26 +10292,32 @@ void loop() {
                 (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
                 if (current_screen == 2 && !hist_detail_open) {
                     if (IS_KEY_UP(cur_arrow)) {
-                        history_selected_idx--;
-                        if (history_selected_idx < 0) history_selected_idx = 0;
-                        if (history_selected_idx < history_scroll_offset)
-                            history_scroll_offset = history_selected_idx;
+                        if (history_selected_idx > 0) {
+                            history_selected_idx--;
+                            if (history_selected_idx < history_scroll_offset)
+                                history_scroll_offset = history_selected_idx;
+                        }
                     } else {
                         int ht = sd_available ? sd_hist_count : capture_history_count;
-                        history_selected_idx++;
-                        if (history_selected_idx >= ht) history_selected_idx = max(0, ht - 1);
-                        if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
-                            history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                        if (history_selected_idx < ht - 1) {
+                            history_selected_idx++;
+                            if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+                                history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                        }
                     }
                     screen_dirty = true;
                 } else if (current_screen == 4) {
                     if (IS_KEY_UP(cur_arrow)) {
-                        stats_scroll_target -= STATS_SCROLL_STEP;
-                        if (stats_scroll_target < 0) stats_scroll_target = 0;
+                        if (stats_scroll_target > 0) {
+                            stats_scroll_target -= STATS_SCROLL_STEP;
+                            if (stats_scroll_target < 0) stats_scroll_target = 0;
+                        }
                     } else {
-                        stats_scroll_target += STATS_SCROLL_STEP;
-                        if (stats_scroll_target > STATS_MAX_SCROLL)
-                            stats_scroll_target = STATS_MAX_SCROLL;
+                        if (stats_scroll_target < STATS_MAX_SCROLL) {
+                            stats_scroll_target += STATS_SCROLL_STEP;
+                            if (stats_scroll_target > STATS_MAX_SCROLL)
+                                stats_scroll_target = STATS_MAX_SCROLL;
+                        }
                     }
                     screen_dirty = true;
                 }
