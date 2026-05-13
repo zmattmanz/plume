@@ -61,6 +61,7 @@ static void perform_detection_delete(int idx);
 void transition_screen(int new_screen, int dir);
 void play_escalated_alarm(int confidence, int source);
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
+template<typename WriteFn> static bool littlefs_atomic_write(const char* target_path, WriteFn write_fn);
 void beep(int frequency, int duration_ms);
 void apply_color_palette();
 void draw_help_overlay();
