@@ -1065,6 +1065,12 @@ int locator_peak_rssi = -120;
 #define LOC_TRACE_SIZE        60          // 2 minutes at 2-second intervals
 #define LOC_TRACE_INTERVAL_MS 2000
 
+// Signal bar and trace normalization range — single source of truth.
+// Values below RSSI_FLOOR clamp to bottom; above RSSI_CEIL clamp to top.
+#define RSSI_FLOOR (-70)
+#define RSSI_CEIL  (-30)
+#define RSSI_RANGE (RSSI_CEIL - RSSI_FLOOR)  // 40
+
 struct LocTraceEntry {
     int8_t        rssi;          // raw dBm value; -128 = no reading
     unsigned long timestamp;
@@ -7599,7 +7605,7 @@ void draw_signal_screen() {
         && rssi_tracker[tracker_idx].sample_count > 0) {
         target_rssi = rssi_tracker[tracker_idx].samples[
                           rssi_tracker[tracker_idx].sample_count - 1];
-        has_rssi = (frame_ms - newest_ms < 10000);
+        has_rssi = (frame_ms - newest_ms < 15000);
     }
     memcpy(trace_snap, loc_trace, sizeof(loc_trace));
     trace_head  = loc_trace_head;
@@ -7615,7 +7621,7 @@ void draw_signal_screen() {
 
         for (int i = 0; i < trace_count; i++) {
             int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
-            float raw = (float)((int)trace_snap[slot].rssi + 70) / 40.0f;
+            float raw = (float)((int)trace_snap[slot].rssi - RSSI_FLOOR) / (float)RSSI_RANGE;
             if (raw < 0.0f) raw = 0.0f;
             if (raw > 1.0f) raw = 1.0f;
             loc_trace_smooth[i] = anim_filter(loc_trace_smooth[i], raw, 300.0f, dt);
@@ -7629,8 +7635,8 @@ void draw_signal_screen() {
 
     // ── Status pill (right-aligned, capsule) ──
     {
-        bool is_flock = (strstr(target_type, "FLOCK") != NULL
-                      || strstr(target_type, "RAVEN") != NULL);
+        bool is_flock = (strncmp(target_type, "FLOCK", 5) == 0
+                      || strncmp(target_type, "RAVEN", 5) == 0);
         const char* pill_text;
         uint16_t    pill_color;
         if (!active) { pill_text = "No Target"; pill_color = DIM_COLOR; }
@@ -7667,13 +7673,20 @@ void draw_signal_screen() {
             bool nok = target_name[0] != '\0'
                        && strcmp(target_name, "Hidden")  != 0
                        && strcmp(target_name, "Unknown") != 0;
-            const char* disp = nok ? target_name
-                             : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
+            const char* raw = nok ? target_name
+                            : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
+            char id_buf[10] = "";
+            if (target_id > 0)
+                snprintf(id_buf, sizeof(id_buf), " (#%03d)", target_id);
+            int id_w       = (int)strlen(id_buf) * ts_char_w(TS_BODY);
+            int avail_w    = DISP_W - TL * 2 - id_w;
+            int max_chars  = avail_w / ts_char_w(TS_BODY);
+            char disp[65];
+            strncpy(disp, raw, max_chars);
+            disp[max_chars] = '\0';
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
             spr.print(disp);
-            if (target_id > 0) {
-                char id_buf[10];
-                snprintf(id_buf, sizeof(id_buf), " (#%03d)", target_id);
+            if (id_buf[0]) {
                 spr.setTextColor(DIM_COLOR, BG_COLOR);
                 spr.print(id_buf);
             }
@@ -7706,7 +7719,7 @@ void draw_signal_screen() {
         int bar_w = DISP_W - TL * 2;
         spr.fillRoundRect(bar_x, bar_y, bar_w, 4, 2, CARD_COLOR);
         if (has_rssi) {
-            float pct = (float)(target_rssi + 70) / 40.0f;
+            float pct = (float)(target_rssi - RSSI_FLOOR) / (float)RSSI_RANGE;
             if (pct < 0.0f) pct = 0.0f;
             if (pct > 1.0f) pct = 1.0f;
             int fill_w = (int)(pct * (float)bar_w);
@@ -9526,6 +9539,21 @@ void loop() {
     process_wifi_event_queue();
     feed_commit_pending();
     update_channel_histogram();
+
+    // Gap-fill the trace when target is silent — push a floor-level sample
+    // so the curve drops rather than freezing at the last reading.
+    if (take_data_mutex()) {
+        if (locator_active && loc_trace_count > 0
+            && (millis() - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
+            unsigned long gap_ms = millis();
+            loc_trace_last_sample = gap_ms;
+            loc_trace[loc_trace_head].rssi      = (int8_t)RSSI_FLOOR;
+            loc_trace[loc_trace_head].timestamp = gap_ms;
+            loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
+            if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
+        }
+        give_data_mutex();
+    }
     if (wdt_subscribed) esp_task_wdt_reset();
 
     int conf_snapshot = 0;
@@ -9857,6 +9885,11 @@ void loop() {
                 }
             }
             else if (IS_KEY_LEFT(c)) {
+                if (show_feed_expanded) {
+                    show_feed_expanded = false;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                    continue;
+                }
                 if (!stealth_mode && !screen_transitioned) {
                     int prev = current_screen - 1;
                     int d = (prev < 0) ? 1 : -1;
@@ -9866,6 +9899,11 @@ void loop() {
                 }
             }
             else if (IS_KEY_RIGHT(c)) {
+                if (show_feed_expanded) {
+                    show_feed_expanded = false;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                    continue;
+                }
                 if (!stealth_mode && !screen_transitioned) {
                     int next = current_screen + 1;
                     int d = (next >= NUM_SCREENS) ? -1 : 1;
@@ -10104,7 +10142,7 @@ void loop() {
                     if (show_feed_expanded) {
                         show_feed_expanded = false;
                     } else {
-                        if (current_screen != 0) transition_screen(0, -1);
+                        if (current_screen != 0 && current_screen != 1) transition_screen(0, -1);
                         show_feed_expanded = true;
                         feed_expand_ms = millis();
                         feed_expanded_selected = 0;
