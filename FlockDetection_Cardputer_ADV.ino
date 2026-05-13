@@ -326,20 +326,30 @@ static const unsigned long UI_PULSE_BREATHE = 1200;
 static const unsigned long UI_PULSE_MEDIUM  = 600;
 static const unsigned long UI_PULSE_FAST    = 300;
 
-// ── Type scale — named tiers replacing magic textSize values ──
-// Maps the design system's 5-tier scale to hardware setTextSize() values.
+// ── Type scale — 3 active tiers ──
+// All UI text uses one of these three sizes. No other values
+// should appear in setTextSize() calls (boot screen excepted —
+// it renders directly to lcd, not the sprite).
 //
-// Tier guide:
-//   TS_MICRO  — footnotes, RSSI dBm, footer hints, scrollbar labels
-//   TS_BODY   — primary UI: labels, feed rows, status badges, kprint text
-//   TS_STRONG — hero inline values: target name, stat card numbers
-//   TS_H2     — menu items, overlay titles, locator distance
-//   TS_H1     — big numerals: scanner counters, ambient mode count
+//   TS_MICRO  — labels, footnotes, pills, field captions,
+//               footer hints, channel numbers, timestamps,
+//               scrollbar labels, RSSI dBm values
+//   TS_BODY   — primary UI text: kprint, feed row names,
+//               header screen names, status badge text,
+//               section titles, overlay subtitles
+//   TS_STRONG — hero inline values: stat card numbers,
+//               menu item labels, locator target name,
+//               locator dist/signal, detection detail names
 static const float TS_MICRO  = 1.0f;
 static const float TS_BODY   = 1.2f;
-static const float TS_STRONG = 1.5f;
-static const float TS_H2     = 2.0f;
-static const float TS_H1     = 3.0f;
+static const float TS_STRONG = 1.6f;
+
+// Char width in pixels for a given type-scale tier.
+// Base font is 6px wide; textSize multiplies it.
+// Replaces all hardcoded 6/7/9 magic numbers in layout math.
+static inline int ts_char_w(float size) {
+    return (int)(size * 6.0f);
+}
 
 // ── Spacing — 4-step scale ──
 //   UI_PAD_XS — hairline gaps, pill vertical inset
@@ -4604,7 +4614,7 @@ void draw_header_spr(int screen_num) {
         };
         for (int i = 0; i < 4; i++) {
             if (!badges[i].active) continue;
-            int pw = (int)strlen(badges[i].letter) * 7 + 6;
+            int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
             drawPill(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
             icon_right -= pw + 2;
         }
@@ -4639,7 +4649,7 @@ void draw_header_spr(int screen_num) {
     {
         char det_str[8];
         snprintf(det_str, sizeof(det_str), "D%lu", (unsigned long)pill_det);
-        int dw = (int)strlen(det_str) * 7 + 6;
+        int dw = (int)strlen(det_str) * ts_char_w(TS_MICRO) + 6;
         drawPill(icon_right - dw, icon_y, det_str, ACCENT_COLOR, 0.0f, true);
         icon_right -= dw + 2;
     }
@@ -4648,13 +4658,13 @@ void draw_header_spr(int screen_num) {
     {
         char b_str[8];
         snprintf(b_str, sizeof(b_str), "B%ld", pill_ble);
-        int bw = (int)strlen(b_str) * 7 + 6;
+        int bw = (int)strlen(b_str) * ts_char_w(TS_MICRO) + 6;
         drawPill(icon_right - bw, icon_y, b_str, DIM_COLOR);
         icon_right -= bw + 2;
 
         char w_str[8];
         snprintf(w_str, sizeof(w_str), "W%ld", pill_wifi);
-        int ww = (int)strlen(w_str) * 7 + 6;
+        int ww = (int)strlen(w_str) * ts_char_w(TS_MICRO) + 6;
         drawPill(icon_right - ww, icon_y, w_str, DIM_COLOR);
         icon_right -= ww + 2;
     }
@@ -4671,7 +4681,7 @@ void draw_header_spr(int screen_num) {
         } else {
             snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct);
         }
-        int pw = (int)strlen(bat_str) * 7 + 6;
+        int pw = (int)strlen(bat_str) * ts_char_w(TS_MICRO) + 6;
         uint16_t bat_col = charging    ? GPS_COLOR
                          : (bat_pct <= 10) ? CAUTION_COLOR
                          : (bat_pct <= 25) ? lerp_col16(DIM_COLOR, CAUTION_COLOR, 0.5f)
@@ -4744,7 +4754,7 @@ void draw_toast_spr() {
 
     // ── Centered pip+pill layout ──
     int text_len = (int)strlen(text_snap);
-    int char_w   = 7;
+    int char_w   = ts_char_w(TS_BODY);
     int text_w   = text_len * char_w;
     int pip_w    = 7;
     int gap      = 3;
@@ -4851,7 +4861,7 @@ void draw_vol_overlay() {
         snprintf(label, sizeof(label), "VOL %d%%", vol_pct);
     }
 
-    int char_w   = 7;
+    int char_w   = ts_char_w(TS_BODY);
     int label_w  = (int)strlen(label) * char_w;
     int pad_lr   = 8;
     int th       = 16;
@@ -4899,7 +4909,7 @@ void drawCard(int x, int y, int w, int h) {
 // filled: if true, the pill is solid accent_col with BG-colored text.
 static void drawPill(int x, int y, const char* text, uint16_t accent_col,
                      float bg_accent_pct, bool filled) {
-    int tw = (int)strlen(text) * 7 + 6;  // 7px per char + 6px padding
+    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 6;
     int th = 11;
     uint16_t bg = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, bg_accent_pct);
     uint16_t fg = filled ? BG_COLOR : TEXT_COLOR;
@@ -5354,7 +5364,7 @@ static void draw_menu_overlay() {
             // Current screen indicator — small filled circle after label
             if (idx >= 0 && idx <= 4 && idx == current_screen) {
                 int label_len = (int)strlen(label_text);
-                int dot_x = LABEL_X + label_len * 7 + 6;
+                int dot_x = LABEL_X + label_len * ts_char_w(TS_STRONG) + 6;
                 spr.fillCircle(dot_x, ry + ROW_H / 2, 2, ea(HEADER_COLOR));
             }
 
@@ -5471,7 +5481,7 @@ void draw_wifi_config_overlay() {
         display[32] = '\0';
         spr.print(display);
         if (ssid_editing && cursor_visible) {
-            int cursor_x = cx + 9 + wifi_config_cursor * 6;
+            int cursor_x = cx + 9 + wifi_config_cursor * ts_char_w(TS_MICRO);
             spr.drawFastVLine(cursor_x, input_y + 3, 10, ea(HEADER_COLOR));
         }
     }
@@ -5510,7 +5520,7 @@ void draw_wifi_config_overlay() {
             for (int i = 0; i < plen && i < 32; i++) spr.print("*");
         }
         if (pass_editing && cursor_visible) {
-            int cursor_x = cx + 9 + wifi_config_cursor * 6;
+            int cursor_x = cx + 9 + wifi_config_cursor * ts_char_w(TS_MICRO);
             spr.drawFastVLine(cursor_x, input_y + 3, 10, ea(HEADER_COLOR));
         }
     }
@@ -5773,7 +5783,7 @@ static void draw_export_info() {
     // Status badge
     {
         const char* status_str = "EXPORT ACTIVE";
-        int bw = (int)strlen(status_str) * 7 + 12;
+        int bw = (int)strlen(status_str) * ts_char_w(TS_BODY) + 12;
         uint16_t sfill = lerp_col16(BG_COLOR, HEADER_COLOR, 0.22f);
         spr.fillRoundRect(LBL_X, ry, bw, 16, 5, sfill);
         spr.drawRoundRect(LBL_X, ry, bw, 16, 5, HEADER_COLOR);
@@ -5896,7 +5906,7 @@ void draw_scanner_screen() {
             char ind_str[6];
             snprintf(ind_str, sizeof(ind_str), "%d/%d",
                      scanner_viz_mode + 1, SCANNER_VIZ_COUNT);
-            int ind_w = (int)strlen(ind_str) * 6;
+            int ind_w = (int)strlen(ind_str) * ts_char_w(TS_MICRO);
             spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.setTextSize(TS_MICRO);
             spr.setCursor(VIZ_RIGHT - UI_PAD_SM - ind_w, LABEL_MICRO_Y);
@@ -6051,7 +6061,7 @@ void draw_scanner_screen() {
         spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
         spr.setTextSize(TS_BODY);
 
-        int max_chars = (FEED_RIGHT - name_x - 2) / 7;
+        int max_chars = (FEED_RIGHT - name_x - 2) / ts_char_w(TS_BODY);
         if (max_chars > 14) max_chars = 14;
         if (max_chars < 1)  max_chars = 1;
         char nd[16];
@@ -6067,7 +6077,7 @@ void draw_scanner_screen() {
             else if (e.rssi > -75) dot_base = DIM_COLOR;
             else                   dot_base = CARD_BORDER;
 
-            int dot_x = name_x + (int)strlen(nd) * 7 + UI_PAD_XS * 2;
+            int dot_x = name_x + (int)strlen(nd) * ts_char_w(TS_BODY) + UI_PAD_XS * 2;
             if (dot_x + 2 < FEED_RIGHT) {
                 spr.fillCircle(dot_x, ry + 6, 1, lerp_col16(BG_COLOR, dot_base, af));
             }
@@ -6659,7 +6669,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
             int lx = plot_x + (ch_idx * plot_w) / 12;
             char ch_label[4];
             snprintf(ch_label, sizeof(ch_label), "%d", label_chs[li]);
-            int label_w = (int)strlen(ch_label) * 6;
+            int label_w = (int)strlen(ch_label) * ts_char_w(TS_MICRO);
             bool in_ble = (label_chs[li] <= 11);
             spr.setTextColor((ble_active && in_ble) ? PURPLE_COLOR : DIM_COLOR, BG_COLOR);
             spr.setCursor(lx - label_w / 2, plot_bottom + 2);
@@ -6823,7 +6833,7 @@ static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
     // Band pill — below LINE title, dark background over hatch
     {
         const char* band_label = "2.4GHz";
-        int pill_w = (int)strlen(band_label) * 7 + UI_PAD_SM;
+        int pill_w = (int)strlen(band_label) * ts_char_w(TS_MICRO) + UI_PAD_SM;
         int pill_x = TEXT_LEFT + UI_PAD_XS;
         int pill_y = VIZ_Y + UI_PAD_SM;
         int pill_h = 11;
@@ -7113,7 +7123,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
             if (mx < VIZ_X || mx > VIZ_X + VIZ_W) continue;
             if (my + UI_PAD_SM < VIZ_Y || my > VIZ_Y + VIZ_H - UI_PAD_XS) continue;
             spr.drawFastVLine(mx, my, 3, DIM_COLOR);
-            int label_w = (int)strlen(marks[mi].label) * 6;
+            int label_w = (int)strlen(marks[mi].label) * ts_char_w(TS_MICRO);
             int lx = mx - label_w / 2;
             if (lx < VIZ_X) lx = VIZ_X;
             spr.setCursor(lx, my + UI_PAD_XS + 2);
@@ -7180,7 +7190,7 @@ void draw_feed_expanded_overlay() {
         spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
         spr.setTextSize(TS_BODY);
         const char* msg = "no activity yet";
-        int mw = (int)strlen(msg) * 7;
+        int mw = (int)strlen(msg) * ts_char_w(TS_BODY);
         spr.setCursor((DISP_W - mw) / 2, DISP_H / 2 - 4);
         kprint(spr, msg);
     } else {
@@ -7250,7 +7260,7 @@ void draw_feed_expanded_overlay() {
             }
             // DEVICE name — matches scanner feed preview spacing
             int name_start_x = sym_x + UI_PAD_MD;
-            int name_max_chars = (col_rssi - name_start_x - 4) / 7;
+            int name_max_chars = (col_rssi - name_start_x - 4) / ts_char_w(TS_BODY);
             if (name_max_chars > 14) name_max_chars = 14;
             if (name_max_chars < 1) name_max_chars = 1;
             if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
@@ -7398,7 +7408,7 @@ void draw_capture_history_screen() {
 
         // Confidence bar + label — right-aligned
         {
-            int conf_label_w = (int)strlen(conf_label_str) * 6;
+            int conf_label_w = (int)strlen(conf_label_str) * ts_char_w(TS_MICRO);
             int conf_label_x = DISP_W - 6 - conf_label_w;
             int conf_bar_w   = 44;
             int conf_bar_x   = conf_label_x - conf_bar_w - 4;
@@ -7432,7 +7442,7 @@ void draw_capture_history_screen() {
         if (d_id > 0) {
             char id_str[8];
             snprintf(id_str, sizeof(id_str), "#%03d", d_id);
-            int id_w = (int)strlen(id_str) * 6;
+            int id_w = (int)strlen(id_str) * ts_char_w(TS_MICRO);
             spr.setCursor(DISP_W - LBL_X - id_w, ry);
             spr.print(id_str);
         }
@@ -7458,7 +7468,7 @@ void draw_capture_history_screen() {
             else if (d_rssi > -80) { sig_str = "MED";    sig_col = CAUTION_COLOR; }
             else                   { sig_str = "WEAK";   sig_col = TEXT_COLOR; }
 
-            int rssi_w = (int)strlen(rssi_str) * 6;
+            int rssi_w = (int)strlen(rssi_str) * ts_char_w(TS_MICRO);
             spr.setTextColor(sig_col, BG_COLOR);
             spr.setCursor(VAL_X + rssi_w + 6, ry);
             spr.print(sig_str);
@@ -7475,7 +7485,7 @@ void draw_capture_history_screen() {
             char human[48];
             methods_to_human(d_method, human, sizeof(human));
             // Truncate to fit screen width
-            int max_match = (DISP_W - VAL_X - LBL_X) / 6;
+            int max_match = (DISP_W - VAL_X - LBL_X) / ts_char_w(TS_MICRO);
             if ((int)strlen(human) > max_match) human[max_match] = '\0';
 
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
@@ -7496,7 +7506,7 @@ void draw_capture_history_screen() {
             spr.print(d_timestamp);
 
             // Date after timestamp with a gap
-            int ts_w = (int)strlen(d_timestamp) * 6;
+            int ts_w = (int)strlen(d_timestamp) * ts_char_w(TS_MICRO);
             spr.setCursor(VAL_X + ts_w + 8, ry);
             spr.print(d_datestamp);
         }
@@ -7591,7 +7601,7 @@ void draw_capture_history_screen() {
             // RSSI right-aligned
             char rssi_str[8];
             snprintf(rssi_str, sizeof(rssi_str), "%d", e_rssi);
-            int rssi_w = (int)strlen(rssi_str) * 6;
+            int rssi_w = (int)strlen(rssi_str) * ts_char_w(TS_MICRO);
             spr.setTextColor(DIM_COLOR, row_bg);
             spr.setTextSize(TS_MICRO);
             spr.setCursor(DISP_W - rssi_w - 4, row_y + 7);
@@ -7769,7 +7779,7 @@ void draw_locator_screen() {
     }
     {
         int max_chars_sb = (int)strlen(status_base) + (status_anim ? 3 : 0);
-        int box_w = max_chars_sb * 8 + 12;
+        int box_w = max_chars_sb * (ts_char_w(TS_BODY) + 1) + 12;
         int avail_w = DISP_W - rpx - 2;
         if (box_w > avail_w) box_w = avail_w;
         uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
@@ -7807,7 +7817,7 @@ void draw_locator_screen() {
 
         // Badges after the name: detection ID (#NNN) and north-mode indicator (N).
         {
-            int name_w  = (int)strlen(tname) * (int)(TS_STRONG * 6.0f);
+            int name_w  = (int)strlen(tname) * ts_char_w(TS_STRONG);
             int id_y    = target_name_y + (int)(TS_STRONG * 8.0f) - 8;
             int badge_x = rpx + name_w + UI_PAD_SM;
             if (active && target_id > 0) {
@@ -7816,7 +7826,7 @@ void draw_locator_screen() {
                 spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
                 spr.setCursor(badge_x, id_y);
                 spr.print(id_buf);
-                badge_x += (int)strlen(id_buf) * 6 + UI_PAD_SM;
+                badge_x += (int)strlen(id_buf) * ts_char_w(TS_MICRO) + UI_PAD_SM;
             }
             if (north_mode) {
                 spr.setTextColor(GPS_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
@@ -7828,7 +7838,7 @@ void draw_locator_screen() {
 
     // ── DIST + SIG (labels TS_MICRO, values TS_STRONG side-by-side) ──
     // TS_STRONG fits the worst-case strings ("9999ft" / "STRONG") in the
-    // ~154 px right panel without overlap; TS_H2 would overflow.
+    // ~154 px right panel without overlap; larger sizes would overflow.
     int dist_label_y = target_name_y + (int)(TS_STRONG * 8.0f) + UI_PAD_SM;
     int dist_value_y = dist_label_y + 10;
     int sig_x        = rpx + 64;
@@ -8162,7 +8172,7 @@ void draw_gps_screen() {
             strncpy(status_str, status_base, sizeof(status_str) - 1);
             status_str[sizeof(status_str) - 1] = '\0';
         }
-        int bw = (int)strlen(status_base) * 7 + (status_anim ? 3 * 7 : 0) + 12;
+        int bw = (int)strlen(status_base) * ts_char_w(TS_BODY) + (status_anim ? 3 * ts_char_w(TS_BODY) : 0) + 12;
         if (bw > RW) bw = RW;
         uint16_t sfill = lerp_col16(BG_COLOR, status_col, 0.22f);
         spr.fillRoundRect(RX, ry, bw, 16, 5, sfill);
@@ -8185,7 +8195,7 @@ void draw_gps_screen() {
         kprint(spr, label);
 
         // Value (right-aligned)
-        int val_w = (int)strlen(value) * 7;
+        int val_w = (int)strlen(value) * ts_char_w(TS_BODY);
         spr.setTextColor(val_col, BG_COLOR);
         spr.setTextSize(TS_BODY);
         spr.setCursor(KV_RIGHT - val_w, ry);
@@ -8246,7 +8256,7 @@ void draw_gps_screen() {
 
 // Draw a single stat card. Outlined only (no fill).
 // Label: TS_MICRO, DIM_COLOR, kprint with extra=2 letter-spacing — hugs top.
-// Value: TS_STRONG by default (TS_H2 for hero), TEXT_COLOR — hugs bottom.
+// Value: TS_STRONG by default, TEXT_COLOR — hugs bottom.
 // prev_str / char_anim_ms (size STAT_MAX_CHARS each): per-character
 //   change tracking. The function compares value[ci] against prev_str[ci]
 //   and bumps char_anim_ms[ci] whenever a column's glyph changes, then
@@ -8270,7 +8280,7 @@ static void draw_stat_card(int x, int y, int w, int h,
     kprint(spr, label, 2);
 
     int value_glyph_h  = (int)(value_size * 8.0f);
-    int char_w         = (int)(value_size * 6.0f);
+    int char_w         = ts_char_w(value_size);
     int value_target_y = y + h - value_glyph_h - UI_PAD_SM;
     int value_x        = x + card_inset;
 
@@ -8446,7 +8456,7 @@ void draw_device_info_screen() {
     const int x_h1     = 4;        // half-card x positions
     const int x_h2     = 119;      // x_h1 + 109 + 6 gap
     const int w_half   = 109;
-    const int H_HERO   = 50;       // 6+8+14+16+6 — TS_H2 hero w/ generous gap
+    const int H_HERO   = 50;       // 6+8+14+16+6 — generous gap (unused, kept for future)
     const int H_NORMAL = 36;       // 6+8+4+12+6 — TS_STRONG fits in tighter card
 
     auto card = [&](int vx, int vy, int w, int h, const char* label, const char* value,
@@ -8908,7 +8918,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
         cur_buf[cur_len] = '\0';
 
-        int cur_w = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
+        int cur_w = (cur_len > 0) ? (cur_len * ts_char_w(TS_BODY) - 1) : 0;
         int cur_x = (DISP_W - cur_w) / 2;
 
         const unsigned long ROLL_MS = 120;
