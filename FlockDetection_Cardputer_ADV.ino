@@ -123,7 +123,9 @@ static unsigned long help_ease_start = 0;
 
 // Ambient mode: dim minimal UI after sustained idle
 static unsigned long last_user_input_ms = 0;
-static const unsigned long AMBIENT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+// 2 minutes — long enough to glance away and come back without re-waking,
+// short enough that pocket-sitting doesn't burn unnecessary battery.
+static const unsigned long AMBIENT_TIMEOUT_MS = 2UL * 60UL * 1000UL;
 static const uint8_t AMBIENT_BRIGHTNESS = 40;
 static bool ambient_mode = false;
 
@@ -138,6 +140,7 @@ int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 static bool wifi_config_open = false;
 static int  wifi_config_field = 0;        // 0 = SSID, 1 = Password, 2 = Save, 3 = Clear
 static bool wifi_config_editing = false;   // true = text input mode active
+static bool wifi_config_show_pass = false; // 's' toggles plaintext password reveal
 static char wifi_config_ssid_buf[33] = "";
 static char wifi_config_pass_buf[65] = "";
 static int  wifi_config_cursor = 0;        // cursor position in active field
@@ -4752,20 +4755,23 @@ void draw_header_spr(int screen_num) {
     int icon_right = DISP_W - 4;
     int icon_y = 4;
 
-    // Mode badges: N / S / L / P — same as before but using drawPill
+    // Mode badges: A / N / S / L / P — same as before but using drawPill.
+    // 'A' (ambient) is dim and intentionally subtle — it just confirms
+    // the dim screen is intentional, not a freeze or low-brightness mode.
     {
         struct ModeBadge {
             bool active;
             const char* letter;
             uint16_t color;
         };
-        ModeBadge badges[4] = {
+        ModeBadge badges[5] = {
+            { ambient_mode,    "A", DIM_COLOR },
             { night_mode,      "N", HEADER_COLOR },
             { stealth_mode,    "S", DIM_COLOR },
             { locator_active,  "L", CAUTION_COLOR },
             { low_power_mode,  "P", ACCENT_COLOR },
         };
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             if (!badges[i].active) continue;
             int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
             drawPill(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
@@ -5577,7 +5583,7 @@ static void draw_menu_overlay() {
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(UI_PAD_SM, DISP_H - 10);
-    spr.print("arrows  ENT select  M close");
+    spr.print("arrows  ENT select  M close  TAB help");
 }
 void draw_wifi_config_overlay() {
     float alpha = ui_progress(wifi_config_open_ms, UI_FADE_IN_MS);
@@ -5661,7 +5667,10 @@ void draw_wifi_config_overlay() {
     if (pass_empty && !pass_editing) {
         spr.print("(not set)");
     } else {
-        if (pass_editing) {
+        // Show plaintext when (a) actively editing, or (b) the user has
+        // toggled reveal mode with 's'. Otherwise mask with asterisks.
+        bool show_plain = pass_editing || wifi_config_show_pass;
+        if (show_plain) {
             char display[66];
             strncpy(display, pass_src, 64);
             display[64] = '\0';
@@ -5706,6 +5715,10 @@ void draw_wifi_config_overlay() {
     spr.setCursor(cx + 6, cy + ch - 11);
     if (wifi_config_editing) {
         spr.print("type  <> move  ENT done  DEL bksp");
+    } else if (wifi_config_field == 1) {
+        // Password field selected — surface the show/hide affordance.
+        spr.print(wifi_config_show_pass ? "ENT edit  s hide  ESC close"
+                                        : "ENT edit  s show  ESC close");
     } else {
         spr.print("ENT edit  ^/v field  ESC close");
     }
@@ -9863,18 +9876,53 @@ void loop() {
 
     int32_t loop_mv = get_filtered_voltage();
 
-    // Low-battery voltage warnings — once per crossing, 100mV hysteresis to re-arm.
+    // Low-battery voltage warnings:
+    //   - Initial toast on each threshold crossing (3.7V warning, 3.5V critical).
+    //   - 100mV hysteresis so a noisy ADC doesn't strobe the toast.
+    //   - Periodic re-warn every 10 minutes while voltage stays below warning,
+    //     because dismissing one toast shouldn't silence all future reminders.
+    //   - Re-warn cadence tightens to 2 minutes once below the critical threshold.
     {
+        static const unsigned long BATT_REWARN_LOW_MS  = 10UL * 60UL * 1000UL;
+        static const unsigned long BATT_REWARN_CRIT_MS =  2UL * 60UL * 1000UL;
+
         static int32_t last_battery_warning_mv = 9999;
+        static unsigned long last_battery_warn_toast_ms = 0;
+        unsigned long batt_now = millis();
+
+        // Initial crossing-detection (unchanged behavior).
         if (loop_mv <= 3500 && last_battery_warning_mv > 3500) {
             set_toast_direct("BATT CRITICAL 3.5V", TOAST_WARNING, false);
             last_battery_warning_mv = 3500;
+            last_battery_warn_toast_ms = batt_now;
         } else if (loop_mv <= 3700 && last_battery_warning_mv > 3700) {
             set_toast_direct("BATT LOW 3.7V", TOAST_WARNING, false);
             last_battery_warning_mv = 3700;
+            last_battery_warn_toast_ms = batt_now;
         } else if (last_battery_warning_mv < 9999
                    && loop_mv >= last_battery_warning_mv + 100) {
+            // Voltage recovered (charger plugged in, or rebound from load drop).
             last_battery_warning_mv = 9999;
+            last_battery_warn_toast_ms = 0;
+        }
+
+        // Periodic re-warn while below a threshold.
+        if (last_battery_warning_mv == 3500 && last_battery_warn_toast_ms != 0
+            && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_CRIT_MS) {
+            char buf[TOAST_TEXT_LEN];
+            int32_t mv_now = loop_mv;
+            snprintf(buf, sizeof(buf), "BATT CRITICAL %ld.%02ldV",
+                     (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
+            set_toast_direct(buf, TOAST_WARNING, false);
+            last_battery_warn_toast_ms = batt_now;
+        } else if (last_battery_warning_mv == 3700 && last_battery_warn_toast_ms != 0
+                   && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_LOW_MS) {
+            char buf[TOAST_TEXT_LEN];
+            int32_t mv_now = loop_mv;
+            snprintf(buf, sizeof(buf), "BATT LOW %ld.%02ldV",
+                     (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
+            set_toast_direct(buf, TOAST_WARNING, false);
+            last_battery_warn_toast_ms = batt_now;
         }
     }
 
@@ -10146,6 +10194,10 @@ void loop() {
                         wifi_config_field++;
                         if (wifi_config_field > 3) wifi_config_field = 3;
                         M5Cardputer.Speaker.tone(660, 5);
+                    } else if (c == 's' && wifi_config_field == 1) {
+                        // Toggle plaintext reveal of the password field.
+                        wifi_config_show_pass = !wifi_config_show_pass;
+                        M5Cardputer.Speaker.tone(660, 5);
                     } else if (c == '\n' || c == '\r') {
                         if (wifi_config_field == 0 || wifi_config_field == 1) {
                             wifi_config_editing = true;
@@ -10165,6 +10217,7 @@ void loop() {
                             if (!persist_in_flight) schedule_persist();
                             set_toast_direct("WIFI SAVED", TOAST_SUCCESS);
                             wifi_config_open = false;
+                            wifi_config_show_pass = false;  // never persist plaintext reveal
                         } else if (wifi_config_field == 3) {
                             // Clear
                             export_ssid[0] = '\0';
@@ -10175,9 +10228,11 @@ void loop() {
                             if (!persist_in_flight) schedule_persist();
                             set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
                             wifi_config_open = false;
+                            wifi_config_show_pass = false;  // never persist plaintext reveal
                         }
                     } else if (c == 0x1B) {
                         wifi_config_open = false;
+                        wifi_config_show_pass = false;  // never persist plaintext reveal
                     }
                 }
                 draw_current_screen(); spr.pushSprite(0, 0);
@@ -10676,6 +10731,7 @@ void loop() {
                         if (!persist_in_flight) schedule_persist();
                         set_toast_direct("WIFI SAVED", TOAST_SUCCESS);
                         wifi_config_open = false;
+                        wifi_config_show_pass = false;  // never persist plaintext reveal
                     } else if (wifi_config_field == 3) {
                         export_ssid[0] = '\0';
                         export_pass[0] = '\0';
@@ -10685,6 +10741,7 @@ void loop() {
                         if (!persist_in_flight) schedule_persist();
                         set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
                         wifi_config_open = false;
+                        wifi_config_show_pass = false;  // never persist plaintext reveal
                     }
                 }
                 draw_current_screen(); spr.pushSprite(0, 0);
