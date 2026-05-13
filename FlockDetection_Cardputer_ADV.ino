@@ -1090,6 +1090,25 @@ static int locator_dist_history_head = 0;
 static unsigned long locator_last_trend_sample_ms = 0;
 volatile bool locator_announce_pending = false;
 
+// ── Locator signal trace ring buffer ──
+#define LOC_TRACE_SIZE        60          // 2 minutes at 2-second intervals
+#define LOC_TRACE_INTERVAL_MS 2000
+
+struct LocTraceEntry {
+    int8_t        rssi;          // raw dBm value; -128 = no reading
+    unsigned long timestamp;
+};
+
+static LocTraceEntry loc_trace[LOC_TRACE_SIZE];
+static int           loc_trace_head        = 0;  // next slot to write
+static int           loc_trace_count       = 0;
+static unsigned long loc_trace_last_sample = 0;
+
+// ── Peak GPS bookmark ──
+static double locator_peak_lat     = 0.0;
+static double locator_peak_lng     = 0.0;
+static bool   locator_peak_has_gps = false;
+
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
 
@@ -3686,6 +3705,12 @@ float bearing_to(double lat1, double lon1, double lat2, double lon2) {
     return (float)brng;
 }
 
+static const char* bearing_to_compass(float degrees_val) {
+    int idx = ((int)(degrees_val + 22.5f) % 360) / 45;
+    static const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+    return dirs[idx & 7];
+}
+
 // Returns -1 if distance is decreasing (closer), +1 if increasing (farther), 0 if stable.
 static int locator_distance_trend() {
     if (locator_dist_history_count < 4) return 0;
@@ -3707,118 +3732,34 @@ static int locator_distance_trend() {
 }
 
 void locator_add_sample(const char* mac, int rssi) {
-    // ── Phase 1: validate and snapshot under mutex (short hold) ──
-    LocSample local_samples[LOC_MAX_SAMPLES];
-    int       local_sample_count = 0;
-    int       local_peak_rssi    = -120;
-    bool      should_compute     = false;
-    double    my_lat = 0, my_lng = 0;
-    bool      my_loc_valid = false;
-
     if (!take_data_mutex()) return;
 
     if (!locator_active || strncmp(mac, locator_target_mac, 17) != 0) {
         give_data_mutex();
         return;
     }
-    if (millis() - locator_last_sample < LOC_SAMPLE_INTERVAL) {
-        give_data_mutex();
-        return;
-    }
-    if (!gps.location.isValid() || gps.location.age() > 2000) {
-        give_data_mutex();
-        return;
-    }
 
-    int idx = locator_sample_count;
-    if (idx >= LOC_MAX_SAMPLES) {
-        const unsigned long LOC_EVICT_AGE_MS = 300000UL;
-        unsigned long now_ms = millis();
-        int worst = 0;
-        float worst_score = 1e9f;
-        for (int i = 0; i < LOC_MAX_SAMPLES; i++) {
-            float r = (float)(locator_samples[i].rssi + 100) / 80.0f;
-            if (r < 0) r = 0; if (r > 1) r = 1;
-            unsigned long age = now_ms - locator_samples[i].timestamp;
-            float rec = 1.0f - (float)age / (float)LOC_EVICT_AGE_MS;
-            if (rec < 0) rec = 0;
-            float combined = r * rec;
-            if (combined < worst_score) { worst_score = combined; worst = i; }
-        }
-        float new_r = (float)(rssi + 100) / 80.0f;
-        if (new_r < 0) new_r = 0; if (new_r > 1) new_r = 1;
-        if (new_r > worst_score) { idx = worst; }
-        else { give_data_mutex(); return; }
-    } else {
-        locator_sample_count++;
-    }
+    unsigned long now_ms = millis();
+    locator_newest_sample_ms = now_ms;
 
-    locator_samples[idx] = {gps.location.lat(), gps.location.lng(), rssi, millis()};
-    locator_last_sample      = millis();
-    locator_newest_sample_ms = millis();
-    if (rssi > locator_peak_rssi) locator_peak_rssi = rssi;
-
-    if (locator_sample_count >= LOC_MIN_SAMPLES_EST) {
-        local_sample_count = locator_sample_count;
-        for (int i = 0; i < local_sample_count; i++) local_samples[i] = locator_samples[i];
-        local_peak_rssi = locator_peak_rssi;
-        should_compute  = true;
-        if (gps.location.isValid()) {
-            my_lat = gps.location.lat();
-            my_lng = gps.location.lng();
-            my_loc_valid = true;
+    // Update all-time peak RSSI; bookmark the GPS position where it occurred
+    if (rssi > locator_peak_rssi) {
+        locator_peak_rssi = rssi;
+        if (gps.location.isValid() && gps.location.age() < 5000) {
+            locator_peak_lat     = gps.location.lat();
+            locator_peak_lng     = gps.location.lng();
+            locator_peak_has_gps = true;
         }
     }
 
-    give_data_mutex();
-
-    // ── Phase 2: heavy FP computation outside mutex ──
-    if (!should_compute) return;
-
-    double sum_wlat = 0, sum_wlng = 0, sum_w = 0;
-    for (int i = 0; i < local_sample_count; i++) {
-        double w = rssi_to_weight(local_samples[i].rssi);
-        sum_wlat += local_samples[i].lat * w;
-        sum_wlng += local_samples[i].lng * w;
-        sum_w    += w;
-    }
-    if (sum_w <= 0) return;
-
-    double est_lat      = sum_wlat / sum_w;
-    double est_lng      = sum_wlng / sum_w;
-    float  est_distance = 0.0f;
-    float  est_bearing  = 0.0f;
-    if (my_loc_valid) {
-        est_distance = haversine_m(my_lat, my_lng, est_lat, est_lng);
-        est_bearing  = bearing_to(my_lat, my_lng, est_lat, est_lng);
-    }
-
-    double sum_wd2 = 0;
-    for (int i = 0; i < local_sample_count; i++) {
-        double d = haversine_m(local_samples[i].lat, local_samples[i].lng, est_lat, est_lng);
-        double w = rssi_to_weight(local_samples[i].rssi);
-        sum_wd2 += w * d * d;
-    }
-    float conf_radius = (float)sqrt(sum_wd2 / sum_w);
-
-    // ── Phase 3: write results back under mutex (short hold) ──
-    if (!take_data_mutex()) return;
-
-    if (!locator_active) {
-        give_data_mutex();
-        return;
-    }
-
-    locator_est_lat       = est_lat;
-    locator_est_lng       = est_lng;
-    locator_has_estimate  = true;
-    locator_est_distance  = est_distance;
-    locator_bearing       = est_bearing;
-    locator_confidence_radius = conf_radius;
-
-    if (!locator_estimate_announced) {
-        locator_estimate_announced = true;
-        locator_announce_pending   = true;
+    // Feed trace ring buffer at LOC_TRACE_INTERVAL_MS cadence
+    if (loc_trace_count == 0 || now_ms - loc_trace_last_sample >= LOC_TRACE_INTERVAL_MS) {
+        loc_trace_last_sample = now_ms;
+        int8_t clamped = (int8_t)(rssi < -128 ? -128 : rssi > 127 ? 127 : rssi);
+        loc_trace[loc_trace_head].rssi      = clamped;
+        loc_trace[loc_trace_head].timestamp = now_ms;
+        loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
+        if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
     }
 
     give_data_mutex();
@@ -3839,6 +3780,8 @@ void locator_start(const char* mac, const char* name, const char* type = "", int
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
     locator_tracker_idx = -1;
+    loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
+    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
     give_data_mutex();
 }
 
@@ -3851,6 +3794,9 @@ void locator_stop() {
     locator_dist_history_head = 0;
     locator_last_trend_sample_ms = 0;
     locator_tracker_idx = -1;
+    loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
+    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
+    locator_peak_rssi = -120;
     give_data_mutex();
 }
 
@@ -4965,7 +4911,6 @@ void draw_help_overlay() {
     static const HelpKey locator_keys[] = {
         {"l",   "start/stop"},
         {"t",   "target"},
-        {"n",   "north"},
     };
     static const HelpKey detections_keys[] = {
         {"^/v", "navigate"},
@@ -7634,261 +7579,331 @@ void draw_capture_history_screen() {
 
 
 void draw_locator_screen() {
+    unsigned long frame_ms = millis();
+
+    // ── Snapshot state under mutex ──
+    bool  active, peak_has_gps, gps_loc_valid;
+    char  target_mac[18], target_name[65];
+    int   target_id, peak_rssi, tracker_idx, gps_sats;
+    double cur_lat, cur_lng, peak_lat, peak_lng;
+    unsigned long newest_ms;
+    int   target_rssi = 0;
+    bool  has_rssi    = false;
+    static LocTraceEntry trace_snap[LOC_TRACE_SIZE];
+    int trace_head, trace_count;
+
     if (!take_data_mutex()) return;
-    bool active=locator_active, has_est=locator_has_estimate;
-    char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
-    char target_name[65]; safe_copy(target_name, locator_target_name, sizeof(target_name));
-    int  target_id = locator_target_id;
-    float dist=locator_est_distance, brng=locator_bearing;
-    bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
-    float gps_course = gps_valid ? gps.course.deg() : 0.0f;
-    bool has_loc   = gps.location.isValid();
-    int target_rssi = 0; bool has_rssi = false;
-    if (locator_tracker_idx >= 0 && locator_tracker_idx < rssi_tracker_count
-        && rssi_tracker[locator_tracker_idx].sample_count > 0) {
-        target_rssi = rssi_tracker[locator_tracker_idx].samples[
-            rssi_tracker[locator_tracker_idx].sample_count - 1];
-        has_rssi = true;
+    active        = locator_active;
+    safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
+    safe_copy(target_name, locator_target_name, sizeof(target_name));
+    target_id     = locator_target_id;
+    peak_rssi     = locator_peak_rssi;
+    peak_has_gps  = locator_peak_has_gps;
+    peak_lat      = locator_peak_lat;
+    peak_lng      = locator_peak_lng;
+    tracker_idx   = locator_tracker_idx;
+    newest_ms     = locator_newest_sample_ms;
+    gps_loc_valid = gps.location.isValid() && gps.location.age() < 2000;
+    gps_sats      = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+    cur_lat       = gps_loc_valid ? gps.location.lat() : 0.0;
+    cur_lng       = gps_loc_valid ? gps.location.lng() : 0.0;
+    if (tracker_idx >= 0 && tracker_idx < rssi_tracker_count
+        && rssi_tracker[tracker_idx].sample_count > 0) {
+        target_rssi = rssi_tracker[tracker_idx].samples[
+                          rssi_tracker[tracker_idx].sample_count - 1];
+        has_rssi = (frame_ms - newest_ms < 10000);
     }
+    memcpy(trace_snap, loc_trace, sizeof(loc_trace));
+    trace_head  = loc_trace_head;
+    trace_count = loc_trace_count;
     give_data_mutex();
 
-    bool demo = !active;
+    spr.fillSprite(BG_COLOR);
+    draw_header_spr(1);
 
-    spr.fillSprite(BG_COLOR); draw_header_spr(1);
+    const int TL = TEXT_LEFT;           // 4
+    const int TR = DISP_W - TEXT_LEFT;  // 236
 
-    // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 78;
-    const int GRID_STEP  = 14;
-    unsigned long now_ms = millis();
-
-    // Direction slowly reverses every ~10s for radar feel
-    static float  grid_speed = 1.0f;   // +1 or -1, eases between
-    static float  grid_spd_target = 1.0f;
-    static unsigned long grid_dir_ms = 0;
-    if (now_ms - grid_dir_ms > 9500) {
-        grid_dir_ms = now_ms;
-        if ((now_ms / 9500) % 3 == 0) grid_spd_target = -grid_spd_target;
-    }
-    grid_speed += (grid_spd_target - grid_speed) * 0.004f; // very slow ease
-
-    // Accumulate offset per-frame so direction reversals ease smoothly (no jump)
-    static float  cumulative_grid_offset = 0.0f;
-    static unsigned long last_grid_ms = 0;
-    if (last_grid_ms == 0) last_grid_ms = now_ms;
-    unsigned long grid_dt = now_ms - last_grid_ms;
-    if (grid_dt > 100) grid_dt = 100;  // cap on first call or long gaps
-    last_grid_ms = now_ms;
-    cumulative_grid_offset += grid_speed * (float)grid_dt / (1500.0f / GRID_STEP);
-
-    int grid_o = (int)fmodf(cumulative_grid_offset, (float)GRID_STEP);
-    if (grid_o < 0) grid_o += GRID_STEP;
-    // Wrap the accumulator after sampling so it cannot grow without
-    // bound — at multi-hour timescales the float loses sub-pixel
-    // precision and the grid stutters or jumps.
-    cumulative_grid_offset = fmodf(cumulative_grid_offset, (float)GRID_STEP);
-
-    for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
-        spr.drawLine(gx, 18, gx, DISP_H - 1, CARD_BORDER);
-    for (int gy = 18 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
-        if (gy >= 18) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
-    // Solid vertical separator on right edge of grid panel
-    spr.drawFastVLine(GRID_RIGHT, 18, DISP_H - 18, CARD_BORDER);
-
-    const int cx = 39, cy = 62;
-
-    // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
-    static float ease_arrow = 0.0f;
-    static unsigned long last_ar_ms = 0;
-    unsigned long ar_dt = now_ms - last_ar_ms;
-    if (ar_dt > 100) ar_dt = 15;
-    last_ar_ms = now_ms;
-
-    if (north_mode && gps_valid) {
-        // Compass mode while moving: rotate by the negative of travel heading
-        // so the arrow always points to true north regardless of orientation.
-        float tgt = radians(-gps_course - 90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.08f * d;
-    } else if (north_mode && !gps_valid) {
-        // No GPS heading available — arrow defaults to "up" (screen-relative north).
-        float tgt = radians(-90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.08f * d;
-    } else if (active && has_est) {
-        float rel = brng - (gps_valid ? gps_course : 0.0f);
-        float tgt = radians(rel - 90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        // Slower lock-on (was 0.09) — arrow visibly swings and settles
-        // toward the target rather than snapping into place.
-        ease_arrow += 0.06f * d;
-    } else {
-        // Clockwise drift: 1 rev per 8s — gives a more visible "searching" feel.
-        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 8000.0f);
-        if (ease_arrow > 2.0f*(float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
-    }
-    float ang = ease_arrow;
-
-    // ── Direction pointer: thin line from pivot, filled dot at tip ──
-    // Compass needle aesthetic — direction is the line, target lives at
-    // the dot. Pivot circle marks the user's position. Hatching/grid
-    // background gives the panel a tactical feel without the polygon.
+    // ── Status pill (right-aligned) ──
     {
-        const int line_len = 28;
-        int tip_x = cx + (int)(line_len * cosf(ang));
-        int tip_y = cy + (int)(line_len * sinf(ang));
+        const char* sp;
+        if (!active)             sp = "No Target";
+        else if (!gps_loc_valid) sp = (gps_sats >= 1) ? "Awaiting GPS" : "No GPS";
+        else if (!has_rssi)      sp = "Awaiting Signal";
+        else                     sp = "Hunting";
 
-        // Direction line and tip dot — full HEADER_COLOR for emphasis.
-        spr.drawLine(cx, cy, tip_x, tip_y, HEADER_COLOR);
-        spr.fillCircle(tip_x, tip_y, 3, HEADER_COLOR);
-
-        // Open pivot ring — sits over the line at the rotation center.
-        spr.drawCircle(cx, cy, 2, DIM_COLOR);
+        int pw = (int)strlen(sp) * ts_char_w(TS_MICRO) + 6;
+        int px = TR - pw;
+        int py = CONTENT_Y + 3;
+        uint16_t fill = lerp_col16(BG_COLOR, HEADER_COLOR, 0.12f);
+        spr.fillRoundRect(px, py, pw, 11, 3, fill);
+        spr.drawRoundRect(px, py, pw, 11, 3, HEADER_COLOR);
+        spr.setTextColor(HEADER_COLOR, fill);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(px + 3, py + 2);
+        spr.print(sp);
     }
 
-
-    // ── Right panel ──
-    int rx = 82;
-    int rpx = rx + 4;
-
-    // ── Status badge ──
-    const char* status_base; uint16_t status_col; bool status_anim = false;
-    if (north_mode) {
-        status_base = "N Mode";  status_col = GPS_COLOR;
-    } else if (!has_loc && !gps_valid) {
-        status_base = "Searching";   status_col = GPS_COLOR;     status_anim = true;
-    } else if (!active) {
-        status_base = "Need Target"; status_col = CAUTION_COLOR; status_anim = true;
-    } else if (!gps_valid) {
-        status_base = "Need GPS Fix"; status_col = CAUTION_COLOR; status_anim = true;
-    } else {
-        status_base = "Hunting";     status_col = ACCENT_COLOR;
-    }
-    char status_str[26];
-    if (status_anim) {
-        char dots[4];
-        anim_ellipsis(dots, sizeof(dots));
-        snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
-    } else {
-        safe_copy(status_str, status_base, sizeof(status_str));
-    }
-    {
-        int max_chars_sb = (int)strlen(status_base) + (status_anim ? 3 : 0);
-        int box_w = max_chars_sb * (ts_char_w(TS_BODY) + 1) + 12;
-        int avail_w = DISP_W - rpx - 2;
-        if (box_w > avail_w) box_w = avail_w;
-        uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
-        spr.fillRoundRect(rpx, 23, box_w, 16, 5, status_fill);
-        spr.drawRoundRect(rpx, 23, box_w, 16, 5, status_col);
-        spr.setTextColor(status_col, status_fill); spr.setTextSize(TS_BODY);
-        spr.setClipRect(rpx + 1, 24, box_w - 2, 14);
-        spr.setCursor(rpx + 6, 27); kprint(spr, status_str);
-        spr.clearClipRect();
-    }
-
-    // ── TARGET label + name + ID ──
-    // Section spacing follows the standard tiers: UI_PAD_MD between the
-    // status pill and the TARGET section, UI_PAD_SM between rows.
-    int target_label_y = 23 + 16 + UI_PAD_MD;          // pill bottom + UI_PAD_MD
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-    spr.setCursor(rpx, target_label_y);
+    // ── Row 1: TARGET label (y = CONTENT_Y + 4) ──
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(TL, CONTENT_Y + 4);
     kprint(spr, "TARGET");
 
-    int target_name_y = target_label_y + 10;
+    // ── Row 2: Target name + ID (y = CONTENT_Y + 16) ──
     {
-        char tname[18];
-        if (active) {
-            bool nok = (target_name[0] != '\0'
-                        && strcmp(target_name, "Hidden")  != 0
-                        && strcmp(target_name, "Unknown") != 0);
-            const char* src = nok ? target_name
-                                   : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
-            safe_copy(tname, src, sizeof(tname));
+        char disp[33];
+        if (!active) {
+            safe_copy(disp, "No Target", sizeof(disp));
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
         } else {
-            safe_copy(tname, "No Target", sizeof(tname));
-        }
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_STRONG);
-        spr.setCursor(rpx, target_name_y); spr.print(tname);
-
-        // Badges after the name: detection ID (#NNN) and north-mode indicator (N).
-        {
-            int name_w  = (int)strlen(tname) * ts_char_w(TS_STRONG);
-            int id_y    = target_name_y + (int)(TS_STRONG * 8.0f) - 8;
-            int badge_x = rpx + name_w + UI_PAD_SM;
-            if (active && target_id > 0) {
-                char id_buf[8];
-                snprintf(id_buf, sizeof(id_buf), "#%03d", target_id);
-                spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-                spr.setCursor(badge_x, id_y);
-                spr.print(id_buf);
-                badge_x += (int)strlen(id_buf) * ts_char_w(TS_MICRO) + UI_PAD_SM;
-            }
-            if (north_mode) {
-                spr.setTextColor(GPS_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-                spr.setCursor(badge_x, id_y);
-                spr.print("N");
-            }
-        }
-    }
-
-    // ── DIST + SIG (labels TS_MICRO, values TS_STRONG side-by-side) ──
-    // TS_STRONG fits the worst-case strings ("9999ft" / "STRONG") in the
-    // ~154 px right panel without overlap; larger sizes would overflow.
-    int dist_label_y = target_name_y + (int)(TS_STRONG * 8.0f) + UI_PAD_SM;
-    int dist_value_y = dist_label_y + 10;
-    int sig_x        = rpx + 64;
-
-    spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(TS_MICRO);
-    spr.setCursor(rpx,   dist_label_y); kprint(spr, "DIST");
-    spr.setCursor(sig_x, dist_label_y); kprint(spr, "SIG");
-
-    // Trend indicator just past the DIST label
-    {
-        int trend = (active && has_est) ? locator_distance_trend() : 0;
-        if (trend != 0) {
-            int tx = rpx + 28, ty = dist_label_y;
-            if (trend < 0) {
-                spr.fillTriangle(tx, ty, tx + 5, ty, tx + 2, ty + 5, ACCENT_COLOR);
+            bool nok = target_name[0] != '\0'
+                       && strcmp(target_name, "Hidden")  != 0
+                       && strcmp(target_name, "Unknown") != 0;
+            if (nok) {
+                safe_copy(disp, target_name, sizeof(disp));
             } else {
-                spr.fillTriangle(tx, ty + 5, tx + 5, ty + 5, tx + 2, ty, CAUTION_COLOR);
+                const char* tail = (strlen(target_mac) > 8) ? target_mac + 9 : target_mac;
+                safe_copy(disp, tail, sizeof(disp));
+            }
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        }
+        spr.setTextSize(TS_STRONG);
+        spr.setCursor(TL, CONTENT_Y + 16);
+        spr.print(disp);
+        if (active && target_id > 0) {
+            char id_buf[10];
+            snprintf(id_buf, sizeof(id_buf), "(#%03d)", target_id);
+            int nx  = TL + (int)strlen(disp) * ts_char_w(TS_STRONG) + 4;
+            int idy = CONTENT_Y + 16 + (int)(TS_STRONG * 8.0f) - 8;
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(nx, idy);
+            spr.print(id_buf);
+        }
+    }
+
+    // ── Divider 1 (y = CONTENT_Y + 28) ──
+    spr.drawFastHLine(TL, CONTENT_Y + 28, TR - TL, CARD_BORDER);
+
+    // ── Row 3: LIVE SIGNAL label + inline dBm value (y = CONTENT_Y + 34) ──
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(TL, CONTENT_Y + 34);
+    kprint(spr, "LIVE SIGNAL");
+    {
+        char rssi_buf[12];
+        const char* rv = has_rssi ? rssi_buf : "--";
+        if (has_rssi) snprintf(rssi_buf, sizeof(rssi_buf), "%ddBm", target_rssi);
+        int lbl_w = 11 * (ts_char_w(TS_MICRO) + 1);  // "LIVE SIGNAL" kprint advance
+        spr.setTextColor(has_rssi ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(TL + lbl_w + 8, CONTENT_Y + 32);
+        spr.print(rv);
+    }
+
+    // ── Row 4: Signal bar (y = CONTENT_Y + 42, h = 4) ──
+    {
+        int bx = TL, by = CONTENT_Y + 42, bw = TR - TL;
+        spr.fillRoundRect(bx, by, bw, 4, 2, CARD_COLOR);
+        if (has_rssi) {
+            int pct = (target_rssi + 90) * 100 / 60;
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            int fw = bw * pct / 100;
+            if (fw > 0) spr.fillRoundRect(bx, by, fw, 4, 2, HEADER_COLOR);
+        }
+    }
+
+    // ── Row 5: Peak signal notification (y = CONTENT_Y + 52) ──
+    {
+        int py = CONTENT_Y + 52;
+        spr.setTextSize(TS_MICRO);
+        if (peak_rssi > -120) {
+            char pbuf[12];
+            snprintf(pbuf, sizeof(pbuf), "%ddBm", peak_rssi);
+            spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+            spr.setCursor(TL, py);
+            spr.print("Peak");
+            int cx_now = TL + 4 * ts_char_w(TS_MICRO) + 2;
+            spr.setCursor(cx_now, py);
+            spr.print(pbuf);
+            cx_now += (int)strlen(pbuf) * ts_char_w(TS_MICRO) + 4;
+            if (gps_loc_valid && peak_has_gps) {
+                float dm  = (float)haversine_m(cur_lat, cur_lng, peak_lat, peak_lng);
+                float df  = dm * 3.28084f;
+                const char* dir = bearing_to_compass(
+                    bearing_to(cur_lat, cur_lng, peak_lat, peak_lng));
+                char dbuf[24];
+                if (df < 5280.0f) snprintf(dbuf, sizeof(dbuf), "%.0fft %s", df, dir);
+                else              snprintf(dbuf, sizeof(dbuf), "%.1fmi %s", df/5280.0f, dir);
+                spr.setTextColor(DIM_COLOR, BG_COLOR);
+                spr.setCursor(cx_now, py);
+                spr.print(dbuf);
+            } else {
+                spr.setTextColor(DIM_COLOR, BG_COLOR);
+                spr.setCursor(cx_now, py);
+                spr.print("-- from peak");
+            }
+        } else {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setCursor(TL, py);
+            spr.print("No peak signal yet");
+        }
+    }
+
+    // ── Divider 2 (y = CONTENT_Y + 62) ──
+    spr.drawFastHLine(TL, CONTENT_Y + 62, TR - TL, CARD_BORDER);
+
+    // ── Signal over time trace ──
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(TL, CONTENT_Y + 68);
+    kprint(spr, "SIGNAL OVER TIME");
+
+    const int plot_left   = TL + 18;
+    const int plot_right  = DISP_W - 2;
+    const int plot_top    = CONTENT_Y + 76;
+    const int plot_bottom = DISP_H - 2;
+    const int plot_w      = plot_right - plot_left;
+    const int plot_h      = plot_bottom - plot_top;
+
+    // Y-axis labels left of plot (-30, -60, -90)
+    {
+        uint16_t lc = lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
+        spr.setTextColor(lc, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        const int dbs[] = {-30, -60, -90};
+        for (int i = 0; i < 3; i++) {
+            int db = dbs[i];
+            float n = (float)(db + 90) / 60.0f;
+            int gy  = plot_bottom - (int)(n * (float)plot_h);
+            char lbl[5]; snprintf(lbl, sizeof(lbl), "%d", db);
+            spr.setCursor(TL, gy - 3);
+            spr.print(lbl);
+        }
+    }
+
+    spr.setClipRect(plot_left, plot_top, plot_w, plot_h);
+
+    if (trace_count >= 2) {
+        static float trace_vals[LOC_TRACE_SIZE];
+        int trace_max_rssi = -128, trace_max_idx = -1;
+        for (int i = 0; i < trace_count; i++) {
+            int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
+            int rv   = (int)trace_snap[slot].rssi;
+            float n  = (float)(rv + 90) / 60.0f;
+            if (n < 0.0f) n = 0.0f;
+            if (n > 1.0f) n = 1.0f;
+            trace_vals[i] = n;
+            if (rv > trace_max_rssi) { trace_max_rssi = rv; trace_max_idx = i; }
+        }
+
+        // Faint grid lines
+        uint16_t gc = lerp_col16(BG_COLOR, CARD_BORDER, 0.4f);
+        for (int db = -30; db >= -90; db -= 30) {
+            float n = (float)(db + 90) / 60.0f;
+            int gy  = plot_bottom - (int)(n * (float)plot_h);
+            if (gy >= plot_top && gy <= plot_bottom)
+                spr.drawFastHLine(plot_left, gy, plot_w, gc);
+        }
+
+        // Catmull-Rom spline evaluator
+        auto eval_cr = [&](float idx_f) -> float {
+            int ci = (int)idx_f;
+            float t  = idx_f - (float)ci;
+            int i0 = ci > 0              ? ci - 1 : 0;
+            int i1 = ci < trace_count-1  ? ci     : trace_count-1;
+            int i2 = ci+1 < trace_count  ? ci+1   : trace_count-1;
+            int i3 = ci+2 < trace_count  ? ci+2   : trace_count-1;
+            float p0=trace_vals[i0], p1=trace_vals[i1];
+            float p2=trace_vals[i2], p3=trace_vals[i3];
+            float t2=t*t, t3=t2*t;
+            float v = 0.5f*((-p0+3*p1-3*p2+p3)*t3 + (2*p0-5*p1+4*p2-p3)*t2
+                            + (-p0+p2)*t + 2*p1);
+            return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+        };
+
+        static float curve_cache[241];
+        for (int px = 0; px <= plot_w && px < 241; px++) {
+            float idx_f = (float)px / (float)plot_w * (float)(trace_count - 1);
+            curve_cache[px] = eval_cr(idx_f);
+        }
+
+        // Fill under curve (run-length encoded gradient, 20% max alpha)
+        for (int px = 0; px <= plot_w; px++) {
+            float val = curve_cache[px];
+            int   cy  = plot_bottom - (int)(val * (float)plot_h);
+            int   sx  = plot_left + px;
+            for (int fy = cy + 1; fy < plot_bottom; ) {
+                float ft  = (float)(fy - cy) / (float)(plot_bottom - cy);
+                float a   = (1.0f - ft*ft) * 0.20f;
+                if (a < 0.02f) break;
+                uint16_t col = lerp_col16(BG_COLOR, HEADER_COLOR, a);
+                int re = fy + 1;
+                while (re < plot_bottom) {
+                    float ft2 = (float)(re - cy) / (float)(plot_bottom - cy);
+                    float a2  = (1.0f - ft2*ft2) * 0.20f;
+                    if (a2 < 0.02f || lerp_col16(BG_COLOR, HEADER_COLOR, a2) != col) break;
+                    re++;
+                }
+                spr.fillRect(sx, fy, 1, re - fy, col);
+                fy = re;
             }
         }
-    }
 
-    // Distance value
-    {
-        float sd = (active && has_est && !north_mode) ? dist : -1.0f;
-        float sd_ft = sd * 3.28084f;
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(TS_STRONG);
-        spr.setCursor(rpx, dist_value_y);
-        if (sd < 0) {
-            spr.print("--");
-        } else if (sd < 300) {
-            char db[12]; snprintf(db, sizeof(db), "%.0fft", sd_ft);
-            spr.print(db);
-        } else {
-            char db[12]; snprintf(db, sizeof(db), "%.1fkm", sd / 1000.0f);
-            spr.print(db);
+        // Curve — 2px thick
+        uint16_t curve_dim = lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f);
+        for (int px = 1; px <= plot_w; px++) {
+            float v0 = curve_cache[px-1], v1 = curve_cache[px];
+            int y0 = plot_bottom - (int)(v0 * (float)plot_h);
+            int y1 = plot_bottom - (int)(v1 * (float)plot_h);
+            spr.drawLine(plot_left+px-1, y0,   plot_left+px, y1,   HEADER_COLOR);
+            spr.drawLine(plot_left+px-1, y0-1, plot_left+px, y1-1, curve_dim);
         }
+
+        // Peak diamond (only when peak falls within the current trace window)
+        if (trace_max_idx >= 0 && trace_max_rssi >= peak_rssi - 2) {
+            int ppx = (int)((float)trace_max_idx / (float)(trace_count-1) * (float)plot_w);
+            float pv = trace_vals[trace_max_idx];
+            int   py = plot_bottom - (int)(pv * (float)plot_h);
+            int   sx = plot_left + ppx;
+            uint16_t dash_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.3f);
+            for (int dy = py + 4; dy < plot_bottom; dy += 6) {
+                int seg = (dy + 3 < plot_bottom) ? 3 : (plot_bottom - dy);
+                spr.drawFastVLine(sx, dy, seg, dash_col);
+            }
+            spr.fillTriangle(sx, py-4, sx+3, py, sx-3, py, CAUTION_COLOR);
+            spr.fillTriangle(sx, py+4, sx+3, py, sx-3, py, CAUTION_COLOR);
+        }
+
+        // Current-position dot (rightmost sample)
+        {
+            float vc = curve_cache[plot_w < 240 ? plot_w : 240];
+            int   yc = plot_bottom - (int)(vc * (float)plot_h);
+            spr.drawCircle(plot_right, yc, 4, lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f));
+            spr.fillCircle(plot_right, yc, 2, HEADER_COLOR);
+        }
+    } else {
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        const char* msg = active ? "awaiting signal..." : "press t to select target";
+        int mw = (int)strlen(msg) * ts_char_w(TS_MICRO);
+        spr.setCursor((DISP_W - mw) / 2, plot_top + plot_h / 2 - 3);
+        spr.print(msg);
     }
 
-    // Signal value (colored by strength)
-    {
-        int sr = (active && has_rssi && !north_mode) ? target_rssi : -999;
-        uint16_t sig_col;
-        const char* sig_str;
-        if      (sr == -999) { sig_str = "--";     sig_col = DIM_COLOR; }
-        else if (sr > -60)   { sig_str = "STRONG"; sig_col = ACCENT_COLOR; }
-        else if (sr > -80)   { sig_str = "MED";    sig_col = CAUTION_COLOR; }
-        else                 { sig_str = "WEAK";   sig_col = DIM_COLOR; }
+    spr.clearClipRect();
 
-        spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(TS_STRONG);
-        spr.setCursor(sig_x, dist_value_y); spr.print(sig_str);
+    // X-axis time labels (inside plot at bottom edge)
+    {
+        uint16_t xc = lerp_col16(BG_COLOR, DIM_COLOR, 0.4f);
+        spr.setTextColor(xc, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        int lby = plot_bottom - 7;
+        spr.setCursor(plot_left + 1,                                lby); spr.print("-2m");
+        spr.setCursor(plot_left + plot_w/2 - ts_char_w(TS_MICRO),  lby); spr.print("-1m");
+        spr.setCursor(plot_right - 3*ts_char_w(TS_MICRO) - 1,      lby); spr.print("now");
     }
 }
 
