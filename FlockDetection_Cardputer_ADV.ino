@@ -315,6 +315,33 @@ static const unsigned long UI_ANIM_NORMAL = 320;
 static const unsigned long UI_ANIM_SLOW   = 500;
 static const int           UI_SLIDE_PX    = 14;
 
+// ── Subsystem-specific timing constants ──
+// Pulled out of their use sites so the timing model lives in one place.
+// Tune here, not at the call sites.
+
+// Stats screen: PACKETS card refresh cadence. ambient_packet_count churns
+// every frame; this throttles how often the displayed value updates so the
+// roll-up animation reads cleanly instead of strobing.
+static const unsigned long STATS_PKT_REFRESH_MS = 3000;
+
+// WiFi mode-transition delays. The ESP-IDF WiFi driver needs settle time
+// between mode changes (STA <-> off, disconnect <-> reconnect, promiscuous
+// on/off). These values are empirical — shortening risks the next call
+// returning before the radio state actually transitioned.
+static const unsigned long WIFI_MODE_SETTLE_SHORT_MS  = 50;
+static const unsigned long WIFI_MODE_SETTLE_MEDIUM_MS = 100;
+static const unsigned long WIFI_MODE_SETTLE_LONG_MS   = 200;
+
+// Live activity feed cadence. FEED_MIN_PUSH_INTERVAL_MS gates normal scanner
+// view; when the feed is expanded (full-screen) it pushes faster so the user
+// sees more activity at a glance.
+static const unsigned long FEED_PUSH_INTERVAL_EXPANDED_MS = 667;
+
+// Feed entry aging. Rows fully visible for the first FEED_AGE_FULL_MS, then
+// fade linearly until FEED_AGE_GONE_MS, after which they're skipped entirely.
+static const unsigned long FEED_AGE_FULL_MS = 30000;
+static const unsigned long FEED_AGE_GONE_MS = 90000;
+
 // Overlay/toast fade tiers — names alias the purpose so call sites
 // can self-document without inventing new durations.
 static const unsigned long UI_FADE_IN_MS  = 150;  // overlays/toasts appearing
@@ -2142,7 +2169,7 @@ static void export_restore_promiscuous() {
     // coalesce free blocks so NimBLE can get its contiguous 20-30KB.
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    delay(200);
+    delay(WIFI_MODE_SETTLE_LONG_MS);
 
     // Reinitialize NimBLE while WiFi is off (maximum heap available)
     NimBLEDevice::init("");
@@ -2160,7 +2187,7 @@ static void export_restore_promiscuous() {
 
     // Now restart WiFi for promiscuous scanning
     WiFi.mode(WIFI_STA);
-    delay(50);
+    delay(WIFI_MODE_SETTLE_SHORT_MS);
     wifi_promiscuous_filter_t pf_restore;
     pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&pf_restore);
@@ -2241,7 +2268,7 @@ bool export_mode_start() {
     pBLEScan = nullptr;
 
     WiFi.disconnect(true);
-    delay(100);
+    delay(WIFI_MODE_SETTLE_MEDIUM_MS);
     WiFi.mode(WIFI_STA);
     WiFi.begin(export_ssid, export_pass);
 
@@ -3430,7 +3457,9 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
 
 static void feed_commit_pending() {
     unsigned long now = millis();
-    unsigned long interval = show_feed_expanded ? 667UL : FEED_MIN_PUSH_INTERVAL_MS;
+    unsigned long interval = show_feed_expanded
+                           ? FEED_PUSH_INTERVAL_EXPANDED_MS
+                           : FEED_MIN_PUSH_INTERVAL_MS;
     if (now - last_feed_push_ms < interval) return;
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (!feed_pending_valid) { xSemaphoreGiveRecursive(dataMutex); return; }
@@ -6242,9 +6271,14 @@ void draw_scanner_screen() {
 
         unsigned long age = feed_now - e.timestamp;
         float af;
-        if (age < 30000UL)      af = 1.0f;
-        else if (age < 90000UL) af = 1.0f - (float)(age - 30000UL) / 60000.0f;
-        else                    af = 0.0f;
+        if (age < FEED_AGE_FULL_MS) {
+            af = 1.0f;
+        } else if (age < FEED_AGE_GONE_MS) {
+            af = 1.0f - (float)(age - FEED_AGE_FULL_MS)
+                       / (float)(FEED_AGE_GONE_MS - FEED_AGE_FULL_MS);
+        } else {
+            af = 0.0f;
+        }
         if (af < 0.1f) continue;
 
         // Symbol — shape=protocol, color=threat status (amber if flock)
@@ -8703,8 +8737,10 @@ void draw_device_info_screen() {
 
     // PACKETS throttle — ambient_packet_count churns every frame, which would
     // strobe the roll-up animation. Only refresh the displayed value once per
-    // 3 s. The first sample populates immediately so the card isn't blank.
-    if (stats_pkt_last_update == 0 || frame_ms - stats_pkt_last_update >= 3000) {
+    // STATS_PKT_REFRESH_MS. The first sample populates immediately so the
+    // card isn't blank.
+    if (stats_pkt_last_update == 0 ||
+        frame_ms - stats_pkt_last_update >= STATS_PKT_REFRESH_MS) {
         stats_pkt_display     = ambient_packet_count;
         stats_pkt_last_update = frame_ms;
     }
@@ -9607,8 +9643,8 @@ void setup() {
     // setRxBufferSize must be called BEFORE begin() to take effect.
     SerialGPS.setRxBufferSize(256);  // NMEA max sentence is 82 bytes; 256 is sufficient
     SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    delay(100);
-    WiFi.mode(WIFI_STA); delay(50);
+    delay(WIFI_MODE_SETTLE_MEDIUM_MS);
+    WiFi.mode(WIFI_STA); delay(WIFI_MODE_SETTLE_SHORT_MS);
     boot_animate(38 + random(0, 4), "connecting GPS");
     boot_animate(46 + random(0, 4), "drawing interface");
 
@@ -9703,11 +9739,11 @@ void setup() {
     session_start_time = millis();
 
     // WiFi promiscuous mode — complete before scanner screen appears
-    WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
+    WiFi.disconnect(); delay(WIFI_MODE_SETTLE_MEDIUM_MS); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
-    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(WIFI_MODE_SETTLE_MEDIUM_MS);
     Serial.printf("[BOOT] Free heap after WiFi promisc: %u\n",
                   (unsigned)esp_get_free_heap_size());
     boot_animate(88, "starting sniffer");
