@@ -85,7 +85,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms);
 static void timeline_init(unsigned long frame_ms);
 static void timeline_shift_bins(unsigned long frame_ms);
 static inline void fast_sincos(float angle, float* s, float* c);
-void draw_locator_screen();
+void draw_signal_screen();
 void draw_device_info_screen();
 
 // ============================================================================
@@ -131,7 +131,6 @@ unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
 static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
-bool north_mode = false;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 
 // ── WiFi Config overlay state ──
@@ -172,7 +171,7 @@ struct MenuSection {
 
 static const MenuItem nav_items[] = {
     {"Scanner",          false, false, 0},
-    {"Locator",          false, false, 1},
+    {"Signal",           false, false, 1},
     {"Detections",       false, false, 2},
     {"GPS Status",       false, false, 3},
     {"Device Stats",     false, false, 4},
@@ -481,9 +480,6 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define TOAST_DURATION_MS 3500
 #define DATA_MUTEX_TIMEOUT_MS 500
 
-#define LOC_MAX_SAMPLES 40
-#define LOC_SAMPLE_INTERVAL 500
-#define LOC_MIN_SAMPLES_EST 3
 
 #define SCORE_DEFINITIVE 100  
 #define SCORE_STRONG     60   
@@ -1056,39 +1052,13 @@ RSSITrack rssi_tracker[RSSI_TRACK_MAX_DEVICES];
 int rssi_tracker_count = 0;
 static int locator_tracker_idx = -1;  // cached index into rssi_tracker for locator target
 
-struct LocSample { 
-    double lat; 
-    double lng; 
-    int rssi; 
-    unsigned long timestamp; 
-};
-
 bool locator_active = false;
 char locator_target_mac[18]  = "";
 char locator_target_name[65] = "";
 char locator_target_type[8]  = "";   // "WiFi", "BLE", or ""
 int  locator_target_id       = 0;    // sequential detection ID; 0 = unknown
-LocSample locator_samples[LOC_MAX_SAMPLES];
-int locator_sample_count = 0;
-unsigned long locator_last_sample = 0;
-unsigned long locator_newest_sample_ms = 0;  
-
-double locator_est_lat = 0.0;
-double locator_est_lng = 0.0;
-float locator_est_distance = 0.0;
-float locator_bearing = 0.0;
-float locator_confidence_radius = 0.0;
-bool locator_has_estimate = false;
+unsigned long locator_newest_sample_ms = 0;
 int locator_peak_rssi = -120;
-bool locator_estimate_announced = false;
-
-// Trend tracking: last N distance samples for "getting warmer" arrow
-#define LOC_TREND_SAMPLES 8
-static float locator_dist_history[LOC_TREND_SAMPLES] = {0};
-static int locator_dist_history_count = 0;
-static int locator_dist_history_head = 0;
-static unsigned long locator_last_trend_sample_ms = 0;
-volatile bool locator_announce_pending = false;
 
 // ── Locator signal trace ring buffer ──
 #define LOC_TRACE_SIZE        60          // 2 minutes at 2-second intervals
@@ -1103,6 +1073,8 @@ static LocTraceEntry loc_trace[LOC_TRACE_SIZE];
 static int           loc_trace_head        = 0;  // next slot to write
 static int           loc_trace_count       = 0;
 static unsigned long loc_trace_last_sample = 0;
+static float         loc_trace_smooth[LOC_TRACE_SIZE];
+static unsigned long loc_trace_last_frame_ms = 0;
 
 // ── Peak GPS bookmark ──
 static double locator_peak_lat     = 0.0;
@@ -3680,12 +3652,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 }
 
 // ============================================================================
-// LOCATOR ENGINE
 // ============================================================================
-double rssi_to_weight(int rssi) { 
-    if (rssi > -20) rssi = -20; if (rssi < -100) rssi = -100; return pow(10.0, (double)(rssi + 100) / 20.0); 
-}
-
 double haversine_m(double lat1, double lon1, double lat2, double lon2) {
     double dLat = radians(lat2 - lat1);
     double dLon = radians(lon2 - lon1);
@@ -3709,26 +3676,6 @@ static const char* bearing_to_compass(float degrees_val) {
     int idx = ((int)(degrees_val + 22.5f) % 360) / 45;
     static const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
     return dirs[idx & 7];
-}
-
-// Returns -1 if distance is decreasing (closer), +1 if increasing (farther), 0 if stable.
-static int locator_distance_trend() {
-    if (locator_dist_history_count < 4) return 0;
-    int n = locator_dist_history_count;
-    int half = n / 2;
-    float old_avg = 0, new_avg = 0;
-    for (int i = 0; i < half; i++) {
-        int idx_old = (locator_dist_history_head - n + i + LOC_TREND_SAMPLES * 2) % LOC_TREND_SAMPLES;
-        int idx_new = (locator_dist_history_head - half + i + LOC_TREND_SAMPLES * 2) % LOC_TREND_SAMPLES;
-        old_avg += locator_dist_history[idx_old];
-        new_avg += locator_dist_history[idx_new];
-    }
-    old_avg /= half;
-    new_avg /= half;
-    float diff = new_avg - old_avg;
-    if (diff < -2.0f) return -1;
-    if (diff >  2.0f) return  1;
-    return 0;
 }
 
 void locator_add_sample(const char* mac, int rssi) {
@@ -3772,31 +3719,26 @@ void locator_start(const char* mac, const char* name, const char* type = "", int
     safe_copy(locator_target_name, name, sizeof(locator_target_name));
     safe_copy(locator_target_type, type, sizeof(locator_target_type));
     locator_target_id = id;
-    locator_sample_count = 0; locator_has_estimate = false; locator_peak_rssi = -120;
-    locator_estimate_announced = false;
-    locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
-    locator_newest_sample_ms = 0;
-    locator_dist_history_count = 0;
-    locator_dist_history_head = 0;
-    locator_last_trend_sample_ms = 0;
+    locator_peak_rssi = -120;
     locator_tracker_idx = -1;
+    locator_newest_sample_ms = 0;
     loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
     locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
+    memset(loc_trace_smooth, 0, sizeof(loc_trace_smooth));
+    loc_trace_last_frame_ms = 0;
     give_data_mutex();
 }
 
 void locator_stop() {
     if (!take_data_mutex()) return;
-    locator_active = false; locator_has_estimate = false; locator_sample_count = 0;
-    locator_newest_sample_ms = 0;
-    locator_estimate_announced = false;
-    locator_dist_history_count = 0;
-    locator_dist_history_head = 0;
-    locator_last_trend_sample_ms = 0;
+    locator_active = false;
+    locator_peak_rssi = -120;
     locator_tracker_idx = -1;
+    locator_newest_sample_ms = 0;
     loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
     locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
-    locator_peak_rssi = -120;
+    memset(loc_trace_smooth, 0, sizeof(loc_trace_smooth));
+    loc_trace_last_frame_ms = 0;
     give_data_mutex();
 }
 
@@ -4493,22 +4435,6 @@ void AlarmTask(void* pvParameters) {
     vTaskDelete(NULL);
 }
 
-void LocatorChimeTask(void* pvParameters) {
-    esp_task_wdt_add(NULL);
-
-    // Same I2S flush as AlarmTask — see comment there.
-    M5Cardputer.Speaker.stop();
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-
-    if (!stealth_mode && !is_muted) {
-        M5Cardputer.Speaker.tone(660, 70);
-        vTaskDelay(80 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(880, 90);
-    }
-    esp_task_wdt_delete(NULL);
-    vTaskDelete(NULL);
-}
-
 void play_escalated_alarm(int confidence, int source) {
     if (stealth_mode || is_muted || is_alarming) return;
     is_alarming = true;
@@ -4521,7 +4447,7 @@ void play_escalated_alarm(int confidence, int source) {
 // ============================================================================
 void draw_header_spr(int screen_num) {
     static const char* screen_names[NUM_SCREENS] = {
-        "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "STATS"
+        "SCANNER", "SIGNAL", "DETECTIONS", "GPS", "STATS"
     };
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
@@ -5080,7 +5006,7 @@ static void menu_icon_scanner(int x, int y, uint16_t col) {
     spr.drawTriangle(x, y+9, x+9, y+9, x+4, y, col);
 }
 
-static void menu_icon_locator(int x, int y, uint16_t col) {
+static void menu_icon_signal(int x, int y, uint16_t col) {
     spr.drawFastHLine(x, y+4, 10, col);
     spr.drawFastVLine(x+4, y, 10, col);
     spr.drawPixel(x+1, y+1, col); spr.drawPixel(x+7, y+1, col);
@@ -5147,7 +5073,7 @@ static void menu_icon_trash(int x, int y, uint16_t col) {
 static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
     switch (flat_idx) {
         case 0:  menu_icon_scanner(x, y, col);    break;
-        case 1:  menu_icon_locator(x, y, col);    break;
+        case 1:  menu_icon_signal(x, y, col);      break;
         case 2:  menu_icon_detections(x, y, col); break;
         case 3:  menu_icon_gps(x, y, col);        break;
         case 4:  menu_icon_stats(x, y, col);      break;
@@ -7578,7 +7504,7 @@ void draw_capture_history_screen() {
 }
 
 
-void draw_locator_screen() {
+void draw_signal_screen() {
     unsigned long frame_ms = millis();
 
     // ── Snapshot state under mutex ──
@@ -7617,6 +7543,22 @@ void draw_locator_screen() {
     trace_head  = loc_trace_head;
     trace_count = loc_trace_count;
     give_data_mutex();
+
+    // ── Smooth trace values for fluid curve motion ──
+    {
+        float dt = (loc_trace_last_frame_ms == 0) ? 16.0f
+                 : (float)(frame_ms - loc_trace_last_frame_ms);
+        if (dt > 100.0f) dt = 100.0f;
+        loc_trace_last_frame_ms = frame_ms;
+
+        for (int i = 0; i < trace_count; i++) {
+            int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
+            float raw = (float)((int)trace_snap[slot].rssi + 90) / 60.0f;
+            if (raw < 0.0f) raw = 0.0f;
+            if (raw > 1.0f) raw = 1.0f;
+            loc_trace_smooth[i] = anim_filter(loc_trace_smooth[i], raw, 300.0f, dt);
+        }
+    }
 
     spr.fillSprite(BG_COLOR);
     draw_header_spr(1);
@@ -7690,12 +7632,13 @@ void draw_locator_screen() {
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(TL, CONTENT_Y + 34);
-    kprint(spr, "LIVE SIGNAL");
     {
+        const char* live_label = "LIVE SIGNAL";
+        kprint(spr, live_label);
         char rssi_buf[12];
         const char* rv = has_rssi ? rssi_buf : "--";
         if (has_rssi) snprintf(rssi_buf, sizeof(rssi_buf), "%ddBm", target_rssi);
-        int lbl_w = 11 * (ts_char_w(TS_MICRO) + 1);  // "LIVE SIGNAL" kprint advance
+        int lbl_w = (int)strlen(live_label) * (ts_char_w(TS_MICRO) + 1);
         spr.setTextColor(has_rssi ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_BODY);
         spr.setCursor(TL + lbl_w + 8, CONTENT_Y + 32);
@@ -7792,10 +7735,8 @@ void draw_locator_screen() {
         for (int i = 0; i < trace_count; i++) {
             int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
             int rv   = (int)trace_snap[slot].rssi;
-            float n  = (float)(rv + 90) / 60.0f;
-            if (n < 0.0f) n = 0.0f;
-            if (n > 1.0f) n = 1.0f;
-            trace_vals[i] = n;
+            // Use smoothed value for curve; raw value for peak marker
+            trace_vals[i] = loc_trace_smooth[i];
             if (rv > trace_max_rssi) { trace_max_rssi = rv; trace_max_idx = i; }
         }
 
@@ -8543,7 +8484,7 @@ void draw_current_screen() {
     if (!fullscreen_overlay) {
         switch (current_screen) {
             case 0: draw_scanner_screen();         break;
-            case 1: draw_locator_screen();         break;
+            case 1: draw_signal_screen();           break;
             case 2: draw_capture_history_screen(); break;
             case 3: draw_gps_screen();             break;
             case 4: draw_device_info_screen();     break;
@@ -10093,10 +10034,7 @@ void loop() {
             }
             else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } schedule_persist(); }
             else if (c == 'n') {
-                if (current_screen == 1) {
-                    north_mode = !north_mode;
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (!stealth_mode) {
+                if (!stealth_mode) {
                     night_mode = !night_mode;
                     apply_color_palette();
                     screen_dirty = true;
@@ -10467,37 +10405,6 @@ void loop() {
     if (wdt_subscribed) esp_task_wdt_reset();
 
     {
-        bool need_update;
-        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-        need_update = locator_active && locator_has_estimate;
-        if (need_update && gps.location.isValid() && gps.location.age() < 2000) {
-            double my_lat = gps.location.lat();
-            double my_lng = gps.location.lng();
-            double tgt_lat = locator_est_lat;
-            double tgt_lng = locator_est_lng;
-            xSemaphoreGiveRecursive(dataMutex);
-
-            float dist = (float)haversine_m(my_lat, my_lng, tgt_lat, tgt_lng);
-            float brng = bearing_to(my_lat, my_lng, tgt_lat, tgt_lng);
-
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            locator_est_distance = dist;
-            locator_bearing = brng;
-            // Sample the distance into the trend history (every ~500ms)
-            unsigned long now_t = millis();
-            if (now_t - locator_last_trend_sample_ms > 500) {
-                locator_dist_history[locator_dist_history_head] = dist;
-                locator_dist_history_head = (locator_dist_history_head + 1) % LOC_TREND_SAMPLES;
-                if (locator_dist_history_count < LOC_TREND_SAMPLES) locator_dist_history_count++;
-                locator_last_trend_sample_ms = now_t;
-            }
-            xSemaphoreGiveRecursive(dataMutex);
-        } else {
-            xSemaphoreGiveRecursive(dataMutex);
-        }
-    }
-
-    {
         bool was_dirty = false;
         if (current_screen == 2 && !hist_detail_open) {
             xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
@@ -10536,14 +10443,6 @@ void loop() {
             give_data_mutex();
         }
         if (tz_gps_ok) tz_compute(tz_lat, tz_lng, tz_year, tz_month, tz_day);
-    }
-
-    if (locator_announce_pending) {
-        locator_announce_pending = false;
-        trigger_toast("INFO", "Estimate ready", 0);
-        if (!is_muted && !stealth_mode) {
-            xTaskCreate(LocatorChimeTask, "LocChime", 1024, NULL, 2, NULL);
-        }
     }
 
     // Enter ambient mode after sustained idle
