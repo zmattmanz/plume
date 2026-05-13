@@ -3422,7 +3422,8 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
     feed_pending.rssi      = (int8_t)rssi;
     feed_pending.proto     = (uint8_t)proto;
     feed_pending.is_flock  = is_flock;
-    feed_pending.timestamp = millis();
+    // timestamp is set in feed_commit_pending() at the moment of commit;
+    // setting it here would be dead-stored.
     feed_pending_valid     = true;
     xSemaphoreGiveRecursive(dataMutex);
 }
@@ -5830,6 +5831,60 @@ static const int VIZ_H         = DISP_H - VIZ_Y;                       // 99
 static const int VIZ_BOTTOM    = VIZ_Y + VIZ_H;                        // 135 (== DISP_H)
 static const int FEED_FIRST_Y  = VIZ_Y;                                // 36 — feed rows start here
 
+// ── SCAN viz angle LUT ─────────────────────────────────────────────
+// One-time precomputed angle (in radians, quantized to 0..255) from
+// each 2×2 block center to the scan-viz center. Replaces the per-frame
+// fast_atan2f calls in the phosphor trail loop. ~3.2KB in PSRAM.
+//
+// Index: row * SCAN_LUT_COLS + col
+//   row = (py - VIZ_Y) / 2
+//   col = (px - VIZ_X) / 2
+// Value: angle * 256 / (2π), so multiply back by (2π/256) for radians.
+static const int SCAN_LUT_COLS = (VIZ_W + 1) / 2;
+static const int SCAN_LUT_ROWS = (VIZ_H + 1) / 2;
+static const int SCAN_LUT_SIZE = SCAN_LUT_COLS * SCAN_LUT_ROWS;
+static const float SCAN_LUT_INV_SCALE = (2.0f * (float)M_PI) / 256.0f;
+
+static uint8_t* scan_angle_lut       = nullptr;
+static bool     scan_angle_lut_ready = false;
+
+static void scan_angle_lut_build() {
+    if (scan_angle_lut_ready) return;
+
+    scan_angle_lut = (uint8_t*)heap_caps_malloc(SCAN_LUT_SIZE,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scan_angle_lut) {
+        scan_angle_lut = (uint8_t*)heap_caps_malloc(SCAN_LUT_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (!scan_angle_lut) {
+        Serial.println("[SCAN] angle LUT alloc failed — falling back to atan2 path");
+        return;
+    }
+
+    const int CX = VIZ_X + VIZ_W / 2;
+    const int CY = VIZ_Y + VIZ_H / 2;
+    const float PI2f  = 2.0f * (float)M_PI;
+    const float SCALE = 256.0f / PI2f;
+
+    for (int row = 0; row < SCAN_LUT_ROWS; row++) {
+        int py = VIZ_Y + row * 2;
+        for (int col = 0; col < SCAN_LUT_COLS; col++) {
+            int px = VIZ_X + col * 2;
+            float dx = (float)(px - CX);
+            float dy = (float)(py - CY);
+            float ang = atan2f(dy, dx);
+            if (ang < 0.0f) ang += PI2f;
+            int quant = (int)(ang * SCALE + 0.5f);
+            if (quant < 0)   quant = 0;
+            if (quant > 255) quant = 255;
+            scan_angle_lut[row * SCAN_LUT_COLS + col] = (uint8_t)quant;
+        }
+    }
+    scan_angle_lut_ready = true;
+    Serial.printf("[SCAN] angle LUT built (%d entries, %u bytes)\n",
+                  SCAN_LUT_SIZE, (unsigned)SCAN_LUT_SIZE);
+}
+
 static inline void fast_sincos(float angle, float* s, float* c) {
     *s = sinf(angle);
     *c = cosf(angle);
@@ -5849,12 +5904,7 @@ static inline float fast_atan2f(float y, float x) {
     return r;
 }
 
-// Schraudolph bit-cast exp — valid for x <= 0, ~5% error, ~20× faster than expf.
-static inline float fast_expf_neg(float x) {
-    union { float f; int32_t i; } v;
-    v.i = (int32_t)(12102203.0f * x) + 1065353216;
-    return v.f;
-}
+
 
 // ── Timeline bin management ───────────────────────────────────────────────
 static void timeline_shift_bins(unsigned long frame_ms) {
@@ -6460,8 +6510,11 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
     // Per-pixel alpha blend in 2×2 blocks — composites over existing
     // content (rings, background) instead of overwriting with flat blocks.
     // Quadratic falloff: bright near the line, smooth monotonic decay to
-    // invisible at the tail. No LUT, no banding, no visible edge.
+    // invisible at the tail. Angle-to-center lookups use scan_angle_lut[]
+    // built once at first render; falls back to fast_atan2f if alloc failed.
     {
+        scan_angle_lut_build();  // no-op after first call
+
         const float TRAIL_ARC = 1.8f;   // radians behind sweep (~103°)
         const float PEAK      = 0.28f;  // max blend alpha right behind line
         const float GAP       = 0.04f;  // skip the line itself
@@ -6471,19 +6524,34 @@ static void draw_scanner_viz_scan(unsigned long frame_ms) {
         uint16_t* sbuf = (uint16_t*)spr.getBuffer();
         const int sbuf_w = DISP_W;
 
-        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py += 2) {
-            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px += 2) {
+        // Normalize sweep angle to [0, 2π) once per frame.
+        float sweep_norm = scan_sweep_angle;
+        if (sweep_norm < 0.0f)           sweep_norm += 2.0f * (float)M_PI;
+        if (sweep_norm >= 2.0f * (float)M_PI) sweep_norm -= 2.0f * (float)M_PI;
+
+        int row_idx = 0;
+        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py += 2, row_idx++) {
+            int col_idx = 0;
+            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px += 2, col_idx++) {
                 float dx = (float)(px - CX);
                 float dy = (float)(py - CY);
                 if (dx * dx + dy * dy > R2_max) continue;
 
-                float diff = scan_sweep_angle - fast_atan2f(dy, dx);
-                if (diff >  (float)M_PI) diff -= PI2f;
-                if (diff < -(float)M_PI) diff += PI2f;
+                float ang;
+                if (scan_angle_lut_ready) {
+                    uint8_t q = scan_angle_lut[row_idx * SCAN_LUT_COLS + col_idx];
+                    ang = (float)q * SCAN_LUT_INV_SCALE;
+                } else {
+                    ang = fast_atan2f(dy, dx);
+                    if (ang < 0.0f) ang += 2.0f * (float)M_PI;
+                }
 
-                if (diff <= 0.0f) continue;        // ahead of sweep
-                if (diff < GAP)   continue;        // within the line
-                if (diff > TRAIL_ARC) continue;    // past the tail
+                float diff = sweep_norm - ang;
+                if (diff < 0.0f) diff += 2.0f * (float)M_PI;
+                // diff is now in [0, 2π) — angular distance behind the sweep.
+
+                if (diff < GAP)       continue;    // within the line
+                if (diff > TRAIL_ARC) continue;    // past the tail (ahead-of-sweep wraps here)
 
                 float t = (diff - GAP) * inv_range; // 0..1 (0 = near line, 1 = tail)
                 float fade = 1.0f - t;
