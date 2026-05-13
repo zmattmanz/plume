@@ -7621,15 +7621,15 @@ void draw_signal_screen() {
         int pill_r = pill_h / 2;
         uint16_t pill_bg = lerp_col16(BG_COLOR, pill_color, 0.15f);
         spr.fillRoundRect(pill_x + 1, pill_y + 1, pill_w - 2, pill_h - 2, pill_r, pill_bg);
-        spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, ea(pill_color));
-        spr.setTextColor(ea(pill_color), pill_bg);
+        spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, pill_color);
+        spr.setTextColor(pill_color, pill_bg);
         spr.setTextSize(TS_MICRO);
         spr.setCursor(pill_x + 6, pill_y + 2);
         spr.print(pill_text);
     }
 
     // ── TARGET label ──
-    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(TL, CONTENT_Y + 2);
     kprint(spr, "TARGET");
@@ -7639,7 +7639,7 @@ void draw_signal_screen() {
         spr.setTextSize(TS_BODY);
         spr.setCursor(TL, CONTENT_Y + 16);
         if (!active) {
-            spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.print("No Target");
         } else {
             bool nok = target_name[0] != '\0'
@@ -7647,12 +7647,12 @@ void draw_signal_screen() {
                        && strcmp(target_name, "Unknown") != 0;
             const char* disp = nok ? target_name
                              : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
-            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
             spr.print(disp);
             if (target_id > 0) {
                 char id_buf[10];
                 snprintf(id_buf, sizeof(id_buf), " (#%03d)", target_id);
-                spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+                spr.setTextColor(DIM_COLOR, BG_COLOR);
                 spr.print(id_buf);
             }
         }
@@ -7665,14 +7665,14 @@ void draw_signal_screen() {
         int hint_x = (DISP_W - hint_w) / 2;
         int hint_y = CONTENT_Y + 16 + (DISP_H - CONTENT_Y - 16) / 2;
         spr.setTextSize(TS_MICRO);
-        spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setCursor(hint_x, hint_y);
         spr.print(hint);
         return;
     }
 
     // ── LIVE SIGNAL label (y = CONTENT_Y + 32) ──
-    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(TL, CONTENT_Y + 32);
     kprint(spr, "LIVE SIGNAL");
@@ -7682,13 +7682,13 @@ void draw_signal_screen() {
         int bar_x = TL;
         int bar_y = CONTENT_Y + 44;
         int bar_w = DISP_W - TL * 2;
-        spr.fillRoundRect(bar_x, bar_y, bar_w, 4, 2, ea(CARD_COLOR));
+        spr.fillRoundRect(bar_x, bar_y, bar_w, 4, 2, CARD_COLOR);
         if (has_rssi) {
             float pct = (float)(target_rssi + 70) / 40.0f;
             if (pct < 0.0f) pct = 0.0f;
             if (pct > 1.0f) pct = 1.0f;
             int fill_w = (int)(pct * (float)bar_w);
-            if (fill_w > 0) spr.fillRoundRect(bar_x, bar_y, fill_w, 4, 2, ea(HEADER_COLOR));
+            if (fill_w > 0) spr.fillRoundRect(bar_x, bar_y, fill_w, 4, 2, HEADER_COLOR);
         }
     }
 
