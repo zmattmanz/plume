@@ -7638,13 +7638,13 @@ void draw_signal_screen() {
         spr.print(sp);
     }
 
-    // ── Row 1: TARGET label (y = CONTENT_Y + 4) ──
+    // ── TARGET label ──
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(TL, CONTENT_Y + 4);
     kprint(spr, "TARGET");
 
-    // ── Row 2: Target name + ID (y = CONTENT_Y + 16) ──
+    // ── Target name (hero) ──
     {
         char disp[33];
         if (!active) {
@@ -7677,61 +7677,70 @@ void draw_signal_screen() {
         }
     }
 
-    // ── Divider 1 (y = CONTENT_Y + 28) ──
+    // ── Divider ──
     spr.drawFastHLine(TL, CONTENT_Y + 28, TR - TL, CARD_BORDER);
 
-    // ── Row 3: LIVE SIGNAL label + inline dBm value (y = CONTENT_Y + 34) ──
+    // ── No-target early exit: centered hint below divider ──
+    if (!active) {
+        const char* hint = "open feed [f] and press [t] to target";
+        int hint_w = (int)strlen(hint) * (ts_char_w(TS_MICRO) + 1);
+        int hint_x = max(TL, (DISP_W - hint_w) / 2);
+        int hint_y = CONTENT_Y + 28 + (DISP_H - CONTENT_Y - 28) / 2 - 3;
+        spr.setTextSize(TS_MICRO);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(hint_x, hint_y);
+        spr.print(hint);
+        return;
+    }
+
+    // ── LIVE SIGNAL label (y = CONTENT_Y + 34) ──
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(TL, CONTENT_Y + 34);
+    kprint(spr, "LIVE SIGNAL");
+
+    // ── dBm value + bar on same line (y = CONTENT_Y + 46) ──
     {
-        const char* live_label = "LIVE SIGNAL";
-        kprint(spr, live_label);
         char rssi_buf[12];
         const char* rv = has_rssi ? rssi_buf : "--";
         if (has_rssi) snprintf(rssi_buf, sizeof(rssi_buf), "%ddBm", target_rssi);
-        int lbl_w = (int)strlen(live_label) * (ts_char_w(TS_MICRO) + 1);
         spr.setTextColor(has_rssi ? TEXT_COLOR : DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_BODY);
-        spr.setCursor(TL + lbl_w + 8, CONTENT_Y + 32);
+        spr.setCursor(TL, CONTENT_Y + 46);
         spr.print(rv);
-    }
-
-    // ── Row 4: Signal bar (y = CONTENT_Y + 42, h = 4) ──
-    {
-        int bx = TL, by = CONTENT_Y + 42, bw = TR - TL;
-        spr.fillRoundRect(bx, by, bw, 4, 2, CARD_COLOR);
+        int val_w  = (int)strlen(rv) * ts_char_w(TS_BODY);
+        int bar_x  = TL + val_w + 8;
+        int bar_w  = DISP_W - TL - bar_x;
+        int bar_y  = CONTENT_Y + 49;
+        spr.fillRoundRect(bar_x, bar_y, bar_w, 4, 2, CARD_COLOR);
         if (has_rssi) {
             int pct = (target_rssi + 90) * 100 / 60;
             if (pct < 0) pct = 0;
             if (pct > 100) pct = 100;
-            int fw = bw * pct / 100;
-            if (fw > 0) spr.fillRoundRect(bx, by, fw, 4, 2, HEADER_COLOR);
+            int fw = bar_w * pct / 100;
+            if (fw > 0) spr.fillRoundRect(bar_x, bar_y, fw, 4, 2, HEADER_COLOR);
         }
     }
 
-    // ── Row 5: Peak signal notification (y = CONTENT_Y + 52) ──
+    // ── Peak text (y = CONTENT_Y + 56) ──
     {
-        int py = CONTENT_Y + 52;
+        int py = CONTENT_Y + 56;
         spr.setTextSize(TS_MICRO);
         if (peak_rssi > -120) {
-            char pbuf[12];
-            snprintf(pbuf, sizeof(pbuf), "%ddBm", peak_rssi);
+            char pbuf[16];
+            snprintf(pbuf, sizeof(pbuf), "Peak %ddBm", peak_rssi);
             spr.setTextColor(CAUTION_COLOR, BG_COLOR);
             spr.setCursor(TL, py);
-            spr.print("Peak");
-            int cx_now = TL + 4 * ts_char_w(TS_MICRO) + 2;
-            spr.setCursor(cx_now, py);
             spr.print(pbuf);
-            cx_now += (int)strlen(pbuf) * ts_char_w(TS_MICRO) + 4;
+            int cx_now = TL + (int)strlen(pbuf) * ts_char_w(TS_MICRO) + 4;
             if (gps_loc_valid && peak_has_gps) {
                 float dm  = (float)haversine_m(cur_lat, cur_lng, peak_lat, peak_lng);
                 float df  = dm * 3.28084f;
                 const char* dir = bearing_to_compass(
                     bearing_to(cur_lat, cur_lng, peak_lat, peak_lng));
                 char dbuf[24];
-                if (df < 5280.0f) snprintf(dbuf, sizeof(dbuf), "%.0fft %s", df, dir);
-                else              snprintf(dbuf, sizeof(dbuf), "%.1fmi %s", df/5280.0f, dir);
+                if (df < 5280.0f) snprintf(dbuf, sizeof(dbuf), "%.0fft %s from you", df, dir);
+                else              snprintf(dbuf, sizeof(dbuf), "%.1fmi %s from you", df/5280.0f, dir);
                 spr.setTextColor(DIM_COLOR, BG_COLOR);
                 spr.setCursor(cx_now, py);
                 spr.print(dbuf);
@@ -7747,37 +7756,16 @@ void draw_signal_screen() {
         }
     }
 
-    // ── Divider 2 (y = CONTENT_Y + 62) ──
-    spr.drawFastHLine(TL, CONTENT_Y + 62, TR - TL, CARD_BORDER);
+    // ── Divider 2 (y = CONTENT_Y + 64) ──
+    spr.drawFastHLine(TL, CONTENT_Y + 64, TR - TL, CARD_BORDER);
 
-    // ── Signal over time trace ──
-    spr.setTextColor(HEADER_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(TL, CONTENT_Y + 68);
-    kprint(spr, "SIGNAL OVER TIME");
-
-    const int plot_left   = TL + 18;
-    const int plot_right  = DISP_W - 2;
-    const int plot_top    = CONTENT_Y + 76;
+    // ── Trace area — full width, full remaining height ──
+    const int plot_left   = TL;
+    const int plot_right  = DISP_W - TL;
+    const int plot_top    = CONTENT_Y + 68;
     const int plot_bottom = DISP_H - 2;
     const int plot_w      = plot_right - plot_left;
     const int plot_h      = plot_bottom - plot_top;
-
-    // Y-axis labels left of plot (-30, -60, -90)
-    {
-        uint16_t lc = lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
-        spr.setTextColor(lc, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        const int dbs[] = {-30, -60, -90};
-        for (int i = 0; i < 3; i++) {
-            int db = dbs[i];
-            float n = (float)(db + 90) / 60.0f;
-            int gy  = plot_bottom - (int)(n * (float)plot_h);
-            char lbl[5]; snprintf(lbl, sizeof(lbl), "%d", db);
-            spr.setCursor(TL, gy - 3);
-            spr.print(lbl);
-        }
-    }
 
     spr.setClipRect(plot_left, plot_top, plot_w, plot_h);
 
@@ -7787,18 +7775,8 @@ void draw_signal_screen() {
         for (int i = 0; i < trace_count; i++) {
             int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
             int rv   = (int)trace_snap[slot].rssi;
-            // Use smoothed value for curve; raw value for peak marker
             trace_vals[i] = loc_trace_smooth[i];
             if (rv > trace_max_rssi) { trace_max_rssi = rv; trace_max_idx = i; }
-        }
-
-        // Faint grid lines
-        uint16_t gc = lerp_col16(BG_COLOR, CARD_BORDER, 0.4f);
-        for (int db = -30; db >= -90; db -= 30) {
-            float n = (float)(db + 90) / 60.0f;
-            int gy  = plot_bottom - (int)(n * (float)plot_h);
-            if (gy >= plot_top && gy <= plot_bottom)
-                spr.drawFastHLine(plot_left, gy, plot_w, gc);
         }
 
         // Catmull-Rom spline evaluator
@@ -7823,21 +7801,21 @@ void draw_signal_screen() {
             curve_cache[px] = eval_cr(idx_f);
         }
 
-        // Fill under curve (run-length encoded gradient, 20% max alpha)
+        // Fill under curve (run-length encoded gradient, 8% max alpha)
         for (int px = 0; px <= plot_w; px++) {
             float val = curve_cache[px];
             int   cy  = plot_bottom - (int)(val * (float)plot_h);
             int   sx  = plot_left + px;
             for (int fy = cy + 1; fy < plot_bottom; ) {
                 float ft  = (float)(fy - cy) / (float)(plot_bottom - cy);
-                float a   = (1.0f - ft*ft) * 0.20f;
-                if (a < 0.02f) break;
+                float a   = (1.0f - ft*ft) * 0.08f;
+                if (a < 0.01f) break;
                 uint16_t col = lerp_col16(BG_COLOR, HEADER_COLOR, a);
                 int re = fy + 1;
                 while (re < plot_bottom) {
                     float ft2 = (float)(re - cy) / (float)(plot_bottom - cy);
-                    float a2  = (1.0f - ft2*ft2) * 0.20f;
-                    if (a2 < 0.02f || lerp_col16(BG_COLOR, HEADER_COLOR, a2) != col) break;
+                    float a2  = (1.0f - ft2*ft2) * 0.08f;
+                    if (a2 < 0.01f || lerp_col16(BG_COLOR, HEADER_COLOR, a2) != col) break;
                     re++;
                 }
                 spr.fillRect(sx, fy, 1, re - fy, col);
@@ -7859,15 +7837,15 @@ void draw_signal_screen() {
         if (trace_max_idx >= 0 && trace_max_rssi >= peak_rssi - 2) {
             int ppx = (int)((float)trace_max_idx / (float)(trace_count-1) * (float)plot_w);
             float pv = trace_vals[trace_max_idx];
-            int   py = plot_bottom - (int)(pv * (float)plot_h);
-            int   sx = plot_left + ppx;
+            int   pdy = plot_bottom - (int)(pv * (float)plot_h);
+            int   sx  = plot_left + ppx;
             uint16_t dash_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.3f);
-            for (int dy = py + 4; dy < plot_bottom; dy += 6) {
+            for (int dy = pdy + 4; dy < plot_bottom; dy += 6) {
                 int seg = (dy + 3 < plot_bottom) ? 3 : (plot_bottom - dy);
                 spr.drawFastVLine(sx, dy, seg, dash_col);
             }
-            spr.fillTriangle(sx, py-4, sx+3, py, sx-3, py, CAUTION_COLOR);
-            spr.fillTriangle(sx, py+4, sx+3, py, sx-3, py, CAUTION_COLOR);
+            spr.fillTriangle(sx, pdy-4, sx+3, pdy, sx-3, pdy, CAUTION_COLOR);
+            spr.fillTriangle(sx, pdy+4, sx+3, pdy, sx-3, pdy, CAUTION_COLOR);
         }
 
         // Current-position dot (rightmost sample)
@@ -7880,24 +7858,13 @@ void draw_signal_screen() {
     } else {
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
-        const char* msg = active ? "awaiting signal..." : "press t to select target";
+        const char* msg = "awaiting signal...";
         int mw = (int)strlen(msg) * ts_char_w(TS_MICRO);
         spr.setCursor((DISP_W - mw) / 2, plot_top + plot_h / 2 - 3);
         spr.print(msg);
     }
 
     spr.clearClipRect();
-
-    // X-axis time labels (inside plot at bottom edge)
-    {
-        uint16_t xc = lerp_col16(BG_COLOR, DIM_COLOR, 0.4f);
-        spr.setTextColor(xc, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        int lby = plot_bottom - 7;
-        spr.setCursor(plot_left + 1,                                lby); spr.print("-2m");
-        spr.setCursor(plot_left + plot_w/2 - ts_char_w(TS_MICRO),  lby); spr.print("-1m");
-        spr.setCursor(plot_right - 3*ts_char_w(TS_MICRO) - 1,      lby); spr.print("now");
-    }
 }
 
 void draw_gps_screen() {
