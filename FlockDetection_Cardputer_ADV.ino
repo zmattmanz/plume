@@ -7620,23 +7620,27 @@ void draw_signal_screen() {
     unsigned long newest_ms;
     int   target_rssi = 0;
     bool  has_rssi    = false;
+    int   tracker_sample_count = 0;
+    int   tracker_samples[RSSI_TRACK_SAMPLES];
     static LocTraceEntry trace_snap[LOC_TRACE_SIZE];
     int trace_head, trace_count;
 
     if (!take_data_mutex()) return;
-    active        = locator_active;
+    active       = locator_active;
     safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
     safe_copy(target_name, locator_target_name, sizeof(target_name));
     safe_copy(target_type, locator_target_type, sizeof(target_type));
-    target_id     = locator_target_id;
-    peak_rssi     = locator_peak_rssi;
-    tracker_idx   = locator_tracker_idx;
-    newest_ms     = locator_newest_sample_ms;
+    target_id    = locator_target_id;
+    peak_rssi    = locator_peak_rssi;
+    tracker_idx  = locator_tracker_idx;
+    newest_ms    = locator_newest_sample_ms;
     if (tracker_idx >= 0 && tracker_idx < rssi_tracker_count
         && rssi_tracker[tracker_idx].sample_count > 0
         && strncmp(rssi_tracker[tracker_idx].mac, target_mac, 17) == 0) {
-        target_rssi = rssi_tracker[tracker_idx].samples[
-                          rssi_tracker[tracker_idx].sample_count - 1];
+        int sc = rssi_tracker[tracker_idx].sample_count;
+        target_rssi = rssi_tracker[tracker_idx].samples[sc - 1];
+        tracker_sample_count = sc;
+        memcpy(tracker_samples, rssi_tracker[tracker_idx].samples, sc * sizeof(int));
         has_rssi = (frame_ms - newest_ms < 15000);
     }
     memcpy(trace_snap, loc_trace, sizeof(loc_trace));
@@ -7644,28 +7648,40 @@ void draw_signal_screen() {
     trace_count = loc_trace_count;
     give_data_mutex();
 
-    // ── Smooth trace values for fluid curve motion ──
-    {
-        float dt = (loc_trace_last_frame_ms == 0) ? 16.0f
-                 : (float)(frame_ms - loc_trace_last_frame_ms);
-        if (dt > 100.0f) dt = 100.0f;
-        loc_trace_last_frame_ms = frame_ms;
+    // ── Per-frame dt — computed once, shared by all smoothers ──
+    float frame_dt = (loc_trace_last_frame_ms == 0) ? 16.0f
+                   : (float)(frame_ms - loc_trace_last_frame_ms);
+    if (frame_dt > 100.0f) frame_dt = 100.0f;
+    loc_trace_last_frame_ms = frame_ms;
 
-        for (int i = 0; i < trace_count; i++) {
-            int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
-            float raw = (float)((int)trace_snap[slot].rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
-            if (raw < 0.0f) raw = 0.0f;
-            if (raw > 1.0f) raw = 1.0f;
-            loc_trace_smooth[i] = anim_filter(loc_trace_smooth[i], raw, 300.0f, dt);
-        }
+    // ── Smooth trace values for fluid curve motion ──
+    for (int i = 0; i < trace_count; i++) {
+        int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
+        float raw = (float)((int)trace_snap[slot].rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
+        if (raw < 0.0f) raw = 0.0f;
+        if (raw > 1.0f) raw = 1.0f;
+        loc_trace_smooth[i] = anim_filter(loc_trace_smooth[i], raw, 300.0f, frame_dt);
+    }
+
+    // ── Trend: slope over tracker sample window ──
+    int trend = 0;
+    if (has_rssi && tracker_sample_count >= 3) {
+        int diff = tracker_samples[tracker_sample_count - 1] - tracker_samples[0];
+        if (diff > 3)       trend =  1;
+        else if (diff < -3) trend = -1;
     }
 
     spr.fillSprite(BG_COLOR);
     draw_header_spr(1);
 
-    const int TL = TEXT_LEFT;  // 4
+    const int TL = TEXT_LEFT;
 
-    // ── Status badge (right-aligned, matches GPS screen style) ──
+    // ── Row 1: TARGET label (left) + status badge (right) ──
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(TL, CONTENT_Y + UI_PAD_SM);
+    kprint(spr, "TARGET");
+
     {
         bool is_flock = (strncmp(target_type, "FLOCK", 5) == 0
                       || strncmp(target_type, "RAVEN", 5) == 0);
@@ -7677,7 +7693,7 @@ void draw_signal_screen() {
         int bw = (int)strlen(badge_text) * (ts_char_w(TS_MICRO) + 1) + 12;
         int bh = 16;
         int bx = DISP_W - TL - bw;
-        int by = CONTENT_Y;
+        int by = CONTENT_Y + UI_PAD_XS;
         uint16_t sfill = lerp_col16(BG_COLOR, badge_col, 0.22f);
         spr.fillRoundRect(bx, by, bw, bh, 5, sfill);
         spr.drawRoundRect(bx, by, bw, bh, 5, badge_col);
@@ -7687,16 +7703,11 @@ void draw_signal_screen() {
         kprint(spr, badge_text);
     }
 
-    // ── TARGET label (left, shares row with badge) ──
-    spr.setTextColor(HEADER_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(TL, CONTENT_Y + 4);
-    kprint(spr, "TARGET");
-
-    // ── Target name (TS_BODY, below badge) ──
+    // ── Row 2: Target name ──
+    int name_y = CONTENT_Y + UI_PAD_XS + 16 + UI_PAD_XS;  // 2px below badge bottom
     {
         spr.setTextSize(TS_BODY);
-        spr.setCursor(TL, CONTENT_Y + 18);
+        spr.setCursor(TL, name_y);
         if (!active) {
             spr.setTextColor(DIM_COLOR, BG_COLOR);
             spr.print("No Target");
@@ -7704,16 +7715,16 @@ void draw_signal_screen() {
             bool nok = target_name[0] != '\0'
                        && strcmp(target_name, "Hidden")  != 0
                        && strcmp(target_name, "Unknown") != 0;
-            const char* raw = nok ? target_name
-                            : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
+            const char* raw_name = nok ? target_name
+                                 : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
             char id_buf[10] = "";
             if (target_id > 0)
                 snprintf(id_buf, sizeof(id_buf), " (#%03d)", target_id);
-            int id_w       = (int)strlen(id_buf) * ts_char_w(TS_BODY);
-            int avail_w    = DISP_W - TL * 2 - id_w;
-            int max_chars  = avail_w / ts_char_w(TS_BODY);
+            int id_w      = (int)strlen(id_buf) * ts_char_w(TS_BODY);
+            int avail_w   = DISP_W - TL * 2 - id_w;
+            int max_chars = avail_w / ts_char_w(TS_BODY);
             char disp[65];
-            strncpy(disp, raw, max_chars);
+            strncpy(disp, raw_name, max_chars);
             disp[max_chars] = '\0';
             spr.setTextColor(TEXT_COLOR, BG_COLOR);
             spr.print(disp);
@@ -7724,57 +7735,89 @@ void draw_signal_screen() {
         }
     }
 
-    // ── No-target early exit: centered hint ──
+    // ── No-target early exit ──
     if (!active) {
         const char* hint = "open feed [f] and press [t] to target";
         int hint_w = (int)strlen(hint) * (ts_char_w(TS_MICRO) + 1);
         int hint_x = (DISP_W - hint_w) / 2;
-        int hint_y = CONTENT_Y + 18 + (DISP_H - CONTENT_Y - 18) / 2;
+        int hint_y = name_y + 10 + (DISP_H - name_y - 10) / 2;
         spr.setTextSize(TS_MICRO);
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setCursor(hint_x, hint_y);
-        spr.print(hint);
+        kprint(spr, hint);
         return;
     }
 
-    // ── LIVE SIGNAL label (y = CONTENT_Y + 40) ──
+    // ── Row 3: LIVE SIGNAL label ──
+    int live_y = name_y + 10 + UI_PAD_MD;
     spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(TL, CONTENT_Y + 40);
+    spr.setCursor(TL, live_y);
     kprint(spr, "LIVE SIGNAL");
 
-    // ── Signal bar — full width, 6px tall, smoothed + glow (y = CONTENT_Y + 50) ──
+    // ── Row 4: dBm hero + trend indicator ──
+    int hero_y = live_y + 10 + UI_PAD_XS;
+    {
+        spr.setTextSize(TS_STRONG);
+        if (has_rssi) {
+            char num_buf[6];
+            snprintf(num_buf, sizeof(num_buf), "%d", target_rssi);
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(TL, hero_y);
+            spr.print(num_buf);
+            int num_w = (int)strlen(num_buf) * ts_char_w(TS_STRONG);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(TL + num_w + UI_PAD_XS, hero_y + 3);
+            spr.print("dBm");
+        } else {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setCursor(TL, hero_y);
+            spr.print("--");
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(TL + 2 * ts_char_w(TS_STRONG) + UI_PAD_XS, hero_y + 3);
+            spr.print("dBm");
+        }
+    }
+
+    if (has_rssi && trend != 0) {
+        const char* trend_text = (trend > 0) ? "CLOSER" : "FARTHER";
+        uint16_t    trend_col  = (trend > 0) ? HEADER_COLOR : CAUTION_COLOR;
+        int tri_x  = TL + 80;
+        int tri_cy = hero_y + 6;
+        if (trend > 0) {
+            spr.fillTriangle(tri_x, tri_cy + 3, tri_x + 6, tri_cy + 3, tri_x + 3, tri_cy - 3, trend_col);
+        } else {
+            spr.fillTriangle(tri_x, tri_cy - 3, tri_x + 6, tri_cy - 3, tri_x + 3, tri_cy + 3, trend_col);
+        }
+        spr.setTextColor(trend_col, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(tri_x + 10, hero_y + 2);
+        kprint(spr, trend_text);
+    }
+
+    // ── Row 5: Signal bar with micro-jitter ──
+    int bar_y = hero_y + 14 + UI_PAD_SM;
     {
         int bar_x = TL;
-        int bar_y = CONTENT_Y + 50;
         int bar_w = DISP_W - TL * 2;
         int bar_h = 6;
         int bar_r = 3;
+
+        spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, CARD_COLOR);
 
         if (has_rssi) {
             float raw_pct = (float)(target_rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
             if (raw_pct < 0.0f) raw_pct = 0.0f;
             if (raw_pct > 1.0f) raw_pct = 1.0f;
-            float dt = (loc_trace_last_frame_ms == 0) ? 16.0f
-                     : (float)(frame_ms - loc_trace_last_frame_ms);
-            if (dt > 100.0f) dt = 100.0f;
             signal_bar_smooth = anim_filter_seed(signal_bar_smooth, raw_pct,
-                                                 120.0f, dt, &signal_bar_seeded);
-
-            // Glow halo behind bar
-            if (signal_bar_smooth > 0.05f) {
-                float pulse = anim_pulse(UI_PULSE_MEDIUM);
-                float glow_alpha = 0.08f + pulse * 0.07f;
-                int glow_fill_w = (int)(signal_bar_smooth * (float)bar_w);
-                int glow_w = glow_fill_w + 8;
-                if (glow_w > bar_w) glow_w = bar_w;
-                spr.fillRoundRect(bar_x, bar_y - 1, glow_w, bar_h + 2, bar_r + 1,
-                                  lerp_col16(BG_COLOR, HEADER_COLOR, glow_alpha));
-            }
-
-            spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, CARD_COLOR);
-
-            int fill_w = (int)(signal_bar_smooth * (float)bar_w);
+                                                 120.0f, frame_dt, &signal_bar_seeded);
+            float jitter = sinf((float)frame_ms * 0.007f) * 0.008f
+                         + sinf((float)frame_ms * 0.013f) * 0.005f;
+            float display_pct = signal_bar_smooth + jitter;
+            if (display_pct < 0.005f) display_pct = 0.005f;
+            if (display_pct > 1.0f)   display_pct = 1.0f;
+            int fill_w = (int)(display_pct * (float)bar_w);
             if (fill_w > 0) {
                 int fr = fill_w / 2 < bar_r ? fill_w / 2 : bar_r;
                 spr.fillRoundRect(bar_x, bar_y, fill_w, bar_h, fr, HEADER_COLOR);
@@ -7782,19 +7825,18 @@ void draw_signal_screen() {
         } else {
             signal_bar_smooth = 0.0f;
             signal_bar_seeded = false;
-            spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, CARD_COLOR);
         }
     }
 
-    // ── Trace area (y = CONTENT_Y + 60 to DISP_H - 2) ──
-    const int plot_left   = TL;
-    const int plot_right  = DISP_W - TL;
-    const int plot_top    = CONTENT_Y + 60;
-    const int plot_bottom = DISP_H - 2;
-    const int plot_w      = plot_right - plot_left;
-    const int plot_h      = plot_bottom - plot_top;
+    // ── Row 6: Trace area ──
+    int trace_top    = bar_y + 6 + UI_PAD_XS + 2;
+    int trace_bottom = DISP_H - 2;
+    int trace_left   = TL;
+    int trace_right  = DISP_W - TL;
+    int trace_w      = trace_right - trace_left;
+    int trace_h      = trace_bottom - trace_top;
 
-    spr.setClipRect(plot_left, plot_top, plot_w, plot_h);
+    spr.setClipRect(trace_left, trace_top, trace_w, trace_h);
 
     if (trace_count >= 2) {
         static float trace_vals[LOC_TRACE_SIZE];
@@ -7823,25 +7865,25 @@ void draw_signal_screen() {
         };
 
         static float curve_cache[241];
-        for (int px = 0; px <= plot_w && px < 241; px++) {
-            float idx_f = (float)px / (float)plot_w * (float)(trace_count - 1);
+        for (int px = 0; px <= trace_w && px < 241; px++) {
+            float idx_f = (float)px / (float)trace_w * (float)(trace_count - 1);
             curve_cache[px] = eval_cr(idx_f);
         }
 
-        // Fill under curve (run-length encoded gradient, 8% max alpha)
-        for (int px = 0; px <= plot_w; px++) {
+        // Fill under curve (6% max alpha — trace is context, not primary)
+        for (int px = 0; px <= trace_w; px++) {
             float val = curve_cache[px];
-            int   cy  = plot_bottom - (int)(val * (float)plot_h);
-            int   sx  = plot_left + px;
-            for (int fy = cy + 1; fy < plot_bottom; ) {
-                float ft  = (float)(fy - cy) / (float)(plot_bottom - cy);
-                float a   = (1.0f - ft*ft) * 0.08f;
+            int   cy  = trace_bottom - (int)(val * (float)trace_h);
+            int   sx  = trace_left + px;
+            for (int fy = cy + 1; fy < trace_bottom; ) {
+                float ft  = (float)(fy - cy) / (float)(trace_bottom - cy);
+                float a   = (1.0f - ft*ft) * 0.06f;
                 if (a < 0.01f) break;
                 uint16_t col = lerp_col16(BG_COLOR, HEADER_COLOR, a);
                 int re = fy + 1;
-                while (re < plot_bottom) {
-                    float ft2 = (float)(re - cy) / (float)(plot_bottom - cy);
-                    float a2  = (1.0f - ft2*ft2) * 0.08f;
+                while (re < trace_bottom) {
+                    float ft2 = (float)(re - cy) / (float)(trace_bottom - cy);
+                    float a2  = (1.0f - ft2*ft2) * 0.06f;
                     if (a2 < 0.01f || lerp_col16(BG_COLOR, HEADER_COLOR, a2) != col) break;
                     re++;
                 }
@@ -7850,45 +7892,60 @@ void draw_signal_screen() {
             }
         }
 
-        // Curve — 2px thick
-        uint16_t curve_dim = lerp_col16(BG_COLOR, HEADER_COLOR, 0.5f);
-        for (int px = 1; px <= plot_w; px++) {
+        // Curve — 50% opacity stroke
+        uint16_t curve_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
+        uint16_t curve_dim = lerp_col16(BG_COLOR, HEADER_COLOR, 0.30f);
+        for (int px = 1; px <= trace_w; px++) {
             float v0 = curve_cache[px-1], v1 = curve_cache[px];
-            int y0 = plot_bottom - (int)(v0 * (float)plot_h);
-            int y1 = plot_bottom - (int)(v1 * (float)plot_h);
-            spr.drawLine(plot_left+px-1, y0,   plot_left+px, y1,   HEADER_COLOR);
-            spr.drawLine(plot_left+px-1, y0-1, plot_left+px, y1-1, curve_dim);
+            int y0 = trace_bottom - (int)(v0 * (float)trace_h);
+            int y1 = trace_bottom - (int)(v1 * (float)trace_h);
+            spr.drawLine(trace_left+px-1, y0,   trace_left+px, y1,   curve_col);
+            spr.drawLine(trace_left+px-1, y0-1, trace_left+px, y1-1, curve_dim);
         }
 
-        // Peak diamond (only when peak falls within the current trace window)
+        // Peak diamond
         if (trace_max_idx >= 0 && trace_max_rssi >= peak_rssi - 2) {
-            int ppx = (int)((float)trace_max_idx / (float)(trace_count-1) * (float)plot_w);
+            int ppx = (int)((float)trace_max_idx / (float)(trace_count-1) * (float)trace_w);
             float pv = trace_vals[trace_max_idx];
-            int   pdy = plot_bottom - (int)(pv * (float)plot_h);
-            int   sx  = plot_left + ppx;
+            int   pdy = trace_bottom - (int)(pv * (float)trace_h);
+            int   sx  = trace_left + ppx;
             uint16_t dash_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.3f);
-            for (int dy = pdy + 4; dy < plot_bottom; dy += 6) {
-                int seg = (dy + 3 < plot_bottom) ? 3 : (plot_bottom - dy);
+            for (int dy = pdy + 4; dy < trace_bottom; dy += 6) {
+                int seg = (dy + 3 < trace_bottom) ? 3 : (trace_bottom - dy);
                 spr.drawFastVLine(sx, dy, seg, dash_col);
             }
             spr.fillTriangle(sx, pdy-4, sx+3, pdy, sx-3, pdy, CAUTION_COLOR);
             spr.fillTriangle(sx, pdy+4, sx+3, pdy, sx-3, pdy, CAUTION_COLOR);
         }
 
-        // Current-position dot (rightmost sample)
+        // Current-position dot
         {
-            float vc = curve_cache[plot_w < 240 ? plot_w : 240];
-            int   yc = plot_bottom - (int)(vc * (float)plot_h);
-            spr.drawCircle(plot_right, yc, 4, lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f));
-            spr.fillCircle(plot_right, yc, 2, HEADER_COLOR);
+            float vc = curve_cache[trace_w < 240 ? trace_w : 240];
+            int   yc = trace_bottom - (int)(vc * (float)trace_h);
+            spr.drawCircle(trace_right, yc, 4, lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f));
+            spr.fillCircle(trace_right, yc, 2, HEADER_COLOR);
         }
+
+    } else if (trace_count == 1) {
+        // Single dot before the curve can form
+        float n = loc_trace_smooth[0];
+        int dot_y = trace_bottom - (int)(n * (float)trace_h);
+        if (dot_y < trace_top)    dot_y = trace_top;
+        if (dot_y > trace_bottom) dot_y = trace_bottom;
+        spr.drawCircle(trace_right, dot_y, 4, lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f));
+        spr.fillCircle(trace_right, dot_y, 2, HEADER_COLOR);
+
     } else {
+        // No samples — animated scanning indicator
+        char dots[4];
+        anim_ellipsis(dots, sizeof(dots));
+        char scanning[16];
+        snprintf(scanning, sizeof(scanning), "scanning%s", dots);
+        int msg_w = (int)strlen(scanning) * (ts_char_w(TS_MICRO) + 1);
         spr.setTextColor(DIM_COLOR, BG_COLOR);
         spr.setTextSize(TS_MICRO);
-        const char* msg = "awaiting signal...";
-        int mw = (int)strlen(msg) * ts_char_w(TS_MICRO);
-        spr.setCursor((DISP_W - mw) / 2, plot_top + plot_h / 2 - 3);
-        spr.print(msg);
+        spr.setCursor((DISP_W - msg_w) / 2, trace_top + trace_h / 2 - 4);
+        kprint(spr, scanning);
     }
 
     spr.clearClipRect();
