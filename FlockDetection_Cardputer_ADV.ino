@@ -2521,6 +2521,28 @@ void load_sd_history() {
     for (int i = 0; i < parsed_count; i++) {
         sd_hist[i] = parsed[parsed_count - 1 - i];
     }
+
+    // Deduplicate by MAC — keep newest (lowest index) per device.
+    // Re-detections after the seen_mac window expires append new CSV lines
+    // for the same device; collapse those to one entry here.
+    {
+        int write = 0;
+        for (int i = 0; i < sd_hist_count; i++) {
+            bool dup = false;
+            for (int j = 0; j < write; j++) {
+                if (strncmp(sd_hist[i].mac, sd_hist[j].mac, 17) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                if (write != i) sd_hist[write] = sd_hist[i];
+                write++;
+            }
+        }
+        sd_hist_count = write;
+    }
+
     xSemaphoreGiveRecursive(dataMutex);
 }
 
@@ -3545,6 +3567,17 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         // need to re-scan the SD log file. We already hold dataMutex.
         // Without this, every new MAC would trigger a full FlockLog.csv
         // re-read in loop() — which is megabytes after a day of use.
+
+        // Remove any existing entry with the same MAC before inserting.
+        // Keeps one entry per device when re-detected after the seen_mac window.
+        for (int i = 0; i < sd_hist_count; i++) {
+            if (strncmp(sd_hist[i].mac, mac, 17) == 0) {
+                for (int j = i; j < sd_hist_count - 1; j++) sd_hist[j] = sd_hist[j + 1];
+                sd_hist_count--;
+                break;
+            }
+        }
+
         int new_count = (sd_hist_count < SD_HIST_SIZE) ? sd_hist_count + 1 : SD_HIST_SIZE;
         for (int i = new_count - 1; i > 0; i--) sd_hist[i] = sd_hist[i - 1];
         safe_copy(sd_hist[0].type,   type,             sizeof(sd_hist[0].type));
