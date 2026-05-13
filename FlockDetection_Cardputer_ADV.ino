@@ -2437,7 +2437,8 @@ void load_sd_history() {
         copy_f(10, e.method, 24);
         e.rssi       = atoi(line + fs[6]);
         e.confidence = atoi(line + fs[11]);
-        e.id         = 0;
+        // DetID is column 20 — only present in newer log files
+        e.id = (fc >= 20) ? atoi(line + fs[20]) : 0;
         {
             unsigned long uptime = (unsigned long)strtoul(line + fs[0], NULL, 10);
             format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
@@ -2678,7 +2679,7 @@ static void sd_check_hotplug() {
             if (!SD.exists(current_log_file)) {
                 File f = SD.open(current_log_file, FILE_WRITE);
                 if (f) {
-                    f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM");
+                    f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM,DetID");
                     f.close();
                 }
             }
@@ -3472,6 +3473,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
     // Brief window 2: is_new check, counters, history, LED
     bool is_new = false;
+    int assigned_det_id = 0;
     uint16_t blip_col = ACCENT_COLOR;
     if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         Serial.println("[MUTEX] log_detection: main window timeout — skipping counters");
@@ -3522,6 +3524,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         // pushed at index 0. Counter is persisted in PERSIST_FILE.
         sd_hist[0].id         = (int)next_detection_id;
         capture_history[0].id = (int)next_detection_id;
+        assigned_det_id       = (int)next_detection_id;
         next_detection_id++;
         if (next_detection_id > 999999) {
             next_detection_id = 1;
@@ -3628,10 +3631,10 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
         char local_line[SD_LINE_LEN];
         snprintf(local_line, SD_LINE_LEN,
-            "%lu,%u,%d,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s",
+            "%lu,%u,%d,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s,%d",
             now_ms, ts_epoch, ts_is_gps ? 1 : 0, channel, type, proto, rssi, mac, clean_name,
             tx_power, detection_method, confidence,
-            confidence_label(confidence), clean_extra, seq_num, gps_fields);
+            confidence_label(confidence), clean_extra, seq_num, gps_fields, assigned_det_id);
 
         // Brief window 3: commit line to sd_write_buffer
         if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
@@ -9183,7 +9186,7 @@ void setup() {
 
         if (!SD.exists(current_log_file)) {
             File file = SD.open(current_log_file, FILE_WRITE);
-            if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
+            if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM,DetID"); file.close(); }
         }
         {
             bool need_pcap_header = !SD.exists(current_pcap_file);
