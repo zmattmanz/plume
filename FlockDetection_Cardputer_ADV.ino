@@ -7077,19 +7077,12 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 // EXPANDED FEED OVERLAY — fullscreen activity feed view
 // ============================================================================
 void draw_feed_expanded_overlay() {
-    // Snapshot feed under mutex. Static to avoid stack pressure — rendering
-    // is single-threaded from loop().
-    static FeedEntry local_feed[FEED_SIZE];
-    int local_count, local_head;
-    unsigned long local_now;
-    if (!take_data_mutex()) return;
-    local_count = feed_count;
-    local_head = feed_head;
-    // feed_entries is a ring keyed by feed_head; copy the whole array
-    // so the renderer's modular index reaches the actual newest entry.
-    for (int i = 0; i < FEED_SIZE; i++) local_feed[i] = feed_entries[i];
-    local_now = millis();
-    give_data_mutex();
+    // Read directly from the scanner's frozen snapshot — scan_local_feed is not
+    // updated while show_feed_expanded is true, so it matches exactly what the
+    // 't' key targeting code reads. No mutex needed; no per-frame copy.
+    int local_count = scan_local_count;
+    int local_head  = scan_local_head;
+    unsigned long local_now = millis();
 
     // Slide-in animation state — tracks new entries arriving while overlay is open
     static int           expand_prev_head   = -1;
@@ -7195,7 +7188,7 @@ void draw_feed_expanded_overlay() {
         int rendered = 0;
         for (int i = 0; i < local_count && rendered < max_rows; i++) {
             int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-            FeedEntry& e = local_feed[idx];
+            FeedEntry& e = scan_local_feed[idx];
             int row_y = row_top_adj + rendered * row_h - expand_slide_offset;
 
             bool is_sel = (rendered == feed_expanded_selected);
@@ -8567,7 +8560,7 @@ void transition_screen(int new_screen, int dir) {
             for (int ci = 0; ci < STAT_MAX_CHARS; ci++)
                 stats_char_anim[i][ci] = 0;
     }
-    if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
+    if (show_feed_expanded && new_screen != 0 && new_screen != 1) show_feed_expanded = false;
 
     // ── Swipe animation ──────────────────────────────────────────────
     // The old screen is already on the display from the previous push.
@@ -10544,6 +10537,7 @@ void loop() {
     if (!ambient_mode && !stealth_mode && !toast_active && !locator_active && !export_mode_active &&
         (millis() - last_user_input_ms) > AMBIENT_TIMEOUT_MS) {
         ambient_mode = true;
+        show_feed_expanded = false;
         M5Cardputer.Display.setBrightness(AMBIENT_BRIGHTNESS);
     }
 
