@@ -5500,6 +5500,7 @@ void handle_menu_select() {
             screen_dirty = true;
             break;
         case 8:
+            show_feed_expanded = false;
             wifi_config_open = true;
             wifi_config_open_ms = millis();
             wifi_config_field = 0;
@@ -7602,7 +7603,8 @@ void draw_signal_screen() {
     tracker_idx   = locator_tracker_idx;
     newest_ms     = locator_newest_sample_ms;
     if (tracker_idx >= 0 && tracker_idx < rssi_tracker_count
-        && rssi_tracker[tracker_idx].sample_count > 0) {
+        && rssi_tracker[tracker_idx].sample_count > 0
+        && strncmp(rssi_tracker[tracker_idx].mac, target_mac, 17) == 0) {
         target_rssi = rssi_tracker[tracker_idx].samples[
                           rssi_tracker[tracker_idx].sample_count - 1];
         has_rssi = (frame_ms - newest_ms < 15000);
@@ -9613,6 +9615,7 @@ void loop() {
         if (status.tab && !stealth_mode) {
             show_help_overlay = !show_help_overlay;
             if (show_help_overlay) {
+                show_feed_expanded = false;
                 help_ease_start = millis();
             }
             draw_current_screen(); spr.pushSprite(0,0);
@@ -9781,6 +9784,7 @@ void loop() {
                 if (!stealth_mode) {
                     menu_open = !menu_open;
                     if (menu_open) {
+                        show_feed_expanded = false;
                         menu_open_ms = millis();
                         menu_scroll_offset = 0;
                         menu_scroll_y_f    = 0.0f;
@@ -10143,6 +10147,9 @@ void loop() {
                         show_feed_expanded = false;
                     } else {
                         if (current_screen != 0 && current_screen != 1) transition_screen(0, -1);
+                        menu_open        = false;
+                        show_help_overlay = false;
+                        wifi_config_open  = false;
                         show_feed_expanded = true;
                         feed_expand_ms = millis();
                         feed_expanded_selected = 0;
