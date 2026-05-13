@@ -1056,7 +1056,7 @@ static int locator_tracker_idx = -1;  // cached index into rssi_tracker for loca
 bool locator_active = false;
 char locator_target_mac[18]  = "";
 char locator_target_name[65] = "";
-char locator_target_type[8]  = "";   // "WiFi", "BLE", or ""
+char locator_target_type[16] = "";   // "WiFi", "BLE", or ""
 int  locator_target_id       = 0;    // sequential detection ID; 0 = unknown
 unsigned long locator_newest_sample_ms = 0;
 int locator_peak_rssi = -120;
@@ -3674,7 +3674,9 @@ float bearing_to(double lat1, double lon1, double lat2, double lon2) {
 }
 
 static const char* bearing_to_compass(float degrees_val) {
-    int idx = ((int)(degrees_val + 22.5f) % 360) / 45;
+    float norm = fmodf(degrees_val, 360.0f);
+    if (norm < 0.0f) norm += 360.0f;
+    int idx = ((int)(norm + 22.5f) % 360) / 45;
     static const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
     return dirs[idx & 7];
 }
@@ -3715,7 +3717,6 @@ void locator_add_sample(const char* mac, int rssi) {
 
 void locator_start(const char* mac, const char* name, const char* type = "", int id = 0) {
     if (!take_data_mutex()) return;
-    locator_active = true;
     safe_copy(locator_target_mac,  mac,  sizeof(locator_target_mac));
     safe_copy(locator_target_name, name, sizeof(locator_target_name));
     safe_copy(locator_target_type, type, sizeof(locator_target_type));
@@ -3727,12 +3728,17 @@ void locator_start(const char* mac, const char* name, const char* type = "", int
     locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
     memset(loc_trace_smooth, 0, sizeof(loc_trace_smooth));
     loc_trace_last_frame_ms = 0;
+    locator_active = true;
     give_data_mutex();
 }
 
 void locator_stop() {
     if (!take_data_mutex()) return;
     locator_active = false;
+    locator_target_mac[0]  = '\0';
+    locator_target_name[0] = '\0';
+    locator_target_type[0] = '\0';
+    locator_target_id      = 0;
     locator_peak_rssi = -120;
     locator_tracker_idx = -1;
     locator_newest_sample_ms = 0;
@@ -3987,9 +3993,16 @@ void process_wifi_event_queue() {
         }
 
         // Feed RSSI to the Signal screen for any active target, regardless of confidence.
-        if (locator_active && strncmp(mac_str, locator_target_mac, 17) == 0) {
-            rssi_track_update(mac_str, local.rssi);
-            locator_add_sample(mac_str, local.rssi);
+        {
+            bool should_feed = false;
+            if (take_data_mutex()) {
+                should_feed = locator_active && strncmp(mac_str, locator_target_mac, 17) == 0;
+                give_data_mutex();
+            }
+            if (should_feed) {
+                rssi_track_update(mac_str, local.rssi);
+                locator_add_sample(mac_str, local.rssi);
+            }
         }
 
         int  confidence    = 0;
@@ -4161,9 +4174,16 @@ static void ble_worker_task(void* pvParameters) {
                                 ev->have_name ? dev_name_char : "",
                                 ev->rssi, 1, preview_is_flock);
             // Feed RSSI to the Signal screen for any active target, regardless of confidence.
-            if (locator_active && strncmp(mac_str_feed, locator_target_mac, 17) == 0) {
-                rssi_track_update(mac_str_feed, ev->rssi);
-                locator_add_sample(mac_str_feed, ev->rssi);
+            {
+                bool should_feed = false;
+                if (take_data_mutex()) {
+                    should_feed = locator_active && strncmp(mac_str_feed, locator_target_mac, 17) == 0;
+                    give_data_mutex();
+                }
+                if (should_feed) {
+                    rssi_track_update(mac_str_feed, ev->rssi);
+                    locator_add_sample(mac_str_feed, ev->rssi);
+                }
             }
         }
 
@@ -7690,7 +7710,10 @@ void draw_signal_screen() {
             if (pct < 0.0f) pct = 0.0f;
             if (pct > 1.0f) pct = 1.0f;
             int fill_w = (int)(pct * (float)bar_w);
-            if (fill_w > 0) spr.fillRoundRect(bar_x, bar_y, fill_w, 4, 2, HEADER_COLOR);
+            if (fill_w > 0) {
+                int fr = fill_w / 2 < 2 ? fill_w / 2 : 2;
+                spr.fillRoundRect(bar_x, bar_y, fill_w, 4, fr, HEADER_COLOR);
+            }
         }
     }
 
