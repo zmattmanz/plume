@@ -1053,7 +1053,7 @@ RSSITrack rssi_tracker[RSSI_TRACK_MAX_DEVICES];
 int rssi_tracker_count = 0;
 static int locator_tracker_idx = -1;  // cached index into rssi_tracker for locator target
 
-bool locator_active = false;
+static volatile bool locator_active = false;
 char locator_target_mac[18]  = "";
 char locator_target_name[65] = "";
 char locator_target_type[16] = "";   // "WiFi", "BLE", or ""
@@ -1066,14 +1066,13 @@ int locator_peak_rssi = -120;
 #define LOC_TRACE_INTERVAL_MS 2000
 
 // Signal bar and trace normalization range — single source of truth.
-// Values below RSSI_FLOOR clamp to bottom; above RSSI_CEIL clamp to top.
-#define RSSI_FLOOR (-70)
-#define RSSI_CEIL  (-30)
-#define RSSI_RANGE (RSSI_CEIL - RSSI_FLOOR)  // 40
+// Values below RSSI_VIS_FLOOR clamp to bottom; above RSSI_VIS_CEIL clamp to top.
+#define RSSI_VIS_FLOOR (-70)
+#define RSSI_VIS_CEIL  (-30)
+#define RSSI_VIS_RANGE (RSSI_VIS_CEIL - RSSI_VIS_FLOOR)  // 40
 
 struct LocTraceEntry {
-    int8_t        rssi;          // raw dBm value; -128 = no reading
-    unsigned long timestamp;
+    int8_t rssi;  // raw dBm value; -128 = floor/gap
 };
 
 static LocTraceEntry loc_trace[LOC_TRACE_SIZE];
@@ -1081,6 +1080,8 @@ static int           loc_trace_head        = 0;  // next slot to write
 static int           loc_trace_count       = 0;
 static unsigned long loc_trace_last_sample = 0;
 static float         loc_trace_smooth[LOC_TRACE_SIZE];
+static int           last_rendered_trace_head  = -1;
+static int           last_rendered_trace_count = 0;
 static unsigned long loc_trace_last_frame_ms = 0;
 
 // ── Peak GPS bookmark ──
@@ -3687,72 +3688,89 @@ static const char* bearing_to_compass(float degrees_val) {
     return dirs[idx & 7];
 }
 
-void locator_add_sample(const char* mac, int rssi) {
-    if (!take_data_mutex()) return;
+// Called under dataMutex (caller already holds it recursively).
+// Feeds an RSSI sample into the tracker, trace buffer, and peak bookmark.
+static void signal_feed_rssi(const char* mac, int rssi) {
+    rssi_track_update(mac, rssi);
 
-    if (!locator_active || strncmp(mac, locator_target_mac, 17) != 0) {
-        give_data_mutex();
-        return;
+    unsigned long now = millis();
+    if (loc_trace_count == 0 || (now - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
+        loc_trace[loc_trace_head].rssi = (int8_t)(rssi < -128 ? -128 : rssi > 127 ? 127 : rssi);
+        loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
+        if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
+        loc_trace_last_sample = now;
     }
 
-    unsigned long now_ms = millis();
-    locator_newest_sample_ms = now_ms;
-
-    // Update all-time peak RSSI; bookmark the GPS position where it occurred
     if (rssi > locator_peak_rssi) {
         locator_peak_rssi = rssi;
-        if (gps.location.isValid() && gps.location.age() < 5000) {
-            locator_peak_lat     = gps.location.lat();
-            locator_peak_lng     = gps.location.lng();
-            locator_peak_has_gps = true;
+        if (gps.location.isValid() && gps.location.age() < 2000) {
+            double lat = gps.location.lat();
+            double lng = gps.location.lng();
+            if (!isnan(lat) && !isnan(lng) && !isinf(lat) && !isinf(lng)) {
+                locator_peak_lat     = lat;
+                locator_peak_lng     = lng;
+                locator_peak_has_gps = true;
+            }
         }
     }
 
-    // Feed trace ring buffer at LOC_TRACE_INTERVAL_MS cadence
-    if (loc_trace_count == 0 || now_ms - loc_trace_last_sample >= LOC_TRACE_INTERVAL_MS) {
-        loc_trace_last_sample = now_ms;
-        int8_t clamped = (int8_t)(rssi < -128 ? -128 : rssi > 127 ? 127 : rssi);
-        loc_trace[loc_trace_head].rssi      = clamped;
-        loc_trace[loc_trace_head].timestamp = now_ms;
-        loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
-        if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
-    }
-
-    give_data_mutex();
+    locator_newest_sample_ms = now;
 }
 
 void locator_start(const char* mac, const char* name, const char* type = "", int id = 0) {
-    if (!take_data_mutex()) return;
-    safe_copy(locator_target_mac,  mac,  sizeof(locator_target_mac));
-    safe_copy(locator_target_name, name, sizeof(locator_target_name));
-    safe_copy(locator_target_type, type, sizeof(locator_target_type));
-    locator_target_id = id;
-    locator_peak_rssi = -120;
-    locator_tracker_idx = -1;
-    locator_newest_sample_ms = 0;
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+
+    locator_active = false;
+
     loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
-    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
     memset(loc_trace_smooth, 0, sizeof(loc_trace_smooth));
     loc_trace_last_frame_ms = 0;
+    last_rendered_trace_head  = -1;
+    last_rendered_trace_count = 0;
+
+    locator_peak_rssi = -120;
+    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
+
+    locator_tracker_idx = -1;
+    locator_newest_sample_ms = 0;
+
+    strncpy(locator_target_mac,  mac,  17); locator_target_mac[17]  = '\0';
+    strncpy(locator_target_name, name, sizeof(locator_target_name) - 1);
+    locator_target_name[sizeof(locator_target_name) - 1] = '\0';
+    strncpy(locator_target_type, type, sizeof(locator_target_type) - 1);
+    locator_target_type[sizeof(locator_target_type) - 1] = '\0';
+    locator_target_id = id;
+
     locator_active = true;
-    give_data_mutex();
+
+    xSemaphoreGiveRecursive(dataMutex);
+    screen_dirty = true;
 }
 
 void locator_stop() {
-    if (!take_data_mutex()) return;
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+
     locator_active = false;
+
     locator_target_mac[0]  = '\0';
     locator_target_name[0] = '\0';
     locator_target_type[0] = '\0';
     locator_target_id      = 0;
+
     locator_peak_rssi = -120;
+    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
+
     locator_tracker_idx = -1;
     locator_newest_sample_ms = 0;
+
     loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
-    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
     memset(loc_trace_smooth, 0, sizeof(loc_trace_smooth));
     loc_trace_last_frame_ms = 0;
-    give_data_mutex();
+    last_rendered_trace_head  = -1;
+    last_rendered_trace_count = 0;
+
+    xSemaphoreGiveRecursive(dataMutex);
+    screen_dirty = true;
 }
 
 // ============================================================================
@@ -3999,16 +4017,11 @@ void process_wifi_event_queue() {
         }
 
         // Feed RSSI to the Signal screen for any active target, regardless of confidence.
-        {
-            bool should_feed = false;
-            if (take_data_mutex()) {
-                should_feed = locator_active && strncmp(mac_str, locator_target_mac, 17) == 0;
-                give_data_mutex();
-            }
-            if (should_feed) {
-                rssi_track_update(mac_str, local.rssi);
-                locator_add_sample(mac_str, local.rssi);
-            }
+        if (locator_active) {
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            if (locator_active && strncmp(mac_str, locator_target_mac, 17) == 0)
+                signal_feed_rssi(mac_str, local.rssi);
+            xSemaphoreGiveRecursive(dataMutex);
         }
 
         int  confidence    = 0;
@@ -4084,7 +4097,6 @@ void process_wifi_event_queue() {
             rssi_track_update(mac_str, local.rssi);
             if (rssi_track_is_stationary(mac_str)) confidence += SCORE_BONUS_STAT;
             if (confidence > 100) confidence = 100;
-            locator_add_sample(mac_str, local.rssi);
 
             int mlen = strlen(methods);
             if (mlen > 0 && methods[mlen - 1] == ' ') methods[mlen - 1] = '\0';
@@ -4180,16 +4192,11 @@ static void ble_worker_task(void* pvParameters) {
                                 ev->have_name ? dev_name_char : "",
                                 ev->rssi, 1, preview_is_flock);
             // Feed RSSI to the Signal screen for any active target, regardless of confidence.
-            {
-                bool should_feed = false;
-                if (take_data_mutex()) {
-                    should_feed = locator_active && strncmp(mac_str_feed, locator_target_mac, 17) == 0;
-                    give_data_mutex();
-                }
-                if (should_feed) {
-                    rssi_track_update(mac_str_feed, ev->rssi);
-                    locator_add_sample(mac_str_feed, ev->rssi);
-                }
+            if (locator_active) {
+                xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                if (locator_active && strncmp(mac_str_feed, locator_target_mac, 17) == 0)
+                    signal_feed_rssi(mac_str_feed, ev->rssi);
+                xSemaphoreGiveRecursive(dataMutex);
             }
         }
 
@@ -4249,7 +4256,6 @@ static void ble_worker_task(void* pvParameters) {
             __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_string, ev->rssi);
             if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
-            locator_add_sample(mac_string, ev->rssi);
         }
         if (confidence > 100) confidence = 100;
 
@@ -7623,7 +7629,7 @@ void draw_signal_screen() {
 
         for (int i = 0; i < trace_count; i++) {
             int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
-            float raw = (float)((int)trace_snap[slot].rssi - RSSI_FLOOR) / (float)RSSI_RANGE;
+            float raw = (float)((int)trace_snap[slot].rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
             if (raw < 0.0f) raw = 0.0f;
             if (raw > 1.0f) raw = 1.0f;
             loc_trace_smooth[i] = anim_filter(loc_trace_smooth[i], raw, 300.0f, dt);
@@ -7721,7 +7727,7 @@ void draw_signal_screen() {
         int bar_w = DISP_W - TL * 2;
         spr.fillRoundRect(bar_x, bar_y, bar_w, 4, 2, CARD_COLOR);
         if (has_rssi) {
-            float pct = (float)(target_rssi - RSSI_FLOOR) / (float)RSSI_RANGE;
+            float pct = (float)(target_rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
             if (pct < 0.0f) pct = 0.0f;
             if (pct > 1.0f) pct = 1.0f;
             int fill_w = (int)(pct * (float)bar_w);
@@ -9542,19 +9548,20 @@ void loop() {
     feed_commit_pending();
     update_channel_histogram();
 
-    // Gap-fill the trace when target is silent — push a floor-level sample
-    // so the curve drops rather than freezing at the last reading.
-    if (take_data_mutex()) {
-        if (locator_active && loc_trace_count > 0
-            && (millis() - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
-            unsigned long gap_ms = millis();
-            loc_trace_last_sample = gap_ms;
-            loc_trace[loc_trace_head].rssi      = (int8_t)RSSI_FLOOR;
-            loc_trace[loc_trace_head].timestamp = gap_ms;
-            loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
-            if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
+    // Gap-fill: push a floor-level sample when the target is silent so the
+    // trace curve drops rather than freezing at the last reading.
+    if (locator_active) {
+        unsigned long now = millis();
+        if ((now - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            if (locator_active && (millis() - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
+                loc_trace[loc_trace_head].rssi = (int8_t)RSSI_VIS_FLOOR;
+                loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
+                if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
+                loc_trace_last_sample = millis();
+            }
+            xSemaphoreGiveRecursive(dataMutex);
         }
-        give_data_mutex();
     }
     if (wdt_subscribed) esp_task_wdt_reset();
 
