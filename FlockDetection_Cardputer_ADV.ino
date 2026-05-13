@@ -1045,11 +1045,6 @@ static int toast_queue_count = 0;
 static unsigned long toast_start = 0;
 static bool toast_active = false;
 
-// Compatibility shims for direct-write sites (battery warnings, flash errors)
-static char toast_text[TOAST_TEXT_LEN] = "";
-static uint16_t toast_accent_color = 0;
-static bool toast_is_action = false;
-
 unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
 unsigned long last_persist_save = 0;
@@ -3595,41 +3590,17 @@ void flush_sd_buffer() {
 // Does NOT touch the queue — it only sets the currently-displayed toast.
 static void set_toast_direct(const char* text, uint16_t accent, bool is_info) {
     if (!take_data_mutex()) return;
-    if (toast_active && toast_queue_count > 0) {
-        // Replace the head entry so the expiry handler in draw_toast_spr
-        // doesn't pop a phantom slot.
-        strncpy(toast_queue[toast_queue_head].text, text,
-                sizeof(toast_queue[toast_queue_head].text) - 1);
-        toast_queue[toast_queue_head].text[sizeof(toast_queue[toast_queue_head].text) - 1] = '\0';
-        toast_queue[toast_queue_head].accent    = accent;
-        toast_queue[toast_queue_head].is_action = is_info;
-    } else {
-        // No active toast — push as a new queue entry so expiry accounting
-        // matches. Covers both the toast_queue_count == 0 case and the
-        // !toast_active && toast_queue_count > 0 case (the latter would
-        // otherwise be silently lost: expiry would advance past a queued
-        // toast that was never displayed).
-        if (toast_queue_count >= TOAST_QUEUE_SIZE) {
-            toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
-            toast_queue_count--;
-        }
-        int slot = (toast_queue_head + toast_queue_count) % TOAST_QUEUE_SIZE;
-        strncpy(toast_queue[slot].text, text, sizeof(toast_queue[slot].text) - 1);
-        toast_queue[slot].text[sizeof(toast_queue[slot].text) - 1] = '\0';
-        toast_queue[slot].accent    = accent;
-        toast_queue[slot].is_action = is_info;
-        toast_queue_count++;
-        // Advance head to the just-pushed entry so the legacy mirror and
-        // expiry pop refer to the same slot we're about to display.
-        toast_queue_head = slot;
+    ToastEntry& head = toast_queue[toast_queue_head];
+    strncpy(head.text, text, sizeof(head.text) - 1);
+    head.text[sizeof(head.text) - 1] = '\0';
+    head.accent    = accent;
+    head.is_action = is_info;
+    if (!toast_active) {
+        toast_queue_count = 1;
     }
-    strncpy(toast_text, text, sizeof(toast_text) - 1);
-    toast_text[sizeof(toast_text) - 1] = '\0';
-    toast_accent_color = accent;
-    toast_is_action    = is_info;
-    toast_start        = millis();
-    toast_active       = true;
-    screen_dirty       = true;
+    toast_start  = millis();
+    toast_active = true;
+    screen_dirty = true;
     give_data_mutex();
 }
 
@@ -3670,11 +3641,7 @@ void trigger_toast(const char* type, const char* name, int confidence) {
 
     // If nothing currently showing, activate immediately
     if (!toast_active) {
-        strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
-        toast_text[sizeof(toast_text) - 1] = '\0';
-        toast_accent_color = toast_queue[toast_queue_head].accent;
-        toast_is_action = toast_queue[toast_queue_head].is_action;
-        toast_start = millis();
+        toast_start  = millis();
         toast_active = true;
     }
     screen_dirty = true;
@@ -4888,10 +4855,11 @@ void draw_toast_spr() {
     if (!take_data_mutex()) return;
     active_snap = toast_active;
     if (active_snap) {
-        strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
+        const ToastEntry& head = toast_queue[toast_queue_head];
+        strncpy(text_snap, head.text, sizeof(text_snap) - 1);
         text_snap[sizeof(text_snap) - 1] = '\0';
-        accent_snap      = toast_accent_color;
-        is_info_snap     = toast_is_action;
+        accent_snap      = head.accent;
+        is_info_snap     = head.is_action;
         start_snap       = toast_start;
         queue_count_snap = toast_queue_count;
     }
@@ -4909,12 +4877,8 @@ void draw_toast_spr() {
             toast_queue_count--;
         }
         if (toast_queue_count > 0) {
-            strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
-            toast_text[sizeof(toast_text) - 1] = '\0';
-            toast_accent_color = toast_queue[toast_queue_head].accent;
-            toast_is_action    = toast_queue[toast_queue_head].is_action;
-            toast_start        = millis();
-            toast_active       = true;
+            toast_start  = millis();
+            toast_active = true;
         } else {
             toast_active = false;
         }
