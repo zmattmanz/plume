@@ -2236,8 +2236,11 @@ static void load_deleted_ids() {
 static void perform_detection_delete(int idx) {
     if (!take_data_mutex()) return;
 
+    char deleted_mac[18] = "";
+
     if (sd_available && idx >= 0 && idx < sd_hist_count) {
         int deleted_id = sd_hist[idx].id;
+        strncpy(deleted_mac, sd_hist[idx].mac, 17); deleted_mac[17] = '\0';
 
         // Remove from sd_hist[] by shifting
         for (int i = idx; i < sd_hist_count - 1; i++) sd_hist[i] = sd_hist[i + 1];
@@ -2264,7 +2267,29 @@ static void perform_detection_delete(int idx) {
             history_scroll_offset = 0;
         if (history_scroll_offset > max(0, sd_hist_count - HIST_VISIBLE_ROWS))
             history_scroll_offset = max(0, sd_hist_count - HIST_VISIBLE_ROWS);
+
+    } else if (!sd_available && idx >= 0 && idx < capture_history_count) {
+        int deleted_id = capture_history[idx].id;
+        strncpy(deleted_mac, capture_history[idx].mac, 17); deleted_mac[17] = '\0';
+
+        for (int i = idx; i < capture_history_count - 1; i++)
+            capture_history[i] = capture_history[i + 1];
+        capture_history_count--;
+
+        if (deleted_id > 0) add_deleted_id(deleted_id);
+
+        if (history_selected_idx >= capture_history_count)
+            history_selected_idx = max(0, capture_history_count - 1);
+
+        if (history_scroll_offset > 0 && capture_history_count <= HIST_VISIBLE_ROWS)
+            history_scroll_offset = 0;
+        if (history_scroll_offset > max(0, capture_history_count - HIST_VISIBLE_ROWS))
+            history_scroll_offset = max(0, capture_history_count - HIST_VISIBLE_ROWS);
     }
+
+    // Refresh seen_mac_table timestamp so the 5-minute redetect window restarts
+    // from now, not from when the device was first detected.
+    if (deleted_mac[0] != '\0') add_seen_mac(deleted_mac);
 
     give_data_mutex();
     save_deleted_ids();
