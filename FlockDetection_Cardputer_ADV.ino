@@ -1622,59 +1622,215 @@ static bool export_check_auth() {
     return true;
 }
 
+// ── Export page HTML template (stored in flash via PROGMEM) ──────────────
+// Dynamic placeholders (in order):
+//   %s  = export_auth_user
+//   %s  = export_auth_pass
+//   %s  = file rows HTML (built separately based on sd_available)
+//   %u  = remaining minutes
+//   %02u = remaining seconds
+//   %d  = timer bar fill percentage (0-100)
+//   %s  = VERSION_STRING (footer)
+//   %lu = remaining milliseconds (for JS countdown)
+static const char EXPORT_PAGE_TEMPLATE[] PROGMEM = R"rawhtml(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flock Finder Export</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap');
+:root{--bg:#050A14;--card:#1D3258;--cb:#2E4670;--h:#4DDBC2;--t:#E8EFFF;
+--d:#95A5B8;--p:#8B7CDB;--ca:#FFB547;--hd:rgba(77,219,194,.15);
+--gl:rgba(46,70,112,.5)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--t);
+min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(
+135deg,transparent,transparent 7px,var(--gl) 7px,var(--gl) 8px);opacity:.25;
+pointer-events:none;z-index:0}
+.pg{position:relative;z-index:1;max-width:520px;margin:0 auto;padding:24px 20px 40px}
+.hs{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;
+border-bottom:1px solid var(--cb);margin-bottom:20px}
+.ht{font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--h);
+letter-spacing:3px;text-transform:uppercase}
+.pl{display:inline-flex;align-items:center;gap:4px;border:1px solid;border-radius:6px;
+padding:2px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;
+letter-spacing:1px;line-height:1.4;white-space:nowrap;text-decoration:none;
+transition:all .2s ease}
+.po{border-color:rgba(149,165,184,.4);color:var(--t);background:rgba(149,165,184,.12)}
+.ph{border-color:var(--h);color:var(--bg);background:var(--h);font-weight:600}
+.ph:hover{filter:brightness(1.15);box-shadow:0 0 12px rgba(77,219,194,.4)}
+.pp{border-color:var(--p);color:var(--bg);background:var(--p);font-weight:600}
+.pp:hover{filter:brightness(1.15);box-shadow:0 0 12px rgba(139,124,219,.4)}
+.sb{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--h);
+border-radius:8px;padding:6px 14px;background:var(--hd);color:var(--h);
+font-size:12px;letter-spacing:2px;font-weight:500;
+animation:bg 3s ease-in-out infinite}
+.sb .dt{width:6px;height:6px;border-radius:50%;background:var(--h);
+animation:dp 1.5s ease-in-out infinite}
+@keyframes bg{0%%,100%%{box-shadow:0 0 8px rgba(77,219,194,.1)}
+50%%{box-shadow:0 0 16px rgba(77,219,194,.2)}}
+@keyframes dp{0%%,100%%{opacity:.5}50%%{opacity:1}}
+.sl{font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--h);
+letter-spacing:3px;text-transform:uppercase;margin-bottom:10px;padding-bottom:6px;
+border-bottom:1px solid var(--cb)}
+.cd{border:1px solid var(--cb);border-radius:6px;padding:14px 16px;margin-bottom:14px;
+background:transparent;transition:border-color .25s ease}
+.cd:hover{border-color:rgba(77,219,194,.35)}
+.kv{display:flex;justify-content:space-between;align-items:center;padding:4px 0}
+.kl{font-size:11px;color:var(--h);letter-spacing:2px;text-transform:uppercase}
+.kv2{font-size:13px;color:var(--t);font-weight:500;font-family:'Share Tech Mono',monospace;
+letter-spacing:1px}
+.fr{display:flex;align-items:center;justify-content:space-between;padding:10px 0;
+border-bottom:1px solid rgba(46,70,112,.3);transition:background .15s}
+.fr:last-child{border-bottom:none}
+.fr:hover{background:rgba(77,219,194,.04);margin:0 -16px;padding-left:16px;
+padding-right:16px;border-radius:4px}
+.fi{display:flex;flex-direction:column;gap:3px}
+.fn{font-size:13px;color:var(--t);font-weight:500;letter-spacing:.5px}
+.fd{font-size:10px;color:var(--d);letter-spacing:1px;text-transform:uppercase}
+.fs{width:20px;height:20px;margin-right:10px;flex-shrink:0;color:var(--h)}
+.fp{color:var(--p)}
+.fl{display:flex;align-items:center}
+a.pl{cursor:pointer}a.pl:active{transform:scale(.96)}
+.ft{display:flex;justify-content:space-between;align-items:center;margin-top:20px;
+padding-top:12px;border-top:1px solid var(--cb)}
+.fd2{font-size:10px;color:var(--d);letter-spacing:1px}
+.tb{height:3px;background:var(--cb);border-radius:2px;margin-top:8px;overflow:hidden}
+.tf{height:100%%;background:var(--h);border-radius:2px;transition:width 1s linear}
+.ws{display:flex;align-items:center;gap:8px;padding:8px 12px;
+border:1px solid rgba(255,181,71,.3);border-radius:6px;
+background:rgba(255,181,71,.12);margin-bottom:14px}
+.ws span{font-size:11px;color:var(--ca);letter-spacing:1px}
+.fi2{opacity:0;transform:translateY(10px);animation:su .4s ease forwards}
+@keyframes su{to{opacity:1;transform:translateY(0)}}
+.fi2:nth-child(1){animation-delay:.05s}.fi2:nth-child(2){animation-delay:.12s}
+.fi2:nth-child(3){animation-delay:.19s}.fi2:nth-child(4){animation-delay:.26s}
+.fi2:nth-child(5){animation-delay:.33s}.fi2:nth-child(6){animation-delay:.4s}
+.fi2:nth-child(7){animation-delay:.47s}
+@media(max-width:400px){.pg{padding:16px 14px 32px}
+.fr{flex-direction:column;align-items:flex-start;gap:8px}
+.fr a.pl{align-self:flex-end}}
+</style></head><body><div class="pg">
+<div class="hs fi2"><span class="ht">Flock Finder</span>
+<div style="display:flex;gap:6px;align-items:center">
+<span class="pl po">v1.0b</span><span class="pl ph">EXP</span></div></div>
+<div class="fi2" style="margin-bottom:18px"><div class="sb">
+<span class="dt"></span>EXPORT ACTIVE</div></div>
+<div class="ws fi2">
+<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+<path d="M7 1L13 12H1L7 1Z" stroke="#FFB547" stroke-width="1.5" fill="none"/>
+<line x1="7" y1="5" x2="7" y2="8" stroke="#FFB547" stroke-width="1.5" stroke-linecap="round"/>
+<circle cx="7" cy="10" r=".8" fill="#FFB547"/></svg>
+<span>All scanning paused during export</span></div>
+<div class="fi2"><div class="sl">Credentials</div><div class="cd">
+<div class="kv"><span class="kl">User</span><span class="kv2">%s</span></div>
+<div class="kv"><span class="kl">Pass</span><span class="kv2">%s</span></div>
+</div></div>
+<div class="fi2"><div class="sl">Files</div><div class="cd">%s</div></div>
+<div class="fi2"><div class="sl">Session</div><div class="cd">
+<div class="kv"><span class="kl">Time Left</span>
+<span class="kv2" id="tm">%um %02us</span></div>
+<div class="tb"><div class="tf" id="tf" style="width:%d%%"></div></div>
+</div></div>
+<div class="ft fi2"><span class="fd2">%s</span>
+<span class="pl po" style="font-size:10px">
+<svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+<circle cx="4" cy="4" r="3" stroke="currentColor" stroke-width="1"/>
+<line x1="4" y1="2" x2="4" y2="4.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+<line x1="4" y1="4.5" x2="5.5" y2="5.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+</svg>Auto-exit</span></div></div>
+<script>var r=%lu;setInterval(function(){r-=1000;if(r<0)r=0;
+var m=Math.floor(r/60000),s=Math.floor((r%%60000)/1000);
+var e=document.getElementById('tm');if(e)e.textContent=m+'m '+String(s).padStart(2,'0')+'s';
+var f=document.getElementById('tf');if(f)f.style.width=(r/600000*100)+'%%';},1000);
+</script></body></html>)rawhtml";
+
+static const char FILE_ICON_WIFI[] PROGMEM =
+    "<svg class=\"fs\" viewBox=\"0 0 20 20\" fill=\"none\">"
+    "<polygon points=\"10,3 18,17 2,17\" stroke=\"currentColor\" "
+    "stroke-width=\"1.5\" fill=\"none\"/></svg>";
+
+static const char FILE_ICON_BLE[] PROGMEM =
+    "<svg class=\"fs fp\" viewBox=\"0 0 20 20\" fill=\"none\">"
+    "<polygon points=\"10,2 18,10 10,18 2,10\" stroke=\"currentColor\" "
+    "stroke-width=\"1.5\" fill=\"none\"/></svg>";
+
+static const char DL_ICON[] PROGMEM =
+    "<svg width=\"10\" height=\"10\" viewBox=\"0 0 10 10\" fill=\"none\">"
+    "<path d=\"M5 1V7M5 7L2 4.5M5 7L8 4.5\" stroke=\"#050A14\" "
+    "stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
+    "<line x1=\"1\" y1=\"9\" x2=\"9\" y2=\"9\" stroke=\"#050A14\" "
+    "stroke-width=\"1.5\" stroke-linecap=\"round\"/></svg>";
+
+static int build_file_row(char* buf, size_t buf_size,
+                          const char* href, const char* name,
+                          const char* desc, const char* icon,
+                          const char* pill_class) {
+    return snprintf(buf, buf_size,
+        "<div class=\"fr\"><div class=\"fl\">%s"
+        "<div class=\"fi\"><span class=\"fn\">%s</span>"
+        "<span class=\"fd\">%s</span></div></div>"
+        "<a href=\"%s\" class=\"pl %s\">%s DL</a></div>",
+        icon, name, desc, href, pill_class, DL_ICON);
+}
+
 void export_server_setup_routes() {
     if (!export_server) return;
 
-    // Index: simple HTML file list
     export_server->on("/", HTTP_GET, []() {
         if (!export_check_auth()) return;
         export_mode_started_at = millis();
-        String html = "<!DOCTYPE html><html><head><title>Flock Finder Export</title>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<style>"
-            "body{font-family:'Courier New',monospace;background:#050A14;color:#E8EFFF;padding:24px;margin:0;}"
-            ".card{background:#1D3258;border:1px solid #2E4670;border-radius:8px;padding:16px 20px;margin:16px 0;}"
-            "h1{color:#4DDBC2;font-size:1.4em;letter-spacing:2px;margin:0 0 4px;}"
-            ".ver{color:#95A5B8;font-size:0.8em;letter-spacing:1px;}"
-            "a{color:#4DDBC2;text-decoration:none;display:flex;align-items:center;gap:8px;"
-            "padding:10px 14px;border:1px solid #2E4670;border-radius:6px;margin:8px 0;"
-            "transition:border-color 0.2s;}"
-            "a:hover{border-color:#4DDBC2;background:rgba(77,219,194,0.06);}"
-            ".tag{font-size:0.75em;color:#95A5B8;}"
-            ".purple{color:#8B7CDB;}"
-            ".dim{color:#95A5B8;font-size:0.8em;}"
-            ".pill{display:inline-block;border:1px solid #4DDBC2;color:#4DDBC2;"
-            "border-radius:10px;padding:2px 10px;font-size:0.75em;letter-spacing:1px;}"
-            "hr{border:none;border-top:1px solid #2E4670;margin:16px 0;}"
-            ".cred{display:flex;gap:24px;margin:8px 0;}"
-            ".cred span{color:#95A5B8;font-size:0.85em;}"
-            ".cred b{color:#E8EFFF;}"
-            "</style></head><body>";
-        html += "<h1>FLOCK FINDER</h1>";
-        html += "<span class='ver'>" + String(VERSION_STRING) + "</span>";
-        html += "<div class='card'>";
-        html += "<div style='color:#95A5B8;font-size:0.8em;letter-spacing:1px;margin-bottom:8px;'>CREDENTIALS</div>";
-        html += "<div class='cred'><span>User: <b>" + String(export_auth_user) + "</b></span>";
-        html += "<span>Pass: <b>" + String(export_auth_pass) + "</b></span></div>";
-        html += "</div>";
-        html += "<div class='card'>";
-        html += "<div style='color:#95A5B8;font-size:0.8em;letter-spacing:1px;margin-bottom:12px;'>FILES</div>";
+
+        // ── Build the dynamic file-rows block ──
+        char file_rows[512] = "";
+        int foff = 0;
         if (sd_available) {
-            html += "<a href='/FlockLog.csv'>FlockLog.csv <span class='tag'>detections CSV</span></a>";
-            html += "<a href='/Threats.pcap' class='purple'>Threats.pcap <span class='tag'>WiFi capture</span></a>";
-            html += "<a href='/BLE_Threats.pcap' class='purple'>BLE_Threats.pcap <span class='tag'>BLE capture</span></a>";
+            foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
+                "/FlockLog.csv", "FlockLog.csv", "Detections log",
+                FILE_ICON_WIFI, "ph");
+            foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
+                "/Threats.pcap", "Threats.pcap", "WiFi packet capture",
+                FILE_ICON_WIFI, "pp");
+            foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
+                "/BLE_Threats.pcap", "BLE_Threats.pcap", "Bluetooth capture",
+                FILE_ICON_BLE, "pp");
         } else {
-            html += "<span class='dim'>SD card unavailable</span>";
+            snprintf(file_rows, sizeof(file_rows),
+                "<span style=\"font-size:11px;color:#95A5B8;letter-spacing:1px\">"
+                "SD card unavailable</span>");
         }
-        html += "</div>";
-        unsigned long remaining = 0;
-        if (millis() - export_mode_started_at < EXPORT_MODE_MAX_MS)
-            remaining = EXPORT_MODE_MAX_MS - (millis() - export_mode_started_at);
-        html += "<div class='dim' style='margin-top:16px;'>Auto-exit in ";
-        html += String(remaining / 60000UL) + "m " + String((remaining / 1000UL) % 60) + "s</div>";
-        html += "</body></html>";
+
+        // ── Compute time remaining ──
+        unsigned long elapsed = millis() - export_mode_started_at;
+        unsigned long remaining_ms = (elapsed < EXPORT_MODE_MAX_MS)
+                                   ? (EXPORT_MODE_MAX_MS - elapsed) : 0;
+        unsigned int rm = (unsigned int)(remaining_ms / 60000UL);
+        unsigned int rs = (unsigned int)((remaining_ms / 1000UL) % 60);
+        int fill_pct = (int)(remaining_ms * 100UL / EXPORT_MODE_MAX_MS);
+
+        // ── Render into a heap buffer ──
+        // Template is ~3.5KB, dynamic content adds ~500B, total < 5KB.
+        const size_t PAGE_BUF_SIZE = 5120;
+        char* page = (char*)malloc(PAGE_BUF_SIZE);
+        if (!page) {
+            export_server->send(503, "text/plain", "Low memory");
+            return;
+        }
+
+        snprintf(page, PAGE_BUF_SIZE, EXPORT_PAGE_TEMPLATE,
+            export_auth_user,           // %s  credentials user
+            export_auth_pass,           // %s  credentials pass
+            file_rows,                  // %s  file row HTML
+            rm,                         // %u  minutes
+            rs,                         // %02u seconds
+            fill_pct,                   // %d  timer bar width
+            VERSION_STRING,             // %s  footer version
+            (unsigned long)remaining_ms // %lu JS countdown seed
+        );
+
         export_server->sendHeader("Connection", "close");
-        export_server->send(200, "text/html", html);
+        export_server->send(200, "text/html", page);
+        free(page);
     });
 
     auto serve_sd_file = [](const char* path, const char* mime) {
@@ -1787,8 +1943,11 @@ static void export_restore_promiscuous() {
     pBLEScan->setMaxResults(0);
     last_ble_restart_ms = millis();
 
-    // Resume scanner task
-    if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
+    // Resume scanner task and re-subscribe to WDT
+    if (ScannerTaskHandle) {
+        vTaskResume(ScannerTaskHandle);
+        esp_task_wdt_add(ScannerTaskHandle);
+    }
     last_ble_scan = millis();
 }
 
@@ -1838,7 +1997,10 @@ bool export_mode_start() {
 
     // Shut down all scanning before joining a network
     esp_wifi_set_promiscuous(false);
-    if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
+    if (ScannerTaskHandle) {
+        esp_task_wdt_delete(ScannerTaskHandle);
+        vTaskSuspend(ScannerTaskHandle);
+    }
     if (pBLEScan && pBLEScan->isScanning()) {
         pBLEScan->stop();
         pBLEScan->clearResults();
@@ -3682,9 +3844,13 @@ static void parse_wifi_event(WifiEvent* ev) {
         tagged_params = frame_body;
         remaining = (int)ev->payload_snap_len - 24;
     }
-    // Subtract FCS (4 bytes) if present in the snapshot
-    remaining -= 4;
-    if (remaining < 0) remaining = 0;
+    // Subtract FCS (4 bytes) only when the full frame fits in the snapshot.
+    // Truncated frames (payload_snap_len < orig_len) don't contain the FCS;
+    // subtracting 4 would discard real tagged parameter data at the tail.
+    if (ev->payload_snap_len >= ev->orig_len) {
+        remaining -= 4;
+        if (remaining < 0) remaining = 0;
+    }
 
     // ── SSID extraction (tag 0) ──
     memset(ev->ssid, 0, sizeof(ev->ssid));
@@ -7436,6 +7602,7 @@ void draw_locator_screen() {
     int  target_id = locator_target_id;
     float dist=locator_est_distance, brng=locator_bearing;
     bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
+    float gps_course = gps_valid ? gps.course.deg() : 0.0f;
     bool has_loc   = gps.location.isValid();
     int target_rssi = 0; bool has_rssi = false;
     if (locator_tracker_idx >= 0 && locator_tracker_idx < rssi_tracker_count
@@ -9323,11 +9490,11 @@ void loop() {
             UBaseType_t led_hw  = LedTaskHandle ? uxTaskGetStackHighWaterMark(LedTaskHandle) : 0;
             UBaseType_t loop_hw = uxTaskGetStackHighWaterMark(NULL);  // NULL = calling task (loop)
             Serial.printf("[STACK] High-water marks (bytes remaining):\n");
-            Serial.printf("  Scanner: %u / 2048\n", (unsigned)scan_hw);
-            Serial.printf("  GPS:     %u / 2048\n", (unsigned)gps_hw);
-            Serial.printf("  BLE:     %u / 4096\n", (unsigned)ble_hw);
+            Serial.printf("  Scanner: %u / 1584\n", (unsigned)scan_hw);
+            Serial.printf("  GPS:     %u / 1336\n", (unsigned)gps_hw);
+            Serial.printf("  BLE:     %u / 2352\n", (unsigned)ble_hw);
             Serial.printf("  LED:     %u / 1536\n", (unsigned)led_hw);
-            Serial.printf("  Loop:    %u / 8192\n", (unsigned)loop_hw);
+            Serial.printf("  Loop:    %u / 5120\n", (unsigned)loop_hw);
             Serial.printf("[STACK] Safe to reduce any task where remaining > 512 bytes.\n");
             Serial.printf("  Recommended: new_stack = current - (remaining - 256)\n");
         }
@@ -9402,7 +9569,10 @@ void loop() {
             show_feed_expanded = false;
             draw_current_screen();
             spr.pushSprite(0, 0);
-        } else {
+        } else if (!(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())) {
+            // Only advance on BtnA when no keyboard key is simultaneously
+            // pressed — prevents double-transition when BtnA fires
+            // alongside an arrow key on the Cardputer keyboard deck.
             int next_screen = current_screen + 1;
             int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
             if (next_screen >= NUM_SCREENS) next_screen = 0;
@@ -9913,80 +10083,6 @@ void loop() {
             }
         }
 
-        // ── Key-hold repeat for the ; / . arrow keys ──
-        // The M5Cardputer keyboard doesn't auto-repeat; we track hold state
-        // ourselves so a held arrow keeps scrolling at REPEAT_INTERVAL after
-        // a HOLD_DELAY initial wait.
-        {
-            static unsigned long arrow_hold_start = 0;
-            static unsigned long arrow_last_repeat = 0;
-            static char arrow_held_key = 0;
-            const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
-            const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
-
-            bool up_held = false, down_held = false;
-            // Skip hold-repeat when the menu is open — the menu's own
-            // input handler already processed the arrows and the hold-repeat
-            // would double-fire navigation.
-            if (!menu_open && !wifi_config_open) {
-                for (auto c : status.word) {
-                    if (IS_KEY_UP(c))   up_held   = true;
-                    if (IS_KEY_DOWN(c)) down_held = true;
-                }
-            }
-            char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
-
-            if (cur_arrow && cur_arrow == arrow_held_key) {
-                unsigned long hold_dur = millis() - arrow_hold_start;
-                if (hold_dur > HOLD_DELAY &&
-                    (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
-                    if (menu_open) {
-                        if (IS_KEY_UP(cur_arrow)) {
-                            menu_selected = (menu_selected - 1 + MENU_ITEM_COUNT) % MENU_ITEM_COUNT;
-                        } else {
-                            menu_selected = (menu_selected + 1) % MENU_ITEM_COUNT;
-                        }
-                        menu_click();
-                        screen_dirty = true;
-                    } else if (current_screen == 2 && !hist_detail_open) {
-                        if (IS_KEY_UP(cur_arrow)) {
-                            history_selected_idx--;
-                            if (history_selected_idx < 0) history_selected_idx = 0;
-                            if (history_selected_idx < history_scroll_offset)
-                                history_scroll_offset = history_selected_idx;
-                        } else {
-                            int ht = sd_available ? sd_hist_count : capture_history_count;
-                            history_selected_idx++;
-                            if (history_selected_idx >= ht) history_selected_idx = max(0, ht - 1);
-                            if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
-                                history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
-                        }
-                        screen_dirty = true;
-                    } else if (current_screen == 4 && (IS_KEY_UP(cur_arrow) || IS_KEY_DOWN(cur_arrow))) {
-                        if (IS_KEY_UP(cur_arrow)) {
-                            stats_scroll_target -= STATS_SCROLL_STEP;
-                            if (stats_scroll_target < 0) stats_scroll_target = 0;
-                        } else {
-                            stats_scroll_target += STATS_SCROLL_STEP;
-                            if (stats_scroll_target > STATS_MAX_SCROLL)
-                                stats_scroll_target = STATS_MAX_SCROLL;
-                        }
-                        screen_dirty = true;
-                    // LEFT/RIGHT omitted: screen transitions don't benefit from
-                    // auto-repeat and would oscillate due to animation overlap.
-                    }
-                    arrow_last_repeat = millis();
-                }
-            } else if (cur_arrow) {
-                arrow_held_key = cur_arrow;
-                arrow_hold_start = millis();
-                arrow_last_repeat = millis();
-            } else {
-                arrow_held_key = 0;
-            }
-        }
-
-
         // Fallback ENTER check — some Cardputer ADV firmware doesn't put
         // ENTER in status.word. Check status.enter directly only when the
         // loop above didn't already act on it (firmwares that report ENTER
@@ -10096,7 +10192,72 @@ void loop() {
             }
         }
     }
+
     if (wdt_subscribed) esp_task_wdt_reset();
+
+    // ── Key-hold repeat for the ; / . arrow keys ──
+    // Runs OUTSIDE the isChange() block so it fires during sustained holds.
+    // isChange() is edge-triggered — only true on press/release transitions,
+    // not during a continuous hold. The repeat logic needs to run every
+    // loop iteration to detect when HOLD_DELAY has elapsed.
+    {
+        static unsigned long arrow_hold_start = 0;
+        static unsigned long arrow_last_repeat = 0;
+        static char arrow_held_key = 0;
+        const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
+        const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
+
+        bool up_held = false, down_held = false;
+        if (!menu_open && !wifi_config_open) {
+            Keyboard_Class::KeysState hold_st = M5Cardputer.Keyboard.keysState();
+            for (auto c : hold_st.word) {
+                if (IS_KEY_UP(c))   up_held   = true;
+                if (IS_KEY_DOWN(c)) down_held = true;
+            }
+        }
+        char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
+
+        if (cur_arrow && cur_arrow == arrow_held_key) {
+            unsigned long hold_dur = millis() - arrow_hold_start;
+            if (hold_dur > HOLD_DELAY &&
+                (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
+                if (current_screen == 2 && !hist_detail_open) {
+                    if (IS_KEY_UP(cur_arrow)) {
+                        history_selected_idx--;
+                        if (history_selected_idx < 0) history_selected_idx = 0;
+                        if (history_selected_idx < history_scroll_offset)
+                            history_scroll_offset = history_selected_idx;
+                    } else {
+                        int ht = sd_available ? sd_hist_count : capture_history_count;
+                        history_selected_idx++;
+                        if (history_selected_idx >= ht) history_selected_idx = max(0, ht - 1);
+                        if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+                            history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                    }
+                    screen_dirty = true;
+                } else if (current_screen == 4) {
+                    if (IS_KEY_UP(cur_arrow)) {
+                        stats_scroll_target -= STATS_SCROLL_STEP;
+                        if (stats_scroll_target < 0) stats_scroll_target = 0;
+                    } else {
+                        stats_scroll_target += STATS_SCROLL_STEP;
+                        if (stats_scroll_target > STATS_MAX_SCROLL)
+                            stats_scroll_target = STATS_MAX_SCROLL;
+                    }
+                    screen_dirty = true;
+                }
+                // LEFT/RIGHT omitted: screen transitions don't benefit from
+                // auto-repeat and would oscillate due to animation overlap.
+                arrow_last_repeat = millis();
+            }
+        } else if (cur_arrow) {
+            arrow_held_key = cur_arrow;
+            arrow_hold_start = millis();
+            arrow_last_repeat = millis();
+        } else {
+            arrow_held_key = 0;
+        }
+    }
 
     // Fire pending '\' single-press action if double-tap window expired
     if (bs_pending_exists && millis() >= bs_pending_until) {
