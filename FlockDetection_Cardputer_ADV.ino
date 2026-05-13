@@ -131,6 +131,7 @@ unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
 static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
+static int  feed_expanded_selected = 0;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 
 // ── WiFi Config overlay state ──
@@ -3970,19 +3971,25 @@ void process_wifi_event_queue() {
         bool is_random_mac = (local.mac[0] & 0x02) != 0;
         int  mac_score     = is_random_mac ? 0 : check_mac_prefix_tiered(local.mac);
 
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+            local.mac[0], local.mac[1], local.mac[2],
+            local.mac[3], local.mac[4], local.mac[5]);
+
         // Push to live feed (every observed device, preview flock status)
         {
-            char mac_str_feed[18];
-            snprintf(mac_str_feed, sizeof(mac_str_feed),
-                     "%02x:%02x:%02x:%02x:%02x:%02x",
-                     local.mac[0], local.mac[1], local.mac[2],
-                     local.mac[3], local.mac[4], local.mac[5]);
             const char* feed_name = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
             bool preview_is_flock  = (strlen(local.ssid) > 0
                                       && (is_flock_ssid_format(local.ssid)
                                           || check_ssid_pattern(local.ssid)))
                                      || mac_score == 1;
-            feed_push_candidate(mac_str_feed, feed_name, local.rssi, 0, preview_is_flock);
+            feed_push_candidate(mac_str, feed_name, local.rssi, 0, preview_is_flock);
+        }
+
+        // Feed RSSI to the Signal screen for any active target, regardless of confidence.
+        if (locator_active && strncmp(mac_str, locator_target_mac, 17) == 0) {
+            rssi_track_update(mac_str, local.rssi);
+            locator_add_sample(mac_str, local.rssi);
         }
 
         int  confidence    = 0;
@@ -4017,10 +4024,6 @@ void process_wifi_event_queue() {
             confidence += 10;
         }
 
-        char mac_str[18];
-        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-            local.mac[0], local.mac[1], local.mac[2],
-            local.mac[3], local.mac[4], local.mac[5]);
         const char* name_str       = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
         const char* frame_type_str = local.is_beacon ? "Beacon" : "ProbeReq";
 
@@ -4157,6 +4160,11 @@ static void ble_worker_task(void* pvParameters) {
             feed_push_candidate(mac_str_feed,
                                 ev->have_name ? dev_name_char : "",
                                 ev->rssi, 1, preview_is_flock);
+            // Feed RSSI to the Signal screen for any active target, regardless of confidence.
+            if (locator_active && strncmp(mac_str_feed, locator_target_mac, 17) == 0) {
+                rssi_track_update(mac_str_feed, ev->rssi);
+                locator_add_sample(mac_str_feed, ev->rssi);
+            }
         }
 
         if (ev->have_mfg) {
@@ -7027,11 +7035,14 @@ void draw_feed_expanded_overlay() {
     static int           expand_prev_head   = -1;
     static unsigned long expand_shift_ms    = 0;
     static unsigned long expand_open_ms_last = 0;
+    static float         feed_sel_y_f       = 0.0f;
+    static unsigned long feed_sel_last_frame = 0;
 
     if (feed_expand_ms != expand_open_ms_last) {
         expand_open_ms_last = feed_expand_ms;
         expand_prev_head    = local_head;
         expand_shift_ms     = 0;
+        feed_sel_last_frame = 0;
     }
     if (local_count > 0 && expand_prev_head != -1 && local_head != expand_prev_head) {
         expand_shift_ms  = local_now;
@@ -7092,6 +7103,25 @@ void draw_feed_expanded_overlay() {
         const int row_pad    = avail_h - (max_rows * row_h);
         const int row_top_adj = row_top + row_pad / 2;
 
+        // Clamp selection to visible rows (handles feed shrinking while overlay is open)
+        {
+            int visible_count = local_count < max_rows ? local_count : max_rows;
+            if (visible_count < 1) visible_count = 1;
+            if (feed_expanded_selected >= visible_count)
+                feed_expanded_selected = visible_count - 1;
+        }
+
+        // Eased selection highlight Y
+        float sel_target_y = (float)(row_top_adj + feed_expanded_selected * row_h);
+        {
+            float sdt = (feed_sel_last_frame == 0) ? 0.0f
+                      : (float)(local_now - feed_sel_last_frame);
+            if (sdt > 100.0f) sdt = 100.0f;
+            feed_sel_last_frame = local_now;
+            feed_sel_y_f = (sdt == 0.0f) ? sel_target_y
+                         : anim_filter(feed_sel_y_f, sel_target_y, 80.0f, sdt);
+        }
+
         // Shared slide offset — when a new entry arrives every row shifts
         // down together, mirroring the scanner-feed-preview animation.
         float expand_slide_t = 1.0f;
@@ -7107,6 +7137,17 @@ void draw_feed_expanded_overlay() {
             int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
             FeedEntry& e = local_feed[idx];
             int row_y = row_top_adj + rendered * row_h - expand_slide_offset;
+
+            bool is_sel = (rendered == feed_expanded_selected);
+            uint16_t row_bg = is_sel ? lerp_col16(BG_COLOR, CARD_COLOR, 0.5f) : BG_COLOR;
+
+            // Selection highlight
+            if (is_sel) {
+                int sel_y = (int)feed_sel_y_f - expand_slide_offset;
+                spr.fillRect(0, sel_y, DISP_W, row_h, ea(row_bg));
+                spr.drawFastHLine(0, sel_y,            DISP_W, ea(ACCENT_COLOR));
+                spr.drawFastHLine(0, sel_y + row_h - 1, DISP_W, ea(ACCENT_COLOR));
+            }
 
             // Type symbol color (flock entries tinted toward amber), faded in
             uint16_t proto_col = e.is_flock  ? CAUTION_COLOR
@@ -7138,7 +7179,7 @@ void draw_feed_expanded_overlay() {
             char name_disp[20];
             strncpy(name_disp, e.name, name_max_chars);
             name_disp[name_max_chars] = '\0';
-            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+            spr.setTextColor(ea(TEXT_COLOR), ea(row_bg));
             spr.setTextSize(TS_BODY);
             spr.setCursor(name_start_x, row_y + 3);
             spr.print(name_disp);
@@ -7146,7 +7187,7 @@ void draw_feed_expanded_overlay() {
             // RSSI in dBm with units — right-aligned within the RSSI column
             char rssi_str[10];
             snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
-            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+            spr.setTextColor(ea(TEXT_COLOR), ea(row_bg));
             spr.setCursor(col_rssi, row_y + 3);
             spr.print(rssi_str);
 
@@ -7156,7 +7197,7 @@ void draw_feed_expanded_overlay() {
             if (e.rssi > -60)      { strength_str = "STRONG"; strength_col = ACCENT_COLOR; }
             else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
             else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
-            spr.setTextColor(ea(strength_col), BG_COLOR);
+            spr.setTextColor(ea(strength_col), ea(row_bg));
             spr.setCursor(col_sig, row_y + 3);
             spr.print(strength_str);
 
@@ -7164,6 +7205,12 @@ void draw_feed_expanded_overlay() {
         }
         spr.clearClipRect();
     }
+
+    // Footer hint
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
+    spr.print("arrows select  t target  f close");
 
 }
 
@@ -7509,7 +7556,7 @@ void draw_signal_screen() {
 
     // ── Snapshot state under mutex ──
     bool  active, peak_has_gps, gps_loc_valid;
-    char  target_mac[18], target_name[65];
+    char  target_mac[18], target_name[65], target_type[16];
     int   target_id, peak_rssi, tracker_idx, gps_sats;
     double cur_lat, cur_lng, peak_lat, peak_lng;
     unsigned long newest_ms;
@@ -7522,6 +7569,7 @@ void draw_signal_screen() {
     active        = locator_active;
     safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
     safe_copy(target_name, locator_target_name, sizeof(target_name));
+    safe_copy(target_type, locator_target_type, sizeof(target_type));
     target_id     = locator_target_id;
     peak_rssi     = locator_peak_rssi;
     peak_has_gps  = locator_peak_has_gps;
@@ -7568,19 +7616,23 @@ void draw_signal_screen() {
 
     // ── Status pill (right-aligned) ──
     {
+        bool is_flock_target = (strstr(target_type, "FLOCK") != NULL
+                             || strstr(target_type, "RAVEN") != NULL);
         const char* sp;
         if (!active)             sp = "No Target";
         else if (!gps_loc_valid) sp = (gps_sats >= 1) ? "Awaiting GPS" : "No GPS";
         else if (!has_rssi)      sp = "Awaiting Signal";
-        else                     sp = "Hunting";
+        else                     sp = is_flock_target ? "Hunting" : "Tracking";
+
+        uint16_t pill_accent = (active && has_rssi && !is_flock_target) ? DIM_COLOR : HEADER_COLOR;
 
         int pw = (int)strlen(sp) * ts_char_w(TS_MICRO) + 6;
         int px = TR - pw;
         int py = CONTENT_Y + 3;
-        uint16_t fill = lerp_col16(BG_COLOR, HEADER_COLOR, 0.12f);
+        uint16_t fill = lerp_col16(BG_COLOR, pill_accent, 0.12f);
         spr.fillRoundRect(px, py, pw, 11, 3, fill);
-        spr.drawRoundRect(px, py, pw, 11, 3, HEADER_COLOR);
-        spr.setTextColor(HEADER_COLOR, fill);
+        spr.drawRoundRect(px, py, pw, 11, 3, pill_accent);
+        spr.setTextColor(pill_accent, fill);
         spr.setTextSize(TS_MICRO);
         spr.setCursor(px + 3, py + 2);
         spr.print(sp);
@@ -9788,6 +9840,11 @@ void loop() {
                 screen_dirty = true;
             }
             else if (IS_KEY_UP(c)) {
+                if (show_feed_expanded) {
+                    if (feed_expanded_selected > 0) feed_expanded_selected--;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                    continue;
+                }
                 if (current_screen == 2) {
                     if (hist_detail_open) { /* no nav while detail is open */ }
                     else {
@@ -9820,6 +9877,13 @@ void loop() {
                 }
             }
             else if (IS_KEY_DOWN(c)) {
+                if (show_feed_expanded) {
+                    int max_sel = min(scan_local_count, 6) - 1;
+                    if (max_sel < 0) max_sel = 0;
+                    if (feed_expanded_selected < max_sel) feed_expanded_selected++;
+                    draw_current_screen(); spr.pushSprite(0, 0);
+                    continue;
+                }
                 if (current_screen == 2) {
                     if (hist_detail_open) { /* no nav while detail is open */ }
                     else {
@@ -9978,7 +10042,21 @@ void loop() {
             }
 #endif // DEBUG_KEYS
             else if (c == 't') {
-                if (!stealth_mode && current_screen == 2 && hist_detail_open) {
+                if (!stealth_mode && show_feed_expanded) {
+                    if (scan_local_count > 0 && feed_expanded_selected < scan_local_count) {
+                        int idx = (scan_local_head - feed_expanded_selected + FEED_SIZE * 2) % FEED_SIZE;
+                        FeedEntry& fe = scan_local_feed[idx];
+                        if (fe.mac[0] != '\0') {
+                            const char* type_str = fe.is_flock
+                                ? (fe.proto == 0 ? "FLOCK_WIFI" : "FLOCK_BLE")
+                                : (fe.proto == 0 ? "WIFI" : "BLE");
+                            locator_start(fe.mac, fe.name, type_str, 0);
+                            trigger_toast("TARGET", fe.name, 0);
+                            show_feed_expanded = false;
+                            transition_screen(1, 1);
+                        }
+                    }
+                } else if (!stealth_mode && current_screen == 2 && hist_detail_open) {
                     // Target the detection currently shown in detail view
                     const char* t_mac = "";
                     const char* t_name = "";
@@ -10090,6 +10168,7 @@ void loop() {
                         if (current_screen != 0) transition_screen(0, -1);
                         show_feed_expanded = true;
                         feed_expand_ms = millis();
+                        feed_expanded_selected = 0;
                     }
                     draw_current_screen();
                     spr.pushSprite(0, 0);
