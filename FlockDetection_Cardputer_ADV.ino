@@ -3384,6 +3384,26 @@ void flush_sd_buffer() {
     int pcap_count = 0;
     int ble_pcap_count = 0;
 
+    // Preconditions FIRST — if any fail, buffered data stays in place
+    // for the next flush attempt rather than being silently discarded.
+    if (!sd_available) return;
+
+    // Skip flush if heap is critically low — the SD FAT driver mallocs
+    // internally and will abort() if it gets NULL. Better to drop a flush
+    // cycle than crash; the buffers will retry next interval.
+    if (esp_get_free_heap_size() < 6000) {
+        Serial.println("[SD] Skipping flush — heap too low");
+        return;
+    }
+
+    // Short timed take — flush runs every 500ms and gladly retries on the
+    // next tick. Blocking for seconds here freezes the main loop and
+    // starves alarms / WiFi event processing.
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return;
+    }
+
+    // Now safe to snapshot and clear — we're guaranteed to write below.
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     log_count = sd_write_count;
     for (int i = 0; i < log_count; i++) {
@@ -3403,23 +3423,6 @@ void flush_sd_buffer() {
     }
     ble_pcap_write_count = 0;
     xSemaphoreGiveRecursive(dataMutex);
-
-    if (!sd_available) return;
-
-    // Skip flush if heap is critically low — the SD FAT driver mallocs
-    // internally and will abort() if it gets NULL. Better to drop a flush
-    // cycle than crash; the buffers will retry next interval.
-    if (esp_get_free_heap_size() < 6000) {
-        Serial.println("[SD] Skipping flush — heap too low");
-        return;
-    }
-
-    // Short timed take — flush runs every 500ms and gladly retries on the
-    // next tick. Blocking for seconds here freezes the main loop and
-    // starves alarms / WiFi event processing.
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return;
-    }
 
     if (log_count > 0) {
         File file = SD.open(current_log_file, FILE_APPEND);
@@ -4636,7 +4639,12 @@ void play_escalated_alarm(int confidence, int source) {
     if (stealth_mode || is_muted || is_alarming) return;
     is_alarming = true;
     intptr_t param = ((intptr_t)confidence & 0xFFFF) | ((intptr_t)(source & 0x1) << 16);
-    xTaskCreate(AlarmTask, "AlarmTask", 1536, (void*)param, 2, NULL);
+    if (xTaskCreate(AlarmTask, "AlarmTask", 1536, (void*)param, 2, NULL) != pdPASS) {
+        // Spawn failed (heap pressure); reset the gate so future alarms
+        // can still fire instead of being permanently suppressed.
+        is_alarming = false;
+        Serial.println("[ALARM] xTaskCreate failed — alarm skipped");
+    }
 }
 
 // ============================================================================
@@ -10059,9 +10067,12 @@ void loop() {
                     if (hist_detail_open) { /* no nav while detail is open */ }
                     else {
                         if (history_selected_idx <= 0) {
-                            int prev = current_screen - 1;
-                            if (prev < 0) prev = NUM_SCREENS - 1;
-                            transition_screen(prev, -1);
+                            if (!screen_transitioned) {
+                                int prev = current_screen - 1;
+                                if (prev < 0) prev = NUM_SCREENS - 1;
+                                transition_screen(prev, -1);
+                                screen_transitioned = true;
+                            }
                         } else {
                             history_selected_idx--;
                             if (history_selected_idx < history_scroll_offset)
@@ -10071,19 +10082,23 @@ void loop() {
                     }
                 } else if (current_screen == 4) {
                     if (stats_scroll_target <= 0) {
-                        int prev = current_screen - 1;
-                        if (prev < 0) prev = NUM_SCREENS - 1;
-                        transition_screen(prev, -1);
+                        if (!screen_transitioned) {
+                            int prev = current_screen - 1;
+                            if (prev < 0) prev = NUM_SCREENS - 1;
+                            transition_screen(prev, -1);
+                            screen_transitioned = true;
+                        }
                     } else {
                         stats_scroll_target -= STATS_SCROLL_STEP;
                         if (stats_scroll_target < 0) stats_scroll_target = 0;
                         screen_dirty = true;
                     }
-                } else if (!stealth_mode) {
+                } else if (!stealth_mode && !screen_transitioned) {
                     int prev = current_screen - 1;
                     int d = (prev < 0) ? 1 : -1;
                     if (prev < 0) prev = NUM_SCREENS - 1;
                     transition_screen(prev, d);
+                    screen_transitioned = true;
                 }
             }
             else if (IS_KEY_DOWN(c)) {
@@ -10099,9 +10114,12 @@ void loop() {
                     else {
                         int hist_total = sd_available ? sd_hist_count : capture_history_count;
                         if (history_selected_idx >= hist_total - 1) {
-                            int next = current_screen + 1;
-                            if (next >= NUM_SCREENS) next = 0;
-                            transition_screen(next, 1);
+                            if (!screen_transitioned) {
+                                int next = current_screen + 1;
+                                if (next >= NUM_SCREENS) next = 0;
+                                transition_screen(next, 1);
+                                screen_transitioned = true;
+                            }
                         } else {
                             history_selected_idx++;
                             if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
@@ -10111,20 +10129,24 @@ void loop() {
                     }
                 } else if (current_screen == 4) {
                     if (stats_scroll_target >= STATS_MAX_SCROLL) {
-                        int next = current_screen + 1;
-                        if (next >= NUM_SCREENS) next = 0;
-                        transition_screen(next, 1);
+                        if (!screen_transitioned) {
+                            int next = current_screen + 1;
+                            if (next >= NUM_SCREENS) next = 0;
+                            transition_screen(next, 1);
+                            screen_transitioned = true;
+                        }
                     } else {
                         stats_scroll_target += STATS_SCROLL_STEP;
                         if (stats_scroll_target > STATS_MAX_SCROLL)
                             stats_scroll_target = STATS_MAX_SCROLL;
                         screen_dirty = true;
                     }
-                } else if (!stealth_mode) {
+                } else if (!stealth_mode && !screen_transitioned) {
                     int next = current_screen + 1;
                     int d = (next >= NUM_SCREENS) ? -1 : 1;
                     if (next >= NUM_SCREENS) next = 0;
                     transition_screen(next, d);
+                    screen_transitioned = true;
                 }
             }
             else if (IS_KEY_LEFT(c)) {
