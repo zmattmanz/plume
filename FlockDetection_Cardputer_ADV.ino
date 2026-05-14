@@ -8834,7 +8834,7 @@ void draw_gps_screen() {
         } else {
             strncpy(time_buf, "--:--:--", sizeof(time_buf));
         }
-        kv_row(auto_tz_valid ? "LOCAL" : "UTC", time_buf, DIM_COLOR);
+        kv_row(auto_tz_valid ? "LOCAL" : "UTC", time_buf, TEXT_COLOR);
     }
 }
 
