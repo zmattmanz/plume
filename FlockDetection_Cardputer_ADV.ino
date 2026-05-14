@@ -3402,6 +3402,8 @@ static ScanDevice    scan_devs[SCAN_MAX_DEVICES] = {};
 static unsigned long scan_last_refresh_ms = 0;
 static unsigned long scan_last_frame_ms   = 0;
 static float         scan_sweep_angle     = 0.0f;
+static uint8_t* scan_angle_lut       = nullptr;
+static bool     scan_angle_lut_ready = false;
 
 // Byte order detection for direct sprite buffer access.
 // Set once on first call to draw_scanner_viz_scan.
@@ -5985,9 +5987,6 @@ static const int SCAN_LUT_COLS = (VIZ_W + 1) / 2;
 static const int SCAN_LUT_ROWS = (VIZ_H + 1) / 2;
 static const int SCAN_LUT_SIZE = SCAN_LUT_COLS * SCAN_LUT_ROWS;
 static const float SCAN_LUT_INV_SCALE = (2.0f * (float)M_PI) / 256.0f;
-
-static uint8_t* scan_angle_lut       = nullptr;
-static bool     scan_angle_lut_ready = false;
 
 static void scan_angle_lut_build() {
     if (scan_angle_lut_ready) return;
