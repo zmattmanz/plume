@@ -5232,28 +5232,105 @@ static void render_frame() {
     auto& lcd = M5Cardputer.Display;
     lcd.startWrite();
 
-    // Draw header first (onto clean LCD, before content push)
-    if (menu_open) {
-        draw_overlay_header_lcd("MENU");
-    } else if (show_help_overlay) {
-        draw_overlay_header_lcd("HELP");
-    } else if (wifi_config_open) {
-        draw_overlay_header_lcd("WIFI CONFIG");
-    } else if (export_mode_active) {
-        draw_overlay_header_lcd("EXPORT");
-    } else {
-        draw_header_lcd(current_screen);
-        if (show_feed_expanded) {
-            lcd.setTextColor(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f), BG_COLOR);
-            lcd.setTextSize(TS_BODY);
-            lcd.setCursor(56, 5);
-            kprint_lcd("/ FEED");
+    // ── Dirty-track header state — only redraw when something changes ──
+    static bool     first_call          = true;
+    static int      last_screen         = -1;
+    static long     last_det            = -1;
+    static long     last_wifi           = -1;
+    static long     last_ble            = -1;
+    static int      last_bat_pct        = -1;
+    static bool     last_charging       = false;
+    static bool     last_gps_lock       = false;
+    static bool     last_muted          = false;
+    static bool     last_ambient        = false;
+    static bool     last_night          = false;
+    static bool     last_stealth        = false;
+    static bool     last_locator        = false;
+    static bool     last_low_power      = false;
+    static bool     last_sd             = true;
+    static bool     last_export         = false;
+    static bool     last_menu           = false;
+    static bool     last_help           = false;
+    static bool     last_wifi_cfg       = false;
+    static bool     last_feed_exp       = false;
+
+    // Sample current state under mutex
+    long cur_det = 0, cur_wifi = 0, cur_ble = 0;
+    bool cur_gps = false;
+    if (take_data_mutex()) {
+        cur_det  = lifetime_flock_total;
+        cur_wifi = session_flock_wifi;
+        cur_ble  = session_flock_ble;
+        cur_gps  = gps.satellites.isValid() && gps.satellites.value() >= 1;
+        give_data_mutex();
+    }
+    int  cur_bat      = voltage_to_percent(get_filtered_voltage());
+    bool cur_charging = M5Cardputer.Power.isCharging();
+
+    bool header_dirty = first_call
+        || (current_screen     != last_screen)
+        || (cur_det            != last_det)
+        || (cur_wifi           != last_wifi)
+        || (cur_ble            != last_ble)
+        || (cur_bat            != last_bat_pct)
+        || (cur_charging       != last_charging)
+        || (cur_gps            != last_gps_lock)
+        || (is_muted           != last_muted)
+        || (ambient_mode       != last_ambient)
+        || (night_mode         != last_night)
+        || (stealth_mode       != last_stealth)
+        || (locator_active     != last_locator)
+        || (low_power_mode     != last_low_power)
+        || (sd_available       != last_sd)
+        || (export_mode_active != last_export)
+        || (menu_open          != last_menu)
+        || (show_help_overlay  != last_help)
+        || (wifi_config_open   != last_wifi_cfg)
+        || (show_feed_expanded != last_feed_exp);
+
+    if (header_dirty) {
+        first_call     = false;
+        last_screen    = current_screen;
+        last_det       = cur_det;
+        last_wifi      = cur_wifi;
+        last_ble       = cur_ble;
+        last_bat_pct   = cur_bat;
+        last_charging  = cur_charging;
+        last_gps_lock  = cur_gps;
+        last_muted     = is_muted;
+        last_ambient   = ambient_mode;
+        last_night     = night_mode;
+        last_stealth   = stealth_mode;
+        last_locator   = locator_active;
+        last_low_power = low_power_mode;
+        last_sd        = sd_available;
+        last_export    = export_mode_active;
+        last_menu      = menu_open;
+        last_help      = show_help_overlay;
+        last_wifi_cfg  = wifi_config_open;
+        last_feed_exp  = show_feed_expanded;
+
+        if (menu_open) {
+            draw_overlay_header_lcd("MENU");
+        } else if (show_help_overlay) {
+            draw_overlay_header_lcd("HELP");
+        } else if (wifi_config_open) {
+            draw_overlay_header_lcd("WIFI CONFIG");
+        } else if (export_mode_active) {
+            draw_overlay_header_lcd("EXPORT");
+        } else {
+            draw_header_lcd(current_screen);
+            if (show_feed_expanded) {
+                lcd.setTextColor(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f), BG_COLOR);
+                lcd.setTextSize(TS_BODY);
+                lcd.setCursor(56, 5);
+                kprint_lcd("/ FEED");
+            }
         }
     }
 
-    // Push content rows via DMA, telling the library the buffer is already
-    // in the display's native swap565 byte order so no per-pixel conversion
-    // happens. This goes through the same fast path pushSprite uses.
+    // Push content rows via DMA — buffer already in native swap565 byte order,
+    // lgfx::swap565_t* cast bypasses per-pixel conversion and goes direct DMA.
     uint16_t* buf = (uint16_t*)spr.getBuffer();
     if (buf) {
         lcd.pushImageDMA(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y,
