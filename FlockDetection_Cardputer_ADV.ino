@@ -2228,14 +2228,6 @@ bool export_mode_start() {
     NimBLEDevice::deinit(true);
     pBLEScan = nullptr;
 
-    // Free the SCAN viz angle LUT — not used during export, rebuilds
-    // automatically on first SCAN render after export_restore_promiscuous().
-    if (scan_angle_lut) {
-        free(scan_angle_lut);
-        scan_angle_lut = nullptr;
-        scan_angle_lut_ready = false;
-    }
-
     WiFi.disconnect(true);
     delay(WIFI_MODE_SETTLE_MEDIUM_MS);
     WiFi.mode(WIFI_STA);
