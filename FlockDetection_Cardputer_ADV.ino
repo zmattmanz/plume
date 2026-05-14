@@ -2305,6 +2305,8 @@ static void perform_detection_delete(int idx) {
         safe_copy(target_mac, sd_hist[idx].mac, sizeof(target_mac));
         target_uptime_ms = sd_hist[idx].uptime_ms;
         target_rssi = sd_hist[idx].rssi;
+        Serial.printf("[DELDIAG] snapshot: idx=%d mac=%s uptime_ms=%lu (sd_hist_count=%d)\n",
+                      idx, target_mac, target_uptime_ms, sd_hist_count);
 
         // Remove from in-memory sd_hist[] by shifting
         for (int i = idx; i < sd_hist_count - 1; i++) sd_hist[i] = sd_hist[i + 1];
@@ -2361,6 +2363,11 @@ static void perform_detection_delete(int idx) {
 // Called on screen-leave, 5s idle, export start, or stats clear.
 static void flush_pending_deletes() {
     if (pending_delete_count == 0) return;
+    Serial.printf("[DELDIAG] flush ENTER: pending=%d\n", pending_delete_count);
+    for (int p = 0; p < pending_delete_count; p++) {
+        Serial.printf("[DELDIAG]   pending[%d]: mac=%s uptime_ms=%lu\n",
+                      p, pending_deletes[p].mac, pending_deletes[p].uptime_ms);
+    }
     if (!sd_available) { pending_delete_count = 0; pending_delete_dirty_ms = 0; return; }
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) != pdTRUE) return;
 
@@ -2407,6 +2414,13 @@ static void flush_pending_deletes() {
         }
 
         // Check against every pending delete
+        for (int p = 0; p < pending_delete_count; p++) {
+            if (strncmp(row_mac, pending_deletes[p].mac, 17) == 0) {
+                Serial.printf("[DELDIAG]   MAC match: row_uptime_ms=%lu vs pending=%lu -> %s\n",
+                              row_uptime_ms, pending_deletes[p].uptime_ms,
+                              (row_uptime_ms == pending_deletes[p].uptime_ms) ? "DROP" : "KEEP");
+            }
+        }
         bool drop = false;
         for (int p = 0; p < pending_delete_count && !drop; p++) {
             if (row_uptime_ms == pending_deletes[p].uptime_ms &&
@@ -2434,8 +2448,7 @@ static void flush_pending_deletes() {
         SD.remove(tmp_path);
     }
 
-    Serial.printf("[DELDIAG] flush_pending_deletes: dropped=%d pending=%d\n",
-                  skipped, pending_delete_count);
+    Serial.printf("[DELDIAG] flush EXIT: dropped=%d\n", skipped);
     pending_delete_count  = 0;
     pending_delete_dirty_ms = 0;
     xSemaphoreGive(sdMutex);
