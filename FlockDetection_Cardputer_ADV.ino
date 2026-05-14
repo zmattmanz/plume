@@ -9654,7 +9654,7 @@ static void apply_ble_scan_params() {
     }
 }
 
-SET_LOOP_TASK_STACK_SIZE(5440);
+SET_LOOP_TASK_STACK_SIZE(7168);
 
 void setup() {
     // ── Safe WDT reconfiguration ────────────────────────────────────
@@ -9991,7 +9991,7 @@ void setup() {
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 1856, NULL, 1, &ScannerTaskHandle, 0);
+    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 2048, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 2048, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
@@ -10206,11 +10206,11 @@ void loop() {
 
         auto log_watermarks = [&](const char* tag, const UBaseType_t hw[5]) {
             Serial.printf("[STACK] %s — bytes remaining:\n", tag);
-            Serial.printf("  Scanner: %u / 1856\n", (unsigned)hw[0]);
+            Serial.printf("  Scanner: %u / 2048\n", (unsigned)hw[0]);
             Serial.printf("  GPS:     %u / 2048\n", (unsigned)hw[1]);
             Serial.printf("  BLE:     %u / 2752\n", (unsigned)hw[2]);
             Serial.printf("  LED:     %u / 1536\n", (unsigned)hw[3]);
-            Serial.printf("  Loop:    %u / 5440\n", (unsigned)hw[4]);
+            Serial.printf("  Loop:    %u / 7168\n", (unsigned)hw[4]);
         };
 
         // Layer 1: baseline log at 60 seconds.
