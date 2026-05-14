@@ -191,13 +191,13 @@ static const MenuItem settings_items[] = {
     {"Night Mode",       true,  false, 5},
     {"Low Power Mode",   true,  false, 6},
     {"Mute Beeps",       true,  false, 7},
-    {"Turbo Mode",       true,  false, 11},
+    {"Turbo Mode",       true,  false, 8},
 };
 
 static const MenuItem tools_items[] = {
-    {"WiFi Config",      false, false, 8},
-    {"Export Mode",      false, false, 9},
-    {"Clear All Stats",  false, true,  10},
+    {"WiFi Config",      false, false, 9},
+    {"Export Mode",      false, false, 10},
+    {"Clear All Stats",  false, true,  11},
 };
 
 static const MenuSection menu_sections[] = {
@@ -5640,9 +5640,10 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
         case 5:  menu_icon_night(x, y, col);      break;
         case 6:  menu_icon_power(x, y, col);      break;
         case 7:  menu_icon_mute(x, y, col);       break;
-        case 8:  menu_icon_wifi(x, y, col);       break;
-        case 9:  menu_icon_export(x, y, col);     break;
-        case 10: menu_icon_trash(x, y, col);      break;
+        case 8:  menu_icon_signal(x, y, col);     break;
+        case 9:  menu_icon_wifi(x, y, col);       break;
+        case 10: menu_icon_export(x, y, col);     break;
+        case 11: menu_icon_trash(x, y, col);      break;
     }
 }
 
@@ -5682,7 +5683,7 @@ static void draw_menu_overlay() {
     static const MRow mrows[] = {
         {0, -1, "SCREENS"},
         {1,  0, "Scanner"},
-        {1,  1, "Locator"},
+        {1,  1, "Signal"},
         {1,  2, "Detections"},
         {1,  3, "GPS"},
         {1,  4, "Stats"},
@@ -5691,16 +5692,17 @@ static void draw_menu_overlay() {
         {1,  5, "Night Mode"},
         {1,  6, "Low Power"},
         {1,  7, "Mute Beeps"},
+        {1,  8, "Turbo Mode"},
         {2, -1, ""},
         {0, -1, "ACTIONS"},
-        {1,  8, "WiFi Config"},
-        {1,  9, "Export Mode"},
-        {1, 10, "Clear All"},
+        {1,  9, "WiFi Config"},
+        {1, 10, "Export Mode"},
+        {1, 11, "Clear All"},
     };
-    const int NROWS = 16;
+    const int NROWS = 17;
 
     // Compute virtual y for each row
-    int virt_y[16];
+    int virt_y[17];
     int cy = 0;
     for (int i = 0; i < NROWS; i++) {
         virt_y[i] = cy;
@@ -5772,8 +5774,8 @@ static void draw_menu_overlay() {
         } else {
             int idx = mrows[i].idx;
             bool sel = (menu_selected == idx);
-            bool danger = (idx == 10);
-            bool export_active_row = (idx == 9 && (export_mode_active || export_connecting));
+            bool danger = (idx == 11);
+            bool export_active_row = (idx == 10 && (export_mode_active || export_connecting));
 
             // Icon
             uint16_t icon_col = ea(export_active_row ? CAUTION_COLOR
@@ -5799,11 +5801,12 @@ static void draw_menu_overlay() {
                 spr.fillCircle(dot_x, ry + ROW_H / 2, 2, ea(HEADER_COLOR));
             }
 
-            // Toggle pills for settings (idx 5-7)
-            if (idx >= 5 && idx <= 7) {
+            // Toggle pills for settings (idx 5-8)
+            if (idx >= 5 && idx <= 8) {
                 bool on = (idx == 5) ? night_mode
                         : (idx == 6) ? low_power_mode
-                        : is_muted;
+                        : (idx == 7) ? is_muted
+                        : turbo_mode_active;
                 if (on) {
                     int pw = 14, ph = 9;
                     int px = DISP_W - pw - UI_PAD_SM - 4;
@@ -5832,8 +5835,8 @@ static void draw_menu_overlay() {
         int sel_draw_y = (int)(menu_sel_y_f + 0.5f);
         if (sel_draw_y + ROW_H > VIEW_TOP && sel_draw_y < VIEW_TOP + VIEW_H) {
             spr.setClipRect(0, VIEW_TOP, DISP_W, VIEW_H);
-            bool danger = (menu_selected == 10);
-            bool export_active_sel = (menu_selected == 9 && (export_mode_active || export_connecting));
+            bool danger = (menu_selected == 11);
+            bool export_active_sel = (menu_selected == 10 && (export_mode_active || export_connecting));
             uint16_t accent = (danger || export_active_sel) ? CAUTION_COLOR : HEADER_COLOR;
             spr.drawRect(ROW_LEFT, sel_draw_y, ROW_W, ROW_H, ea(accent));
             spr.fillRect(ROW_LEFT, sel_draw_y, 2, ROW_H, ea(accent));
@@ -6050,6 +6053,9 @@ void handle_menu_select() {
             screen_dirty = true;
             break;
         case 8:
+            set_turbo_mode(!turbo_mode_active);
+            break;
+        case 9:
             show_feed_expanded = false;
             wifi_config_open = true;
             wifi_config_open_ms = millis();
@@ -6062,7 +6068,7 @@ void handle_menu_select() {
             wifi_config_cursor = 0;
             draw_current_screen(); render_frame();
             break;
-        case 9:
+        case 10:
             if (export_mode_active || export_connecting) {
                 export_mode_stop();
             } else {
@@ -6070,10 +6076,7 @@ void handle_menu_select() {
             }
             screen_dirty = true;
             break;
-        case 11:
-            set_turbo_mode(!turbo_mode_active);
-            break;
-        case 10: {
+        case 11: {
             // Clear all stats — session and lifetime
             flush_pending_deletes();
             xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
