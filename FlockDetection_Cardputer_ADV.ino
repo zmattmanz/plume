@@ -139,6 +139,10 @@ unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
 static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
+static bool          title_card_active   = true;
+static unsigned long title_card_start_ms = 0;
+static const unsigned long TITLE_CARD_HOLD_MS = 3000;
+static const unsigned long TITLE_CARD_FADE_MS = 1000;
 static int  feed_expanded_selected = 0;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 
@@ -5647,6 +5651,51 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
     }
 }
 
+static void draw_title_card() {
+    unsigned long elapsed = millis() - title_card_start_ms;
+    unsigned long total = TITLE_CARD_HOLD_MS + TITLE_CARD_FADE_MS;
+
+    if (elapsed >= total) {
+        title_card_active = false;
+        return;
+    }
+
+    float alpha = 1.0f;
+    if (elapsed > TITLE_CARD_HOLD_MS) {
+        alpha = 1.0f - (float)(elapsed - TITLE_CARD_HOLD_MS) / (float)TITLE_CARD_FADE_MS;
+    }
+
+    int card_w = 120;
+    int card_h = 36;
+    int card_x = (DISP_W - card_w) / 2;
+    int card_y = CONTENT_Y + ((DISP_H - CONTENT_Y - card_h) / 2);
+
+    uint16_t border_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+    uint16_t title_col  = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+    uint16_t ver_col    = lerp_col16(BG_COLOR, DIM_COLOR, alpha);
+
+    spr.fillRoundRect(card_x, card_y, card_w, card_h, 3, BG_COLOR);
+    spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, border_col);
+
+    // "FLOCK FINDER" centered
+    int title_chars = 12;
+    int title_w = title_chars * 7;  // kprint with extra=1: 6px char + 1px kern = 7px
+    int title_x = card_x + (card_w - title_w) / 2;
+    spr.setTextColor(title_col, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(title_x, card_y + 8);
+    kprint(spr, "FLOCK FINDER", 1);
+
+    // Version string centered underneath
+    const char* ver = VERSION_STRING;
+    int ver_w = (int)strlen(ver) * ts_char_w(TS_MICRO);
+    int ver_x = card_x + (card_w - ver_w) / 2;
+    spr.setTextColor(ver_col, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(ver_x, card_y + 22);
+    spr.print(ver);
+}
+
 // ── Fullscreen single-column scrollable menu ────────────────────────
 static void draw_menu_overlay() {
     float alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
@@ -9157,7 +9206,10 @@ void draw_current_screen() {
 
     if (!fullscreen_overlay) {
         switch (current_screen) {
-            case 0: draw_scanner_screen();         break;
+            case 0:
+                draw_scanner_screen();
+                if (title_card_active) draw_title_card();
+                break;
             case 1: draw_signal_screen();           break;
             case 2: draw_capture_history_screen(); break;
             case 3: draw_gps_screen();             break;
@@ -10099,6 +10151,8 @@ void setup() {
         scan_feed_last_snapshot = millis();
     }
 
+    title_card_start_ms = millis();
+
     // ── Crossfade from boot screen to scanner via the backlight PWM ──
     // Fade-out: ramp brightness to 0 over ~400ms, so the still-rendered boot
     // content dims away. Swap sprite contents while the screen is dark.
@@ -10420,6 +10474,10 @@ void loop() {
             M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
             // Same I2S wake as the BtnA path.
             M5Cardputer.Speaker.stop();
+        }
+        if (title_card_active) {
+            title_card_active = false;
+            screen_dirty = true;
         }
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         
@@ -11427,7 +11485,7 @@ void loop() {
 
         if (menu_open ||
             current_screen == 0 || current_screen == 1 || current_screen == 3 ||
-            show_vol_overlay || toast_active || stats_scrolling || stats_rolling ||
+            show_vol_overlay || toast_active || title_card_active || stats_scrolling || stats_rolling ||
             hist_animating ||
             (now - last_fast_anim < 30)) {
             // Stats screen caps at 30 fps to suppress the SPI/scan-line
