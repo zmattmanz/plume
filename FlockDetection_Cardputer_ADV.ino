@@ -5251,14 +5251,13 @@ static void render_frame() {
         }
     }
 
-    // Push ONLY content rows from the sprite buffer, skipping header rows.
-    // setAddrWindow constrains the display controller's write region so
-    // the header area is never touched by the pixel data.
+    // Push content rows via DMA, telling the library the buffer is already
+    // in the display's native swap565 byte order so no per-pixel conversion
+    // happens. This goes through the same fast path pushSprite uses.
     uint16_t* buf = (uint16_t*)spr.getBuffer();
     if (buf) {
-        lcd.setAddrWindow(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
-        lcd.pushPixels(buf + (CONTENT_Y * DISP_W),
-                       DISP_W * (DISP_H - CONTENT_Y));
+        lcd.pushImageDMA(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y,
+                         (lgfx::swap565_t*)(buf + CONTENT_Y * DISP_W));
     }
 
     lcd.endWrite();
