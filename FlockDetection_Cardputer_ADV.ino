@@ -50,6 +50,7 @@ enum BootPersonality {
 // FORWARD DECLARATIONS
 // ============================================================================
 void draw_header_spr(int screen_num);
+void draw_header_lcd(int screen_num);
 void draw_toast_spr();
 void draw_vol_overlay();
 void drawCard(int x, int y, int w, int h);
@@ -5067,6 +5068,154 @@ static void drawPill(int x, int y, const char* text, uint16_t accent_col,
     spr.print(text);
 }
 
+// ── LCD-direct rendering helpers (Phase 1 of sprite-split) ──────────
+// These mirror kprint / drawPill but target M5Cardputer.Display instead
+// of the sprite. Used by draw_header_lcd(). Nothing else changes yet.
+
+static void kprint_lcd(const char* text, int extra = 1) {
+    auto& lcd = M5Cardputer.Display;
+    int cx = lcd.getCursorX(), cy = lcd.getCursorY();
+    for (const char* p = text; *p; p++) {
+        char ch[2] = {*p, '\0'};
+        lcd.setCursor(cx, cy);
+        lcd.print(ch);
+        cx += 6 + extra;
+    }
+}
+
+static void drawPill_lcd(int x, int y, const char* text, uint16_t accent_col,
+                         float bg_accent_pct = 0.18f, bool filled = false) {
+    auto& lcd = M5Cardputer.Display;
+    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 6;
+    int th = 11;
+    uint16_t bg = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, bg_accent_pct);
+    uint16_t fg = filled ? BG_COLOR : TEXT_COLOR;
+    uint16_t border = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, 0.4f);
+    lcd.fillRoundRect(x, y, tw, th, 3, bg);
+    lcd.drawRoundRect(x, y, tw, th, 3, border);
+    lcd.setTextColor(fg, bg);
+    lcd.setTextSize(TS_MICRO);
+    lcd.setCursor(x + 3, y + 2);
+    lcd.print(text);
+}
+
+void draw_header_lcd(int screen_num) {
+    auto& lcd = M5Cardputer.Display;
+    static const char* screen_names[NUM_SCREENS] = {
+        "SCANNER", "SIGNAL", "DETECTIONS", "GPS", "STATS"
+    };
+    if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
+
+    lcd.fillRect(0, 0, DISP_W, 18, BG_COLOR);
+    lcd.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+    lcd.setTextColor(HEADER_COLOR, BG_COLOR);
+    lcd.setTextSize(TS_BODY);
+    lcd.setCursor(TEXT_LEFT, 5);
+    kprint_lcd(screen_names[screen_num]);
+
+    // ── Status pill row (mirrors draw_header_spr exactly) ──
+    bool gps_lock_now;
+    if (!take_data_mutex()) return;
+    gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
+    long pill_det  = lifetime_flock_total;
+    long pill_wifi = session_flock_wifi;
+    long pill_ble  = session_flock_ble;
+    give_data_mutex();
+    bool muted_now = is_muted;
+
+    int icon_right = DISP_W - 4;
+    int icon_y = 4;
+
+    // Mode badges
+    {
+        struct ModeBadge { bool active; const char* letter; uint16_t color; };
+        ModeBadge badges[5] = {
+            { ambient_mode,    "A", DIM_COLOR },
+            { night_mode,      "N", HEADER_COLOR },
+            { stealth_mode,    "S", DIM_COLOR },
+            { locator_active,  "L", CAUTION_COLOR },
+            { low_power_mode,  "P", ACCENT_COLOR },
+        };
+        for (int i = 0; i < 5; i++) {
+            if (!badges[i].active) continue;
+            int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
+            drawPill_lcd(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
+            icon_right -= pw + 2;
+        }
+    }
+
+    // Export mode indicator
+    if (export_mode_active) {
+        drawPill_lcd(icon_right - 27, icon_y, "EXP", CAUTION_COLOR, 0.0f, true);
+        icon_right -= 29;
+    }
+
+    // Muted indicator
+    if (muted_now) {
+        drawPill_lcd(icon_right - 13, icon_y, "M", DIM_COLOR);
+        icon_right -= 15;
+    }
+
+    // SD missing
+    if (system_fully_booted && !sd_available) {
+        uint16_t sd_warn = lgfx::color565(180, 40, 40);
+        drawPill_lcd(icon_right - 20, icon_y, "SD", sd_warn);
+        icon_right -= 22;
+    }
+
+    // GPS missing
+    if (!gps_lock_now) {
+        drawPill_lcd(icon_right - 27, icon_y, "GPS", CAUTION_COLOR);
+        icon_right -= 29;
+    }
+
+    // Detection count pill
+    {
+        char det_str[8];
+        snprintf(det_str, sizeof(det_str), "D%lu", (unsigned long)pill_det);
+        int dw = (int)strlen(det_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill_lcd(icon_right - dw, icon_y, det_str, ACCENT_COLOR, 0.0f, true);
+        icon_right -= dw + 2;
+    }
+
+    // WiFi + BLE session count pills
+    {
+        char b_str[8];
+        snprintf(b_str, sizeof(b_str), "B%ld", pill_ble);
+        int bw = (int)strlen(b_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill_lcd(icon_right - bw, icon_y, b_str, DIM_COLOR);
+        icon_right -= bw + 2;
+
+        char w_str[8];
+        snprintf(w_str, sizeof(w_str), "W%ld", pill_wifi);
+        int ww = (int)strlen(w_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill_lcd(icon_right - ww, icon_y, w_str, DIM_COLOR);
+        icon_right -= ww + 2;
+    }
+
+    // Battery percentage pill
+    {
+        int32_t bat_mv = get_filtered_voltage();
+        int bat_pct = voltage_to_percent(bat_mv);
+        bool charging = M5Cardputer.Power.isCharging();
+
+        char bat_str[10];
+        if (charging) {
+            snprintf(bat_str, sizeof(bat_str), "%d%%+", bat_pct);
+        } else {
+            snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct);
+        }
+        int pw = (int)strlen(bat_str) * ts_char_w(TS_MICRO) + 6;
+        uint16_t bat_col = charging       ? GPS_COLOR
+                         : (bat_pct <= 10) ? CAUTION_COLOR
+                         : (bat_pct <= 25) ? lerp_col16(DIM_COLOR, CAUTION_COLOR, 0.5f)
+                         :                   DIM_COLOR;
+        drawPill_lcd(icon_right - pw, icon_y, bat_str, bat_col);
+    }
+
+    // TEMP: verification marker — remove after confirming LCD header works
+    lcd.fillCircle(DISP_W / 2, 9, 3, lgfx::color565(255, 0, 255));
+}
 
 void draw_help_overlay() {
     float alpha = ui_progress(help_ease_start, UI_FADE_IN_MS);
@@ -11061,6 +11210,10 @@ void loop() {
             draw_current_screen();
             M5Cardputer.Display.startWrite();
             spr.pushSprite(0, 0);
+            if (!menu_open && !show_help_overlay && !wifi_config_open
+                && !show_feed_expanded && !export_mode_active) {
+                draw_header_lcd(current_screen);
+            }
             M5Cardputer.Display.endWrite();
             last_ambient_draw = now_amb;
         }
@@ -11132,6 +11285,10 @@ void loop() {
                 // mid-frame and tear the image.
                 M5Cardputer.Display.startWrite();
                 spr.pushSprite(0, 0);
+                if (!menu_open && !show_help_overlay && !wifi_config_open
+                    && !show_feed_expanded && !export_mode_active) {
+                    draw_header_lcd(current_screen);
+                }
                 M5Cardputer.Display.endWrite();
                 last_fast_anim = now;
                 screen_dirty = false;
@@ -11150,6 +11307,10 @@ void loop() {
                     draw_current_screen();
                     M5Cardputer.Display.startWrite();
                     spr.pushSprite(0, 0);
+                    if (!menu_open && !show_help_overlay && !wifi_config_open
+                        && !show_feed_expanded && !export_mode_active) {
+                        draw_header_lcd(current_screen);
+                    }
                     M5Cardputer.Display.endWrite();
                     screen_dirty = false;
                 }
