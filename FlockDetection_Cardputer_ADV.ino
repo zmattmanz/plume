@@ -4014,7 +4014,7 @@ struct WifiEvent {
     char     ssid[33];
     bool     is_beacon;
     bool     is_probe_req;   // mgmt subtype 4 — required for the wildcard-probe signature
-    uint8_t  payload_snap[256];
+    uint8_t  payload_snap[192];
     uint16_t payload_snap_len;
     uint16_t orig_len;
     volatile uint32_t ready;
@@ -4082,7 +4082,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     }
     ev->orig_len         = sig_len;
     if (sig_len > 512) sig_len = 512;
-    ev->payload_snap_len = (sig_len < 256) ? sig_len : 256;
+    ev->payload_snap_len = (sig_len < sizeof(ev->payload_snap)) ? sig_len : (uint16_t)sizeof(ev->payload_snap);
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
 
     // Clear parsed fields — they'll be populated by parse_wifi_event()
