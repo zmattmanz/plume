@@ -3398,6 +3398,7 @@ static ScanDevice    scan_devs[SCAN_MAX_DEVICES] = {};
 static unsigned long scan_last_refresh_ms = 0;
 static unsigned long scan_last_frame_ms   = 0;
 static float         scan_sweep_angle     = 0.0f;
+static float*        signal_curve_cache   = nullptr; // allocated on enter screen 1, freed on leave
 
 // Byte order detection for direct sprite buffer access.
 // Set once on first call to draw_scanner_viz_scan.
@@ -8388,7 +8389,8 @@ void draw_signal_screen() {
             return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
         };
 
-        static float curve_cache[241];
+        if (!signal_curve_cache) return; // allocation failed or not on screen 1
+        float* curve_cache = signal_curve_cache;
         for (int px = 0; px <= trace_w && px < 241; px++) {
             float idx_f = (float)px / (float)trace_w * (float)(trace_count - 1);
             curve_cache[px] = eval_cr(idx_f);
@@ -9144,6 +9146,14 @@ void transition_screen(int new_screen, int dir) {
     // Flush queued deletes whenever we leave the history screen
     if (current_screen == 2 && new_screen != 2 && pending_delete_count > 0)
         flush_pending_deletes();
+
+    // Signal screen curve cache — alloc on enter, free on leave
+    if (new_screen == 1 && !signal_curve_cache)
+        signal_curve_cache = (float*)malloc(241 * sizeof(float));
+    if (current_screen == 1 && new_screen != 1 && signal_curve_cache) {
+        free(signal_curve_cache);
+        signal_curve_cache = nullptr;
+    }
 
     // Screen-specific setup (same as before)
     if (new_screen == 0) {
