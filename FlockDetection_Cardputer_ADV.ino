@@ -4019,7 +4019,7 @@ struct WifiEvent {
     char     ssid[33];
     bool     is_beacon;
     bool     is_probe_req;   // mgmt subtype 4 — required for the wildcard-probe signature
-    uint8_t  payload_snap[192];
+    uint8_t  payload_snap[128];
     uint16_t payload_snap_len;
     uint16_t orig_len;
     volatile uint32_t ready;
