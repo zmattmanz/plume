@@ -986,10 +986,14 @@ static void deleted_macs_add(const char* mac, int before_id) {
     deleted_mac_count++;
 }
 
-static bool deleted_macs_suppresses(const char* mac, int id) {
+static bool deleted_macs_suppresses(const char* mac, int /*id*/) {
+    // Once a MAC has been deleted, ALL future detections of that MAC
+    // are suppressed on the Detections screen. The screen shows one
+    // row per MAC (post-dedup), so this matches the UX: deleting a
+    // row removes the device entirely until it's re-encountered with
+    // a fresh slate (which requires clearing the deletion filter).
     for (int i = 0; i < deleted_mac_count; i++) {
-        if (strncmp(deleted_macs[i].mac, mac, 17) == 0)
-            return id <= deleted_macs[i].before_id;
+        if (strncmp(deleted_macs[i].mac, mac, 17) == 0) return true;
     }
     return false;
 }
