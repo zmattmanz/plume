@@ -5234,7 +5234,7 @@ static void render_frame() {
 
     // Push sprite content only — clip out header rows 0-19
     lcd.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
-    render_frame();
+    spr.pushSprite(0, 0);
     lcd.clearClipRect();
 
     // Draw header directly to LCD
