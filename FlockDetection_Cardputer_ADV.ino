@@ -920,131 +920,6 @@ bool hist_detail_open      = false;
 bool hist_delete_confirming = false;
 volatile bool sd_hist_dirty = false;
 
-#define MAX_DELETED_IDS    64
-#define DELETED_IDS_FILE   "/FLOCK_FINDER/flock_deleted.dat"
-static int  deleted_ids[MAX_DELETED_IDS];
-static int  deleted_id_count = 0;
-
-static void add_deleted_id(int id) {
-    if (deleted_id_count >= MAX_DELETED_IDS) {
-        for (int i = 0; i < MAX_DELETED_IDS - 1; i++) deleted_ids[i] = deleted_ids[i + 1];
-        deleted_id_count = MAX_DELETED_IDS - 1;
-    }
-    Serial.printf("[DELDIAG] add_deleted_id(%d) — count was %d\n", id, deleted_id_count);
-    deleted_ids[deleted_id_count++] = id;
-    Serial.printf("[DELDIAG] add_deleted_id done — count now %d\n", deleted_id_count);
-}
-
-static bool is_id_deleted(int id) {
-    if (id <= 0) return false;
-    for (int i = 0; i < deleted_id_count; i++) {
-        if (deleted_ids[i] == id) return true;
-    }
-    return false;
-}
-
-// FNV-1a over (mac, epoch_utc, uptime_ms, rssi) → stable synthetic ID for
-// legacy CSV lines that lack a DetID column. Result forced into
-// 0x40000000..0x7FFFFFFF so it never collides with the sequential counter.
-static int synthesize_detection_id(const char* mac, uint32_t epoch,
-                                   unsigned long uptime_ms, int rssi) {
-    uint32_t h = 2166136261u;
-    if (mac) {
-        for (const char* p = mac; *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
-    }
-    h ^= epoch;               h *= 16777619u;
-    h ^= (uint32_t)uptime_ms; h *= 16777619u;
-    h ^= (uint32_t)rssi;      h *= 16777619u;
-    return (int)((h & 0x3FFFFFFFu) | 0x40000000u);
-}
-
-#define MAX_DELETED_MACS 24
-struct DeletedMacEntry {
-    char mac[18];
-    int  before_id;   // suppress CSV lines with id <= before_id for this MAC
-};
-static DeletedMacEntry deleted_macs[MAX_DELETED_MACS];
-static int deleted_mac_count = 0;
-static const char DELETED_MACS_FILE[] = "/FLOCK_FINDER/flock_deleted_macs.dat";
-
-static void deleted_macs_add(const char* mac, int before_id) {
-    for (int i = 0; i < deleted_mac_count; i++) {
-        if (strncmp(deleted_macs[i].mac, mac, 17) == 0) {
-            if (before_id > deleted_macs[i].before_id)
-                deleted_macs[i].before_id = before_id;
-            return;
-        }
-    }
-    if (deleted_mac_count >= MAX_DELETED_MACS) {
-        for (int i = 0; i < MAX_DELETED_MACS - 1; i++)
-            deleted_macs[i] = deleted_macs[i + 1];
-        deleted_mac_count = MAX_DELETED_MACS - 1;
-    }
-    strncpy(deleted_macs[deleted_mac_count].mac, mac, 17);
-    deleted_macs[deleted_mac_count].mac[17] = '\0';
-    deleted_macs[deleted_mac_count].before_id = before_id;
-    deleted_mac_count++;
-}
-
-static bool deleted_macs_suppresses(const char* mac, int /*id*/) {
-    // Once a MAC has been deleted, ALL future detections of that MAC
-    // are suppressed on the Detections screen. The screen shows one
-    // row per MAC (post-dedup), so this matches the UX: deleting a
-    // row removes the device entirely until it's re-encountered with
-    // a fresh slate (which requires clearing the deletion filter).
-    for (int i = 0; i < deleted_mac_count; i++) {
-        if (strncmp(deleted_macs[i].mac, mac, 17) == 0) return true;
-    }
-    return false;
-}
-
-static void deleted_macs_save() {
-    if (!sd_available) return;
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
-    File f = SD.open(DELETED_MACS_FILE, FILE_WRITE);
-    if (f) {
-        for (int i = 0; i < deleted_mac_count; i++) {
-            f.printf("%s,%d\n", deleted_macs[i].mac, deleted_macs[i].before_id);
-        }
-        f.close();
-        Serial.printf("[DELDIAG] deleted_macs_save EXIT — wrote %d to SD\n",
-                      deleted_mac_count);
-    }
-    xSemaphoreGive(sdMutex);
-}
-
-static void deleted_macs_load() {
-    deleted_mac_count = 0;
-    if (!sd_available) return;
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
-    if (!SD.exists(DELETED_MACS_FILE)) {
-        xSemaphoreGive(sdMutex);
-        return;
-    }
-    File f = SD.open(DELETED_MACS_FILE, FILE_READ);
-    if (!f) {
-        xSemaphoreGive(sdMutex);
-        return;
-    }
-    while (f.available() && deleted_mac_count < MAX_DELETED_MACS) {
-        String ln = f.readStringUntil('\n');
-        int comma = ln.indexOf(',');
-        if (comma < 17) continue;
-        String mac_s = ln.substring(0, 17);
-        int bid = ln.substring(comma + 1).toInt();
-        strncpy(deleted_macs[deleted_mac_count].mac, mac_s.c_str(), 17);
-        deleted_macs[deleted_mac_count].mac[17] = '\0';
-        deleted_macs[deleted_mac_count].before_id = bid;
-        deleted_mac_count++;
-    }
-    f.close();
-    xSemaphoreGive(sdMutex);
-    Serial.printf("[DELDIAG] deleted_macs_load EXIT — loaded %d from SD\n",
-                  deleted_mac_count);
-}
-
-static void save_deleted_ids();   // forward decl
-static void load_deleted_ids();   // forward decl
 
 // Detections screen — selection ease + detail overlay open/close transition.
 // hist_sel_y_f follows the target row y via anim_filter for smooth motion.
@@ -2395,71 +2270,27 @@ void save_detections_to_flash() {
     });
 }
 
-static void save_deleted_ids() {
-    if (!sd_available) return;
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        Serial.println("[DELDIAG] save_deleted_ids — sdMutex timeout");
-        return;
-    }
-    File f = SD.open(DELETED_IDS_FILE, FILE_WRITE);
-    if (f) {
-        for (int i = 0; i < deleted_id_count; i++) {
-            f.printf("%d\n", deleted_ids[i]);
-        }
-        f.close();
-        Serial.printf("[DELDIAG] save_deleted_ids EXIT — wrote %d ids to SD\n",
-                      deleted_id_count);
-    } else {
-        Serial.println("[DELDIAG] save_deleted_ids — SD.open failed");
-    }
-    xSemaphoreGive(sdMutex);
-}
-
-static void load_deleted_ids() {
-    deleted_id_count = 0;
-    if (!sd_available) return;
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
-    if (!SD.exists(DELETED_IDS_FILE)) {
-        xSemaphoreGive(sdMutex);
-        Serial.println("[DELDIAG] load_deleted_ids — file does not exist on SD");
-        return;
-    }
-    File f = SD.open(DELETED_IDS_FILE, FILE_READ);
-    if (!f) {
-        xSemaphoreGive(sdMutex);
-        return;
-    }
-    while (f.available() && deleted_id_count < MAX_DELETED_IDS) {
-        String line = f.readStringUntil('\n');
-        if (line.length() > 0) {
-            int id = line.toInt();
-            if (id > 0) deleted_ids[deleted_id_count++] = id;
-        }
-    }
-    f.close();
-    xSemaphoreGive(sdMutex);
-    Serial.printf("[DELDIAG] load_deleted_ids EXIT — loaded %d ids from SD\n",
-                  deleted_id_count);
-}
 
 static void perform_detection_delete(int idx) {
-    Serial.printf("[DELDIAG] perform_detection_delete(idx=%d) — sd_avail=%d sd_hist_count=%d cap_count=%d\n",
-                  idx, sd_available ? 1 : 0, sd_hist_count, capture_history_count);
     if (!take_data_mutex()) return;
 
-    char deleted_mac[18] = "";
+    // Snapshot the target MAC and timestamp before mutating sd_hist[]
+    char target_mac[18] = "";
+    char target_uptime[9] = "";
+    int  target_rssi = 0;
 
     if (sd_available && idx >= 0 && idx < sd_hist_count) {
-        int deleted_id = sd_hist[idx].id;
-        strncpy(deleted_mac, sd_hist[idx].mac, 17); deleted_mac[17] = '\0';
+        safe_copy(target_mac,    sd_hist[idx].mac,       sizeof(target_mac));
+        safe_copy(target_uptime, sd_hist[idx].timestamp, sizeof(target_uptime));
+        target_rssi = sd_hist[idx].rssi;
 
-        // Remove from sd_hist[] by shifting
+        // Remove from in-memory sd_hist[] by shifting
         for (int i = idx; i < sd_hist_count - 1; i++) sd_hist[i] = sd_hist[i + 1];
         sd_hist_count--;
 
-        // Remove matching entry from capture_history[] if present
+        // Also remove matching entry from capture_history[] (by MAC)
         for (int i = 0; i < capture_history_count; i++) {
-            if (capture_history[i].id == deleted_id) {
+            if (strncmp(capture_history[i].mac, target_mac, 17) == 0) {
                 for (int j = i; j < capture_history_count - 1; j++) {
                     capture_history[j] = capture_history[j + 1];
                 }
@@ -2468,51 +2299,129 @@ static void perform_detection_delete(int idx) {
             }
         }
 
-        if (deleted_id != 0) {
-            add_deleted_id(deleted_id);
-            if (deleted_mac[0] != '\0') deleted_macs_add(deleted_mac, deleted_id);
-        }
-
         if (history_selected_idx >= sd_hist_count)
             history_selected_idx = max(0, sd_hist_count - 1);
-
-        // Fix scroll so selection stays in view
-        if (history_scroll_offset > 0 && sd_hist_count <= HIST_VISIBLE_ROWS)
-            history_scroll_offset = 0;
         if (history_scroll_offset > max(0, sd_hist_count - HIST_VISIBLE_ROWS))
             history_scroll_offset = max(0, sd_hist_count - HIST_VISIBLE_ROWS);
 
     } else if (!sd_available && idx >= 0 && idx < capture_history_count) {
-        int deleted_id = capture_history[idx].id;
-        strncpy(deleted_mac, capture_history[idx].mac, 17); deleted_mac[17] = '\0';
-
+        // No SD — only the in-memory list exists
+        safe_copy(target_mac, capture_history[idx].mac, sizeof(target_mac));
         for (int i = idx; i < capture_history_count - 1; i++)
             capture_history[i] = capture_history[i + 1];
         capture_history_count--;
-
-        if (deleted_id != 0) {
-            add_deleted_id(deleted_id);
-            if (deleted_mac[0] != '\0') deleted_macs_add(deleted_mac, deleted_id);
-        }
-
         if (history_selected_idx >= capture_history_count)
             history_selected_idx = max(0, capture_history_count - 1);
-
-        if (history_scroll_offset > 0 && capture_history_count <= HIST_VISIBLE_ROWS)
-            history_scroll_offset = 0;
-        if (history_scroll_offset > max(0, capture_history_count - HIST_VISIBLE_ROWS))
-            history_scroll_offset = max(0, capture_history_count - HIST_VISIBLE_ROWS);
     }
 
-    // Refresh seen_mac_table timestamp so the 5-minute redetect window restarts
-    // from now, not from when the device was first detected.
-    if (deleted_mac[0] != '\0') add_seen_mac(deleted_mac);
+    // Refresh seen_mac_table so the redetect window restarts
+    if (target_mac[0] != '\0') add_seen_mac(target_mac);
 
-    Serial.printf("[DELDIAG] perform_detection_delete done — deleted_mac='%s' deleted_id_count_now=%d deleted_mac_count_now=%d\n",
-                  deleted_mac, deleted_id_count, deleted_mac_count);
     give_data_mutex();
-    save_deleted_ids();
-    deleted_macs_save();
+
+    // Hard-delete from CSV by rewriting it without the matching line.
+    // Match on MAC + Uptime_ms + RSSI — uniquely identifies the row.
+    if (sd_available && target_mac[0] != '\0') {
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            Serial.println("[DEL] sdMutex timeout — CSV not rewritten");
+            set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
+            return;
+        }
+
+        const char* tmp_path = "/FLOCK_FINDER/logs/FlockLog.tmp";
+        File src = SD.open(current_log_file, FILE_READ);
+        if (!src) {
+            xSemaphoreGive(sdMutex);
+            Serial.println("[DEL] could not open CSV for read");
+            set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
+            return;
+        }
+        if (SD.exists(tmp_path)) SD.remove(tmp_path);
+        File dst = SD.open(tmp_path, FILE_WRITE);
+        if (!dst) {
+            src.close();
+            xSemaphoreGive(sdMutex);
+            Serial.println("[DEL] could not open tmp for write");
+            set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
+            return;
+        }
+
+        int skipped = 0;
+        int kept = 0;
+        char linebuf[SD_LINE_LEN];
+
+        while (src.available()) {
+            int len = src.readBytesUntil('\n', linebuf, sizeof(linebuf) - 1);
+            if (len <= 0) break;
+            linebuf[len] = '\0';
+            // Strip trailing \r if present
+            if (len > 0 && linebuf[len - 1] == '\r') linebuf[--len] = '\0';
+
+            bool is_match = false;
+            // Header row always kept
+            if (strncmp(linebuf, "Uptime_ms", 9) != 0) {
+                // Parse fields: 0=Uptime_ms, 6=RSSI, 7=MAC (per the CSV header)
+                int fs[21]; int fc = 0;
+                fs[0] = 0;
+                for (int ci = 0; ci < len && fc < 20; ci++) {
+                    if (linebuf[ci] == ',') fs[++fc] = ci + 1;
+                }
+                if (fc >= 8) {
+                    // Extract MAC from field 7
+                    char line_mac[18] = "";
+                    int  mac_start = fs[7];
+                    int  m = 0;
+                    while (mac_start + m < len && linebuf[mac_start + m] != ','
+                           && m < 17) {
+                        line_mac[m] = linebuf[mac_start + m]; m++;
+                    }
+                    line_mac[m] = '\0';
+
+                    if (strcasecmp(line_mac, target_mac) == 0) {
+                        // MAC matches — also verify uptime + rssi to be safe
+                        unsigned long line_uptime = strtoul(linebuf + fs[0], NULL, 10);
+                        int           line_rssi   = atoi(linebuf + fs[6]);
+                        char line_uptime_str[9];
+                        format_time_buf(line_uptime / 1000,
+                                        line_uptime_str, sizeof(line_uptime_str));
+                        if (strcmp(line_uptime_str, target_uptime) == 0
+                            && line_rssi == target_rssi) {
+                            is_match = true;
+                        }
+                    }
+                }
+            }
+
+            if (is_match) {
+                skipped++;
+            } else {
+                dst.write((const uint8_t*)linebuf, len);
+                dst.write((const uint8_t*)"\n", 1);
+                kept++;
+            }
+
+            // Reset WDT every 32 lines so large logs don't trip it
+            if (((kept + skipped) & 0x1F) == 0) esp_task_wdt_reset();
+        }
+        src.close();
+        dst.close();
+
+        if (skipped > 0) {
+            SD.remove(current_log_file);
+            if (!SD.rename(tmp_path, current_log_file)) {
+                Serial.println("[DEL] CSV rename failed");
+                xSemaphoreGive(sdMutex);
+                set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
+                return;
+            }
+            Serial.printf("[DEL] removed %d line(s), kept %d\n", skipped, kept);
+        } else {
+            SD.remove(tmp_path);
+            Serial.println("[DEL] no matching CSV line found");
+        }
+        xSemaphoreGive(sdMutex);
+    }
+
     set_toast_direct("DETECTION DELETED", TOAST_WARNING, false);
 }
 
@@ -2544,9 +2453,8 @@ void load_detections_from_flash() {
 
 // Load last SD_HIST_SIZE detections from SD CSV (most recent first in sd_hist[])
 void load_sd_history() {
-    Serial.printf("[DELDIAG] load_sd_history ENTER — heap=%u deleted_id_count=%d deleted_mac_count=%d sd_hist_count=%d\n",
-                  (unsigned)esp_get_free_heap_size(),
-                  deleted_id_count, deleted_mac_count, sd_hist_count);
+    Serial.printf("[DELDIAG] load_sd_history ENTER — heap=%u sd_hist_count=%d\n",
+                  (unsigned)esp_get_free_heap_size(), sd_hist_count);
     // On no-PSRAM boards, runtime heap is ~6KB after NimBLE init.
     // The tail buffer needs 2-4KB contiguous. If heap is too low,
     // preserve existing sd_hist (populated at boot or by log_detection
@@ -2729,21 +2637,6 @@ void load_sd_history() {
                      (unsigned)m, (unsigned)d, (unsigned)(y % 100));
         } else {
             safe_copy(e.datestamp, "--/--/--", sizeof(e.datestamp));
-        }
-        // Legacy lines missing DetID column get a deterministic synthetic ID
-        // so the deleted_ids / deleted_macs filters can hold them down across loads.
-        if (e.id == 0) {
-            unsigned long uptime_ms = (unsigned long)strtoul(line + fs[0], NULL, 10);
-            e.id = synthesize_detection_id(e.mac, e.epoch_utc, uptime_ms, e.rssi);
-        }
-        // Skip if this ID (real or synthetic) was deleted by the user
-        if (is_id_deleted(e.id)) {
-            Serial.printf("[DELDIAG] FILTER id-match — skipping mac=%s id=%d\n", e.mac, e.id);
-            continue;
-        }
-        if (deleted_macs_suppresses(e.mac, e.id)) {
-            Serial.printf("[DELDIAG] FILTER mac-match — skipping mac=%s id=%d\n", e.mac, e.id);
-            continue;
         }
         parsed_count++;
     }
@@ -3830,7 +3723,6 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         next_detection_id++;
         if (next_detection_id > 999999) {
             next_detection_id = 1;
-            deleted_id_count = 0;  // clear deletion list — old IDs no longer in use
         }
         if (sd_hist_count < SD_HIST_SIZE) sd_hist_count++;
         // New fields: datestamp (local time), GPS coordinates, epoch (always UTC)
@@ -5853,13 +5745,6 @@ void handle_menu_select() {
             // (~200-800ms, longer on a slow card). schedule_persist
             // already no-ops if a write is in flight.
             schedule_persist();
-            deleted_id_count = 0;
-            deleted_mac_count = 0;
-            if (sd_available && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                if (SD.exists(DELETED_IDS_FILE))   SD.remove(DELETED_IDS_FILE);
-                if (SD.exists(DELETED_MACS_FILE))  SD.remove(DELETED_MACS_FILE);
-                xSemaphoreGive(sdMutex);
-            }
             set_toast_direct("STATS CLEARED", TOAST_WARNING, false);
             screen_dirty = true;
             break;
@@ -9668,18 +9553,10 @@ void setup() {
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
 
-    // Load deletion filters from SD before history so the first load_sd_history
-    // already has them. No mutex needed — tasks haven't been spawned yet,
-    // and the SD guard inside each function takes sdMutex itself.
-    if (sd_available) {
-        load_deleted_ids();
-        deleted_macs_load();
-    }
-
     // Load detection history from SD so the Detections screen has data
     // immediately. No mutex needed — tasks haven't been spawned yet.
     if (sd_available) {
-        Serial.println("[DELDIAG] === EARLY load_sd_history (filters loaded from SD) ===");
+        Serial.println("[DELDIAG] === EARLY load_sd_history ===");
         load_sd_history();
         if (sd_hist_count > 0) {
             Serial.printf("[SD] Loaded %d detections from history\n", sd_hist_count);
@@ -9752,15 +9629,12 @@ void setup() {
         }
     }
 
-    Serial.println("[DELDIAG] === Loading LittleFS data ===");
     if (littlefs_available) {
         load_session_from_flash();
         load_wifi_credentials();
         load_detections_from_flash();
         load_whitelist();
     }
-    Serial.printf("[DELDIAG] === LittleFS load complete — deleted_ids=%d deleted_macs=%d ===\n",
-                  deleted_id_count, deleted_mac_count);
     // Apply persisted settings that require hardware calls after load
     if (night_mode)     apply_color_palette();
     if (low_power_mode) setCpuFrequencyMhz(80);
