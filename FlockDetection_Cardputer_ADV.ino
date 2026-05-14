@@ -2021,7 +2021,7 @@ struct BleEventData {
     uint8_t  mfg_data[64];
     uint8_t  mfg_data_len;
     bool     have_mfg;
-    char     service_uuids[8][37];
+    char     service_uuids[5][37];
     uint8_t  uuid_count;
     uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
     volatile uint32_t in_use;  // pool slot occupancy flag (0 = free, 1 = occupied)
@@ -2090,7 +2090,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 
         if (advertisedDevice->haveServiceUUID()) {
             int count = advertisedDevice->getServiceUUIDCount();
-            ev->uuid_count = (uint8_t)(count > 8 ? 8 : count);
+            ev->uuid_count = (uint8_t)(count > 5 ? 5 : count);
             for (int i = 0; i < ev->uuid_count; i++) {
                 std::string uuid = advertisedDevice->getServiceUUID(i).toString();
                 strncpy(ev->service_uuids[i], uuid.c_str(), 36);
@@ -2222,6 +2222,14 @@ bool export_mode_start() {
     __atomic_store_n(&ble_pool_write, 0u, __ATOMIC_RELEASE);
     NimBLEDevice::deinit(true);
     pBLEScan = nullptr;
+
+    // Free the SCAN viz angle LUT — not used during export, rebuilds
+    // automatically on first SCAN render after export_restore_promiscuous().
+    if (scan_angle_lut) {
+        free(scan_angle_lut);
+        scan_angle_lut = nullptr;
+        scan_angle_lut_ready = false;
+    }
 
     WiFi.disconnect(true);
     delay(WIFI_MODE_SETTLE_MEDIUM_MS);
@@ -7079,16 +7087,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     // Values are already [0..1] from RSSI mapping; sqrtf lifts valleys.
 
     // Static: avoid stack overflow — fully overwritten each frame, single-threaded.
-    static float wifi_norm[TIMELINE_BIN_COUNT];
-    static float ble_norm[TIMELINE_BIN_COUNT];
-    // Reverse so index 0 = newest (maps to origin at bottom-left)
-    for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
-        int ri = TIMELINE_BIN_COUNT - 1 - i;
-        wifi_norm[i] = tl_wifi_smooth[ri];
-        ble_norm[i]  = tl_ble_smooth[ri];
-        if (wifi_norm[i] > 1.0f) wifi_norm[i] = 1.0f;
-        if (ble_norm[i]  > 1.0f) ble_norm[i]  = 1.0f;
-    }
+    static float norm_buf[TIMELINE_BIN_COUNT];
 
     // Inline Catmull-Rom: for each span [i, i+1], emit TL_INTERP_FACTOR
     // sub-samples using the standard cubic basis.
@@ -7116,13 +7115,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         *dst_n = out;
     };
 
-    static float wifi_smooth_pts[TL_SMOOTH_MAX];
-    static float ble_smooth_pts[TL_SMOOTH_MAX];
-    int   smooth_n = 0;
-    catmull_rom_fill(wifi_norm, TIMELINE_BIN_COUNT, wifi_smooth_pts, &smooth_n);
-    // BLE uses the same count — both arrays have identical length.
-    int ble_smooth_n = 0;
-    catmull_rom_fill(ble_norm, TIMELINE_BIN_COUNT, ble_smooth_pts, &ble_smooth_n);
+    static float smooth_buf[TL_SMOOTH_MAX];
 
     // ════════════════════════════════════════════════════════════════════════
     // TRUE ISOMETRIC PROJECTION — 30° axes (cos30 / sin30)
@@ -7197,8 +7190,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
     struct RibbonDef {
         float    depth;
-        float*   smooth_pts;
-        int      num_pts;
         uint16_t curve_col;
         uint16_t bright_col;
         uint16_t mid_col;
@@ -7211,8 +7202,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
     // WiFi (back)
     ribbons[0].depth      = 1.0f;
-    ribbons[0].smooth_pts = wifi_smooth_pts;
-    ribbons[0].num_pts    = smooth_n;
     ribbons[0].curve_col  = HEADER_COLOR;
     ribbons[0].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
     ribbons[0].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
@@ -7222,8 +7211,6 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
 
     // BLE (front)
     ribbons[1].depth      = 0.0f;
-    ribbons[1].smooth_pts = ble_smooth_pts;
-    ribbons[1].num_pts    = ble_smooth_n;
     ribbons[1].curve_col  = PURPLE_COLOR;
     ribbons[1].bright_col = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.50f);
     ribbons[1].mid_col    = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.20f);
@@ -7234,7 +7221,15 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
     for (int ri = 0; ri < 2; ri++) {
         const RibbonDef& R = ribbons[ri];
         const float d = R.depth;
-        const int   n = R.num_pts;
+
+        // Fill shared norm + smooth buffers for this ribbon
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+            int rev = TIMELINE_BIN_COUNT - 1 - i;
+            norm_buf[i] = (ri == 0) ? tl_wifi_smooth[rev] : tl_ble_smooth[rev];
+            if (norm_buf[i] > 1.0f) norm_buf[i] = 1.0f;
+        }
+        int n = 0;
+        catmull_rom_fill(norm_buf, TIMELINE_BIN_COUNT, smooth_buf, &n);
 
         // ── Step A: Precompute projected coordinates ──
         static float rx[TL_SMOOTH_MAX];
@@ -7244,7 +7239,7 @@ static void draw_scanner_viz_timeline(unsigned long frame_ms) {
         for (int i = 0; i < n; i++) {
             float tt = -0.10f + (float)i / (float)(n - 1) * 1.30f;
             rx[i] = PXf(tt, d);
-            cy[i] = PYf(tt, d, R.smooth_pts[i]);
+            cy[i] = PYf(tt, d, smooth_buf[i]);
             by[i] = PYf(tt, d, 0.0f);
         }
 
