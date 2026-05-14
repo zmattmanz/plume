@@ -5234,7 +5234,7 @@ static void render_frame() {
 
     // Push sprite content only — clip out header rows 0-19
     lcd.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
-    spr.pushSprite(0, 0);
+    render_frame();
     lcd.clearClipRect();
 
     // Draw header directly to LCD
@@ -10300,7 +10300,7 @@ void loop() {
                 show_feed_expanded = false;
                 help_ease_start = millis();
             }
-            draw_current_screen(); spr.pushSprite(0,0);
+            draw_current_screen(); render_frame();
         }
 
         // Tracks whether ENTER was already handled by the status.word loop
@@ -10794,7 +10794,7 @@ void loop() {
                     schedule_persist();
                 }
             }
-            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } schedule_persist(); }
+            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); render_frame(); } schedule_persist(); }
             else if (c == 'n') {
                 if (!stealth_mode) {
                     night_mode = !night_mode;
@@ -11254,7 +11254,7 @@ void loop() {
             spr.setTextSize(TS_MICRO);
             spr.setCursor(DISP_W - 8, DISP_H - 9);
             spr.print("S");
-            spr.pushSprite(0, 0);
+            render_frame();
             last_stealth_draw = millis();
         }
     } else {
