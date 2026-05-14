@@ -878,7 +878,7 @@ char last_cap_time[9]        = "00:00:00";
 char last_cap_det_method[64] = "";
 int  last_cap_seq_num        = -1;
 
-#define CAPTURE_HISTORY_SIZE 5
+#define CAPTURE_HISTORY_SIZE 3
 struct CaptureEntry {
     char  type[16];
     char  mac[18];
@@ -899,7 +899,7 @@ long next_detection_id = 1;
 bool sd_full_warned    = false;  // toast once on first SD-full write failure
 
 // SD-backed detection history (recent detections screen)
-#define SD_HIST_SIZE 12
+#define SD_HIST_SIZE 8
 struct SDHistEntry {
     char     type[16];
     char     mac[18];
@@ -922,7 +922,7 @@ bool hist_detail_open      = false;
 bool hist_delete_confirming = false;
 volatile bool sd_hist_dirty = false;
 
-#define MAX_PENDING_DELETES 32
+#define MAX_PENDING_DELETES 16
 struct PendingDelete {
     char mac[18];
     unsigned long uptime_ms;   // matches CSV col 0 (Uptime_ms) exactly
@@ -983,7 +983,7 @@ static bool  stats_values_initialized = false;
 static uint32_t stats_pkt_display       = 0;
 static unsigned long stats_pkt_last_update = 0;
 
-#define TOAST_QUEUE_SIZE 3
+#define TOAST_QUEUE_SIZE 2
 #define TOAST_TEXT_LEN   48
 struct ToastEntry {
     char text[TOAST_TEXT_LEN];
