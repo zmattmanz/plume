@@ -913,6 +913,7 @@ struct SDHistEntry {
     double   lat;             // GPS latitude at detection time (0.0 if no fix)
     double   lng;             // GPS longitude at detection time (0.0 if no fix)
     uint32_t epoch_utc;       // Unix epoch seconds (0 if no GPS)
+    unsigned long uptime_ms;  // raw Uptime_ms from CSV col 0 — dedup key for delete
 };
 SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
@@ -924,7 +925,7 @@ volatile bool sd_hist_dirty = false;
 #define MAX_PENDING_DELETES 32
 struct PendingDelete {
     char mac[18];
-    char uptime_str[9];
+    unsigned long uptime_ms;   // matches CSV col 0 (Uptime_ms) exactly
     int  rssi;
 };
 static PendingDelete pending_deletes[MAX_PENDING_DELETES];
@@ -2288,12 +2289,12 @@ static void perform_detection_delete(int idx) {
 
     // Snapshot the target MAC and timestamp before mutating sd_hist[]
     char target_mac[18] = "";
-    char target_uptime[9] = "";
+    unsigned long target_uptime_ms = 0;
     int  target_rssi = 0;
 
     if (sd_available && idx >= 0 && idx < sd_hist_count) {
-        safe_copy(target_mac,    sd_hist[idx].mac,       sizeof(target_mac));
-        safe_copy(target_uptime, sd_hist[idx].timestamp, sizeof(target_uptime));
+        safe_copy(target_mac, sd_hist[idx].mac, sizeof(target_mac));
+        target_uptime_ms = sd_hist[idx].uptime_ms;
         target_rssi = sd_hist[idx].rssi;
 
         // Remove from in-memory sd_hist[] by shifting
@@ -2337,8 +2338,7 @@ static void perform_detection_delete(int idx) {
         if (pending_delete_count < MAX_PENDING_DELETES) {
             safe_copy(pending_deletes[pending_delete_count].mac,
                       target_mac, sizeof(pending_deletes[0].mac));
-            safe_copy(pending_deletes[pending_delete_count].uptime_str,
-                      target_uptime, sizeof(pending_deletes[0].uptime_str));
+            pending_deletes[pending_delete_count].uptime_ms = target_uptime_ms;
             pending_deletes[pending_delete_count].rssi = target_rssi;
             pending_delete_count++;
             pending_delete_dirty_ms = millis();
@@ -2381,15 +2381,15 @@ static void flush_pending_deletes() {
         // Always keep the header row
         if (strncmp(line, "Uptime_ms", 9) == 0) { dst.println(line); continue; }
 
-        // Parse col 7 (MAC) and col 0 (uptime)
+        // Parse col 7 (MAC) and col 0 (Uptime_ms — raw integer)
         char row_mac[18] = "";
-        char row_uptime[9] = "";
+        unsigned long row_uptime_ms = 0;
         int  col = 0, start = 0;
         for (int i = 0; i <= len; i++) {
             if (line[i] == ',' || line[i] == '\0') {
                 int flen = i - start;
-                if (col == 0 && flen < (int)sizeof(row_uptime)) {
-                    memcpy(row_uptime, line + start, flen); row_uptime[flen] = '\0';
+                if (col == 0 && flen > 0) {
+                    row_uptime_ms = strtoul(line + start, NULL, 10);
                 } else if (col == 7 && flen == 17) {
                     memcpy(row_mac, line + start, 17); row_mac[17] = '\0';
                 }
@@ -2400,8 +2400,8 @@ static void flush_pending_deletes() {
         // Check against every pending delete
         bool drop = false;
         for (int p = 0; p < pending_delete_count && !drop; p++) {
-            if (strncmp(row_mac, pending_deletes[p].mac, 17) == 0 &&
-                strncmp(row_uptime, pending_deletes[p].uptime_str, 8) == 0) {
+            if (row_uptime_ms == pending_deletes[p].uptime_ms &&
+                strncmp(row_mac, pending_deletes[p].mac, 17) == 0) {
                 drop = true;
             }
         }
@@ -2425,6 +2425,8 @@ static void flush_pending_deletes() {
         SD.remove(tmp_path);
     }
 
+    Serial.printf("[DELDIAG] flush_pending_deletes: dropped=%d pending=%d\n",
+                  skipped, pending_delete_count);
     pending_delete_count  = 0;
     pending_delete_dirty_ms = 0;
     xSemaphoreGive(sdMutex);
@@ -2611,6 +2613,7 @@ void load_sd_history() {
         e.id = (fc >= 20) ? atoi(line + fs[20]) : 0;
         {
             unsigned long uptime = (unsigned long)strtoul(line + fs[0], NULL, 10);
+            e.uptime_ms = uptime;
             format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
         }
         // Parse epoch, lat, lng if columns are present
@@ -3717,6 +3720,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         safe_copy(sd_hist[0].method, detection_method, sizeof(sd_hist[0].method));
         sd_hist[0].rssi       = rssi;
         sd_hist[0].confidence = confidence;
+        sd_hist[0].uptime_ms  = now_ms;
         format_time_buf((millis() - session_start_time) / 1000,
                         sd_hist[0].timestamp, sizeof(sd_hist[0].timestamp));
         // Sequential ID — assigned to both the SD-history mirror and the
