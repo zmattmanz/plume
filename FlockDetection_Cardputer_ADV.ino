@@ -2407,13 +2407,29 @@ static void perform_detection_delete(int idx) {
         dst.close();
 
         if (skipped > 0) {
-            SD.remove(current_log_file);
-            if (!SD.rename(tmp_path, current_log_file)) {
-                Serial.println("[DEL] CSV rename failed");
+            const char* bak_path = "/FLOCK_FINDER/logs/FlockLog.bak";
+
+            // If a .bak exists from a prior crashed delete, remove it first
+            if (SD.exists(bak_path)) SD.remove(bak_path);
+
+            // Step 1: rename original → .bak  (original now safe under new name)
+            if (!SD.rename(current_log_file, bak_path)) {
+                SD.remove(tmp_path);
                 xSemaphoreGive(sdMutex);
                 set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
                 return;
             }
+            // Step 2: rename tmp → original   (new file is now the canonical CSV)
+            if (!SD.rename(tmp_path, current_log_file)) {
+                // Recovery: restore from .bak
+                SD.rename(bak_path, current_log_file);
+                SD.remove(tmp_path);
+                xSemaphoreGive(sdMutex);
+                set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
+                return;
+            }
+            // Step 3: remove the .bak
+            SD.remove(bak_path);
             Serial.printf("[DEL] removed %d line(s), kept %d\n", skipped, kept);
         } else {
             SD.remove(tmp_path);
@@ -9511,6 +9527,23 @@ void setup() {
         if (!SD.exists("/FLOCK_FINDER/captures"))  SD.mkdir("/FLOCK_FINDER/captures");
         if (!SD.exists("/FLOCK_FINDER/stats"))     SD.mkdir("/FLOCK_FINDER/stats");
         Serial.println("[SD] Directory structure OK");
+
+        // Recover from a power loss mid-delete: if .bak exists but the main file
+        // is missing, restore the backup. If both exist, the rename completed —
+        // just clean up the orphan.
+        {
+            const char* main_path = "/FLOCK_FINDER/logs/FlockLog.csv";
+            const char* bak_path  = "/FLOCK_FINDER/logs/FlockLog.bak";
+            if (SD.exists(bak_path)) {
+                if (!SD.exists(main_path)) {
+                    SD.rename(bak_path, main_path);
+                    Serial.println("[SD] Recovered FlockLog.csv from .bak");
+                } else {
+                    SD.remove(bak_path);
+                    Serial.println("[SD] Cleaned orphan FlockLog.bak");
+                }
+            }
+        }
 
         if (!SD.exists(current_log_file)) {
             File file = SD.open(current_log_file, FILE_WRITE);
