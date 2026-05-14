@@ -1274,12 +1274,21 @@ void LedTask(void* pv) {
             b = (uint8_t)((float)led_detect_b * pulse);
         } else {
             led_detect_active = false;
-            if (led_breathing_on && !stealth_mode && !night_mode && brightness_level >= 2) {
-                float breath = anim_pulse(UI_PULSE_BREATHE);
+            bool export_on = (export_mode_active || export_connecting);
+            bool show_led = !stealth_mode && !night_mode &&
+                            (export_on || (led_breathing_on && brightness_level >= 2));
+            if (show_led) {
+                float breath = anim_pulse(export_on ? UI_PULSE_MEDIUM : UI_PULSE_BREATHE);
                 float dim    = 0.15f + breath * 0.35f;
-                r = (uint8_t)((float)led_r * dim);
-                g = (uint8_t)((float)led_g * dim);
-                b = (uint8_t)((float)led_b * dim);
+                if (export_on) {
+                    r = (uint8_t)(255.0f * dim);
+                    g = (uint8_t)(181.0f * dim);
+                    b = (uint8_t)( 71.0f * dim);
+                } else {
+                    r = (uint8_t)((float)led_r * dim);
+                    g = (uint8_t)((float)led_g * dim);
+                    b = (uint8_t)((float)led_b * dim);
+                }
             }
         }
         set_cardputer_led(r, g, b);
