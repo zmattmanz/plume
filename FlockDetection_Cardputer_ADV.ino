@@ -51,6 +51,8 @@ enum BootPersonality {
 // ============================================================================
 void draw_header_spr(int screen_num);
 void draw_header_lcd(int screen_num);
+static void draw_overlay_header_lcd(const char* label);
+static void render_frame();
 void draw_toast_spr();
 void draw_vol_overlay();
 void drawCard(int x, int y, int w, int h);
@@ -5108,7 +5110,7 @@ void draw_header_lcd(int screen_num) {
     };
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
-    lcd.fillRect(0, 0, DISP_W, 18, BG_COLOR);
+    lcd.fillRect(0, 0, DISP_W, CONTENT_Y, BG_COLOR);
     lcd.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
     lcd.setTextColor(HEADER_COLOR, BG_COLOR);
     lcd.setTextSize(TS_BODY);
@@ -5214,9 +5216,47 @@ void draw_header_lcd(int screen_num) {
                          :                   DIM_COLOR;
         drawPill_lcd(icon_right - pw, icon_y, bat_str, bat_col);
     }
+}
 
-    // TEMP: verification marker — remove after confirming LCD header works
-    lcd.fillCircle(DISP_W / 2, 9, 3, lgfx::color565(255, 0, 255));
+static void draw_overlay_header_lcd(const char* label) {
+    auto& lcd = M5Cardputer.Display;
+    lcd.fillRect(0, 0, DISP_W, CONTENT_Y, BG_COLOR);
+    lcd.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+    lcd.setTextColor(HEADER_COLOR, BG_COLOR);
+    lcd.setTextSize(TS_BODY);
+    lcd.setCursor(TEXT_LEFT, 5);
+    kprint_lcd(label);
+}
+
+static void render_frame() {
+    auto& lcd = M5Cardputer.Display;
+    lcd.startWrite();
+
+    // Push sprite content only — clip out header rows 0-19
+    lcd.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
+    spr.pushSprite(0, 0);
+    lcd.clearClipRect();
+
+    // Draw header directly to LCD
+    if (menu_open) {
+        draw_overlay_header_lcd("MENU");
+    } else if (show_help_overlay) {
+        draw_overlay_header_lcd("HELP");
+    } else if (wifi_config_open) {
+        draw_overlay_header_lcd("WIFI CONFIG");
+    } else if (export_mode_active) {
+        draw_overlay_header_lcd("EXPORT");
+    } else {
+        draw_header_lcd(current_screen);
+        if (show_feed_expanded) {
+            lcd.setTextColor(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f), BG_COLOR);
+            lcd.setTextSize(TS_BODY);
+            lcd.setCursor(56, 5);
+            kprint_lcd("/ FEED");
+        }
+    }
+
+    lcd.endWrite();
 }
 
 void draw_help_overlay() {
@@ -5907,7 +5947,7 @@ void handle_menu_select() {
             strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
             wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
             wifi_config_cursor = 0;
-            draw_current_screen(); spr.pushSprite(0, 0);
+            draw_current_screen(); render_frame();
             break;
         case 9:
             if (export_mode_active || export_connecting) {
@@ -6125,8 +6165,6 @@ static void timeline_init(unsigned long frame_ms) {
 // ── Export mode info display — replaces scanner content while active ──
 static void draw_export_info() {
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(0);
-    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
 
     const int LBL_X = UI_PAD_SM + 2;
     const int VAL_X = 46;
@@ -6232,9 +6270,8 @@ void draw_scanner_screen() {
         timeline_shift_bins(frame_ms);
     }
 
-    // Step 1: clear + header
+    // Step 1: clear
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(0);
 
     // Header divider — full width, separates the SCANNER strip from content.
     spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
@@ -7707,8 +7744,6 @@ void draw_capture_history_screen() {
     hist_sel_y_f = anim_filter(hist_sel_y_f, (float)target_y, HIST_SEL_TC, dt_f);
 
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(2);
-    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
 
     if (hist_detail_open && hist_total > 0) {
         // ── Detail overlay — refined layout ───────────────────────────────
@@ -8089,7 +8124,6 @@ void draw_signal_screen() {
     }
 
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(1);
 
     const int TL = TEXT_LEFT;
 
@@ -8370,7 +8404,6 @@ void draw_signal_screen() {
 
 void draw_gps_screen() {
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(3);
     unsigned long frame_ms = millis();
 
     bool has_loc, stale;
@@ -8844,7 +8877,6 @@ void draw_device_info_screen() {
     }
 
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(4);
 
     // ── Format value strings ──
     char det_sess_str[10]; snprintf(det_sess_str, sizeof(det_sess_str), "%ld", session_det_total);
@@ -9085,6 +9117,7 @@ void transition_screen(int new_screen, int dir) {
     const int FRAME_MS = 16;  // ~128ms total
 
     M5Cardputer.Display.startWrite();
+    M5Cardputer.Display.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
     for (int f = 1; f <= FRAMES; f++) {
         float t = ui_ease((float)f / (float)FRAMES);
         // Start fully off-screen on the entering side, ease to 0
@@ -9092,10 +9125,11 @@ void transition_screen(int new_screen, int dir) {
         push_sprite_offset(offset);
         delay(FRAME_MS);
     }
+    M5Cardputer.Display.clearClipRect();
     M5Cardputer.Display.endWrite();
 
-    // Final push at exact origin — clean, no offset
-    spr.pushSprite(0, 0);
+    // Final frame with header
+    render_frame();
 }
 
 // ============================================================================
@@ -9953,7 +9987,7 @@ void setup() {
 
         // Screen is dark — swap to the scanner content
         draw_current_screen();
-        spr.pushSprite(0, 0);
+        render_frame();
 
         for (int i = 1; i <= FADE_STEPS; i++) {
             int b = (start_brightness * i) / FADE_STEPS;
@@ -10237,7 +10271,7 @@ void loop() {
         } else if (show_feed_expanded) {
             show_feed_expanded = false;
             draw_current_screen();
-            spr.pushSprite(0, 0);
+            render_frame();
         } else if (!(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())) {
             // Only advance on BtnA when no keyboard key is simultaneously
             // pressed — prevents double-transition when BtnA fires
@@ -10381,7 +10415,7 @@ void loop() {
                         wifi_config_show_pass = false;  // never persist plaintext reveal
                     }
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
                 continue;  // swallow all keys while wifi config is open
             }
 
@@ -10414,19 +10448,19 @@ void loop() {
                 }
                 if (show_feed_expanded) {
                     show_feed_expanded = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (show_help_overlay) {
                     show_help_overlay = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (current_screen == 2 && hist_detail_open) {
                     hist_delete_confirming = false;
                     hist_detail_open = false;
                     screen_dirty = true;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (current_screen != 0) {
@@ -10468,7 +10502,7 @@ void loop() {
             else if (IS_KEY_UP(c)) {
                 if (show_feed_expanded) {
                     if (feed_expanded_selected > 0) feed_expanded_selected--;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (current_screen == 2) {
@@ -10485,7 +10519,7 @@ void loop() {
                             history_selected_idx--;
                             if (history_selected_idx < history_scroll_offset)
                                 history_scroll_offset = history_selected_idx;
-                            draw_current_screen(); spr.pushSprite(0, 0);
+                            draw_current_screen(); render_frame();
                         }
                     }
                 } else if (current_screen == 4) {
@@ -10514,7 +10548,7 @@ void loop() {
                     int max_sel = min(scan_local_count, 6) - 1;
                     if (max_sel < 0) max_sel = 0;
                     if (feed_expanded_selected < max_sel) feed_expanded_selected++;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (current_screen == 2) {
@@ -10532,7 +10566,7 @@ void loop() {
                             history_selected_idx++;
                             if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
                                 history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
-                            draw_current_screen(); spr.pushSprite(0, 0);
+                            draw_current_screen(); render_frame();
                         }
                     }
                 } else if (current_screen == 4) {
@@ -10560,7 +10594,7 @@ void loop() {
             else if (IS_KEY_LEFT(c)) {
                 if (show_feed_expanded) {
                     show_feed_expanded = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (!stealth_mode && !screen_transitioned) {
@@ -10574,7 +10608,7 @@ void loop() {
             else if (IS_KEY_RIGHT(c)) {
                 if (show_feed_expanded) {
                     show_feed_expanded = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (!stealth_mode && !screen_transitioned) {
@@ -10631,7 +10665,7 @@ void loop() {
                         hist_delete_confirming = true;
                     }
                     screen_dirty = true;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                 }
             }
             else if (c == 'w') {
@@ -10824,7 +10858,7 @@ void loop() {
                         feed_expanded_selected = 0;
                     }
                     draw_current_screen();
-                    spr.pushSprite(0, 0);
+                    render_frame();
                 }
             }
             else if (c == '\n' || c == '\r') {
@@ -10843,7 +10877,7 @@ void loop() {
                             hist_delete_confirming = false;
                         }
                         screen_dirty = true;
-                        draw_current_screen(); spr.pushSprite(0, 0);
+                        draw_current_screen(); render_frame();
                     }
                 }
                 // ENTER on other screens is a no-op (menu handles navigation)
@@ -10890,7 +10924,7 @@ void loop() {
                         wifi_config_show_pass = false;  // never persist plaintext reveal
                     }
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
             } else if (menu_open) {
                 menu_open = false;
                 handle_menu_select();
@@ -10910,7 +10944,7 @@ void loop() {
                         hist_delete_confirming = false;
                     }
                     screen_dirty = true;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                 }
             }
         }
@@ -10940,13 +10974,13 @@ void loop() {
                     // Empty field: no-op — use ESC to close
                 }
                 // DEL never closes the overlay; use ESC for that
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
             } else if (show_feed_expanded) {
                 show_feed_expanded = false;
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
             } else if (show_help_overlay) {
                 show_help_overlay = false;
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
             } else if (menu_open) {
                 menu_open = false;
                 screen_dirty = true;
@@ -10954,7 +10988,7 @@ void loop() {
                 hist_delete_confirming = false;
                 hist_detail_open = false;
                 screen_dirty = true;
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
             } else if (current_screen != 0) {
                 // Nothing to close — go home to scanner
                 transition_screen(0, -1);
@@ -11207,13 +11241,7 @@ void loop() {
                 feed_anim_shift_ms  = 0;
             }
             draw_current_screen();
-            M5Cardputer.Display.startWrite();
-            spr.pushSprite(0, 0);
-            if (!menu_open && !show_help_overlay && !wifi_config_open
-                && !show_feed_expanded && !export_mode_active) {
-                draw_header_lcd(current_screen);
-            }
-            M5Cardputer.Display.endWrite();
+            render_frame();
             last_ambient_draw = now_amb;
         }
     } else if (stealth_mode) {
@@ -11279,16 +11307,7 @@ void loop() {
             unsigned long min_frame_ms = (current_screen == 4) ? 33 : 15;
             if (now - last_fast_anim >= min_frame_ms) {
                 draw_current_screen();
-                // startWrite/endWrite holds FSPI for the entire push so
-                // an SD transfer on the same bus can't interleave bytes
-                // mid-frame and tear the image.
-                M5Cardputer.Display.startWrite();
-                spr.pushSprite(0, 0);
-                if (!menu_open && !show_help_overlay && !wifi_config_open
-                    && !show_feed_expanded && !export_mode_active) {
-                    draw_header_lcd(current_screen);
-                }
-                M5Cardputer.Display.endWrite();
+                render_frame();
                 last_fast_anim = now;
                 screen_dirty = false;
             }
@@ -11304,13 +11323,7 @@ void loop() {
             if (now - last_slow_ui >= 100) {
                 if (screen_dirty || toast_active) {
                     draw_current_screen();
-                    M5Cardputer.Display.startWrite();
-                    spr.pushSprite(0, 0);
-                    if (!menu_open && !show_help_overlay && !wifi_config_open
-                        && !show_feed_expanded && !export_mode_active) {
-                        draw_header_lcd(current_screen);
-                    }
-                    M5Cardputer.Display.endWrite();
+                    render_frame();
                     screen_dirty = false;
                 }
                 last_slow_ui = now;
