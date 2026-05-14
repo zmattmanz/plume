@@ -9391,7 +9391,7 @@ static void apply_ble_scan_params() {
     }
 }
 
-SET_LOOP_TASK_STACK_SIZE(5120);
+SET_LOOP_TASK_STACK_SIZE(6144);
 
 void setup() {
     // ── Safe WDT reconfiguration ────────────────────────────────────
@@ -9627,7 +9627,7 @@ void setup() {
     setCpuFrequencyMhz(240);
     boot_animate(62 + random(0, 3), "boosting CPU");
     ble_event_queue = xQueueCreate(BLE_POOL_SIZE, sizeof(uint8_t));
-    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 2352, NULL, 1, &BLEWorkerHandle, 1);
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 3200, NULL, 1, &BLEWorkerHandle, 1);
     boot_animate(68, "starting Bluetooth");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
@@ -9728,7 +9728,7 @@ void setup() {
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 1584, NULL, 1, &ScannerTaskHandle, 0);
+    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 2560, NULL, 1, &ScannerTaskHandle, 0);
     xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 2048, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
@@ -9943,11 +9943,11 @@ void loop() {
 
         auto log_watermarks = [&](const char* tag, const UBaseType_t hw[5]) {
             Serial.printf("[STACK] %s — bytes remaining:\n", tag);
-            Serial.printf("  Scanner: %u / 1584\n", (unsigned)hw[0]);
+            Serial.printf("  Scanner: %u / 2560\n", (unsigned)hw[0]);
             Serial.printf("  GPS:     %u / 2048\n", (unsigned)hw[1]);
-            Serial.printf("  BLE:     %u / 2352\n", (unsigned)hw[2]);
+            Serial.printf("  BLE:     %u / 3200\n", (unsigned)hw[2]);
             Serial.printf("  LED:     %u / 1536\n", (unsigned)hw[3]);
-            Serial.printf("  Loop:    %u / 5120\n", (unsigned)hw[4]);
+            Serial.printf("  Loop:    %u / 6144\n", (unsigned)hw[4]);
         };
 
         // Layer 1: baseline log at 60 seconds.
