@@ -585,7 +585,9 @@ static inline void give_data_mutex() {
 
 static uint8_t current_channel = 1;
 static unsigned long last_channel_hop = 0;
-static volatile unsigned long channel_lock_until = 0; 
+static volatile unsigned long channel_lock_until = 0;
+static uint8_t* scan_angle_lut       = nullptr;
+static bool     scan_angle_lut_ready = false;
 static unsigned long last_ble_scan = 0;
 // Periodic BLE stack health restart — see loop().
 static unsigned long last_ble_restart_ms = 0;
@@ -3402,8 +3404,6 @@ static ScanDevice    scan_devs[SCAN_MAX_DEVICES] = {};
 static unsigned long scan_last_refresh_ms = 0;
 static unsigned long scan_last_frame_ms   = 0;
 static float         scan_sweep_angle     = 0.0f;
-static uint8_t* scan_angle_lut       = nullptr;
-static bool     scan_angle_lut_ready = false;
 
 // Byte order detection for direct sprite buffer access.
 // Set once on first call to draw_scanner_viz_scan.
