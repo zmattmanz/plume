@@ -58,6 +58,7 @@ static void drawPill(int x, int y, const char* text, uint16_t accent_col,
 void draw_current_screen();
 void draw_capture_history_screen();
 static void perform_detection_delete(int idx);
+static void flush_pending_deletes();
 void transition_screen(int new_screen, int dir);
 void play_escalated_alarm(int confidence, int source);
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
@@ -919,6 +920,16 @@ int  history_selected_idx = 0;
 bool hist_detail_open      = false;
 bool hist_delete_confirming = false;
 volatile bool sd_hist_dirty = false;
+
+#define MAX_PENDING_DELETES 32
+struct PendingDelete {
+    char mac[18];
+    char uptime_str[9];
+    int  rssi;
+};
+static PendingDelete pending_deletes[MAX_PENDING_DELETES];
+static int pending_delete_count = 0;
+static unsigned long pending_delete_dirty_ms = 0;
 
 
 // Detections screen — selection ease + detail overlay open/close transition.
@@ -2171,6 +2182,7 @@ static bool export_finalize_connect() {
 // caller should not assume export_mode_active is set on return. The
 // non-blocking poll in loop() (export_tick_connect) completes or aborts it.
 bool export_mode_start() {
+    flush_pending_deletes();
     if (export_mode_active || export_connecting) return true;
     if (strlen(export_ssid) == 0) {
         set_toast_direct("NO WIFI CONFIGURED", TOAST_WARNING, false);
@@ -2319,126 +2331,103 @@ static void perform_detection_delete(int idx) {
 
     give_data_mutex();
 
-    // Hard-delete from CSV by rewriting it without the matching line.
-    // Match on MAC + Uptime_ms + RSSI — uniquely identifies the row.
+    // Enqueue for batched rewrite — actual CSV rewrite deferred to
+    // flush_pending_deletes() called on screen-leave or 5s idle.
     if (sd_available && target_mac[0] != '\0') {
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-            Serial.println("[DEL] sdMutex timeout — CSV not rewritten");
-            set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
-            return;
+        if (pending_delete_count < MAX_PENDING_DELETES) {
+            safe_copy(pending_deletes[pending_delete_count].mac,
+                      target_mac, sizeof(pending_deletes[0].mac));
+            safe_copy(pending_deletes[pending_delete_count].uptime_str,
+                      target_uptime, sizeof(pending_deletes[0].uptime_str));
+            pending_deletes[pending_delete_count].rssi = target_rssi;
+            pending_delete_count++;
+            pending_delete_dirty_ms = millis();
         }
-
-        const char* tmp_path = "/FLOCK_FINDER/logs/FlockLog.tmp";
-        File src = SD.open(current_log_file, FILE_READ);
-        if (!src) {
-            xSemaphoreGive(sdMutex);
-            Serial.println("[DEL] could not open CSV for read");
-            set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
-            return;
-        }
-        if (SD.exists(tmp_path)) SD.remove(tmp_path);
-        File dst = SD.open(tmp_path, FILE_WRITE);
-        if (!dst) {
-            src.close();
-            xSemaphoreGive(sdMutex);
-            Serial.println("[DEL] could not open tmp for write");
-            set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
-            return;
-        }
-
-        int skipped = 0;
-        int kept = 0;
-        char linebuf[SD_LINE_LEN];
-
-        while (src.available()) {
-            int len = src.readBytesUntil('\n', linebuf, sizeof(linebuf) - 1);
-            if (len <= 0) break;
-            linebuf[len] = '\0';
-            // Strip trailing \r if present
-            if (len > 0 && linebuf[len - 1] == '\r') linebuf[--len] = '\0';
-
-            bool is_match = false;
-            // Header row always kept
-            if (strncmp(linebuf, "Uptime_ms", 9) != 0) {
-                // Parse fields: 0=Uptime_ms, 6=RSSI, 7=MAC (per the CSV header)
-                int fs[21]; int fc = 0;
-                fs[0] = 0;
-                for (int ci = 0; ci < len && fc < 20; ci++) {
-                    if (linebuf[ci] == ',') fs[++fc] = ci + 1;
-                }
-                if (fc >= 8) {
-                    // Extract MAC from field 7
-                    char line_mac[18] = "";
-                    int  mac_start = fs[7];
-                    int  m = 0;
-                    while (mac_start + m < len && linebuf[mac_start + m] != ','
-                           && m < 17) {
-                        line_mac[m] = linebuf[mac_start + m]; m++;
-                    }
-                    line_mac[m] = '\0';
-
-                    if (strcasecmp(line_mac, target_mac) == 0) {
-                        // MAC matches — also verify uptime + rssi to be safe
-                        unsigned long line_uptime = strtoul(linebuf + fs[0], NULL, 10);
-                        int           line_rssi   = atoi(linebuf + fs[6]);
-                        char line_uptime_str[9];
-                        format_time_buf(line_uptime / 1000,
-                                        line_uptime_str, sizeof(line_uptime_str));
-                        if (strcmp(line_uptime_str, target_uptime) == 0
-                            && line_rssi == target_rssi) {
-                            is_match = true;
-                        }
-                    }
-                }
-            }
-
-            if (is_match) {
-                skipped++;
-            } else {
-                dst.write((const uint8_t*)linebuf, len);
-                dst.write((const uint8_t*)"\n", 1);
-                kept++;
-            }
-
-            // Reset WDT every 32 lines so large logs don't trip it
-            if (((kept + skipped) & 0x1F) == 0) esp_task_wdt_reset();
-        }
-        src.close();
-        dst.close();
-
-        if (skipped > 0) {
-            const char* bak_path = "/FLOCK_FINDER/logs/FlockLog.bak";
-
-            // If a .bak exists from a prior crashed delete, remove it first
-            if (SD.exists(bak_path)) SD.remove(bak_path);
-
-            // Step 1: rename original → .bak  (original now safe under new name)
-            if (!SD.rename(current_log_file, bak_path)) {
-                SD.remove(tmp_path);
-                xSemaphoreGive(sdMutex);
-                set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
-                return;
-            }
-            // Step 2: rename tmp → original   (new file is now the canonical CSV)
-            if (!SD.rename(tmp_path, current_log_file)) {
-                // Recovery: restore from .bak
-                SD.rename(bak_path, current_log_file);
-                SD.remove(tmp_path);
-                xSemaphoreGive(sdMutex);
-                set_toast_direct("DELETE FAILED", TOAST_WARNING, false);
-                return;
-            }
-            // Step 3: remove the .bak
-            SD.remove(bak_path);
-            Serial.printf("[DEL] removed %d line(s), kept %d\n", skipped, kept);
-        } else {
-            SD.remove(tmp_path);
-            Serial.println("[DEL] no matching CSV line found");
-        }
-        xSemaphoreGive(sdMutex);
     }
 
     set_toast_direct("DETECTION DELETED", TOAST_WARNING, false);
+}
+
+// Rewrite FlockLog.csv once, removing every MAC in pending_deletes[].
+// Called on screen-leave, 5s idle, export start, or stats clear.
+static void flush_pending_deletes() {
+    if (pending_delete_count == 0) return;
+    if (!sd_available) { pending_delete_count = 0; pending_delete_dirty_ms = 0; return; }
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) != pdTRUE) return;
+
+    const char* tmp_path = "/FLOCK_FINDER/logs/FlockLog.tmp";
+    const char* bak_path = "/FLOCK_FINDER/logs/FlockLog.bak";
+
+    File src = SD.open(current_log_file, FILE_READ);
+    if (!src) { xSemaphoreGive(sdMutex); return; }
+
+    File dst = SD.open(tmp_path, FILE_WRITE);
+    if (!dst) { src.close(); xSemaphoreGive(sdMutex); return; }
+
+    char line[SD_LINE_LEN];
+    int  skipped = 0;
+
+    while (src.available()) {
+        int len = 0;
+        while (src.available() && len < (int)sizeof(line) - 1) {
+            char c = src.read();
+            if (c == '\n') break;
+            line[len++] = c;
+        }
+        while (len > 0 && (line[len-1] == '\r')) len--;
+        line[len] = '\0';
+        if (len == 0) continue;
+
+        // Always keep the header row
+        if (strncmp(line, "Uptime_ms", 9) == 0) { dst.println(line); continue; }
+
+        // Parse col 7 (MAC) and col 0 (uptime)
+        char row_mac[18] = "";
+        char row_uptime[9] = "";
+        int  col = 0, start = 0;
+        for (int i = 0; i <= len; i++) {
+            if (line[i] == ',' || line[i] == '\0') {
+                int flen = i - start;
+                if (col == 0 && flen < (int)sizeof(row_uptime)) {
+                    memcpy(row_uptime, line + start, flen); row_uptime[flen] = '\0';
+                } else if (col == 7 && flen == 17) {
+                    memcpy(row_mac, line + start, 17); row_mac[17] = '\0';
+                }
+                col++; start = i + 1;
+            }
+        }
+
+        // Check against every pending delete
+        bool drop = false;
+        for (int p = 0; p < pending_delete_count && !drop; p++) {
+            if (strncmp(row_mac, pending_deletes[p].mac, 17) == 0 &&
+                strncmp(row_uptime, pending_deletes[p].uptime_str, 8) == 0) {
+                drop = true;
+            }
+        }
+        if (drop) { skipped++; continue; }
+        dst.println(line);
+    }
+    src.close();
+    dst.close();
+
+    if (skipped > 0) {
+        if (SD.exists(bak_path)) SD.remove(bak_path);
+        if (!SD.rename(current_log_file, bak_path)) {
+            SD.remove(tmp_path); xSemaphoreGive(sdMutex); return;
+        }
+        if (!SD.rename(tmp_path, current_log_file)) {
+            SD.rename(bak_path, current_log_file);
+            xSemaphoreGive(sdMutex); return;
+        }
+        SD.remove(bak_path);
+    } else {
+        SD.remove(tmp_path);
+    }
+
+    pending_delete_count  = 0;
+    pending_delete_dirty_ms = 0;
+    xSemaphoreGive(sdMutex);
 }
 
 void load_detections_from_flash() {
@@ -5745,6 +5734,7 @@ void handle_menu_select() {
             break;
         case 10: {
             // Clear all stats — session and lifetime
+            flush_pending_deletes();
             xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             session_wifi = 0; session_ble = 0;
             session_flock_wifi = 0; session_flock_ble = 0;
@@ -8877,6 +8867,10 @@ void transition_screen(int new_screen, int dir) {
     if (stealth_mode) { current_screen = new_screen; return; }
     if (!is_muted) M5Cardputer.Speaker.tone(660, 5);
 
+    // Flush queued deletes whenever we leave the history screen
+    if (current_screen == 2 && new_screen != 2 && pending_delete_count > 0)
+        flush_pending_deletes();
+
     // Screen-specific setup (same as before)
     if (new_screen == 0) {
         feed_anim_prev_head = -1;
@@ -10017,6 +10011,10 @@ void loop() {
             }
         }
     }
+
+    if (pending_delete_count > 0 && pending_delete_dirty_ms != 0 &&
+        (millis() - pending_delete_dirty_ms) > 5000)
+        flush_pending_deletes();
 
     process_wifi_event_queue();
     feed_commit_pending();
