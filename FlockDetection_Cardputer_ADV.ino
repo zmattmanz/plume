@@ -921,7 +921,7 @@ bool hist_delete_confirming = false;
 volatile bool sd_hist_dirty = false;
 
 #define MAX_DELETED_IDS    64
-#define DELETED_IDS_FILE   "/flock_deleted.dat"
+#define DELETED_IDS_FILE   "/FLOCK_FINDER/flock_deleted.dat"
 static int  deleted_ids[MAX_DELETED_IDS];
 static int  deleted_id_count = 0;
 
@@ -965,7 +965,7 @@ struct DeletedMacEntry {
 };
 static DeletedMacEntry deleted_macs[MAX_DELETED_MACS];
 static int deleted_mac_count = 0;
-static const char DELETED_MACS_FILE[] = "/flock_deleted_macs.dat";
+static const char DELETED_MACS_FILE[] = "/FLOCK_FINDER/flock_deleted_macs.dat";
 
 static void deleted_macs_add(const char* mac, int before_id) {
     for (int i = 0; i < deleted_mac_count; i++) {
@@ -999,26 +999,33 @@ static bool deleted_macs_suppresses(const char* mac, int /*id*/) {
 }
 
 static void deleted_macs_save() {
-    Serial.printf("[DELDIAG] deleted_macs_save ENTER — count=%d\n", deleted_mac_count);
-    if (!littlefs_available) return;
-    bool _saved_ok = littlefs_atomic_write(DELETED_MACS_FILE, [&](File& f) -> bool {
+    if (!sd_available) return;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+    File f = SD.open(DELETED_MACS_FILE, FILE_WRITE);
+    if (f) {
         for (int i = 0; i < deleted_mac_count; i++) {
-            if (f.printf("%s,%d\n", deleted_macs[i].mac, deleted_macs[i].before_id) <= 0)
-                return false;
+            f.printf("%s,%d\n", deleted_macs[i].mac, deleted_macs[i].before_id);
         }
-        return true;
-    });
-    Serial.printf("[DELDIAG] deleted_macs_save EXIT — atomic_write returned %d\n",
-                  _saved_ok ? 1 : 0);
+        f.close();
+        Serial.printf("[DELDIAG] deleted_macs_save EXIT — wrote %d to SD\n",
+                      deleted_mac_count);
+    }
+    xSemaphoreGive(sdMutex);
 }
 
 static void deleted_macs_load() {
-    Serial.printf("[DELDIAG] deleted_macs_load ENTER — file_exists=%d\n",
-                  (littlefs_available && LittleFS.exists(DELETED_MACS_FILE)) ? 1 : 0);
     deleted_mac_count = 0;
-    if (!littlefs_available || !LittleFS.exists(DELETED_MACS_FILE)) return;
-    File f = LittleFS.open(DELETED_MACS_FILE, "r");
-    if (!f) return;
+    if (!sd_available) return;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+    if (!SD.exists(DELETED_MACS_FILE)) {
+        xSemaphoreGive(sdMutex);
+        return;
+    }
+    File f = SD.open(DELETED_MACS_FILE, FILE_READ);
+    if (!f) {
+        xSemaphoreGive(sdMutex);
+        return;
+    }
     while (f.available() && deleted_mac_count < MAX_DELETED_MACS) {
         String ln = f.readStringUntil('\n');
         int comma = ln.indexOf(',');
@@ -1031,10 +1038,9 @@ static void deleted_macs_load() {
         deleted_mac_count++;
     }
     f.close();
-    Serial.printf("[DELDIAG] deleted_macs_load EXIT — loaded %d entries:", deleted_mac_count);
-    for (int i = 0; i < deleted_mac_count; i++)
-        Serial.printf(" %s<=%d", deleted_macs[i].mac, deleted_macs[i].before_id);
-    Serial.println();
+    xSemaphoreGive(sdMutex);
+    Serial.printf("[DELDIAG] deleted_macs_load EXIT — loaded %d from SD\n",
+                  deleted_mac_count);
 }
 
 static void save_deleted_ids();   // forward decl
@@ -2390,27 +2396,39 @@ void save_detections_to_flash() {
 }
 
 static void save_deleted_ids() {
-    Serial.printf("[DELDIAG] save_deleted_ids ENTER — littlefs_available=%d count=%d\n",
-                  littlefs_available ? 1 : 0, deleted_id_count);
-    if (!littlefs_available) return;
-    bool _saved_ok = littlefs_atomic_write(DELETED_IDS_FILE, [&](File& f) -> bool {
+    if (!sd_available) return;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        Serial.println("[DELDIAG] save_deleted_ids — sdMutex timeout");
+        return;
+    }
+    File f = SD.open(DELETED_IDS_FILE, FILE_WRITE);
+    if (f) {
         for (int i = 0; i < deleted_id_count; i++) {
-            if (f.printf("%d\n", deleted_ids[i]) <= 0) return false;
+            f.printf("%d\n", deleted_ids[i]);
         }
-        return true;
-    });
-    Serial.printf("[DELDIAG] save_deleted_ids EXIT — atomic_write returned %d\n",
-                  _saved_ok ? 1 : 0);
+        f.close();
+        Serial.printf("[DELDIAG] save_deleted_ids EXIT — wrote %d ids to SD\n",
+                      deleted_id_count);
+    } else {
+        Serial.println("[DELDIAG] save_deleted_ids — SD.open failed");
+    }
+    xSemaphoreGive(sdMutex);
 }
 
 static void load_deleted_ids() {
-    Serial.printf("[DELDIAG] load_deleted_ids ENTER — littlefs_available=%d file_exists=%d\n",
-                  littlefs_available ? 1 : 0,
-                  (littlefs_available && LittleFS.exists(DELETED_IDS_FILE)) ? 1 : 0);
     deleted_id_count = 0;
-    if (!littlefs_available || !LittleFS.exists(DELETED_IDS_FILE)) return;
-    File f = LittleFS.open(DELETED_IDS_FILE, "r");
-    if (!f) return;
+    if (!sd_available) return;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+    if (!SD.exists(DELETED_IDS_FILE)) {
+        xSemaphoreGive(sdMutex);
+        Serial.println("[DELDIAG] load_deleted_ids — file does not exist on SD");
+        return;
+    }
+    File f = SD.open(DELETED_IDS_FILE, FILE_READ);
+    if (!f) {
+        xSemaphoreGive(sdMutex);
+        return;
+    }
     while (f.available() && deleted_id_count < MAX_DELETED_IDS) {
         String line = f.readStringUntil('\n');
         if (line.length() > 0) {
@@ -2419,9 +2437,9 @@ static void load_deleted_ids() {
         }
     }
     f.close();
-    Serial.printf("[DELDIAG] load_deleted_ids EXIT — loaded %d ids:", deleted_id_count);
-    for (int i = 0; i < deleted_id_count; i++) Serial.printf(" %d", deleted_ids[i]);
-    Serial.println();
+    xSemaphoreGive(sdMutex);
+    Serial.printf("[DELDIAG] load_deleted_ids EXIT — loaded %d ids from SD\n",
+                  deleted_id_count);
 }
 
 static void perform_detection_delete(int idx) {
@@ -5836,8 +5854,11 @@ void handle_menu_select() {
             // already no-ops if a write is in flight.
             schedule_persist();
             deleted_id_count = 0;
-            if (littlefs_available && LittleFS.exists(DELETED_IDS_FILE)) {
-                LittleFS.remove(DELETED_IDS_FILE);
+            deleted_mac_count = 0;
+            if (sd_available && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                if (SD.exists(DELETED_IDS_FILE))   SD.remove(DELETED_IDS_FILE);
+                if (SD.exists(DELETED_MACS_FILE))  SD.remove(DELETED_MACS_FILE);
+                xSemaphoreGive(sdMutex);
             }
             set_toast_direct("STATS CLEARED", TOAST_WARNING, false);
             screen_dirty = true;
@@ -9647,10 +9668,18 @@ void setup() {
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
 
+    // Load deletion filters from SD before history so the first load_sd_history
+    // already has them. No mutex needed — tasks haven't been spawned yet,
+    // and the SD guard inside each function takes sdMutex itself.
+    if (sd_available) {
+        load_deleted_ids();
+        deleted_macs_load();
+    }
+
     // Load detection history from SD so the Detections screen has data
     // immediately. No mutex needed — tasks haven't been spawned yet.
     if (sd_available) {
-        Serial.println("[DELDIAG] === EARLY load_sd_history (filters NOT loaded yet) ===");
+        Serial.println("[DELDIAG] === EARLY load_sd_history (filters loaded from SD) ===");
         load_sd_history();
         if (sd_hist_count > 0) {
             Serial.printf("[SD] Loaded %d detections from history\n", sd_hist_count);
@@ -9723,12 +9752,10 @@ void setup() {
         }
     }
 
-    Serial.println("[DELDIAG] === Loading LittleFS data including deletion filters ===");
+    Serial.println("[DELDIAG] === Loading LittleFS data ===");
     if (littlefs_available) {
         load_session_from_flash();
         load_wifi_credentials();
-        load_deleted_ids();
-        deleted_macs_load();
         load_detections_from_flash();
         load_whitelist();
     }
