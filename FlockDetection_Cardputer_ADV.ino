@@ -930,7 +930,9 @@ static void add_deleted_id(int id) {
         for (int i = 0; i < MAX_DELETED_IDS - 1; i++) deleted_ids[i] = deleted_ids[i + 1];
         deleted_id_count = MAX_DELETED_IDS - 1;
     }
+    Serial.printf("[DELDIAG] add_deleted_id(%d) — count was %d\n", id, deleted_id_count);
     deleted_ids[deleted_id_count++] = id;
+    Serial.printf("[DELDIAG] add_deleted_id done — count now %d\n", deleted_id_count);
 }
 
 static bool is_id_deleted(int id) {
@@ -993,17 +995,22 @@ static bool deleted_macs_suppresses(const char* mac, int id) {
 }
 
 static void deleted_macs_save() {
+    Serial.printf("[DELDIAG] deleted_macs_save ENTER — count=%d\n", deleted_mac_count);
     if (!littlefs_available) return;
-    littlefs_atomic_write(DELETED_MACS_FILE, [&](File& f) -> bool {
+    bool _saved_ok = littlefs_atomic_write(DELETED_MACS_FILE, [&](File& f) -> bool {
         for (int i = 0; i < deleted_mac_count; i++) {
             if (f.printf("%s,%d\n", deleted_macs[i].mac, deleted_macs[i].before_id) <= 0)
                 return false;
         }
         return true;
     });
+    Serial.printf("[DELDIAG] deleted_macs_save EXIT — atomic_write returned %d\n",
+                  _saved_ok ? 1 : 0);
 }
 
 static void deleted_macs_load() {
+    Serial.printf("[DELDIAG] deleted_macs_load ENTER — file_exists=%d\n",
+                  (littlefs_available && LittleFS.exists(DELETED_MACS_FILE)) ? 1 : 0);
     deleted_mac_count = 0;
     if (!littlefs_available || !LittleFS.exists(DELETED_MACS_FILE)) return;
     File f = LittleFS.open(DELETED_MACS_FILE, "r");
@@ -1020,6 +1027,10 @@ static void deleted_macs_load() {
         deleted_mac_count++;
     }
     f.close();
+    Serial.printf("[DELDIAG] deleted_macs_load EXIT — loaded %d entries:", deleted_mac_count);
+    for (int i = 0; i < deleted_mac_count; i++)
+        Serial.printf(" %s<=%d", deleted_macs[i].mac, deleted_macs[i].before_id);
+    Serial.println();
 }
 
 static void save_deleted_ids();   // forward decl
@@ -2375,16 +2386,23 @@ void save_detections_to_flash() {
 }
 
 static void save_deleted_ids() {
+    Serial.printf("[DELDIAG] save_deleted_ids ENTER — littlefs_available=%d count=%d\n",
+                  littlefs_available ? 1 : 0, deleted_id_count);
     if (!littlefs_available) return;
-    littlefs_atomic_write(DELETED_IDS_FILE, [&](File& f) -> bool {
+    bool _saved_ok = littlefs_atomic_write(DELETED_IDS_FILE, [&](File& f) -> bool {
         for (int i = 0; i < deleted_id_count; i++) {
             if (f.printf("%d\n", deleted_ids[i]) <= 0) return false;
         }
         return true;
     });
+    Serial.printf("[DELDIAG] save_deleted_ids EXIT — atomic_write returned %d\n",
+                  _saved_ok ? 1 : 0);
 }
 
 static void load_deleted_ids() {
+    Serial.printf("[DELDIAG] load_deleted_ids ENTER — littlefs_available=%d file_exists=%d\n",
+                  littlefs_available ? 1 : 0,
+                  (littlefs_available && LittleFS.exists(DELETED_IDS_FILE)) ? 1 : 0);
     deleted_id_count = 0;
     if (!littlefs_available || !LittleFS.exists(DELETED_IDS_FILE)) return;
     File f = LittleFS.open(DELETED_IDS_FILE, "r");
@@ -2397,9 +2415,14 @@ static void load_deleted_ids() {
         }
     }
     f.close();
+    Serial.printf("[DELDIAG] load_deleted_ids EXIT — loaded %d ids:", deleted_id_count);
+    for (int i = 0; i < deleted_id_count; i++) Serial.printf(" %d", deleted_ids[i]);
+    Serial.println();
 }
 
 static void perform_detection_delete(int idx) {
+    Serial.printf("[DELDIAG] perform_detection_delete(idx=%d) — sd_avail=%d sd_hist_count=%d cap_count=%d\n",
+                  idx, sd_available ? 1 : 0, sd_hist_count, capture_history_count);
     if (!take_data_mutex()) return;
 
     char deleted_mac[18] = "";
@@ -2463,6 +2486,8 @@ static void perform_detection_delete(int idx) {
     // from now, not from when the device was first detected.
     if (deleted_mac[0] != '\0') add_seen_mac(deleted_mac);
 
+    Serial.printf("[DELDIAG] perform_detection_delete done — deleted_mac='%s' deleted_id_count_now=%d deleted_mac_count_now=%d\n",
+                  deleted_mac, deleted_id_count, deleted_mac_count);
     give_data_mutex();
     save_deleted_ids();
     deleted_macs_save();
@@ -2497,14 +2522,17 @@ void load_detections_from_flash() {
 
 // Load last SD_HIST_SIZE detections from SD CSV (most recent first in sd_hist[])
 void load_sd_history() {
+    Serial.printf("[DELDIAG] load_sd_history ENTER — heap=%u deleted_id_count=%d deleted_mac_count=%d sd_hist_count=%d\n",
+                  (unsigned)esp_get_free_heap_size(),
+                  deleted_id_count, deleted_mac_count, sd_hist_count);
     // On no-PSRAM boards, runtime heap is ~6KB after NimBLE init.
     // The tail buffer needs 2-4KB contiguous. If heap is too low,
     // preserve existing sd_hist (populated at boot or by log_detection
     // in-memory pushes) rather than wiping it and failing the malloc.
     if (esp_get_free_heap_size() < 10000) {
         if (sd_hist_count > 0) {
-            Serial.printf("[SD] Skipping reload — heap low, keeping %d cached entries\n",
-                          sd_hist_count);
+            Serial.printf("[DELDIAG] load_sd_history SKIPPED — heap low (%u), keeping %d cached entries (POSSIBLE STALE DATA)\n",
+                          (unsigned)esp_get_free_heap_size(), sd_hist_count);
             return;
         }
         // First load with no cached data — try with a minimal buffer below
@@ -2687,8 +2715,14 @@ void load_sd_history() {
             e.id = synthesize_detection_id(e.mac, e.epoch_utc, uptime_ms, e.rssi);
         }
         // Skip if this ID (real or synthetic) was deleted by the user
-        if (is_id_deleted(e.id)) continue;
-        if (deleted_macs_suppresses(e.mac, e.id)) continue;
+        if (is_id_deleted(e.id)) {
+            Serial.printf("[DELDIAG] FILTER id-match — skipping mac=%s id=%d\n", e.mac, e.id);
+            continue;
+        }
+        if (deleted_macs_suppresses(e.mac, e.id)) {
+            Serial.printf("[DELDIAG] FILTER mac-match — skipping mac=%s id=%d\n", e.mac, e.id);
+            continue;
+        }
         parsed_count++;
     }
 
@@ -2721,6 +2755,7 @@ void load_sd_history() {
         sd_hist_count = write;
     }
 
+    Serial.printf("[DELDIAG] load_sd_history EXIT — sd_hist_count=%d\n", sd_hist_count);
     xSemaphoreGiveRecursive(dataMutex);
 }
 
@@ -8931,6 +8966,7 @@ void transition_screen(int new_screen, int dir) {
         hist_last_frame_ms     = 0;
         if (sd_available) {
             if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                Serial.println("[DELDIAG] === transition_screen(2) — reloading sd_hist with filters ===");
                 load_sd_history();
                 xSemaphoreGive(sdMutex);
                 sd_hist_dirty = false;
@@ -9610,6 +9646,7 @@ void setup() {
     // Load detection history from SD so the Detections screen has data
     // immediately. No mutex needed — tasks haven't been spawned yet.
     if (sd_available) {
+        Serial.println("[DELDIAG] === EARLY load_sd_history (filters NOT loaded yet) ===");
         load_sd_history();
         if (sd_hist_count > 0) {
             Serial.printf("[SD] Loaded %d detections from history\n", sd_hist_count);
@@ -9682,6 +9719,7 @@ void setup() {
         }
     }
 
+    Serial.println("[DELDIAG] === Loading LittleFS data including deletion filters ===");
     if (littlefs_available) {
         load_session_from_flash();
         load_wifi_credentials();
@@ -9690,6 +9728,8 @@ void setup() {
         load_detections_from_flash();
         load_whitelist();
     }
+    Serial.printf("[DELDIAG] === LittleFS load complete — deleted_ids=%d deleted_macs=%d ===\n",
+                  deleted_id_count, deleted_mac_count);
     // Apply persisted settings that require hardware calls after load
     if (night_mode)     apply_color_palette();
     if (low_power_mode) setCpuFrequencyMhz(80);
