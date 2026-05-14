@@ -70,6 +70,7 @@ void beep(int frequency, int duration_ms);
 void apply_color_palette();
 void draw_help_overlay();
 void handle_menu_select();
+static void set_turbo_mode(bool on);
 
 void save_stats_to_sd();
 void draw_feed_expanded_overlay();
@@ -152,7 +153,7 @@ static int  wifi_config_cursor = 0;        // cursor position in active field
 static unsigned long wifi_config_open_ms = 0;
 
 // ── Menu state ──
-static const int MENU_ITEM_COUNT = 11;
+static const int MENU_ITEM_COUNT = 12;
 static int  menu_selected = 0;  // bridged into handle_menu_select()
 
 // ── Fullscreen menu state ──
@@ -190,6 +191,7 @@ static const MenuItem settings_items[] = {
     {"Night Mode",       true,  false, 5},
     {"Low Power Mode",   true,  false, 6},
     {"Mute Beeps",       true,  false, 7},
+    {"Turbo Mode",       true,  false, 11},
 };
 
 static const MenuItem tools_items[] = {
@@ -200,13 +202,14 @@ static const MenuItem tools_items[] = {
 
 static const MenuSection menu_sections[] = {
     {"NAVIGATE", nav_items,      5},
-    {"SETTINGS", settings_items, 3},
+    {"SETTINGS", settings_items, 4},
     {"TOOLS",    tools_items,    3},
 };
 static const int MENU_SECTION_COUNT = 3;
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
 static bool low_power_mode = false;
+static bool turbo_mode_active = false;
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
 // RGB LED state — color cycles with C key, on/off with L when locator idle
@@ -505,9 +508,18 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define MAX_LOG_BUFFER 4
 #define MAX_PCAP_BUFFER 3
 #define SD_FLUSH_INTERVAL 10000
-#define CHANNEL_DWELL_MS 400
+#define CHANNEL_HOP_INTERVAL_NORMAL 250UL
+#define CHANNEL_HOP_INTERVAL_TURBO  150UL
+#define DEDUP_WINDOW_NORMAL_MS      300000UL
+#define DEDUP_WINDOW_TURBO_MS        30000UL
 
-#define REDETECT_WINDOW_MS 300000
+static inline unsigned long current_channel_hop_interval() {
+    return turbo_mode_active ? CHANNEL_HOP_INTERVAL_TURBO
+           : (low_power_mode ? 800UL : CHANNEL_HOP_INTERVAL_NORMAL);
+}
+static inline unsigned long current_dedup_window_ms() {
+    return turbo_mode_active ? DEDUP_WINDOW_TURBO_MS : DEDUP_WINDOW_NORMAL_MS;
+}
 
 #define RSSI_TRACK_MAX_DEVICES 10
 #define RSSI_TRACK_SAMPLES 5
@@ -707,7 +719,7 @@ bool is_mac_recently_seen(const char* mac) {
         SeenMacEntry& e = seen_mac_table[idx];
         if (!e.occupied) return false;
         if (strncmp(e.mac, mac, 17) == 0) {
-            if ((now - e.ts) >= REDETECT_WINDOW_MS) { e.ts = now; return false; }
+            if ((now - e.ts) >= current_dedup_window_ms()) { e.ts = now; return false; }
             return true;
         }
     }
@@ -841,7 +853,7 @@ void seen_mac_expire() {
 
     for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
         if (seen_mac_table[i].occupied &&
-            (now - seen_mac_table[i].ts) >= REDETECT_WINDOW_MS) {
+            (now - seen_mac_table[i].ts) >= current_dedup_window_ms()) {
             seen_mac_table[i].occupied = false;
             any_expired = true;
         }
@@ -2753,7 +2765,7 @@ static void save_session_to_flash() {
 
     long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes, l_next_id;
     int l_vol, l_brightness;
-    bool l_night, l_low_power, l_stealth, l_muted;
+    bool l_night, l_low_power, l_stealth, l_muted, l_turbo;
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
@@ -2764,6 +2776,7 @@ static void save_session_to_flash() {
     l_low_power  = low_power_mode;
     l_stealth    = stealth_mode;
     l_muted      = is_muted;
+    l_turbo      = turbo_mode_active;
     xSemaphoreGiveRecursive(dataMutex);
 
     // Minimum acceptable byte count for a complete write. Computed from
@@ -2804,6 +2817,7 @@ static void save_session_to_flash() {
             wp(f.printf("low_power=%d\n",   l_low_power ? 1 : 0));
             wp(f.printf("stealth=%d\n",     l_stealth ? 1 : 0));
             wp(f.printf("muted=%d\n",       l_muted ? 1 : 0));
+            wp(f.printf("turbo=%d\n",       l_turbo ? 1 : 0));
             return !any_short && written >= PERSIST_MIN_BYTES;
         });
         if (atomic_ok) {
@@ -3069,6 +3083,7 @@ void load_session_from_flash() {
         else if (key == "low_power")  low_power_mode = (val.toInt() != 0);
         else if (key == "stealth")    stealth_mode = (val.toInt() != 0);
         else if (key == "muted")      is_muted = (val.toInt() != 0);
+        else if (key == "turbo")      turbo_mode_active = (val.toInt() != 0);
         else if (key == "ssid") {
             if (val.length() > 0 && val.length() < sizeof(export_ssid)) {
                 strncpy(export_ssid, val.c_str(), sizeof(export_ssid) - 1);
@@ -4585,7 +4600,7 @@ void ScannerLoopTask(void* pvParameters) {
         unsigned long now = millis();
         unsigned long lock_until = __atomic_load_n(&channel_lock_until, __ATOMIC_RELAXED);
         if ((long)(now - lock_until) > 0) {
-            unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
+            unsigned long dwell = current_channel_hop_interval();
             if (now - last_channel_hop > dwell) {
                 current_channel++;
                 if (current_channel > MAX_CHANNEL) current_channel = 1;
@@ -4751,14 +4766,15 @@ void draw_header_spr(int screen_num) {
             const char* letter;
             uint16_t color;
         };
-        ModeBadge badges[5] = {
-            { ambient_mode,    "A", DIM_COLOR },
-            { night_mode,      "N", HEADER_COLOR },
-            { stealth_mode,    "S", DIM_COLOR },
-            { locator_active,  "L", CAUTION_COLOR },
-            { low_power_mode,  "P", ACCENT_COLOR },
+        ModeBadge badges[6] = {
+            { ambient_mode,      "A", DIM_COLOR },
+            { night_mode,        "N", HEADER_COLOR },
+            { stealth_mode,      "S", DIM_COLOR },
+            { locator_active,    "L", CAUTION_COLOR },
+            { low_power_mode,    "P", ACCENT_COLOR },
+            { turbo_mode_active, "T", CAUTION_COLOR },
         };
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 6; i++) {
             if (!badges[i].active) continue;
             int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
             drawPill(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
@@ -5126,14 +5142,15 @@ void draw_header_lcd(int screen_num) {
     // Mode badges
     {
         struct ModeBadge { bool active; const char* letter; uint16_t color; };
-        ModeBadge badges[5] = {
-            { ambient_mode,    "A", DIM_COLOR },
-            { night_mode,      "N", HEADER_COLOR },
-            { stealth_mode,    "S", DIM_COLOR },
-            { locator_active,  "L", CAUTION_COLOR },
-            { low_power_mode,  "P", ACCENT_COLOR },
+        ModeBadge badges[6] = {
+            { ambient_mode,      "A", DIM_COLOR },
+            { night_mode,        "N", HEADER_COLOR },
+            { stealth_mode,      "S", DIM_COLOR },
+            { locator_active,    "L", CAUTION_COLOR },
+            { low_power_mode,    "P", ACCENT_COLOR },
+            { turbo_mode_active, "T", CAUTION_COLOR },
         };
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 6; i++) {
             if (!badges[i].active) continue;
             int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
             drawPill_lcd(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
@@ -5240,6 +5257,7 @@ static void render_frame() {
     static bool     last_stealth        = false;
     static bool     last_locator        = false;
     static bool     last_low_power      = false;
+    static bool     last_turbo          = false;
     static bool     last_sd             = true;
     static bool     last_export         = false;
     static bool     last_menu           = false;
@@ -5274,6 +5292,7 @@ static void render_frame() {
         || (stealth_mode       != last_stealth)
         || (locator_active     != last_locator)
         || (low_power_mode     != last_low_power)
+        || (turbo_mode_active  != last_turbo)
         || (sd_available       != last_sd)
         || (export_mode_active != last_export)
         || (menu_open          != last_menu)
@@ -5296,6 +5315,7 @@ static void render_frame() {
         last_stealth   = stealth_mode;
         last_locator   = locator_active;
         last_low_power = low_power_mode;
+        last_turbo     = turbo_mode_active;
         last_sd        = sd_available;
         last_export    = export_mode_active;
         last_menu      = menu_open;
@@ -5978,6 +5998,24 @@ void draw_wifi_config_overlay() {
     }
 }
 
+static void set_turbo_mode(bool on) {
+    if (on == turbo_mode_active) return;
+    turbo_mode_active = on;
+    if (on) {
+        if (low_power_mode) {
+            low_power_mode = false;
+            apply_ble_scan_params();
+        }
+        setCpuFrequencyMhz(240);
+        set_toast_direct("TURBO ON", TOAST_SUCCESS);
+    } else {
+        setCpuFrequencyMhz(160);
+        set_toast_direct("TURBO OFF", TOAST_NEUTRAL);
+    }
+    schedule_persist();
+    screen_dirty = true;
+}
+
 void handle_menu_select() {
     switch (menu_selected) {
         case 0: case 1: case 2: case 3: case 4: {
@@ -5994,6 +6032,7 @@ void handle_menu_select() {
         case 6:
             low_power_mode = !low_power_mode;
             if (low_power_mode) {
+                if (turbo_mode_active) turbo_mode_active = false;
                 setCpuFrequencyMhz(80);
                 set_toast_direct("LOW POWER ON", TOAST_SUCCESS);
             } else {
@@ -6030,6 +6069,9 @@ void handle_menu_select() {
                 export_mode_start();
             }
             screen_dirty = true;
+            break;
+        case 11:
+            set_turbo_mode(!turbo_mode_active);
             break;
         case 10: {
             // Clear all stats — session and lifetime
@@ -9950,8 +9992,9 @@ void setup() {
     }
     // Apply persisted settings that require hardware calls after load
     if (night_mode)     apply_color_palette();
-    if (low_power_mode) setCpuFrequencyMhz(80);
-    if (stealth_mode)   M5Cardputer.Display.setBrightness(5);
+    if (low_power_mode)    setCpuFrequencyMhz(80);
+    if (turbo_mode_active) setCpuFrequencyMhz(240);
+    if (stealth_mode)      M5Cardputer.Display.setBrightness(5);
     if (is_muted)       M5Cardputer.Speaker.setVolume(0);
     Serial.printf("[BOOT] Free heap after LittleFS: %u\n",
                   (unsigned)esp_get_free_heap_size());
