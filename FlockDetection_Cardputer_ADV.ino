@@ -1752,7 +1752,7 @@ transition:all .2s ease}
 border-radius:8px;padding:6px 14px;background:var(--hd);color:var(--h);
 font-size:12px;letter-spacing:2px;font-weight:500;
 animation:bg 3s ease-in-out infinite}
-.sb .dt{width:6px;height:6px;border-radius:50%;background:var(--h);
+.sb .dt{width:6px;height:6px;border-radius:50%%;background:var(--h);
 animation:dp 1.5s ease-in-out infinite}
 @keyframes bg{0%%,100%%{box-shadow:0 0 8px rgba(77,219,194,.1)}
 50%%{box-shadow:0 0 16px rgba(77,219,194,.2)}}
