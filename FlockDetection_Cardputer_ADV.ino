@@ -5232,12 +5232,7 @@ static void render_frame() {
     auto& lcd = M5Cardputer.Display;
     lcd.startWrite();
 
-    // Push sprite content only — clip out header rows 0-19
-    lcd.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
-    spr.pushSprite(0, 0);
-    lcd.clearClipRect();
-
-    // Draw header directly to LCD
+    // Draw header first (onto clean LCD, before content push)
     if (menu_open) {
         draw_overlay_header_lcd("MENU");
     } else if (show_help_overlay) {
@@ -5254,6 +5249,16 @@ static void render_frame() {
             lcd.setCursor(56, 5);
             kprint_lcd("/ FEED");
         }
+    }
+
+    // Push ONLY content rows from the sprite buffer, skipping header rows.
+    // setAddrWindow constrains the display controller's write region so
+    // the header area is never touched by the pixel data.
+    uint16_t* buf = (uint16_t*)spr.getBuffer();
+    if (buf) {
+        lcd.setAddrWindow(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
+        lcd.pushPixels(buf + (CONTENT_Y * DISP_W),
+                       DISP_W * (DISP_H - CONTENT_Y));
     }
 
     lcd.endWrite();
