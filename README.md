@@ -1,4 +1,4 @@
-# Flock Finder — M5Cardputer ADV Edition
+# Flock Finder for M5Cardputer ADV Edition
 
 > **Note:** Project name is changing. Find-and-replace "Flock Finder" when the new name is chosen.
 
