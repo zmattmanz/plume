@@ -141,7 +141,7 @@ static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
 static bool          title_card_active   = true;
 static unsigned long title_card_start_ms = 0;
-static const unsigned long TITLE_CARD_HOLD_MS = 3000;
+static const unsigned long TITLE_CARD_HOLD_MS = 500;   // boot sequence already did the real hold
 static const unsigned long TITLE_CARD_FADE_MS = 1000;
 static int  feed_expanded_selected = 0;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
@@ -5651,6 +5651,37 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
     }
 }
 
+static void draw_title_card_overlay(float alpha) {
+    if (alpha <= 0.01f) return;
+
+    int card_w = 120;
+    int card_h = 36;
+    int card_x = (DISP_W - card_w) / 2;
+    int card_y = CONTENT_Y + ((DISP_H - CONTENT_Y - card_h) / 2);
+
+    uint16_t border_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+    uint16_t title_col  = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+    uint16_t ver_col    = lerp_col16(BG_COLOR, DIM_COLOR, alpha);
+
+    spr.fillRoundRect(card_x, card_y, card_w, card_h, 3, BG_COLOR);
+    spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, border_col);
+
+    int title_w = 12 * 7;
+    int title_x = card_x + (card_w - title_w) / 2;
+    spr.setTextColor(title_col, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(title_x, card_y + 8);
+    kprint(spr, "FLOCK FINDER", 1);
+
+    const char* ver = VERSION_STRING;
+    int ver_w = (int)strlen(ver) * ts_char_w(TS_MICRO);
+    int ver_x = card_x + (card_w - ver_w) / 2;
+    spr.setTextColor(ver_col, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(ver_x, card_y + 22);
+    spr.print(ver);
+}
+
 static void draw_title_card() {
     unsigned long elapsed = millis() - title_card_start_ms;
     unsigned long total = TITLE_CARD_HOLD_MS + TITLE_CARD_FADE_MS;
@@ -5665,35 +5696,15 @@ static void draw_title_card() {
         alpha = 1.0f - (float)(elapsed - TITLE_CARD_HOLD_MS) / (float)TITLE_CARD_FADE_MS;
     }
 
-    int card_w = 120;
-    int card_h = 36;
-    int card_x = (DISP_W - card_w) / 2;
-    int card_y = CONTENT_Y + ((DISP_H - CONTENT_Y - card_h) / 2);
+    uint16_t title_bg = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
+    for (int y = CONTENT_Y; y < DISP_H; y++) {
+        for (int x = 0; x < DISP_W; x++) {
+            uint16_t px = spr.readPixel(x, y);
+            spr.drawPixel(x, y, lerp_col16(px, title_bg, alpha));
+        }
+    }
 
-    uint16_t border_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
-    uint16_t title_col  = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
-    uint16_t ver_col    = lerp_col16(BG_COLOR, DIM_COLOR, alpha);
-
-    spr.fillRoundRect(card_x, card_y, card_w, card_h, 3, BG_COLOR);
-    spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, border_col);
-
-    // "FLOCK FINDER" centered
-    int title_chars = 12;
-    int title_w = title_chars * 7;  // kprint with extra=1: 6px char + 1px kern = 7px
-    int title_x = card_x + (card_w - title_w) / 2;
-    spr.setTextColor(title_col, BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(title_x, card_y + 8);
-    kprint(spr, "FLOCK FINDER", 1);
-
-    // Version string centered underneath
-    const char* ver = VERSION_STRING;
-    int ver_w = (int)strlen(ver) * ts_char_w(TS_MICRO);
-    int ver_x = card_x + (card_w - ver_w) / 2;
-    spr.setTextColor(ver_col, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(ver_x, card_y + 22);
-    spr.print(ver);
+    draw_title_card_overlay(alpha);
 }
 
 // ── Fullscreen single-column scrollable menu ────────────────────────
@@ -10151,32 +10162,74 @@ void setup() {
         scan_feed_last_snapshot = millis();
     }
 
-    title_card_start_ms = millis();
-
-    // ── Crossfade from boot screen to scanner via the backlight PWM ──
-    // Fade-out: ramp brightness to 0 over ~400ms, so the still-rendered boot
-    // content dims away. Swap sprite contents while the screen is dark.
-    // Fade-in: ramp brightness back to the user's target over ~400ms.
+    // ── Title card boot sequence ──
     {
         int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
-        const int FADE_STEPS   = 12;
-        const int FADE_STEP_MS = 16;   // 12 × 16ms ≈ 192ms per phase
+        uint16_t title_bg = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
 
-        for (int i = 1; i <= FADE_STEPS; i++) {
-            int b = (start_brightness * (FADE_STEPS - i)) / FADE_STEPS;
-            M5Cardputer.Display.setBrightness(b);
-            delay(FADE_STEP_MS);
+        // Phase 1: Fade out boot screen
+        {
+            int steps = 12;
+            for (int i = 1; i <= steps; i++) {
+                float t = (float)i / (float)steps;
+                M5Cardputer.Display.setBrightness((uint8_t)(start_brightness * (1.0f - t)));
+                delay(25);
+            }
         }
 
-        // Screen is dark — swap to the scanner content
+        // Phase 2: Switch to blue title card, fade in
+        {
+            spr.fillSprite(title_bg);
+            draw_title_card_overlay(1.0f);
+            render_frame();
+
+            int steps = 12;
+            for (int i = 1; i <= steps; i++) {
+                float t = (float)i / (float)steps;
+                M5Cardputer.Display.setBrightness((uint8_t)(start_brightness * t));
+                delay(25);
+            }
+        }
+
+        // Phase 3: Hold on blue title card (~2 seconds)
+        {
+            unsigned long hold_start = millis();
+            while (millis() - hold_start < 2000) {
+                spr.fillSprite(title_bg);
+                draw_title_card_overlay(1.0f);
+                render_frame();
+                delay(30);
+            }
+        }
+
+        // Phase 4: Dissolve blue → scanner over 1 second
+        {
+            title_card_start_ms = millis();
+            unsigned long dissolve_start = millis();
+            unsigned long dissolve_ms = 1000;
+
+            while (millis() - dissolve_start < dissolve_ms) {
+                float alpha = 1.0f - (float)(millis() - dissolve_start) / (float)dissolve_ms;
+
+                draw_current_screen();
+
+                for (int y = CONTENT_Y; y < DISP_H; y++) {
+                    for (int x = 0; x < DISP_W; x++) {
+                        uint16_t px = spr.readPixel(x, y);
+                        spr.drawPixel(x, y, lerp_col16(px, title_bg, alpha));
+                    }
+                }
+
+                draw_title_card_overlay(alpha);
+                render_frame();
+                delay(16);
+            }
+        }
+
+        // Phase 5: Clean transition to normal operation
+        title_card_active = false;
         draw_current_screen();
         render_frame();
-
-        for (int i = 1; i <= FADE_STEPS; i++) {
-            int b = (start_brightness * i) / FADE_STEPS;
-            M5Cardputer.Display.setBrightness(b);
-            delay(FADE_STEP_MS);
-        }
     }
 
     // Boot chime — plays after the scanner is visible. Vintage descending
