@@ -141,6 +141,7 @@ static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
 static bool          title_card_active   = true;
 static unsigned long title_card_start_ms = 0;
+static volatile bool scanner_ready       = false;  // set true after boot; guards both callbacks
 static const unsigned long TITLE_CARD_HOLD_MS = 500;   // boot sequence already did the real hold
 static const unsigned long TITLE_CARD_FADE_MS = 1000;
 static int  feed_expanded_selected = 0;
@@ -1133,19 +1134,19 @@ struct RSSITrack {
 };
 RSSITrack rssi_tracker[RSSI_TRACK_MAX_DEVICES];
 int rssi_tracker_count = 0;
-static int locator_tracker_idx = -1;  // cached index into rssi_tracker for locator target
+static int signal_tracker_idx = -1;  // cached index into rssi_tracker for locator target
 
-static volatile bool locator_active = false;
-char locator_target_mac[18]  = "";
-char locator_target_name[65] = "";
-char locator_target_type[16] = "";   // "WiFi", "BLE", or ""
-int  locator_target_id       = 0;    // sequential detection ID; 0 = unknown
-unsigned long locator_newest_sample_ms = 0;
-int locator_peak_rssi = -120;
+static volatile bool signal_active = false;
+char signal_target_mac[18]  = "";
+char signal_target_name[65] = "";
+char signal_target_type[16] = "";   // "WiFi", "BLE", or ""
+int  signal_target_id       = 0;    // sequential detection ID; 0 = unknown
+unsigned long signal_newest_sample_ms = 0;
+int signal_peak_rssi = -120;
 
 // ── Locator signal trace ring buffer ──
-#define LOC_TRACE_SIZE        60          // 2 minutes at 2-second intervals
-#define LOC_TRACE_INTERVAL_MS 2000
+#define SIG_TRACE_SIZE        60          // 2 minutes at 2-second intervals
+#define SIG_TRACE_INTERVAL_MS 2000
 
 // Signal bar and trace normalization range — single source of truth.
 // Values below RSSI_VIS_FLOOR clamp to bottom; above RSSI_VIS_CEIL clamp to top.
@@ -1153,25 +1154,25 @@ int locator_peak_rssi = -120;
 #define RSSI_VIS_CEIL  (-30)
 #define RSSI_VIS_RANGE (RSSI_VIS_CEIL - RSSI_VIS_FLOOR)  // 40
 
-struct LocTraceEntry {
+struct SigTraceEntry {
     int8_t rssi;  // raw dBm value; -128 = floor/gap
 };
 
-static LocTraceEntry loc_trace[LOC_TRACE_SIZE];
-static int           loc_trace_head        = 0;  // next slot to write
-static int           loc_trace_count       = 0;
-static unsigned long loc_trace_last_sample = 0;
-static float         loc_trace_smooth[LOC_TRACE_SIZE];
+static SigTraceEntry sig_trace[SIG_TRACE_SIZE];
+static int           sig_trace_head        = 0;  // next slot to write
+static int           sig_trace_count       = 0;
+static unsigned long sig_trace_last_sample = 0;
+static float         sig_trace_smooth[SIG_TRACE_SIZE];
 static int           last_rendered_trace_head  = -1;
 static int           last_rendered_trace_count = 0;
-static unsigned long loc_trace_last_frame_ms = 0;
+static unsigned long sig_trace_last_frame_ms = 0;
 static float         signal_bar_smooth = 0.0f;
 static bool          signal_bar_seeded = false;
 
 // ── Peak GPS bookmark ──
-static double locator_peak_lat     = 0.0;
-static double locator_peak_lng     = 0.0;
-static bool   locator_peak_has_gps = false;
+static double signal_peak_lat     = 0.0;
+static double signal_peak_lng     = 0.0;
+static bool   signal_peak_has_gps = false;
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
@@ -2059,6 +2060,7 @@ static volatile uint32_t ble_pool_write = 0;
 
 class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+        if (!scanner_ready) return;
         // Claim a pool slot. If the slot is still being processed by the
         // worker task, drop this advertisement — better than heap-allocating.
         uint32_t slot = __atomic_load_n(&ble_pool_write, __ATOMIC_ACQUIRE);
@@ -2176,6 +2178,7 @@ static void export_restore_promiscuous() {
         vTaskResume(ScannerTaskHandle);
         esp_task_wdt_add(ScannerTaskHandle);
     }
+    scanner_ready = true;
     last_ble_scan = millis();
 }
 
@@ -2225,6 +2228,7 @@ bool export_mode_start() {
     }
 
     // Shut down all scanning before joining a network
+    scanner_ready = false;
     esp_wifi_set_promiscuous(false);
     if (ScannerTaskHandle) {
         esp_task_wdt_delete(ScannerTaskHandle);
@@ -2967,6 +2971,7 @@ static void sd_check_hotplug() {
             // PCAP headers are confirmed written, so flush_sd_buffer and
             // PersistTask will find a fully initialized filesystem.
             sd_available = true;
+            sd_full_warned = false;
 
             // Phase 2: history load + stats write. Re-acquire with a
             // longer timeout; if contention persists, skip (PersistTask
@@ -3316,8 +3321,8 @@ void rssi_track_update(const char* mac, int rssi) {
                 rssi_tracker[i].scored = false;
             }
             rssi_tracker[i].last_seen = now;
-            if (locator_active && strncmp(rssi_tracker[i].mac, locator_target_mac, 17) == 0) {
-                locator_tracker_idx = i;
+            if (signal_active && strncmp(rssi_tracker[i].mac, signal_target_mac, 17) == 0) {
+                signal_tracker_idx = i;
             }
             xSemaphoreGiveRecursive(dataMutex);
             return;
@@ -3378,14 +3383,14 @@ void rssi_track_expire() {
         if ((now - rssi_tracker[i].last_seen) > RSSI_TRACK_EXPIRY_MS) {
             for (int j = i; j < rssi_tracker_count - 1; j++) rssi_tracker[j] = rssi_tracker[j + 1];
             rssi_tracker_count--;
-            // Keep locator_tracker_idx consistent across the array shift
-            if (locator_tracker_idx == i)       locator_tracker_idx = -1;
-            else if (locator_tracker_idx > i)   locator_tracker_idx--;
+            // Keep signal_tracker_idx consistent across the array shift
+            if (signal_tracker_idx == i)       signal_tracker_idx = -1;
+            else if (signal_tracker_idx > i)   signal_tracker_idx--;
         }
     }
     // Re-validate after all shifts — defensive against combined adjustments
-    if (locator_tracker_idx >= rssi_tracker_count) {
-        locator_tracker_idx = -1;
+    if (signal_tracker_idx >= rssi_tracker_count) {
+        signal_tracker_idx = -1;
     }
     give_data_mutex();
 }
@@ -3935,80 +3940,80 @@ static void signal_feed_rssi(const char* mac, int rssi) {
     rssi_track_update(mac, rssi);
 
     unsigned long now = millis();
-    if (loc_trace_count == 0 || (now - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
-        loc_trace[loc_trace_head].rssi = (int8_t)(rssi < -128 ? -128 : rssi > 127 ? 127 : rssi);
-        loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
-        if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
-        loc_trace_last_sample = now;
+    if (sig_trace_count == 0 || (now - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
+        sig_trace[sig_trace_head].rssi = (int8_t)(rssi < -128 ? -128 : rssi > 127 ? 127 : rssi);
+        sig_trace_head = (sig_trace_head + 1) % SIG_TRACE_SIZE;
+        if (sig_trace_count < SIG_TRACE_SIZE) sig_trace_count++;
+        sig_trace_last_sample = now;
     }
 
-    if (rssi > locator_peak_rssi) {
-        locator_peak_rssi = rssi;
+    if (rssi > signal_peak_rssi) {
+        signal_peak_rssi = rssi;
         if (gps.location.isValid() && gps.location.age() < 2000) {
             double lat = gps.location.lat();
             double lng = gps.location.lng();
             if (!isnan(lat) && !isnan(lng) && !isinf(lat) && !isinf(lng)) {
-                locator_peak_lat     = lat;
-                locator_peak_lng     = lng;
-                locator_peak_has_gps = true;
+                signal_peak_lat     = lat;
+                signal_peak_lng     = lng;
+                signal_peak_has_gps = true;
             }
         }
     }
 
-    locator_newest_sample_ms = now;
+    signal_newest_sample_ms = now;
 }
 
-void locator_start(const char* mac, const char* name, const char* type = "", int id = 0) {
+void signal_start(const char* mac, const char* name, const char* type = "", int id = 0) {
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
 
-    locator_active = false;
+    signal_active = false;
 
-    loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
-    memset(loc_trace_smooth, 0, sizeof(loc_trace_smooth));
-    loc_trace_last_frame_ms = 0;
+    sig_trace_head = 0; sig_trace_count = 0; sig_trace_last_sample = 0;
+    memset(sig_trace_smooth, 0, sizeof(sig_trace_smooth));
+    sig_trace_last_frame_ms = 0;
     last_rendered_trace_head  = -1;
     last_rendered_trace_count = 0;
     signal_bar_smooth = 0.0f;
     signal_bar_seeded = false;
 
-    locator_peak_rssi = -120;
-    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
+    signal_peak_rssi = -120;
+    signal_peak_lat = 0.0; signal_peak_lng = 0.0; signal_peak_has_gps = false;
 
-    locator_tracker_idx = -1;
-    locator_newest_sample_ms = 0;
+    signal_tracker_idx = -1;
+    signal_newest_sample_ms = 0;
 
-    strncpy(locator_target_mac,  mac,  17); locator_target_mac[17]  = '\0';
-    strncpy(locator_target_name, name, sizeof(locator_target_name) - 1);
-    locator_target_name[sizeof(locator_target_name) - 1] = '\0';
-    strncpy(locator_target_type, type, sizeof(locator_target_type) - 1);
-    locator_target_type[sizeof(locator_target_type) - 1] = '\0';
-    locator_target_id = id;
+    strncpy(signal_target_mac,  mac,  17); signal_target_mac[17]  = '\0';
+    strncpy(signal_target_name, name, sizeof(signal_target_name) - 1);
+    signal_target_name[sizeof(signal_target_name) - 1] = '\0';
+    strncpy(signal_target_type, type, sizeof(signal_target_type) - 1);
+    signal_target_type[sizeof(signal_target_type) - 1] = '\0';
+    signal_target_id = id;
 
-    locator_active = true;
+    signal_active = true;
 
     xSemaphoreGiveRecursive(dataMutex);
     screen_dirty = true;
 }
 
-void locator_stop() {
+void signal_stop() {
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
 
-    locator_active = false;
+    signal_active = false;
 
-    locator_target_mac[0]  = '\0';
-    locator_target_name[0] = '\0';
-    locator_target_type[0] = '\0';
-    locator_target_id      = 0;
+    signal_target_mac[0]  = '\0';
+    signal_target_name[0] = '\0';
+    signal_target_type[0] = '\0';
+    signal_target_id      = 0;
 
-    locator_peak_rssi = -120;
-    locator_peak_lat = 0.0; locator_peak_lng = 0.0; locator_peak_has_gps = false;
+    signal_peak_rssi = -120;
+    signal_peak_lat = 0.0; signal_peak_lng = 0.0; signal_peak_has_gps = false;
 
-    locator_tracker_idx = -1;
-    locator_newest_sample_ms = 0;
+    signal_tracker_idx = -1;
+    signal_newest_sample_ms = 0;
 
-    loc_trace_head = 0; loc_trace_count = 0; loc_trace_last_sample = 0;
-    memset(loc_trace_smooth, 0, sizeof(loc_trace_smooth));
-    loc_trace_last_frame_ms = 0;
+    sig_trace_head = 0; sig_trace_count = 0; sig_trace_last_sample = 0;
+    memset(sig_trace_smooth, 0, sizeof(sig_trace_smooth));
+    sig_trace_last_frame_ms = 0;
     last_rendered_trace_head  = -1;
     last_rendered_trace_count = 0;
     signal_bar_smooth = 0.0f;
@@ -4054,6 +4059,7 @@ static volatile uint32_t wifi_eq_write_idx = 0;
 static uint8_t           wifi_eq_read_idx  = 0;
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
+    if (!scanner_ready) return;
     if (type != WIFI_PKT_MGMT) return;
     const wifi_promiscuous_pkt_t* ppkt = (wifi_promiscuous_pkt_t*)buff;
     if (ppkt->rx_ctrl.sig_len < 24) return;
@@ -4262,9 +4268,9 @@ void process_wifi_event_queue() {
         }
 
         // Feed RSSI to the Signal screen for any active target, regardless of confidence.
-        if (locator_active) {
+        if (signal_active) {
             xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            if (locator_active && strncmp(mac_str, locator_target_mac, 17) == 0)
+            if (signal_active && strncmp(mac_str, signal_target_mac, 17) == 0)
                 signal_feed_rssi(mac_str, local.rssi);
             xSemaphoreGiveRecursive(dataMutex);
         }
@@ -4437,9 +4443,9 @@ static void ble_worker_task(void* pvParameters) {
                                 ev->have_name ? dev_name_char : "",
                                 ev->rssi, 1, preview_is_flock);
             // Feed RSSI to the Signal screen for any active target, regardless of confidence.
-            if (locator_active) {
+            if (signal_active) {
                 xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-                if (locator_active && strncmp(mac_str_feed, locator_target_mac, 17) == 0)
+                if (signal_active && strncmp(mac_str_feed, signal_target_mac, 17) == 0)
                     signal_feed_rssi(mac_str_feed, ev->rssi);
                 xSemaphoreGiveRecursive(dataMutex);
             }
@@ -4774,7 +4780,7 @@ void draw_header_spr(int screen_num) {
             { ambient_mode,      "A", DIM_COLOR },
             { night_mode,        "N", HEADER_COLOR },
             { stealth_mode,      "S", DIM_COLOR },
-            { locator_active,    "L", CAUTION_COLOR },
+            { signal_active,    "L", CAUTION_COLOR },
             { low_power_mode,    "P", ACCENT_COLOR },
             { turbo_mode_active, "T", CAUTION_COLOR },
         };
@@ -5150,7 +5156,7 @@ void draw_header_lcd(int screen_num) {
             { ambient_mode,      "A", DIM_COLOR },
             { night_mode,        "N", HEADER_COLOR },
             { stealth_mode,      "S", DIM_COLOR },
-            { locator_active,    "L", CAUTION_COLOR },
+            { signal_active,    "L", CAUTION_COLOR },
             { low_power_mode,    "P", ACCENT_COLOR },
             { turbo_mode_active, "T", CAUTION_COLOR },
         };
@@ -5259,7 +5265,7 @@ static void render_frame() {
     static bool     last_ambient        = false;
     static bool     last_night          = false;
     static bool     last_stealth        = false;
-    static bool     last_locator        = false;
+    static bool     last_signal_active  = false;
     static bool     last_low_power      = false;
     static bool     last_turbo          = false;
     static bool     last_sd             = true;
@@ -5294,7 +5300,7 @@ static void render_frame() {
         || (ambient_mode       != last_ambient)
         || (night_mode         != last_night)
         || (stealth_mode       != last_stealth)
-        || (locator_active     != last_locator)
+        || (signal_active      != last_signal_active)
         || (low_power_mode     != last_low_power)
         || (turbo_mode_active  != last_turbo)
         || (sd_available       != last_sd)
@@ -5317,7 +5323,7 @@ static void render_frame() {
         last_ambient   = ambient_mode;
         last_night     = night_mode;
         last_stealth   = stealth_mode;
-        last_locator   = locator_active;
+        last_signal_active = signal_active;
         last_low_power = low_power_mode;
         last_turbo     = turbo_mode_active;
         last_sd        = sd_available;
@@ -5654,31 +5660,65 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
 static void draw_title_card_overlay(float alpha) {
     if (alpha <= 0.01f) return;
 
-    int card_w = 150;
-    int card_h = 46;
-    int card_x = (DISP_W - card_w) / 2;
-    int card_y = (DISP_H - card_h) / 2;
+    // ── Animated grid background ──
+    {
+        float grid_alpha = alpha * 0.16f;
+        uint16_t grid_col = lerp_col16(BG_COLOR, HEADER_COLOR, grid_alpha);
 
+        int spacing = 20;
+
+        // Pick a random direction once, keep it forever
+        static float grid_dx = 0.0f, grid_dy = 0.0f;
+        static bool grid_dir_set = false;
+        if (!grid_dir_set) {
+            float angle = (float)random(0, 628) / 100.0f;  // 0 to 2*PI
+            grid_dx = cosf(angle) * 14.0f;  // pixels per second
+            grid_dy = sinf(angle) * 14.0f;
+            grid_dir_set = true;
+        }
+
+        float t = (float)millis() / 1000.0f;
+        int off_x = ((int)(t * grid_dx) % spacing + spacing) % spacing;
+        int off_y = ((int)(t * grid_dy) % spacing + spacing) % spacing;
+
+        for (int y = off_y - spacing; y < DISP_H; y += spacing) {
+            spr.drawFastHLine(0, y, DISP_W, grid_col);
+        }
+        for (int x = off_x - spacing; x < DISP_W; x += spacing) {
+            spr.drawFastVLine(x, 0, DISP_H, grid_col);
+        }
+    }
+
+    // ── Pill with title ──
+    spr.setTextSize(2);
+    int title_w = spr.textWidth("FLOCK FINDER");
+    int title_h = spr.fontHeight();
+
+    int pad_x = 26, pad_y = 18;
+    int pill_w = title_w + pad_x;
+    int pill_h = title_h + pad_y;
+    int pill_r = pill_h / 2;
+    int pill_x = (DISP_W - pill_w) / 2;
+    int pill_y = (DISP_H - pill_h) / 2 - 6;
+
+    uint16_t pill_fill  = lerp_col16(BG_COLOR, lerp_col16(BG_COLOR, HEADER_COLOR, 0.15f), alpha);
     uint16_t border_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
     uint16_t title_col  = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
-    uint16_t ver_col    = lerp_col16(BG_COLOR, DIM_COLOR, alpha);
+    uint16_t ver_col    = lerp_col16(BG_COLOR, TEXT_COLOR, alpha);
 
-    spr.fillRoundRect(card_x, card_y, card_w, card_h, 3, BG_COLOR);
-    spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, border_col);
+    spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, pill_fill);
+    spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, border_col);
 
-    int title_w = 12 * 7;
-    int title_x = card_x + (card_w - title_w) / 2;
-    spr.setTextColor(title_col, BG_COLOR);
-    spr.setTextSize(TS_BODY);
-    spr.setCursor(title_x, card_y + 10);
-    kprint(spr, "FLOCK FINDER", 1);
+    spr.setTextDatum(MC_DATUM);
+    spr.setTextColor(title_col, pill_fill);
+    spr.drawString("FLOCK FINDER", pill_x + pill_w / 2, pill_y + pill_h / 2);
 
-    int ver_w = (int)strlen(VERSION_STRING) * ts_char_w(TS_MICRO);
-    int ver_x = card_x + (card_w - ver_w) / 2;
-    spr.setTextColor(ver_col, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(ver_x, card_y + 28);
-    spr.print(VERSION_STRING);
+    spr.setTextColor(ver_col, BG_COLOR);
+    spr.setTextDatum(TC_DATUM);
+    spr.drawString(VERSION_SHORT, DISP_W / 2, pill_y + pill_h + 6);
+
+    spr.setTextDatum(TL_DATUM);
 }
 
 static void draw_title_card() {
@@ -8137,7 +8177,7 @@ void draw_capture_history_screen() {
             spr.print("DELETE? ENT/d yes  DEL cancel");
         } else {
             spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.print("d del  t locate  w wl  DEL close");
+            spr.print("d del  t track  w wl  DEL close");
         }
 
     } else {
@@ -8244,18 +8284,18 @@ void draw_signal_screen() {
     bool  has_rssi    = false;
     int   tracker_sample_count = 0;
     int   tracker_samples[RSSI_TRACK_SAMPLES];
-    static LocTraceEntry trace_snap[LOC_TRACE_SIZE];
+    static SigTraceEntry trace_snap[SIG_TRACE_SIZE];
     int trace_head, trace_count;
 
     if (!take_data_mutex()) return;
-    active       = locator_active;
-    safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
-    safe_copy(target_name, locator_target_name, sizeof(target_name));
-    safe_copy(target_type, locator_target_type, sizeof(target_type));
-    target_id    = locator_target_id;
-    peak_rssi    = locator_peak_rssi;
-    tracker_idx  = locator_tracker_idx;
-    newest_ms    = locator_newest_sample_ms;
+    active       = signal_active;
+    safe_copy(target_mac,  signal_target_mac,  sizeof(target_mac));
+    safe_copy(target_name, signal_target_name, sizeof(target_name));
+    safe_copy(target_type, signal_target_type, sizeof(target_type));
+    target_id    = signal_target_id;
+    peak_rssi    = signal_peak_rssi;
+    tracker_idx  = signal_tracker_idx;
+    newest_ms    = signal_newest_sample_ms;
     if (tracker_idx >= 0 && tracker_idx < rssi_tracker_count
         && rssi_tracker[tracker_idx].sample_count > 0
         && strncmp(rssi_tracker[tracker_idx].mac, target_mac, 17) == 0) {
@@ -8265,24 +8305,24 @@ void draw_signal_screen() {
         memcpy(tracker_samples, rssi_tracker[tracker_idx].samples, sc * sizeof(int));
         has_rssi = (frame_ms - newest_ms < 15000);
     }
-    memcpy(trace_snap, loc_trace, sizeof(loc_trace));
-    trace_head  = loc_trace_head;
-    trace_count = loc_trace_count;
+    memcpy(trace_snap, sig_trace, sizeof(sig_trace));
+    trace_head  = sig_trace_head;
+    trace_count = sig_trace_count;
     give_data_mutex();
 
     // ── Per-frame dt — computed once, shared by all smoothers ──
-    float frame_dt = (loc_trace_last_frame_ms == 0) ? 16.0f
-                   : (float)(frame_ms - loc_trace_last_frame_ms);
+    float frame_dt = (sig_trace_last_frame_ms == 0) ? 16.0f
+                   : (float)(frame_ms - sig_trace_last_frame_ms);
     if (frame_dt > 100.0f) frame_dt = 100.0f;
-    loc_trace_last_frame_ms = frame_ms;
+    sig_trace_last_frame_ms = frame_ms;
 
     // ── Smooth trace values for fluid curve motion ──
     for (int i = 0; i < trace_count; i++) {
-        int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
+        int slot = (trace_head - trace_count + i + SIG_TRACE_SIZE) % SIG_TRACE_SIZE;
         float raw = (float)((int)trace_snap[slot].rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
         if (raw < 0.0f) raw = 0.0f;
         if (raw > 1.0f) raw = 1.0f;
-        loc_trace_smooth[i] = anim_filter(loc_trace_smooth[i], raw, 300.0f, frame_dt);
+        sig_trace_smooth[i] = anim_filter(sig_trace_smooth[i], raw, 300.0f, frame_dt);
     }
 
     // ── Trend: slope over tracker sample window ──
@@ -8460,12 +8500,12 @@ void draw_signal_screen() {
     spr.setClipRect(trace_left, trace_top, trace_w, trace_h);
 
     if (trace_count >= 2) {
-        static float trace_vals[LOC_TRACE_SIZE];
+        static float trace_vals[SIG_TRACE_SIZE];
         int trace_max_rssi = -128, trace_max_idx = -1;
         for (int i = 0; i < trace_count; i++) {
-            int slot = (trace_head - trace_count + i + LOC_TRACE_SIZE) % LOC_TRACE_SIZE;
+            int slot = (trace_head - trace_count + i + SIG_TRACE_SIZE) % SIG_TRACE_SIZE;
             int rv   = (int)trace_snap[slot].rssi;
-            trace_vals[i] = loc_trace_smooth[i];
+            trace_vals[i] = sig_trace_smooth[i];
             if (rv > trace_max_rssi) { trace_max_rssi = rv; trace_max_idx = i; }
         }
 
@@ -8485,8 +8525,17 @@ void draw_signal_screen() {
             return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
         };
 
-        if (!signal_curve_cache) return; // allocation failed or not on screen 1
         float* curve_cache = signal_curve_cache;
+        if (!curve_cache) {
+            // Cache alloc failed — show message instead of trace
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            int msg_w = 12 * (ts_char_w(TS_MICRO) + 1);
+            spr.setCursor((DISP_W - msg_w) / 2, trace_top + trace_h / 2 - 4);
+            kprint(spr, "low memory", 1);
+            spr.clearClipRect();
+            return;
+        }
         for (int px = 0; px <= trace_w && px < 241; px++) {
             float idx_f = (float)px / (float)trace_w * (float)(trace_count - 1);
             curve_cache[px] = eval_cr(idx_f);
@@ -8550,7 +8599,7 @@ void draw_signal_screen() {
 
     } else if (trace_count == 1) {
         // Single dot before the curve can form
-        float n = loc_trace_smooth[0];
+        float n = sig_trace_smooth[0];
         int dot_y = trace_bottom - (int)(n * (float)trace_h);
         if (dot_y < trace_top)    dot_y = trace_top;
         if (dot_y > trace_bottom) dot_y = trace_bottom;
@@ -9603,20 +9652,6 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         if (t >= 1.0f) boot_status_settled_drawn = true;
     }
 
-    // ── Version tag — bottom-right corner, drawn once ──
-    static bool boot_ver_drawn = false;
-    if (!boot_ver_drawn) {
-        const char* ver = VERSION_SHORT;
-        int ver_w = (int)strlen(ver) * 6;  // textSize(1) = 6px/char
-        lcd.startWrite();
-        lcd.setTextSize(1);
-        lcd.setTextColor(dim, bg);
-        lcd.setTextDatum(TL_DATUM);
-        lcd.drawString(ver, DISP_W - ver_w - 4, DISP_H - 10);
-        lcd.endWrite();
-        boot_ver_drawn = true;
-    }
-
     lcd.setTextDatum(TL_DATUM);
 }
 
@@ -10081,10 +10116,10 @@ void setup() {
     // speed, not smooth UI animation.
     {
         unsigned long feed_gate_start = millis();
-        const unsigned long FEED_GATE_MAX_MS = 4500;
+        const unsigned long FEED_GATE_MAX_MS = 1500;
         last_feed_push_ms = 0;
         while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
-            if (ambient_packet_count >= 15) break;
+            if (ambient_packet_count >= 5) break;
             draw_boot_screen(100, "listening for signals");
             delay(30);
             M5Cardputer.update();
@@ -10128,22 +10163,7 @@ void setup() {
         // Phase 2: Draw title card on dark background, fade in
         {
             spr.fillSprite(BG_COLOR);
-            int card_w = 150, card_h = 46;
-            int card_x = (DISP_W - card_w) / 2;
-            int card_y = (DISP_H - card_h) / 2;
-            spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, HEADER_COLOR);
-            int title_w = 12 * 7;
-            int title_x = card_x + (card_w - title_w) / 2;
-            spr.setTextColor(HEADER_COLOR, BG_COLOR);
-            spr.setTextSize(TS_BODY);
-            spr.setCursor(title_x, card_y + 10);
-            kprint(spr, "FLOCK FINDER", 1);
-            int ver_w = (int)strlen(VERSION_STRING) * ts_char_w(TS_MICRO);
-            int ver_x = card_x + (card_w - ver_w) / 2;
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            spr.setCursor(ver_x, card_y + 28);
-            spr.print(VERSION_STRING);
+            draw_title_card_overlay(1.0f);
             spr.pushSprite(0, 0);
 
             int steps = 12;
@@ -10159,22 +10179,7 @@ void setup() {
             unsigned long hold_start = millis();
             while (millis() - hold_start < 2000) {
                 spr.fillSprite(BG_COLOR);
-                int card_w = 150, card_h = 46;
-                int card_x = (DISP_W - card_w) / 2;
-                int card_y = (DISP_H - card_h) / 2;
-                spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, HEADER_COLOR);
-                int title_w = 12 * 7;
-                int title_x = card_x + (card_w - title_w) / 2;
-                spr.setTextColor(HEADER_COLOR, BG_COLOR);
-                spr.setTextSize(TS_BODY);
-                spr.setCursor(title_x, card_y + 10);
-                kprint(spr, "FLOCK FINDER", 1);
-                int ver_w = (int)strlen(VERSION_STRING) * ts_char_w(TS_MICRO);
-                int ver_x = card_x + (card_w - ver_w) / 2;
-                spr.setTextColor(DIM_COLOR, BG_COLOR);
-                spr.setTextSize(TS_MICRO);
-                spr.setCursor(ver_x, card_y + 28);
-                spr.print(VERSION_STRING);
+                draw_title_card_overlay(1.0f);
                 spr.pushSprite(0, 0);
                 delay(30);
             }
@@ -10222,10 +10227,18 @@ void setup() {
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
-    // Drop to 160MHz for normal operation. Boot and radio init benefit from
-    // 240MHz; steady-state scanning, rendering, and BLE processing do not.
-    // Saves ~20mA continuous draw (~2 hours extra on 1750mAh).
-    setCpuFrequencyMhz(160);
+    // Set CPU frequency based on persisted mode. Boot and radio init ran at
+    // 240MHz; now drop to the appropriate steady-state clock.
+    if (turbo_mode_active)
+        setCpuFrequencyMhz(240);
+    else if (low_power_mode)
+        setCpuFrequencyMhz(80);
+    else
+        setCpuFrequencyMhz(160);
+
+    // Ungate callbacks — both WiFi and BLE were discarding packets until now.
+    scanner_ready = true;
+    Serial.println("[BOOT] Scanner ready — promiscuous callbacks enabled");
 }
 
 // ============================================================================
@@ -10439,15 +10452,15 @@ void loop() {
 
     // Gap-fill: push a floor-level sample when the target is silent so the
     // trace curve drops rather than freezing at the last reading.
-    if (locator_active) {
+    if (signal_active) {
         unsigned long now = millis();
-        if ((now - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
+        if ((now - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
             xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            if (locator_active && (millis() - loc_trace_last_sample) >= LOC_TRACE_INTERVAL_MS) {
-                loc_trace[loc_trace_head].rssi = (int8_t)RSSI_VIS_FLOOR;
-                loc_trace_head = (loc_trace_head + 1) % LOC_TRACE_SIZE;
-                if (loc_trace_count < LOC_TRACE_SIZE) loc_trace_count++;
-                loc_trace_last_sample = millis();
+            if (signal_active && (millis() - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
+                sig_trace[sig_trace_head].rssi = (int8_t)RSSI_VIS_FLOOR;
+                sig_trace_head = (sig_trace_head + 1) % SIG_TRACE_SIZE;
+                if (sig_trace_count < SIG_TRACE_SIZE) sig_trace_count++;
+                sig_trace_last_sample = millis();
             }
             xSemaphoreGiveRecursive(dataMutex);
         }
@@ -10952,7 +10965,7 @@ void loop() {
                             const char* type_str = fe.is_flock
                                 ? (fe.proto == 0 ? "FLOCK_WIFI" : "FLOCK_BLE")
                                 : (fe.proto == 0 ? "WIFI" : "BLE");
-                            locator_start(fe.mac, fe.name, type_str, 0);
+                            signal_start(fe.mac, fe.name, type_str, 0);
                             trigger_toast("TARGET", fe.name, 0);
                             show_feed_expanded = false;
                             transition_screen(1, 1);
@@ -10975,7 +10988,7 @@ void loop() {
                     }
                     xSemaphoreGiveRecursive(dataMutex);
                     if (strlen(t_mac) > 0) {
-                        locator_start(t_mac, t_name, t_type, t_id);
+                        signal_start(t_mac, t_name, t_type, t_id);
                         trigger_toast("TARGET", t_name, 0);
                         hist_detail_open = false;
                         transition_screen(1, 1);
@@ -10992,7 +11005,7 @@ void loop() {
                     int t_id   = capture_history[target_select_idx].id;
                     xSemaphoreGiveRecursive(dataMutex);
 
-                    locator_start(t_mac, t_name, t_type, t_id);
+                    signal_start(t_mac, t_name, t_type, t_id);
                     trigger_toast("TARGET", t_name, t_conf);
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
@@ -11027,8 +11040,8 @@ void loop() {
                 }
             }
             else if (c == 'l') {
-                if (locator_active && !stealth_mode) {
-                    locator_stop();
+                if (signal_active && !stealth_mode) {
+                    signal_stop();
                     trigger_toast("SIGNAL", "Target cleared", 0);
                     beep(500, 60);
                     screen_dirty = true;
@@ -11319,6 +11332,7 @@ void loop() {
         last_ble_restart_ms = millis();
 
         // 1. Stop scanning so the callback stops producing new events.
+        scanner_ready = false;
         if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
         if (pBLEScan) {
             pBLEScan->stop();
@@ -11367,6 +11381,7 @@ void loop() {
         pBLEScan->setMaxResults(0);
         last_ble_scan = millis();
         if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
+        scanner_ready = true;
         Serial.println("[BLE] Periodic stack restart completed");
     }
 
@@ -11433,7 +11448,7 @@ void loop() {
     }
 
     // Enter ambient mode after sustained idle
-    if (!ambient_mode && !stealth_mode && !toast_active && !locator_active && !export_mode_active &&
+    if (!ambient_mode && !stealth_mode && !toast_active && !signal_active && !export_mode_active &&
         (millis() - last_user_input_ms) > AMBIENT_TIMEOUT_MS) {
         ambient_mode = true;
         show_feed_expanded = false;
@@ -11441,7 +11456,7 @@ void loop() {
     }
 
     // Exit ambient if conditions change from non-input sources
-    if (ambient_mode && (locator_active || export_mode_active || toast_active)) {
+    if (ambient_mode && (signal_active || export_mode_active || toast_active)) {
         ambient_mode = false;
         M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
     }

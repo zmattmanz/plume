@@ -1,1 +1,21 @@
+# Claude Code
 .claude/settings.local.json
+.claude/worktrees/
+
+# Arduino build artifacts
+build/
+*.ino.bin
+*.ino.elf
+*.ino.map
+*.ino.merged.bin
+*.ino.partitions.bin
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor files
+*.swp
+*.swo
+*~
