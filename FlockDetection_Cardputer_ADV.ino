@@ -573,8 +573,8 @@ static inline unsigned long current_dedup_window_ms() {
 // Pre-configure WiFi credentials for export mode. User edits these in source
 // once, then they're saved to flash on first boot. To change later, edit
 // source and re-flash. This is a hobby/field-tool compromise.
-#define EXPORT_WIFI_SSID "YOUR_SSID_HERE"
-#define EXPORT_WIFI_PASS "YOUR_PASSWORD_HERE"
+#define EXPORT_WIFI_SSID ""
+#define EXPORT_WIFI_PASS ""
 
 // Compile-time guard: screen name array in draw_header_spr() must stay in sync.
 #define NUM_SCREENS 5
@@ -2219,7 +2219,7 @@ bool export_mode_start() {
     flush_pending_deletes();
     if (export_mode_active || export_connecting) return true;
     if (strlen(export_ssid) == 0) {
-        set_toast_direct("NO WIFI CONFIGURED", TOAST_WARNING, false);
+        set_toast_direct("SET WIFI IN MENU", TOAST_WARNING, false);
         return false;
     }
     if (esp_get_free_heap_size() < 15000) {
@@ -10051,11 +10051,11 @@ void setup() {
     boot_animate(78 + random(0, 3), "loading session");
 
     // First-boot WiFi credential initialization from #defines if flash is empty
-    if (strlen(export_ssid) == 0 && strcmp(EXPORT_WIFI_SSID, "YOUR_SSID_HERE") != 0) {
+    if (strlen(export_ssid) == 0 && strlen(EXPORT_WIFI_SSID) > 0) {
         strncpy(export_ssid, EXPORT_WIFI_SSID, sizeof(export_ssid) - 1);
         export_ssid[sizeof(export_ssid) - 1] = '\0';
     }
-    if (strlen(export_pass) == 0 && strcmp(EXPORT_WIFI_PASS, "YOUR_PASSWORD_HERE") != 0) {
+    if (strlen(export_pass) == 0 && strlen(EXPORT_WIFI_PASS) > 0) {
         strncpy(export_pass, EXPORT_WIFI_PASS, sizeof(export_pass) - 1);
         export_pass[sizeof(export_pass) - 1] = '\0';
     }
