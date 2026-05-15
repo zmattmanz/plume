@@ -9338,23 +9338,20 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
-    // Bar geometry — ~10% smaller again (130×20). Single 1px outline
-    // (the inset inner stroke is dropped — looks cleaner at this size).
+    // Bar geometry — 130×20, positioned 13px below the percentage number.
     const int bar_w = 130;
     const int bar_h = 20;
     const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = 78;
+    const int bar_y = (DISP_H - 75) / 2 + 16 + 13;   // num_y + num_h + gap = 59
     const int bar_r = bar_h / 2;
 
-    // Number geometry — textSize 2 (matches stats/values typography stack).
-    // textSize 2 = 12px char width, 16px char height.
-    const int num_y = 49;
+    // Centered layout: (DISP_H - total_h) / 2 where total_h = num(16) + gap(13) + bar(20) + gap(18) + status(8) = 75
+    const int num_y = (DISP_H - 75) / 2;          // = 30
     const int num_w = 80;
     const int num_x = (DISP_W - num_w) / 2;
     const int num_h = 16;
 
-    // Status text geometry — moved up for tighter overall composition.
-    const int status_y = 116;
+    const int status_y = num_y + num_h + 13 + 20 + 18;  // = 97
     const int status_h = 8;
 
     // ── Staggered intro — each element fades in at its own offset ──
@@ -9364,7 +9361,6 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     //   220ms → bar outline begins drawing over 350ms
     //   500ms → percentage + status text begin allowed to render
     static unsigned long boot_intro_start_ms = 0;
-    static bool          boot_title_drawn    = false;
     static int           boot_outline_drawn_to = 0;  // pixels of outline drawn so far
 
     if (boot_first_draw) {
@@ -9373,48 +9369,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         boot_eased_fill      = 0.0f;
         boot_prev_fill_w     = 0;
         boot_intro_start_ms  = millis();
-        boot_title_drawn     = false;
         boot_outline_drawn_to = 0;
     }
 
     unsigned long intro_elapsed = millis() - boot_intro_start_ms;
-
-    // ── Title: slide down + fade in over 350ms, settled at y=24 ──
-    {
-        // textSize 1: 6×8 px native size, uniform strokes. textSize 1.5
-        // produced uneven strokes — fractional scaling rounds some pixel rows
-        // up and others down. y bumped up to maintain ~13px gaps.
-        const int TITLE_FINAL_Y  = 20;
-        const int TITLE_SLIDE_PX = 10;
-
-        if (intro_elapsed < UI_ANIM_NORMAL) {
-            // Title slides DOWN from above its resting position. Same elapsed
-            // window drives the color fade; both read from the same start.
-            unsigned long start = millis() - intro_elapsed;
-            int y = anim_slide_in(TITLE_FINAL_Y, -TITLE_SLIDE_PX, start, UI_ANIM_NORMAL);
-            float ease = ui_progress(start, UI_ANIM_NORMAL);
-            uint16_t col = lerp_col16(bg, blue, ease);
-
-            lcd.startWrite();
-            lcd.setClipRect(0, 14, DISP_W, 22);
-            lcd.fillRect(0, 14, DISP_W, 22, bg);
-            lcd.setTextColor(col, bg);
-            lcd.setTextSize(1);  // integer-scaled, clean uniform strokes
-            lcd.setTextDatum(TC_DATUM);
-            lcd.drawString(VERSION_STRING, DISP_W / 2, y);
-            lcd.clearClipRect();
-            lcd.endWrite();
-        } else if (!boot_title_drawn) {
-            // Settled: paint once at full color, then never touch again
-            lcd.startWrite();
-            lcd.setTextColor(blue, bg);
-            lcd.setTextSize(1);
-            lcd.setTextDatum(TC_DATUM);
-            lcd.drawString(VERSION_STRING, DISP_W / 2, TITLE_FINAL_Y);
-            lcd.endWrite();
-            boot_title_drawn = true;
-        }
-    }
 
     // ── Bar outline: draws across 350ms starting at +220ms ──
     // Implemented as a left-to-right reveal — each frame extends the drawn
