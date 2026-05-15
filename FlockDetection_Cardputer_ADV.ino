@@ -1,5 +1,5 @@
 // ============================================================================
-// FLOCK DETECTOR v9.0-ADV — Tactical Edition (Build 2)
+// FLOCK FINDER v9.0-ADV — Tactical Edition (Build 2)
 // ============================================================================
 
 #include <M5Cardputer.h>
@@ -16,6 +16,8 @@
 #include "esp_task_wdt.h"
 #include "esp_partition.h"
 #include "esp_mac.h"
+#include "mbedtls/aes.h"
+#include "mbedtls/md.h"
 #include "driver/gpio.h"
 #include <SPI.h>
 #include <SD.h>
@@ -23,7 +25,12 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <math.h>
-#include "ui_beep.h"  // PCM sound for screen transitions
+#if __has_include("ui_beep.h")
+#include "ui_beep.h"
+#define HAS_UI_BEEP 1
+#else
+#define HAS_UI_BEEP 0
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -43,18 +50,28 @@ enum BootPersonality {
 // FORWARD DECLARATIONS
 // ============================================================================
 void draw_header_spr(int screen_num);
+void draw_header_lcd(int screen_num);
+static void draw_overlay_header_lcd(const char* label);
+static void render_frame();
 void draw_toast_spr();
 void draw_vol_overlay();
 void drawCard(int x, int y, int w, int h);
+static void drawPill(int x, int y, const char* text, uint16_t accent_col,
+                     float bg_accent_pct = 0.18f, bool filled = false);
 void draw_current_screen();
+void draw_capture_history_screen();
+static void perform_detection_delete(int idx);
+static void flush_pending_deletes();
 void transition_screen(int new_screen, int dir);
 void play_escalated_alarm(int confidence, int source);
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b);
+template<typename WriteFn> static bool littlefs_atomic_write(const char* target_path, WriteFn write_fn);
 void beep(int frequency, int duration_ms);
 void apply_color_palette();
 void draw_help_overlay();
-void draw_menu_overlay();
 void handle_menu_select();
+static void set_turbo_mode(bool on);
+
 void save_stats_to_sd();
 void draw_feed_expanded_overlay();
 void draw_wifi_config_overlay();
@@ -63,8 +80,19 @@ static void load_wifi_credentials();
 void draw_gps_screen();
 void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
-static void set_toast_direct(const char* text, uint16_t accent);
+static void set_toast_direct(const char* text, uint16_t accent, bool is_info = true);
 static void apply_ble_scan_params();
+struct WifiEvent;
+static void parse_wifi_event(struct WifiEvent* ev);
+static void update_channel_histogram();
+static void draw_scanner_viz_scan(unsigned long frame_ms);
+static void draw_scanner_viz_spectrum(unsigned long frame_ms);
+static void draw_scanner_viz_timeline(unsigned long frame_ms);
+static void timeline_init(unsigned long frame_ms);
+static void timeline_shift_bins(unsigned long frame_ms);
+static inline void compute_sincos(float angle, float* s, float* c);
+void draw_signal_screen();
+void draw_device_info_screen();
 
 // ============================================================================
 // DISPLAY & PALETTE VARIABLES (Swappable for Night Mode)
@@ -74,15 +102,36 @@ static void apply_ble_scan_params();
 
 uint16_t BG_COLOR, CARD_COLOR, CARD_BORDER;
 uint16_t HEADER_COLOR, TEXT_COLOR, DIM_COLOR;
-uint16_t ACCENT_COLOR, TEAL_COLOR, PURPLE_COLOR;
+uint16_t TEAL_COLOR, PURPLE_COLOR;
 uint16_t CAUTION_COLOR, GPS_COLOR;
+uint16_t HATCH_COLOR;          // lerp(BG, CARD_BORDER, 0.80) — hatch fill lines
+uint16_t GRID_LINE_DIM;        // lerp(BG, CARD_BORDER, 0.30) — faint grid/axis
+uint16_t GRID_LINE_MED;        // lerp(BG, CARD_BORDER, 0.50) — medium grid lines
+uint16_t SWEEP_LINE_COLOR;     // lerp(BG, HEADER, 0.60) — spectrum scan line
+uint16_t HEADER_DIM_BLEND;     // lerp(BG, HEADER, 0.25) — dim header accent
+uint16_t RING_COLOR;           // lerp(BG, HEADER, 0.25) — flatradar ring lines
+uint16_t CENTER_DOT;           // lerp(BG, HEADER, 0.50) — flatradar center dot
+uint16_t CENTER_DOT_BRIGHT;    // lerp(BG, HEADER, 0.80) — flatradar center highlight
+uint16_t SCALE_LABEL_COLOR;    // lerp(BG, DIM, 0.80) — dBm scale tick labels
+// ACCENT_COLOR is intentionally identical to HEADER_COLOR in all palette modes.
+// Use HEADER_COLOR for UI chrome (headers, pills, outlines).
+// Use ACCENT_COLOR for interactive highlights (selection bars, scrollbar thumbs).
+// They are and will always be the same color — the distinction is semantic only.
+#define ACCENT_COLOR HEADER_COLOR
+
+// Toast severity tiers
+#define TOAST_SUCCESS  HEADER_COLOR   // positive confirmations
+#define TOAST_WARNING  CAUTION_COLOR  // errors, warnings, destructive actions
+#define TOAST_NEUTRAL  DIM_COLOR      // informational, dismissed, hints
 bool night_mode = false;
 bool show_help_overlay = false;
 static unsigned long help_ease_start = 0;
 
 // Ambient mode: dim minimal UI after sustained idle
 static unsigned long last_user_input_ms = 0;
-static const unsigned long AMBIENT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+// 2 minutes — long enough to glance away and come back without re-waking,
+// short enough that pocket-sitting doesn't burn unnecessary battery.
+static const unsigned long AMBIENT_TIMEOUT_MS = 2UL * 60UL * 1000UL;
 static const uint8_t AMBIENT_BRIGHTNESS = 40;
 static bool ambient_mode = false;
 
@@ -90,42 +139,93 @@ unsigned long vol_overlay_start = 0;
 bool show_vol_overlay = false;
 static bool show_feed_expanded = false;
 static unsigned long feed_expand_ms = 0;
-bool north_mode = false;
+static bool          title_card_active   = true;
+static unsigned long title_card_start_ms = 0;
+static volatile bool scanner_ready       = false;  // set true after boot; guards both callbacks
+static const unsigned long TITLE_CARD_HOLD_MS = 500;   // boot sequence already did the real hold
+static const unsigned long TITLE_CARD_FADE_MS = 1000;
+static int  feed_expanded_selected = 0;
 int  brightness_level = 2;  // 0=dim, 1=mid, 2=full — cycled by 'b' key
 
 // ── WiFi Config overlay state ──
 static bool wifi_config_open = false;
 static int  wifi_config_field = 0;        // 0 = SSID, 1 = Password, 2 = Save, 3 = Clear
 static bool wifi_config_editing = false;   // true = text input mode active
+static bool wifi_config_show_pass = false; // 's' toggles plaintext password reveal
 static char wifi_config_ssid_buf[33] = "";
 static char wifi_config_pass_buf[65] = "";
 static int  wifi_config_cursor = 0;        // cursor position in active field
 static unsigned long wifi_config_open_ms = 0;
 
-// ── Menu overlay state ──
-static bool show_menu = false;
-static int  menu_selected = 0;
+// ── Menu state ──
+static const int MENU_ITEM_COUNT = 12;
+static int  menu_selected = 0;  // bridged into handle_menu_select()
+
+// ── Fullscreen menu state ──
+static bool menu_open = false;
 static unsigned long menu_open_ms = 0;
-#define MENU_ITEM_COUNT 11
-static float menu_highlight_ease_y = 0.0f;  // current eased y position of highlight
-static bool  menu_highlight_init = false;   // true after first draw (prevents ease-from-zero)
-static int   menu_scroll_offset = 0;        // index of first visible item
+static int   menu_scroll_offset = 0;
+static float menu_scroll_y_f    = 0.0f;
+static unsigned long menu_last_frame_ms = 0;
+static float menu_sel_y_f      = 0.0f;   // eased Y position of selection highlight
+static bool  menu_sel_y_seeded = false;   // prevents first-frame pop
+
+// ── Menu section model ──
+struct MenuItem {
+    const char* label;
+    bool        is_toggle;
+    bool        is_danger;
+    int         action_id;
+};
+
+struct MenuSection {
+    const char* label;
+    const MenuItem* items;
+    int count;
+};
+
+static const MenuItem nav_items[] = {
+    {"Scanner",          false, false, 0},
+    {"Signal",           false, false, 1},
+    {"Detections",       false, false, 2},
+    {"GPS Status",       false, false, 3},
+    {"Device Stats",     false, false, 4},
+};
+
+static const MenuItem settings_items[] = {
+    {"Night Mode",       true,  false, 5},
+    {"Low Power Mode",   true,  false, 6},
+    {"Mute Beeps",       true,  false, 7},
+    {"Turbo Mode",       true,  false, 8},
+};
+
+static const MenuItem tools_items[] = {
+    {"WiFi Config",      false, false, 9},
+    {"Export Mode",      false, false, 10},
+    {"Clear All Stats",  false, true,  11},
+};
+
+static const MenuSection menu_sections[] = {
+    {"NAVIGATE", nav_items,      5},
+    {"SETTINGS", settings_items, 4},
+    {"TOOLS",    tools_items,    3},
+};
+static const int MENU_SECTION_COUNT = 3;
 
 // Low-power mode: reduces scan cadence across WiFi/BLE for longer runtime
 static bool low_power_mode = false;
+static bool turbo_mode_active = false;
 static const int BRIGHTNESS_LEVELS[3] = {40, 120, 255};
 
-static float ease_muted = 0.0f;
-
 // RGB LED state — color cycles with C key, on/off with L when locator idle
-static uint8_t led_r = 124, led_g = 228, led_b = 210; // default mint (matches ACCENT_COLOR)
+static uint8_t led_r = 77, led_g = 219, led_b = 194;  // default teal (matches HEADER_COLOR)
 static bool    led_breathing_on = true;
 static const uint8_t LED_COLORS[][3] = {
-    {124, 228, 210},  // mint (matches ACCENT_COLOR — default)
+    { 77, 219, 194},  // teal (matches HEADER_COLOR — default)
     { 80, 200, 255},  // cyan
     {  0, 200,   0},  // green
-    {  0, 160, 200},  // teal
-    {200, 100, 255},  // purple
+    {139, 124, 219},  // violet (matches PURPLE_COLOR)
+    {255, 181,  71},  // amber (matches CAUTION_COLOR)
     {255, 255, 255},  // white
     {255,  80,   0},  // orange
     {255,  30,  30},  // red
@@ -137,48 +237,66 @@ static unsigned long led_detection_flash_until = 0;
 static uint8_t  led_detect_r = 0, led_detect_g = 0, led_detect_b = 0;
 static bool     led_detect_active = false;
 
+// Fixed-point color lerp — defined here so apply_color_palette can call it.
+// t_256 is 0..256 (256 = exact tc, no off-by-one). Works in RGB565 component
+// space directly; no lgfx::color565 overhead or float multiply.
+static inline uint16_t lerp_col16_i(uint16_t fc, uint16_t tc, int t_256) {
+    if (t_256 <= 0)   return fc;
+    if (t_256 >= 256) return tc;
+    int fr = (fc >> 11) & 0x1F, fg = (fc >> 5) & 0x3F, fb = fc & 0x1F;
+    int tr = (tc >> 11) & 0x1F, tg = (tc >> 5) & 0x3F, tb = tc & 0x1F;
+    int rr = fr + (((tr - fr) * t_256) >> 8);
+    int rg = fg + (((tg - fg) * t_256) >> 8);
+    int rb = fb + (((tb - fb) * t_256) >> 8);
+    return (uint16_t)((rr << 11) | (rg << 5) | rb);
+}
+// Float wrapper — one float-to-int conversion replaces three float multiplies.
+static inline uint16_t lerp_col16(uint16_t fc, uint16_t tc, float t) {
+    return lerp_col16_i(fc, tc, (int)(t * 256.0f + 0.5f));
+}
+
 void apply_color_palette() {
     if (night_mode) {
-        // Night condensed: red-only chrome, amber stays distinct.
-        // One-token swap from day: mint → red. Everything else follows.
+        // Night: red chrome, lifted dim for readability, amber caution.
         BG_COLOR      = lgfx::color565( 10,   0,   0);   // #0A0000
         CARD_COLOR    = lgfx::color565( 58,  10,  10);   // #3A0A0A
         CARD_BORDER   = lgfx::color565( 90,  20,  20);   // #5A1414
         HEADER_COLOR  = lgfx::color565(255,  90,  90);   // #FF5A5A
         TEXT_COLOR    = lgfx::color565(255, 208, 208);   // #FFD0D0
-        DIM_COLOR     = lgfx::color565(122,  48,  48);   // #7A3030
-        ACCENT_COLOR  = lgfx::color565(255,  90,  90);   // = HEADER (unified)
-        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber (same both modes)
-        TEAL_COLOR    = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
-        PURPLE_COLOR  = lgfx::color565(255, 208, 208);   // = TEXT (collapsed)
+        DIM_COLOR     = lgfx::color565(180,  90,  90);   // #B45A5A lifted red-dim
+        CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber
+        TEAL_COLOR    = lgfx::color565(255,  90,  90);   // = HEADER (collapsed in night)
+        PURPLE_COLOR  = lgfx::color565(255, 150, 150);   // #FF9696 rose — BLE distinguishable
         GPS_COLOR     = lgfx::color565(255,  90,  90);   // = HEADER (collapsed)
+        led_r = 255; led_g = 90; led_b = 90;              // sync LED to night chrome
     } else {
-        // Condensed palette: 4 hues + chrome stack.
-        // Mint-cyan = chrome AND confirmation. Amber = only contrast hue.
-        // WiFi/BLE/Raven feed rows lose categorical color — protocol is
-        // carried by the W/B/R symbol prefix and the flock-confirmed *.
+        // Option C: Analogous Cool — teal + blue-violet + amber.
         BG_COLOR      = lgfx::color565(  5,  10,  20);   // #050A14
         CARD_COLOR    = lgfx::color565( 29,  50,  88);   // #1D3258
         CARD_BORDER   = lgfx::color565( 46,  70, 112);   // #2E4670
-        HEADER_COLOR  = lgfx::color565(124, 228, 210);   // #7CE4D2 mint
+        HEADER_COLOR  = lgfx::color565( 77, 219, 194);   // #4DDBC2 teal
         TEXT_COLOR    = lgfx::color565(232, 239, 255);   // #E8EFFF
-        DIM_COLOR     = lgfx::color565( 90, 107, 128);   // #5A6B80
-        ACCENT_COLOR  = lgfx::color565(124, 228, 210);   // = HEADER (unified)
-        TEAL_COLOR    = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
-        PURPLE_COLOR  = lgfx::color565(232, 239, 255);   // = TEXT (collapsed)
+        DIM_COLOR     = lgfx::color565(149, 165, 184);   // #95A5B8
+        TEAL_COLOR    = lgfx::color565( 77, 219, 194);   // = HEADER (alias)
+        PURPLE_COLOR  = lgfx::color565(139, 124, 219);   // #8B7CDB blue-violet
         CAUTION_COLOR = lgfx::color565(255, 181,  71);   // #FFB547 amber
-        GPS_COLOR     = lgfx::color565(124, 228, 210);   // = HEADER (collapsed)
+        GPS_COLOR     = lgfx::color565( 77, 219, 194);   // = HEADER (unified)
+        led_r = LED_COLORS[led_col_idx][0];               // restore user LED color
+        led_g = LED_COLORS[led_col_idx][1];
+        led_b = LED_COLORS[led_col_idx][2];
     }
+    HATCH_COLOR       = lerp_col16(BG_COLOR, CARD_BORDER,  0.80f);
+    GRID_LINE_DIM     = lerp_col16(BG_COLOR, CARD_BORDER,  0.30f);
+    GRID_LINE_MED     = lerp_col16(BG_COLOR, CARD_BORDER,  0.50f);
+    SWEEP_LINE_COLOR  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.60f);
+    HEADER_DIM_BLEND  = lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f);
+    RING_COLOR        = lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f);
+    CENTER_DOT        = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
+    CENTER_DOT_BRIGHT = lerp_col16(BG_COLOR, HEADER_COLOR, 0.80f);
+    SCALE_LABEL_COLOR = lerp_col16(BG_COLOR, DIM_COLOR,    0.80f);
 }
 
 // ── Module-level rendering helpers ──────────────────────────────────────────
-// lerp_col16: linearly interpolate two RGB565 colours by t ∈ [0,1]
-static inline uint16_t lerp_col16(uint16_t fc, uint16_t tc, float t) {
-    int fr=((fc>>11)&0x1F)<<3, fg=((fc>>5)&0x3F)<<2, fb=(fc&0x1F)<<3;
-    int tr=((tc>>11)&0x1F)<<3, tg=((tc>>5)&0x3F)<<2, tb=(tc&0x1F)<<3;
-    return lgfx::color565((uint8_t)(fr+(tr-fr)*t),(uint8_t)(fg+(tg-fg)*t),(uint8_t)(fb+(tb-fb)*t));
-}
-
 // kprint: print text with +1 px inter-character spacing (kerning) at textSize=1
 // Pass cx/cy from the current sprite cursor position before calling.
 static void kprint(M5Canvas& s, const char* text, int extra = 1) {
@@ -191,10 +309,9 @@ static void kprint(M5Canvas& s, const char* text, int extra = 1) {
     }
 }
 
-static void safe_copy(char* dest, const char* src, size_t dest_size) {
+static inline void safe_copy(char* dest, const char* src, size_t dest_size) {
     if (dest_size == 0) return;
-    strncpy(dest, src, dest_size - 1);
-    dest[dest_size - 1] = '\0';
+    strlcpy(dest, src, dest_size);
 }
 
 // ── Unified UI animation vocabulary ──
@@ -214,6 +331,33 @@ static const unsigned long UI_ANIM_NORMAL = 320;
 static const unsigned long UI_ANIM_SLOW   = 500;
 static const int           UI_SLIDE_PX    = 14;
 
+// ── Subsystem-specific timing constants ──
+// Pulled out of their use sites so the timing model lives in one place.
+// Tune here, not at the call sites.
+
+// Stats screen: PACKETS card refresh cadence. ambient_packet_count churns
+// every frame; this throttles how often the displayed value updates so the
+// roll-up animation reads cleanly instead of strobing.
+static const unsigned long STATS_PKT_REFRESH_MS = 3000;
+
+// WiFi mode-transition delays. The ESP-IDF WiFi driver needs settle time
+// between mode changes (STA <-> off, disconnect <-> reconnect, promiscuous
+// on/off). These values are empirical — shortening risks the next call
+// returning before the radio state actually transitioned.
+static const unsigned long WIFI_MODE_SETTLE_SHORT_MS  = 50;
+static const unsigned long WIFI_MODE_SETTLE_MEDIUM_MS = 100;
+static const unsigned long WIFI_MODE_SETTLE_LONG_MS   = 200;
+
+// Live activity feed cadence. FEED_MIN_PUSH_INTERVAL_MS gates normal scanner
+// view; when the feed is expanded (full-screen) it pushes faster so the user
+// sees more activity at a glance.
+static const unsigned long FEED_PUSH_INTERVAL_EXPANDED_MS = 667;
+
+// Feed entry aging. Rows fully visible for the first FEED_AGE_FULL_MS, then
+// fade linearly until FEED_AGE_GONE_MS, after which they're skipped entirely.
+static const unsigned long FEED_AGE_FULL_MS = 30000;
+static const unsigned long FEED_AGE_GONE_MS = 90000;
+
 // Overlay/toast fade tiers — names alias the purpose so call sites
 // can self-document without inventing new durations.
 static const unsigned long UI_FADE_IN_MS  = 150;  // overlays/toasts appearing
@@ -224,6 +368,45 @@ static const unsigned long UI_FADE_OUT_MS = 200;  // overlays/toasts disappearin
 static const unsigned long UI_PULSE_BREATHE = 1200;
 static const unsigned long UI_PULSE_MEDIUM  = 600;
 static const unsigned long UI_PULSE_FAST    = 300;
+
+// ── Type scale — 3 active tiers ──
+// All UI text uses one of these three sizes. No other values
+// should appear in setTextSize() calls (boot screen excepted —
+// it renders directly to lcd, not the sprite).
+//
+//   TS_MICRO  — labels, footnotes, pills, field captions,
+//               footer hints, channel numbers, timestamps,
+//               scrollbar labels, RSSI dBm values
+//   TS_BODY   — primary UI text: kprint, feed row names,
+//               header screen names, status badge text,
+//               section titles, overlay subtitles
+//   TS_STRONG — hero inline values: stat card numbers,
+//               menu item labels, locator target name,
+//               locator dist/signal, detection detail names
+static const float TS_MICRO  = 1.0f;
+static const float TS_BODY   = 1.2f;
+static const float TS_STRONG = 1.6f;
+
+// Char width in pixels for a given type-scale tier.
+// Base font is 6px wide; textSize multiplies it.
+// Replaces all hardcoded 6/7/9 magic numbers in layout math.
+static inline int ts_char_w(float size) {
+    return (int)(size * 6.0f);
+}
+
+// ── Spacing — 4-step scale ──
+//   UI_PAD_XS — hairline gaps, pill vertical inset
+//   UI_PAD_SM — card inner padding, icon-to-text gap
+//   UI_PAD_MD — card-to-card gap, section breaks
+//   UI_PAD_LG — header strip height, menu row pitch
+static const int UI_PAD_XS  = 2;
+static const int UI_PAD_SM  = 6;
+static const int UI_PAD_MD  = 12;
+static const int UI_PAD_LG  = 18;
+
+// Content area starts at this Y on every screen. Header = 0..CONTENT_Y-1.
+static const int CONTENT_Y  = 20;
+static const int TEXT_LEFT   = 4;   // left text margin — aligns header + viz titles + pills
 
 // ui_ease — the single curve we use for every UI animation
 // (ease_out_quad). Decelerating motion: fast start, soft landing.
@@ -247,6 +430,10 @@ static inline float ui_progress(unsigned long start_ms, unsigned long duration_m
 // ── Animation primitives ───────────────────────────────────────────
 // Built on ui_ease/ui_progress. New animation code should reach for
 // these instead of hand-rolling the math at every site.
+//
+// For smoothed values that persist across screen visits, use
+// anim_filter_seed() to avoid the first-frame pop from an unseeded
+// initial value. Pass a static bool alongside the static float.
 
 // Returns the current y for an element animating from
 // (target_y + slide_distance) to target_y over duration_ms with the
@@ -282,6 +469,17 @@ static inline float anim_filter(float state, float target,
     return state + alpha * (target - state);
 }
 
+// Self-seeding variant — snaps to target on the first call (when
+// *initialized is false), then eases normally on subsequent calls.
+// Eliminates the first-frame pop without requiring manual pre-seeding
+// at every call site.
+static inline float anim_filter_seed(float state, float target,
+                                     float time_constant_ms, float dt_ms,
+                                     bool* initialized) {
+    if (!*initialized) { *initialized = true; return target; }
+    return anim_filter(state, target, time_constant_ms, dt_ms);
+}
+
 // Writes 0..max_dots ASCII dots into out_buf, cycling at period_ms per
 // dot. Buffer must be at least max_dots + 1 bytes. period_ms default
 // 500 matches the existing "scanning..." pattern.
@@ -305,17 +503,30 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define BLE_SCAN_DURATION 2
 #define BLE_SCAN_INTERVAL      3000   // normal inter-scan gap (ms)
 #define BLE_SCAN_INTERVAL_LOCK  800   // boosted gap during 10s channel lock window
-#define BUZZER_COOLDOWN 60000
+// Brief global cooldown — prevents two alarms firing in the same audio
+// envelope when multiple detections from different devices arrive in the
+// same scanner tick. The 5-minute seen-MAC dedup is the real repeat
+// suppression; this is just envelope spacing.
+#define BUZZER_COOLDOWN 1500
 #define IGNORE_WEAK_RSSI -80
 
-#define MAX_LOG_BUFFER 6
-#define MAX_PCAP_BUFFER 5
+#define MAX_LOG_BUFFER 4
+#define MAX_PCAP_BUFFER 3
 #define SD_FLUSH_INTERVAL 10000
-#define CHANNEL_DWELL_MS 400
+#define CHANNEL_HOP_INTERVAL_NORMAL 250UL
+#define CHANNEL_HOP_INTERVAL_TURBO  150UL
+#define DEDUP_WINDOW_NORMAL_MS      300000UL
+#define DEDUP_WINDOW_TURBO_MS        30000UL
 
-#define REDETECT_WINDOW_MS 300000
+static inline unsigned long current_channel_hop_interval() {
+    return turbo_mode_active ? CHANNEL_HOP_INTERVAL_TURBO
+           : (low_power_mode ? 800UL : CHANNEL_HOP_INTERVAL_NORMAL);
+}
+static inline unsigned long current_dedup_window_ms() {
+    return turbo_mode_active ? DEDUP_WINDOW_TURBO_MS : DEDUP_WINDOW_NORMAL_MS;
+}
 
-#define RSSI_TRACK_MAX_DEVICES 16
+#define RSSI_TRACK_MAX_DEVICES 10
 #define RSSI_TRACK_SAMPLES 5
 #define RSSI_TRACK_EXPIRY_MS 15000
 
@@ -324,10 +535,8 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define PERSIST_FILE  "/flock_session.dat"
 #define DETECT_FILE   "/flock_detections.txt"
 #define TOAST_DURATION_MS 3500
+#define DATA_MUTEX_TIMEOUT_MS 500
 
-#define LOC_MAX_SAMPLES 40
-#define LOC_SAMPLE_INTERVAL 500
-#define LOC_MIN_SAMPLES_EST 3
 
 #define SCORE_DEFINITIVE 100  
 #define SCORE_STRONG     60   
@@ -344,8 +553,22 @@ static inline void anim_ellipsis(char* out_buf, size_t out_len,
 #define SD_SPI_MOSI_PIN 14
 #define SD_CS_PIN       12
 
-// Version string — single source of truth
-#define VERSION_STRING "FLOCK DETECTOR v9.6"
+// Version strings — update BOTH when bumping.
+// Also update: CHANGELOG.md, README.md badge
+#define VERSION_STRING "FLOCK FINDER v1.0-beta"
+#define VERSION_SHORT  "v1.0b"
+
+// Set to 1 to enable the 'x' key simulation trigger (development only).
+// MUST be 0 for release builds — simulation creates permanent fake
+// entries in the SD log and fires real detection alarms.
+#define DEBUG_KEYS 0
+
+// Arrow key characters — ADV Cardputer 4-key diamond layout:
+// ';' = up, '.' = down, ',' = left, '/' = right
+#define IS_KEY_UP(c)    ((c) == ';')
+#define IS_KEY_DOWN(c)  ((c) == '.')
+#define IS_KEY_LEFT(c)  ((c) == ',')
+#define IS_KEY_RIGHT(c) ((c) == '/')
 
 // Pre-configure WiFi credentials for export mode. User edits these in source
 // once, then they're saved to flash on first boot. To change later, edit
@@ -370,9 +593,20 @@ static TaskHandle_t BLEWorkerHandle = nullptr;
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t sdMutex;    // guards all SD card I/O — FAT is not thread-safe
 
+static inline bool take_data_mutex(TickType_t timeout_ticks = pdMS_TO_TICKS(DATA_MUTEX_TIMEOUT_MS)) {
+    if (xSemaphoreTakeRecursive(dataMutex, timeout_ticks) == pdTRUE) return true;
+    Serial.println("[MUTEX] dataMutex timeout -- skipping operation");
+    return false;
+}
+static inline void give_data_mutex() {
+    xSemaphoreGiveRecursive(dataMutex);
+}
+
 static uint8_t current_channel = 1;
 static unsigned long last_channel_hop = 0;
-static volatile unsigned long channel_lock_until = 0; 
+static volatile unsigned long channel_lock_until = 0;
+static uint8_t* scan_angle_lut       = nullptr;
+static bool     scan_angle_lut_ready = false;
 static unsigned long last_ble_scan = 0;
 // Periodic BLE stack health restart — see loop().
 static unsigned long last_ble_restart_ms = 0;
@@ -418,13 +652,31 @@ static const unsigned long EXPORT_CONNECT_TIMEOUT_MS = 5000UL;
 static char export_ssid[33] = "";  // configured WiFi SSID (persisted)
 static char export_pass[65] = "";  // configured WiFi password (persisted)
 static char export_ip_str[20] = "0.0.0.0";
+static char export_auth_pass[8] = "";
+static const char* export_auth_user = "flock";
+
+// Derive a 4-char hex password from the device's eFuse MAC.
+// Deterministic — same device always produces the same password.
+// Called once before the server starts.
+static void export_derive_password() {
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    // FNV-1a hash of the 6 MAC bytes → 32-bit → truncate to 16-bit → 4 hex chars
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; i++) {
+        h ^= mac[i];
+        h *= 16777619u;
+    }
+    uint16_t code = (uint16_t)(h ^ (h >> 16));
+    snprintf(export_auth_pass, sizeof(export_auth_pass), "%04X", code);
+}
 
 int current_screen = 0;
 bool system_fully_booted = false;
 static bool screen_dirty = true;   // Forces redraw; set by any state change
 bool stealth_mode = false;
-bool is_muted = false;       
-int current_volume = 150;    
+bool is_muted = false;
+int current_volume = 150;
 
 long session_wifi = 0;
 long session_ble = 0;
@@ -441,15 +693,19 @@ long lifetime_flock_total = 0;
 long lifetime_boots = 0;
 long lifetime_flash_writes = 0;
 
-#define MAX_SEEN_MACS 100
+#define MAX_SEEN_MACS 32
+
+#define MAX_WHITELIST 16
+static char mac_whitelist[MAX_WHITELIST][18];
+static int  mac_whitelist_count = 0;
+static const char WHITELIST_FILE[] = "/wl.txt";
 
 struct SeenMacEntry {
     char   mac[18];
     unsigned long ts;
     bool   occupied;
 };
-static SeenMacEntry seen_mac_table[MAX_SEEN_MACS * 2];
-static uint32_t seen_mac_evict_cursor = 0;
+static SeenMacEntry seen_mac_table[MAX_SEEN_MACS];
 
 static uint32_t hash_mac(const char* mac) {
     uint32_t h = 2166136261u;
@@ -460,53 +716,179 @@ static uint32_t hash_mac(const char* mac) {
     return h;
 }
 
-static const int SEEN_MAC_TABLE_SIZE = MAX_SEEN_MACS * 2;
-// Bound the linear-probe walk. Once eviction starts overwriting slots
-// out-of-band, an unbounded probe degrades into a full-table linear
-// scan and the linear-probe invariant is violated anyway. Capping at 8
-// keeps lookup cost O(1); occasional false negatives just trigger a
-// re-toast within the 5-minute redetect window — acceptable.
-static const int SEEN_MAC_PROBE_LIMIT = 8;
-
 bool is_mac_recently_seen(const char* mac) {
-    const char* key = mac;
-    uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
+    uint32_t start = hash_mac(mac) % MAX_SEEN_MACS;
     unsigned long now = millis();
-    for (int probe = 0; probe < SEEN_MAC_PROBE_LIMIT; probe++) {
-        int slot = (idx + probe) % SEEN_MAC_TABLE_SIZE;
-        if (!seen_mac_table[slot].occupied) return false;
-        if (strncmp(seen_mac_table[slot].mac, key, 17) == 0) {
-            if ((now - seen_mac_table[slot].ts) < REDETECT_WINDOW_MS) return true;
-            seen_mac_table[slot].ts = now;
-            return false;
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        uint32_t idx = (start + i) % MAX_SEEN_MACS;
+        SeenMacEntry& e = seen_mac_table[idx];
+        if (!e.occupied) return false;
+        if (strncmp(e.mac, mac, 17) == 0) {
+            if ((now - e.ts) >= current_dedup_window_ms()) { e.ts = now; return false; }
+            return true;
         }
     }
     return false;
 }
 
+static bool is_mac_whitelisted(const char* mac) {
+    for (int i = 0; i < mac_whitelist_count; i++) {
+        if (strcasecmp(mac_whitelist[i], mac) == 0) return true;
+    }
+    return false;
+}
+
+static bool whitelist_add(const char* mac) {
+    if (!mac || strlen(mac) == 0) return false;
+    if (is_mac_whitelisted(mac)) return false;
+    if (mac_whitelist_count >= MAX_WHITELIST) return false;
+    strncpy(mac_whitelist[mac_whitelist_count], mac, 17);
+    mac_whitelist[mac_whitelist_count][17] = '\0';
+    mac_whitelist_count++;
+    return true;
+}
+
+// Atomic write: write content via the callback to a temp file, then rename
+// over the target. Caller's lambda gets the open File and returns true on
+// success. If the lambda returns false, or any FS step fails, the previous
+// good file is left intact.
+//
+// Returns true if the target file now contains the new content.
+template<typename WriteFn>
+static bool littlefs_atomic_write(const char* target_path, WriteFn write_fn) {
+    if (!littlefs_available) return false;
+
+    char tmp_path[64];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
+
+    if (LittleFS.exists(tmp_path)) LittleFS.remove(tmp_path);
+
+    File f = LittleFS.open(tmp_path, "w");
+    if (!f) {
+        Serial.printf("[FS] atomic_write: open '%s' failed\n", tmp_path);
+        return false;
+    }
+
+    bool ok = write_fn(f);
+    f.close();
+
+    if (!ok) {
+        Serial.printf("[FS] atomic_write: writer returned false for '%s'\n", target_path);
+        LittleFS.remove(tmp_path);
+        return false;
+    }
+
+    if (!LittleFS.rename(tmp_path, target_path)) {
+        Serial.printf("[FS] atomic_write: rename '%s' -> '%s' failed\n",
+                      tmp_path, target_path);
+        LittleFS.remove(tmp_path);
+        return false;
+    }
+    return true;
+}
+
+static void save_whitelist() {
+    if (!littlefs_available) return;
+    littlefs_atomic_write(WHITELIST_FILE, [&](File& f) -> bool {
+        for (int i = 0; i < mac_whitelist_count; i++) {
+            if (f.println(mac_whitelist[i]) <= 0) return false;
+        }
+        return true;
+    });
+}
+
+static void load_whitelist() {
+    if (!littlefs_available) return;
+    if (!LittleFS.exists(WHITELIST_FILE)) return;
+    File f = LittleFS.open(WHITELIST_FILE, "r");
+    if (!f) return;
+    mac_whitelist_count = 0;
+    while (f.available() && mac_whitelist_count < MAX_WHITELIST) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 17) {
+            strncpy(mac_whitelist[mac_whitelist_count], line.c_str(), 17);
+            mac_whitelist[mac_whitelist_count][17] = '\0';
+            mac_whitelist_count++;
+        }
+    }
+    f.close();
+}
+
 void add_seen_mac(const char* mac) {
-    const char* key = mac;
-    uint32_t idx = hash_mac(key) % SEEN_MAC_TABLE_SIZE;
-    for (int probe = 0; probe < SEEN_MAC_PROBE_LIMIT; probe++) {
-        int slot = (idx + probe) % SEEN_MAC_TABLE_SIZE;
-        if (!seen_mac_table[slot].occupied ||
-            strncmp(seen_mac_table[slot].mac, key, 17) == 0) {
-            strncpy(seen_mac_table[slot].mac, key, 17);
-            seen_mac_table[slot].mac[17] = '\0';
-            seen_mac_table[slot].ts       = millis();
-            seen_mac_table[slot].occupied = true;
+    uint32_t start = hash_mac(mac) % MAX_SEEN_MACS;
+    unsigned long now = millis();
+
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        uint32_t idx = (start + i) % MAX_SEEN_MACS;
+        SeenMacEntry& e = seen_mac_table[idx];
+        if (!e.occupied) {
+            strncpy(e.mac, mac, 17);
+            e.mac[17] = '\0';
+            e.ts       = now;
+            e.occupied = true;
+            return;
+        }
+        if (strncmp(e.mac, mac, 17) == 0) {
+            e.ts = now;
             return;
         }
     }
-    // Round-robin eviction: O(1), approximates LRU well enough given the
-    // 5-minute redetect window and 400-slot capacity. The cursor advances
-    // monotonically so we don't repeatedly evict the same slot.
-    int evict = (int)(seen_mac_evict_cursor % SEEN_MAC_TABLE_SIZE);
-    seen_mac_evict_cursor++;
-    strncpy(seen_mac_table[evict].mac, key, 17);
-    seen_mac_table[evict].mac[17] = '\0';
-    seen_mac_table[evict].ts       = millis();
-    seen_mac_table[evict].occupied = true;
+
+    // Table full — evict the entry with the oldest timestamp.
+    uint32_t oldest_idx = 0;
+    unsigned long oldest_ts = seen_mac_table[0].ts;
+    for (uint32_t i = 1; i < MAX_SEEN_MACS; i++) {
+        if (seen_mac_table[i].ts < oldest_ts) {
+            oldest_ts  = seen_mac_table[i].ts;
+            oldest_idx = i;
+        }
+    }
+    SeenMacEntry& victim = seen_mac_table[oldest_idx];
+    strncpy(victim.mac, mac, 17);
+    victim.mac[17] = '\0';
+    victim.ts       = now;
+}
+
+// Expires old entries and rehashes to repair probe chains broken by removals.
+// Called from loop() under dataMutex once per second.
+void seen_mac_expire() {
+    unsigned long now = millis();
+    bool any_expired = false;
+
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        if (seen_mac_table[i].occupied &&
+            (now - seen_mac_table[i].ts) >= current_dedup_window_ms()) {
+            seen_mac_table[i].occupied = false;
+            any_expired = true;
+        }
+    }
+
+    if (!any_expired) return;
+
+    // Two-pass rehash: collect all live entries, wipe the table, re-insert
+    // from scratch. Avoids the Robin Hood forward-scan issue where an entry
+    // re-inserted at a lower index than the current cursor gets visited twice
+    // or forms a probe-chain cycle with a hash collision.
+    // Static to avoid 6 KB on the stack (24 B × 256 entries).
+    static SeenMacEntry temp[MAX_SEEN_MACS];
+    int temp_count = 0;
+    for (uint32_t i = 0; i < MAX_SEEN_MACS; i++) {
+        if (seen_mac_table[i].occupied) {
+            temp[temp_count++] = seen_mac_table[i];
+            seen_mac_table[i].occupied = false;
+        }
+    }
+    for (int t = 0; t < temp_count; t++) {
+        uint32_t start = hash_mac(temp[t].mac) % MAX_SEEN_MACS;
+        for (uint32_t j = 0; j < MAX_SEEN_MACS; j++) {
+            uint32_t idx = (start + j) % MAX_SEEN_MACS;
+            if (!seen_mac_table[idx].occupied) {
+                seen_mac_table[idx] = temp[t];
+                break;
+            }
+        }
+    }
 }
 
 char last_cap_type[16]       = "None";
@@ -518,7 +900,7 @@ char last_cap_time[9]        = "00:00:00";
 char last_cap_det_method[64] = "";
 int  last_cap_seq_num        = -1;
 
-#define CAPTURE_HISTORY_SIZE 5
+#define CAPTURE_HISTORY_SIZE 3
 struct CaptureEntry {
     char  type[16];
     char  mac[18];
@@ -528,32 +910,105 @@ struct CaptureEntry {
     char  time[9];
     double lat;
     double lng;
+    int   id;       // sequential detection number; 0 = unknown (pre-feature SD load)
 };
 CaptureEntry capture_history[CAPTURE_HISTORY_SIZE];
 int capture_history_count = 0;
 
+// Sequential detection counter — 1-based, persisted in flash so IDs survive
+// reboots. Bumped once per is_new detection inside log_detection().
+long next_detection_id = 1;
+bool sd_full_warned    = false;  // toast once on first SD-full write failure
+
 // SD-backed detection history (recent detections screen)
-#define SD_HIST_SIZE 20
+#define SD_HIST_SIZE 8
 struct SDHistEntry {
-    char type[16];
-    char mac[18];
-    char name[32];
-    int  rssi;
-    int  confidence;
-    char method[24];
-    char timestamp[9];
+    char     type[16];
+    char     mac[18];
+    char     name[32];
+    int      rssi;
+    int      confidence;
+    char     method[24];
+    char     timestamp[9];    // "HH:MM:SS" session uptime
+    int      id;              // sequential detection number; 0 = loaded from old SD log
+    char     datestamp[12];   // "MM/DD/YY" from GPS date, or "--/--/--"
+    double   lat;             // GPS latitude at detection time (0.0 if no fix)
+    double   lng;             // GPS longitude at detection time (0.0 if no fix)
+    uint32_t epoch_utc;       // Unix epoch seconds (0 if no GPS)
+    unsigned long uptime_ms;  // raw Uptime_ms from CSV col 0 — dedup key for delete
 };
 SDHistEntry sd_hist[SD_HIST_SIZE];
 int  sd_hist_count      = 0;
 int  history_selected_idx = 0;
-bool hist_detail_open   = false;
-static int device_info_scroll = 0;
-static const int DEVICE_INFO_CONTENT_HEIGHT = 320;
+bool hist_detail_open      = false;
+bool hist_delete_confirming = false;
 volatile bool sd_hist_dirty = false;
 
-#define TOAST_QUEUE_SIZE 3
+#define MAX_PENDING_DELETES 16
+struct PendingDelete {
+    char mac[18];
+    unsigned long uptime_ms;   // matches CSV col 0 (Uptime_ms) exactly
+    int  rssi;
+};
+static PendingDelete pending_deletes[MAX_PENDING_DELETES];
+static int pending_delete_count = 0;
+static unsigned long pending_delete_dirty_ms = 0;
+
+
+// Detections screen — selection ease + detail overlay open/close transition.
+// hist_sel_y_f follows the target row y via anim_filter for smooth motion.
+// The detail overlay tracks open/close timestamps so it can slide-up + fade
+// on open and reverse on close (hist_detail_open stays true through the
+// close anim and is cleared by the renderer when alpha hits zero).
+static const int    HIST_ROW_H       = 28;
+static const int    HIST_VISIBLE_ROWS = 4;
+static const float  HIST_SEL_TC      = 80.0f;     // snappy
+static float        hist_sel_y_f     = 0.0f;
+static unsigned long hist_last_frame_ms  = 0;
+static unsigned long hist_detail_open_ms = 0;
+static int          history_scroll_offset = 0;
+
+// Stats screen vertical scroll (Option D — uniform card grid, smoothed).
+// Keys set stats_scroll_target (instant). Renderer eases stats_scroll_y_f
+// toward the target via anim_filter() with a snappy 120 ms time constant.
+static int   stats_scroll_target  = 0;
+static float stats_scroll_y_f     = 0.0f;
+static unsigned long stats_last_frame_ms = 0;
+static const int STATS_CONTENT_H   = 288;  // 7×36 + 7×6 gaps (no hero)
+static const int STATS_VIEW_H      = 115;  // DISP_H - CONTENT_Y
+static const int STATS_SCROLL_STEP = 42;   // one standard card (36) + gap (6)
+static const int STATS_MAX_SCROLL  = STATS_CONTENT_H - STATS_VIEW_H;
+static const float STATS_SCROLL_TC = 80.0f;   // ms — snappier; 120 felt sluggish
+
+// Stats screen roll-up animation state — one slot per card index.
+// New value vs prev value is checked each draw; if changed, roll_start
+// kicks off an anim_slide_in() roll for UI_ANIM_QUICK ms. PACKETS is
+// additionally throttled to a 3 s update cadence so it doesn't churn.
+enum StatsCardIdx {
+    SC_DET_SESSION = 0, SC_DET_LIFETIME, SC_WIFI, SC_BLE, SC_RAVEN,
+    SC_SESSION, SC_LIFETIME,
+    SC_BATTERY, SC_HEAP,
+    SC_PACKETS, SC_SD,
+    SC_BOOTS, SC_FLASH,
+    SC_VERSION, SC_VOLTAGE,
+    STATS_CARD_COUNT
+};
+// Per-character roll animation: comparing the formatted string per char
+// lets only the digits that actually changed slide up. Each card owns a
+// row of timestamps (one per glyph column) — a non-zero entry within the
+// last UI_ANIM_QUICK ms means that column is mid-roll. Sized to fit the
+// longest formatted value we surface (uptime, packet counts, etc.).
+#define STAT_MAX_CHARS 12
+static char          stats_prev_strings[STATS_CARD_COUNT][STAT_MAX_CHARS] = {{0}};
+static unsigned long stats_char_anim[STATS_CARD_COUNT][STAT_MAX_CHARS]    = {{0}};
+static bool  stats_values_initialized = false;
+static uint32_t stats_pkt_display       = 0;
+static unsigned long stats_pkt_last_update = 0;
+
+#define TOAST_QUEUE_SIZE 2
+#define TOAST_TEXT_LEN   48
 struct ToastEntry {
-    char text[32];
+    char text[TOAST_TEXT_LEN];
     uint16_t accent;
     bool is_action;
 };
@@ -563,11 +1018,6 @@ static int toast_queue_count = 0;
 static unsigned long toast_start = 0;
 static bool toast_active = false;
 
-// Compatibility shims for direct-write sites (battery warnings, flash errors)
-static char toast_text[32] = "";
-static uint16_t toast_accent_color = 0;
-static bool toast_is_action = false;
-
 unsigned long last_time_save = 0;
 unsigned long last_sd_flush_check = 0;
 unsigned long last_persist_save = 0;
@@ -576,7 +1026,7 @@ unsigned long last_blip_time = 0;
 // ── Live activity feed (scanner screen) ──
 #define FEED_SIZE 8
 #define FEED_DEDUP_WINDOW_MS   30000UL
-#define FEED_MIN_PUSH_INTERVAL_MS 800UL
+#define FEED_MIN_PUSH_INTERVAL_MS 1200UL
 
 struct FeedEntry {
     char     mac[18];
@@ -593,6 +1043,83 @@ static unsigned long last_feed_push_ms = 0;
 static FeedEntry feed_pending;
 static bool feed_pending_valid = false;
 
+// Scanner reactive-animation triggers — fired from log_detection() is_new
+// path, consumed and decayed inside draw_scanner_screen().
+static unsigned long scanner_flash_ms = 0;
+static uint16_t      scanner_flash_color = 0;
+static uint8_t       scanner_flash_proto = 0;  // 0=WiFi 1=BLE — protocol for flock pip routing
+
+// Cycleable visualization in the scanner's bottom-left panel. 'v' key
+// advances through the modes; the renderer dispatches on this value.
+static int       scanner_viz_mode  = 0;   // 0=SCAN 1=SPECTRUM 2=TIMELINE
+static const int SCANNER_VIZ_COUNT = 3;
+
+// Per-channel packet counter used by the SPECTRUM viz. Counts are
+// incremented in wifi_sniffer_packet_handler() (single 32-bit store on
+// ESP32 is atomic, no mutex needed); the renderer snapshots them every
+// 2 s into channel_pkt_display and decays the live counts so the bars
+// represent a rolling window rather than session totals.
+#define NUM_WIFI_CHANNELS 13
+static volatile uint32_t channel_pkt_counts[NUM_WIFI_CHANNELS] = {0};
+static uint32_t          channel_pkt_display[NUM_WIFI_CHANNELS] = {0};
+static unsigned long     channel_display_last_update = 0;
+static uint32_t          channel_peak = 1;
+
+// Per-channel smoothed [0..1] display height for the spectrum curve.
+// Eased toward the normalised channel_pkt_display ratio every frame
+// so the line glides instead of snapping with each 400ms hop.
+static float             spectrum_smooth[NUM_WIFI_CHANNELS] = {0};
+static unsigned long     spectrum_last_frame = 0;
+
+
+// Eased x-coordinate of the spectrum scan line — slides smoothly
+// between channel positions instead of snapping when the hopper
+// advances. Initialised on first render so it doesn't fly in from x=0.
+static float             scan_line_x_f = 0.0f;
+static unsigned long     scan_line_last_frame = 0;
+// BLE-active color blend for the spectrum curve. Eases toward 1.0
+// when BLE is scanning, back to 0.0 when WiFi resumes.
+static float             spectrum_ble_blend = 0.0f;
+
+// ── Layered timeline state ─────────────────────────────────────────
+#define TIMELINE_BIN_COUNT    50
+#define TIMELINE_WINDOW_MS    (5UL * 60UL * 1000UL)
+#define TIMELINE_BIN_MS       (TIMELINE_WINDOW_MS / TIMELINE_BIN_COUNT)
+
+struct TimelineBin {
+    uint16_t wifi;
+    uint16_t ble;
+    bool     has_flock;
+    uint8_t  flock_proto;
+    unsigned long timestamp;
+    int16_t  wifi_rssi_sum;
+    int16_t  ble_rssi_sum;
+    uint8_t  wifi_rssi_count;
+    uint8_t  ble_rssi_count;
+};
+
+static TimelineBin   tl_bins[TIMELINE_BIN_COUNT]       = {};
+static float         tl_wifi_smooth[TIMELINE_BIN_COUNT] = {};
+static float         tl_ble_smooth[TIMELINE_BIN_COUNT]  = {};
+static unsigned long tl_last_bin_ms   = 0;
+static unsigned long tl_last_frame_ms = 0;
+static bool          tl_initialized   = false;
+static float         tl_flock_fade[TIMELINE_BIN_COUNT]  = {};
+
+
+// Feed slide-in animation — when scan_local_head changes, all rows
+// shift down together over FEED_SHIFT_ANIM_MS with an ease-out curve.
+static int               feed_anim_prev_head = -1;
+static unsigned long     feed_anim_shift_ms  = 0;
+static const unsigned long FEED_SHIFT_ANIM_MS = 250;
+
+// Feed snapshot — refreshed by draw_scanner_screen() once per ~500ms,
+// read directly by the viz functions so they don't need a separate mutex.
+static FeedEntry         scan_local_feed[FEED_SIZE];
+static int               scan_local_count = 0;
+static int               scan_local_head  = 0;
+static unsigned long     scan_feed_last_snapshot = 0;
+
 static const unsigned long DOUBLE_TAP_MS = 400;
 static bool bs_pending_exists = false;
 static unsigned long bs_pending_until = 0;
@@ -607,43 +1134,114 @@ struct RSSITrack {
 };
 RSSITrack rssi_tracker[RSSI_TRACK_MAX_DEVICES];
 int rssi_tracker_count = 0;
-static int locator_tracker_idx = -1;  // cached index into rssi_tracker for locator target
+static int signal_tracker_idx = -1;  // cached index into rssi_tracker for locator target
 
-struct LocSample { 
-    double lat; 
-    double lng; 
-    int rssi; 
-    unsigned long timestamp; 
+static volatile bool signal_active = false;
+char signal_target_mac[18]  = "";
+char signal_target_name[65] = "";
+char signal_target_type[16] = "";   // "WiFi", "BLE", or ""
+int  signal_target_id       = 0;    // sequential detection ID; 0 = unknown
+unsigned long signal_newest_sample_ms = 0;
+int signal_peak_rssi = -120;
+
+// ── Locator signal trace ring buffer ──
+#define SIG_TRACE_SIZE        60          // 2 minutes at 2-second intervals
+#define SIG_TRACE_INTERVAL_MS 2000
+
+// Signal bar and trace normalization range — single source of truth.
+// Values below RSSI_VIS_FLOOR clamp to bottom; above RSSI_VIS_CEIL clamp to top.
+#define RSSI_VIS_FLOOR (-70)
+#define RSSI_VIS_CEIL  (-30)
+#define RSSI_VIS_RANGE (RSSI_VIS_CEIL - RSSI_VIS_FLOOR)  // 40
+
+struct SigTraceEntry {
+    int8_t rssi;  // raw dBm value; -128 = floor/gap
 };
 
-bool locator_active = false;
-char locator_target_mac[18]  = "";
-char locator_target_name[65] = "";
-char locator_target_type[8]  = "";   // "WiFi", "BLE", or ""
-LocSample locator_samples[LOC_MAX_SAMPLES];
-int locator_sample_count = 0;
-unsigned long locator_last_sample = 0;
-unsigned long locator_newest_sample_ms = 0;  
+static SigTraceEntry sig_trace[SIG_TRACE_SIZE];
+static int           sig_trace_head        = 0;  // next slot to write
+static int           sig_trace_count       = 0;
+static unsigned long sig_trace_last_sample = 0;
+static float         sig_trace_smooth[SIG_TRACE_SIZE];
+static int           last_rendered_trace_head  = -1;
+static int           last_rendered_trace_count = 0;
+static unsigned long sig_trace_last_frame_ms = 0;
+static float         signal_bar_smooth = 0.0f;
+static bool          signal_bar_seeded = false;
 
-double locator_est_lat = 0.0;
-double locator_est_lng = 0.0;
-float locator_est_distance = 0.0;
-float locator_bearing = 0.0;
-float locator_confidence_radius = 0.0;
-bool locator_has_estimate = false;
-int locator_peak_rssi = -120;
-bool locator_estimate_announced = false;
-
-// Trend tracking: last N distance samples for "getting warmer" arrow
-#define LOC_TREND_SAMPLES 8
-static float locator_dist_history[LOC_TREND_SAMPLES] = {0};
-static int locator_dist_history_count = 0;
-static int locator_dist_history_head = 0;
-static unsigned long locator_last_trend_sample_ms = 0;
-volatile bool locator_announce_pending = false;
+// ── Peak GPS bookmark ──
+static double signal_peak_lat     = 0.0;
+static double signal_peak_lng     = 0.0;
+static bool   signal_peak_has_gps = false;
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
+
+// ── Auto timezone from GPS ──────────────────────────────────────────
+// Derived from longitude + US DST rules. Recomputed every 5 minutes.
+// Applied at display time only — stored timestamps stay UTC.
+static int8_t  auto_tz_offset    = 0;     // hours from UTC (e.g. -5 for EST, -4 for EDT)
+static bool    auto_tz_valid     = false; // true once computed from a GPS fix
+static unsigned long auto_tz_last_compute_ms = 0;
+static const unsigned long AUTO_TZ_INTERVAL_MS = 300000UL;  // recompute every 5 min
+
+// Day of week: 0=Sunday. Tomohiko Sakamoto's algorithm — valid for any Gregorian date.
+static int tz_day_of_week(int y, int m, int d) {
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y--;
+    return (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
+}
+
+// Returns true if the given UTC date falls within US DST (2007+ rules).
+// DST starts: second Sunday of March. DST ends: first Sunday of November.
+// Date-only check — off by up to 1 hour on transition days, acceptable here.
+static bool tz_is_us_dst(int year, int month, int day) {
+    if (month > 3 && month < 11) return true;
+    if (month < 3 || month > 11) return false;
+    if (month == 3) {
+        int dow_mar1 = tz_day_of_week(year, 3, 1);
+        int first_sun = (dow_mar1 == 0) ? 1 : (8 - dow_mar1);
+        return (day >= first_sun + 7);
+    }
+    // month == 11
+    int dow_nov1 = tz_day_of_week(year, 11, 1);
+    int first_sun = (dow_nov1 == 0) ? 1 : (8 - dow_nov1);
+    return (day < first_sun);
+}
+
+// Compute UTC offset from GPS coordinates and date.
+// US-focused: 6 timezone bands by longitude. Non-US: longitude/15 rounding, no DST.
+static void tz_compute(double lat, double lng, int year, int month, int day) {
+    int8_t base_offset;
+    bool apply_dst = false;
+
+    bool is_conus  = (lat >=  24.0 && lat <=  50.0 && lng >= -125.0 && lng <= -67.0);
+    bool is_alaska = (lat >=  51.0 && lat <=  72.0 && lng >= -170.0 && lng <= -130.0);
+    bool is_hawaii = (lat >=  18.0 && lat <=  23.0 && lng >= -161.0 && lng <= -154.0);
+
+    if (is_hawaii) {
+        base_offset = -10;
+        apply_dst   = false;
+    } else if (is_alaska) {
+        base_offset = -9;
+        apply_dst   = true;
+    } else if (is_conus) {
+        if      (lng < -115.0) base_offset = -8;  // Pacific
+        else if (lng < -100.0) base_offset = -7;  // Mountain
+        else if (lng <  -85.0) base_offset = -6;  // Central
+        else                   base_offset = -5;  // Eastern
+        apply_dst = true;
+    } else {
+        base_offset = (int8_t)roundf((float)lng / 15.0f);
+        apply_dst   = false;
+    }
+
+    if (apply_dst && tz_is_us_dst(year, month, day)) base_offset += 1;
+
+    auto_tz_offset           = base_offset;
+    auto_tz_valid            = true;
+    auto_tz_last_compute_ms  = millis();
+}
 
 // ============================================================================
 // PCAP RING BUFFER STRUCT
@@ -691,19 +1289,28 @@ void LedTask(void* pv) {
     for (;;) {
         uint8_t r = 0, g = 0, b = 0;
         unsigned long now = millis();
-        if (led_detect_active && now < led_detection_flash_until) {
+        if (led_detect_active && !night_mode && now < led_detection_flash_until) {
             float pulse = anim_pulse(UI_PULSE_FAST);
             r = (uint8_t)((float)led_detect_r * pulse);
             g = (uint8_t)((float)led_detect_g * pulse);
             b = (uint8_t)((float)led_detect_b * pulse);
         } else {
             led_detect_active = false;
-            if (led_breathing_on && !stealth_mode && brightness_level >= 2) {
-                float breath = anim_pulse(UI_PULSE_BREATHE);
+            bool export_on = (export_mode_active || export_connecting);
+            bool show_led = !stealth_mode && !night_mode &&
+                            (export_on || (led_breathing_on && brightness_level >= 2));
+            if (show_led) {
+                float breath = anim_pulse(export_on ? UI_PULSE_MEDIUM : UI_PULSE_BREATHE);
                 float dim    = 0.15f + breath * 0.35f;
-                r = (uint8_t)((float)led_r * dim);
-                g = (uint8_t)((float)led_g * dim);
-                b = (uint8_t)((float)led_b * dim);
+                if (export_on) {
+                    r = (uint8_t)(255.0f * dim);
+                    g = (uint8_t)(181.0f * dim);
+                    b = (uint8_t)( 71.0f * dim);
+                } else {
+                    r = (uint8_t)((float)led_r * dim);
+                    g = (uint8_t)((float)led_g * dim);
+                    b = (uint8_t)((float)led_b * dim);
+                }
             }
         }
         set_cardputer_led(r, g, b);
@@ -764,6 +1371,38 @@ void update_load_sag() {
 
     // Update global state for the battery thread
     current_load_sag_mv = total_sag;
+}
+
+// Piecewise linear LiPo discharge curve — 9 breakpoints interpolated.
+// Replaces the linear (mv-3300)*100/900 mapping which is 10+ percentage
+// points off in the 3.5–3.7V danger zone where accuracy matters most.
+static int voltage_to_percent(int32_t mv) {
+    struct BP { int32_t mv; int pct; };
+    static const BP curve[] = {
+        {4200, 100},
+        {4100,  90},
+        {3950,  75},
+        {3830,  60},
+        {3740,  40},
+        {3680,  25},
+        {3600,  15},
+        {3500,   5},
+        {3300,   0},
+    };
+    static const int N = sizeof(curve) / sizeof(curve[0]);
+
+    if (mv >= curve[0].mv) return 100;
+    if (mv <= curve[N - 1].mv) return 0;
+
+    for (int i = 0; i < N - 1; i++) {
+        if (mv >= curve[i + 1].mv) {
+            int32_t range_mv  = curve[i].mv  - curve[i + 1].mv;
+            int     range_pct = curve[i].pct - curve[i + 1].pct;
+            return curve[i + 1].pct +
+                   (int)((mv - curve[i + 1].mv) * range_pct / range_mv);
+        }
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -919,6 +1558,8 @@ bool has_tn_serial(const uint8_t* mfg_data, size_t mfg_len) {
 
 // Convert a UTC Y/M/D h:m:s to Unix epoch seconds without depending on
 // the system timezone. Valid for years 1970..2099.
+// Uses int64_t for the final multiplication to avoid the 32-bit
+// overflow at days ≈ 24855 (early 2038).
 static uint32_t utc_to_epoch(int year, int mon, int day,
                              int hour, int min, int sec) {
     static const int days_before_month[12] = {
@@ -933,14 +1574,19 @@ static uint32_t utc_to_epoch(int year, int mon, int day,
     bool is_leap = ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
     if (is_leap && mon > 2) days += 1;
     days += (day - 1);
-    return (uint32_t)(days * 86400L + hour * 3600L + min * 60L + sec);
+    int64_t total = (int64_t)days * 86400LL
+                  + (int64_t)hour * 3600LL
+                  + (int64_t)min * 60LL
+                  + (int64_t)sec;
+    return (uint32_t)total;
 }
 
 void format_time_buf(unsigned long total_sec, char* buf, size_t buf_len) {
-    unsigned long h = total_sec / 3600;
-    unsigned long m = (total_sec / 60) % 60;
-    unsigned long s = total_sec % 60;
-    snprintf(buf, buf_len, "%02lu:%02lu:%02lu", h, m, s);
+    // h/m/s are always small; unsigned int + %u is warning-free on all platforms.
+    unsigned int h = (unsigned int)(total_sec / 3600);
+    unsigned int m = (unsigned int)((total_sec / 60) % 60);
+    unsigned int s = (unsigned int)(total_sec % 60);
+    snprintf(buf, buf_len, "%02u:%02u:%02u", h, m, s);
 }
 
 // Translate detection method codes into a plain-English summary.
@@ -1017,18 +1663,18 @@ const char* confidence_label(int score) {
 
 // Prefer GPS UTC for PCAP timestamps so captures open in Wireshark with
 // real wall-clock time. Falls back to a synthetic monotonic epoch if no
-// GPS lock is available. Caller must NOT hold dataMutex (non-recursive).
+// GPS lock is available. Caller need not hold dataMutex; function acquires it internally.
 static void compute_pcap_ts(uint32_t* sec, uint32_t* usec) {
     unsigned long ms = millis();
     bool got_gps = false;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
+    if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2020 && gps.date.year() <= 2099) {
             uint32_t epoch = utc_to_epoch(
                 gps.date.year(), gps.date.month(), gps.date.day(),
                 gps.time.hour(), gps.time.minute(), gps.time.second());
             if (epoch > 0) { *sec = epoch; got_gps = true; }
         }
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
     }
     if (!got_gps) {
         *sec = 1700000000UL + (uint32_t)(ms / 1000UL);
@@ -1041,7 +1687,7 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
     uint32_t capture_len = (length > 256) ? 256 : length;
     uint32_t ts_sec = 0, ts_usec = 0;
     compute_pcap_ts(&ts_sec, &ts_usec);
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (pcap_write_count < MAX_PCAP_BUFFER) {
         pcap_write_buffer[pcap_write_count].ts_sec  = ts_sec;
         pcap_write_buffer[pcap_write_count].ts_usec = ts_usec;
@@ -1050,7 +1696,7 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
         memcpy(pcap_write_buffer[pcap_write_count].payload, payload, capture_len);
         pcap_write_count++;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void write_ble_pcap(const uint8_t* payload, uint32_t length) {
@@ -1058,7 +1704,7 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
     uint32_t capture_len = (length > 256) ? 256 : length;
     uint32_t ts_sec = 0, ts_usec = 0;
     compute_pcap_ts(&ts_sec, &ts_usec);
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (ble_pcap_write_count < MAX_PCAP_BUFFER) {
         ble_pcap_write_buffer[ble_pcap_write_count].ts_sec  = ts_sec;
         ble_pcap_write_buffer[ble_pcap_write_count].ts_usec = ts_usec;
@@ -1067,76 +1713,304 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
         memcpy(ble_pcap_write_buffer[ble_pcap_write_count].payload, payload, capture_len);
         ble_pcap_write_count++;
     }
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 // ============================================================================
 // HTTP EXPORT SERVER
 // ============================================================================
 
+// Returns true if the request is authenticated. If not, sends a 401
+// response and returns false — caller should return immediately.
+static bool export_check_auth() {
+    if (!export_server) return false;
+    if (!export_server->authenticate(export_auth_user, export_auth_pass)) {
+        export_server->requestAuthentication(BASIC_AUTH, "Flock Finder");
+        return false;
+    }
+    return true;
+}
+
+// ── Export page HTML template (stored in flash via PROGMEM) ──────────────
+// Dynamic placeholders (in order):
+//   %s  = export_auth_user
+//   %s  = export_auth_pass
+//   %s  = file rows HTML (built separately based on sd_available)
+//   %u  = remaining minutes
+//   %02u = remaining seconds
+//   %d  = timer bar fill percentage (0-100)
+//   %s  = VERSION_STRING (footer)
+//   %lu = remaining milliseconds (for JS countdown)
+static const char EXPORT_PAGE_TEMPLATE[] PROGMEM = R"rawhtml(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flock Finder Export</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap');
+:root{--bg:#050A14;--card:#1D3258;--cb:#2E4670;--h:#4DDBC2;--t:#E8EFFF;
+--d:#95A5B8;--p:#8B7CDB;--ca:#FFB547;--hd:rgba(77,219,194,.15);
+--gl:rgba(46,70,112,.5)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'JetBrains Mono',monospace;background:var(--bg);color:var(--t);
+min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(
+135deg,transparent,transparent 7px,var(--gl) 7px,var(--gl) 8px);opacity:.25;
+pointer-events:none;z-index:0}
+.pg{position:relative;z-index:1;max-width:520px;margin:0 auto;padding:24px 20px 40px}
+.hs{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;
+border-bottom:1px solid var(--cb);margin-bottom:20px}
+.ht{font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--h);
+letter-spacing:3px;text-transform:uppercase}
+.pl{display:inline-flex;align-items:center;gap:4px;border:1px solid;border-radius:6px;
+padding:2px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;
+letter-spacing:1px;line-height:1.4;white-space:nowrap;text-decoration:none;
+transition:all .2s ease}
+.po{border-color:rgba(149,165,184,.4);color:var(--t);background:rgba(149,165,184,.12)}
+.ph{border-color:var(--h);color:var(--bg);background:var(--h);font-weight:600}
+.ph:hover{filter:brightness(1.15);box-shadow:0 0 12px rgba(77,219,194,.4)}
+.pp{border-color:var(--p);color:var(--bg);background:var(--p);font-weight:600}
+.pp:hover{filter:brightness(1.15);box-shadow:0 0 12px rgba(139,124,219,.4)}
+.sb{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--h);
+border-radius:8px;padding:6px 14px;background:var(--hd);color:var(--h);
+font-size:12px;letter-spacing:2px;font-weight:500;
+animation:bg 3s ease-in-out infinite}
+.sb .dt{width:6px;height:6px;border-radius:50%%;background:var(--h);
+animation:dp 1.5s ease-in-out infinite}
+@keyframes bg{0%%,100%%{box-shadow:0 0 8px rgba(77,219,194,.1)}
+50%%{box-shadow:0 0 16px rgba(77,219,194,.2)}}
+@keyframes dp{0%%,100%%{opacity:.5}50%%{opacity:1}}
+.sl{font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--h);
+letter-spacing:3px;text-transform:uppercase;margin-bottom:10px;padding-bottom:6px;
+border-bottom:1px solid var(--cb)}
+.cd{border:1px solid var(--cb);border-radius:6px;padding:14px 16px;margin-bottom:14px;
+background:transparent;transition:border-color .25s ease}
+.cd:hover{border-color:rgba(77,219,194,.35)}
+.kv{display:flex;justify-content:space-between;align-items:center;padding:4px 0}
+.kl{font-size:11px;color:var(--h);letter-spacing:2px;text-transform:uppercase}
+.kv2{font-size:13px;color:var(--t);font-weight:500;font-family:'Share Tech Mono',monospace;
+letter-spacing:1px}
+.fr{display:flex;align-items:center;justify-content:space-between;padding:10px 0;
+border-bottom:1px solid rgba(46,70,112,.3);transition:background .15s}
+.fr:last-child{border-bottom:none}
+.fr:hover{background:rgba(77,219,194,.04);margin:0 -16px;padding-left:16px;
+padding-right:16px;border-radius:4px}
+.fi{display:flex;flex-direction:column;gap:3px}
+.fn{font-size:13px;color:var(--t);font-weight:500;letter-spacing:.5px}
+.fd{font-size:10px;color:var(--d);letter-spacing:1px;text-transform:uppercase}
+.fs{width:20px;height:20px;margin-right:10px;flex-shrink:0;color:var(--h)}
+.fp{color:var(--p)}
+.fl{display:flex;align-items:center}
+a.pl{cursor:pointer}a.pl:active{transform:scale(.96)}
+.ft{display:flex;justify-content:space-between;align-items:center;margin-top:20px;
+padding-top:12px;border-top:1px solid var(--cb)}
+.fd2{font-size:10px;color:var(--d);letter-spacing:1px}
+.tb{height:3px;background:var(--cb);border-radius:2px;margin-top:8px;overflow:hidden}
+.tf{height:100%%;background:var(--h);border-radius:2px;transition:width 1s linear}
+.ws{display:flex;align-items:center;gap:8px;padding:8px 12px;
+border:1px solid rgba(255,181,71,.3);border-radius:6px;
+background:rgba(255,181,71,.12);margin-bottom:14px}
+.ws span{font-size:11px;color:var(--ca);letter-spacing:1px}
+.fi2{opacity:0;transform:translateY(10px);animation:su .4s ease forwards}
+@keyframes su{to{opacity:1;transform:translateY(0)}}
+.fi2:nth-child(1){animation-delay:.05s}.fi2:nth-child(2){animation-delay:.12s}
+.fi2:nth-child(3){animation-delay:.19s}.fi2:nth-child(4){animation-delay:.26s}
+.fi2:nth-child(5){animation-delay:.33s}.fi2:nth-child(6){animation-delay:.4s}
+.fi2:nth-child(7){animation-delay:.47s}
+@media(max-width:400px){.pg{padding:16px 14px 32px}
+.fr{flex-direction:column;align-items:flex-start;gap:8px}
+.fr a.pl{align-self:flex-end}}
+</style></head><body><div class="pg">
+<div class="hs fi2"><span class="ht">Flock Finder</span>
+<div style="display:flex;gap:6px;align-items:center">
+<span class="pl po">v1.0b</span><span class="pl ph">EXP</span></div></div>
+<div class="fi2" style="margin-bottom:18px"><div class="sb">
+<span class="dt"></span>EXPORT ACTIVE</div></div>
+<div class="ws fi2">
+<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+<path d="M7 1L13 12H1L7 1Z" stroke="#FFB547" stroke-width="1.5" fill="none"/>
+<line x1="7" y1="5" x2="7" y2="8" stroke="#FFB547" stroke-width="1.5" stroke-linecap="round"/>
+<circle cx="7" cy="10" r=".8" fill="#FFB547"/></svg>
+<span>All scanning paused during export</span></div>
+<div class="fi2"><div class="sl">Credentials</div><div class="cd">
+<div class="kv"><span class="kl">User</span><span class="kv2">%s</span></div>
+<div class="kv"><span class="kl">Pass</span><span class="kv2">%s</span></div>
+</div></div>
+<div class="fi2"><div class="sl">Files</div><div class="cd">%s</div></div>
+<div class="fi2"><div class="sl">Session</div><div class="cd">
+<div class="kv"><span class="kl">Time Left</span>
+<span class="kv2" id="tm">%um %02us</span></div>
+<div class="tb"><div class="tf" id="tf" style="width:%d%%"></div></div>
+</div></div>
+<div class="ft fi2"><span class="fd2">%s</span>
+<span class="pl po" style="font-size:10px">
+<svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+<circle cx="4" cy="4" r="3" stroke="currentColor" stroke-width="1"/>
+<line x1="4" y1="2" x2="4" y2="4.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+<line x1="4" y1="4.5" x2="5.5" y2="5.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+</svg>Auto-exit</span></div></div>
+<script>var r=%lu;setInterval(function(){r-=1000;if(r<0)r=0;
+var m=Math.floor(r/60000),s=Math.floor((r%%60000)/1000);
+var e=document.getElementById('tm');if(e)e.textContent=m+'m '+String(s).padStart(2,'0')+'s';
+var f=document.getElementById('tf');if(f)f.style.width=(r/600000*100)+'%%';},1000);
+</script></body></html>)rawhtml";
+
+static const char FILE_ICON_WIFI[] PROGMEM =
+    "<svg class=\"fs\" viewBox=\"0 0 20 20\" fill=\"none\">"
+    "<polygon points=\"10,3 18,17 2,17\" stroke=\"currentColor\" "
+    "stroke-width=\"1.5\" fill=\"none\"/></svg>";
+
+static const char FILE_ICON_BLE[] PROGMEM =
+    "<svg class=\"fs fp\" viewBox=\"0 0 20 20\" fill=\"none\">"
+    "<polygon points=\"10,2 18,10 10,18 2,10\" stroke=\"currentColor\" "
+    "stroke-width=\"1.5\" fill=\"none\"/></svg>";
+
+static const char DL_ICON[] PROGMEM =
+    "<svg width=\"10\" height=\"10\" viewBox=\"0 0 10 10\" fill=\"none\">"
+    "<path d=\"M5 1V7M5 7L2 4.5M5 7L8 4.5\" stroke=\"#050A14\" "
+    "stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
+    "<line x1=\"1\" y1=\"9\" x2=\"9\" y2=\"9\" stroke=\"#050A14\" "
+    "stroke-width=\"1.5\" stroke-linecap=\"round\"/></svg>";
+
+static int build_file_row(char* buf, size_t buf_size,
+                          const char* href, const char* name,
+                          const char* desc, const char* icon,
+                          const char* pill_class) {
+    return snprintf(buf, buf_size,
+        "<div class=\"fr\"><div class=\"fl\">%s"
+        "<div class=\"fi\"><span class=\"fn\">%s</span>"
+        "<span class=\"fd\">%s</span></div></div>"
+        "<a href=\"%s\" class=\"pl %s\">%s DL</a></div>",
+        icon, name, desc, href, pill_class, DL_ICON);
+}
+
 void export_server_setup_routes() {
     if (!export_server) return;
 
-    // Index: simple HTML file list
     export_server->on("/", HTTP_GET, []() {
-        String html = "<!DOCTYPE html><html><head><title>Flock Detector Export</title>"
-                      "<style>body{font-family:monospace;background:#0a1430;color:#dce8ff;padding:20px;}"
-                      "a{color:#00d7eb;text-decoration:none;display:block;padding:8px 0;}"
-                      "a:hover{color:#32ff64;}h1{color:#32ff64;}"
-                      ".meta{color:#6490b4;font-size:0.9em;}</style></head><body>";
-        html += "<h1>FLOCK DETECTOR EXPORT</h1>";
-        html += "<p class='meta'>" + String(VERSION_STRING) + "</p>";
-        html += "<hr><h2>Files</h2>";
+        if (!export_check_auth()) return;
+        export_mode_started_at = millis();
+
+        // ── Build the dynamic file-rows block ──
+        char file_rows[2048] = "";
+        int foff = 0;
         if (sd_available) {
-            html += "<a href='/FlockLog.csv'>FlockLog.csv &nbsp; <span class='meta'>detections CSV</span></a>";
-            html += "<a href='/Threats.pcap'>Threats.pcap &nbsp; <span class='meta'>WiFi capture</span></a>";
-            html += "<a href='/BLE_Threats.pcap'>BLE_Threats.pcap &nbsp; <span class='meta'>BLE capture</span></a>";
+            foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
+                "/FlockLog.csv", "FlockLog.csv", "Detections log",
+                FILE_ICON_WIFI, "ph");
+            foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
+                "/Threats.pcap", "Threats.pcap", "WiFi packet capture",
+                FILE_ICON_WIFI, "pp");
+            foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
+                "/BLE_Threats.pcap", "BLE_Threats.pcap", "Bluetooth capture",
+                FILE_ICON_BLE, "pp");
         } else {
-            html += "<p class='meta'>SD unavailable</p>";
+            snprintf(file_rows, sizeof(file_rows),
+                "<span style=\"font-size:11px;color:#95A5B8;letter-spacing:1px\">"
+                "SD card unavailable</span>");
         }
-        html += "<hr><p class='meta'>Auto-exit in ";
-        unsigned long remaining = EXPORT_MODE_MAX_MS - (millis() - export_mode_started_at);
-        html += String(remaining / 60000UL) + "m " + String((remaining / 1000UL) % 60) + "s</p>";
-        html += "</body></html>";
-        export_server->send(200, "text/html", html);
+
+        // ── Compute time remaining ──
+        unsigned long elapsed = millis() - export_mode_started_at;
+        unsigned long remaining_ms = (elapsed < EXPORT_MODE_MAX_MS)
+                                   ? (EXPORT_MODE_MAX_MS - elapsed) : 0;
+        unsigned int rm = (unsigned int)(remaining_ms / 60000UL);
+        unsigned int rs = (unsigned int)((remaining_ms / 1000UL) % 60);
+        int fill_pct = (int)(remaining_ms * 100UL / EXPORT_MODE_MAX_MS);
+
+        // ── Render into a heap buffer ──
+        // Template is ~3.5KB, dynamic content adds ~500B, total < 5KB.
+        const size_t PAGE_BUF_SIZE = 8192;
+        char* page = (char*)malloc(PAGE_BUF_SIZE);
+        if (!page) {
+            export_server->send(503, "text/plain", "Low memory");
+            return;
+        }
+
+        snprintf(page, PAGE_BUF_SIZE, EXPORT_PAGE_TEMPLATE,
+            export_auth_user,           // %s  credentials user
+            export_auth_pass,           // %s  credentials pass
+            file_rows,                  // %s  file row HTML
+            rm,                         // %u  minutes
+            rs,                         // %02u seconds
+            fill_pct,                   // %d  timer bar width
+            VERSION_STRING,             // %s  footer version
+            (unsigned long)remaining_ms // %lu JS countdown seed
+        );
+
+        export_server->sendHeader("Connection", "close");
+        export_server->send(200, "text/html", page);
+        free(page);
     });
 
     auto serve_sd_file = [](const char* path, const char* mime) {
-        if (!sd_available) { export_server->send(503, "text/plain", "SD unavailable"); return; }
-        // Serialize against PersistTask / flush_sd_buffer — the Arduino SD/FAT
-        // driver isn't reentrancy-safe and concurrent reads/writes through
-        // separate File handles can corrupt the FAT cluster table mid-pcap.
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            export_server->send(503, "text/plain", "SD busy");
-            return;
-        }
-        File f = SD.open(path, FILE_READ);
-        if (!f) {
+        if (!export_check_auth()) return;
+        export_mode_started_at = millis();
+        if (!sd_available) { export_server->sendHeader("Connection", "close"); export_server->send(503, "text/plain", "SD unavailable"); return; }
+
+        // Phase 1: stat the file under mutex to get size and confirm existence.
+        size_t total = 0;
+        {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+                export_server->sendHeader("Connection", "close");
+                export_server->send(503, "text/plain", "SD busy");
+                return;
+            }
+            File f = SD.open(path, FILE_READ);
+            if (!f) {
+                xSemaphoreGive(sdMutex);
+                export_server->sendHeader("Connection", "close");
+                export_server->send(404, "text/plain", "Not found");
+                return;
+            }
+            total = f.size();
+            f.close();
             xSemaphoreGive(sdMutex);
-            export_server->send(404, "text/plain", "Not found");
-            return;
         }
-        size_t total = f.size();
+
+        if (total == 0) { export_server->sendHeader("Connection", "close"); export_server->send(200, mime, ""); return; }
+
         export_server->setContentLength(total);
+        export_server->sendHeader("Connection", "close");
         export_server->sendHeader("Content-Disposition",
                                   String("attachment; filename=\"") + (path + 1) + "\"");
         export_server->send(200, mime, "");
 
-        // Stream in 1 KB chunks, resetting the WDT and yielding to TCP/WiFi
-        // tasks between each. streamFile() would block the main loop for the
-        // entire transfer (10–30s on slow clients with multi-MB pcaps),
-        // tripping the 30-second WDT and stalling alarms / event drain.
         WiFiClient client = export_server->client();
-        uint8_t buf[1024];
-        while (f.available() && client.connected()) {
-            int n = f.read(buf, sizeof(buf));
+        static uint8_t buf[512];
+        size_t offset = 0;
+
+        // Phase 2: stream in 1KB chunks, acquiring sdMutex only for each
+        // individual read so flush_sd_buffer and PersistTask can interleave.
+        // Re-open + seek each chunk — the Arduino SD File handle is not safe
+        // to hold across mutex release boundaries.
+        while (offset < total && client.connected()) {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+                Serial.println("[EXPORT] sdMutex timeout mid-transfer, aborting");
+                break;
+            }
+            File f = SD.open(path, FILE_READ);
+            if (!f) {
+                xSemaphoreGive(sdMutex);
+                Serial.println("[EXPORT] Re-open failed mid-transfer, aborting");
+                break;
+            }
+            if (!f.seek(offset)) {
+                f.close();
+                xSemaphoreGive(sdMutex);
+                Serial.println("[EXPORT] Seek failed mid-transfer, aborting");
+                break;
+            }
+            size_t to_read = ((total - offset) < sizeof(buf)) ? (total - offset) : sizeof(buf);
+            int n = f.read(buf, to_read);
+            f.close();
+            xSemaphoreGive(sdMutex);
+
             if (n <= 0) break;
-            client.write(buf, n);
+            if (client.write(buf, n) == 0) break;
+            offset += n;
             esp_task_wdt_reset();
             yield();
         }
-        f.close();
-        xSemaphoreGive(sdMutex);
     };
 
     export_server->on("/FlockLog.csv", HTTP_GET, [serve_sd_file]() {
@@ -1150,21 +2024,162 @@ void export_server_setup_routes() {
     });
 
     export_server->onNotFound([]() {
+        if (!export_check_auth()) return;
+        export_server->sendHeader("Connection", "close");
         export_server->send(404, "text/plain", "Not found");
     });
 }
 
+// ── BLE pool — moved above export functions so export_mode_start and
+// export_restore_promiscuous can reference ble_cb_singleton and the pool.
+struct BleEventData {
+    uint8_t  mac[6];
+    uint8_t  addr_type;
+    int8_t   rssi;
+    int8_t   tx_power;
+    bool     have_tx_power;
+    char     dev_name[65];
+    bool     have_name;
+    uint8_t  mfg_data[64];
+    uint8_t  mfg_data_len;
+    bool     have_mfg;
+    char     service_uuids[5][37];
+    uint8_t  uuid_count;
+    uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
+    volatile uint32_t in_use;  // pool slot occupancy flag (0 = free, 1 = occupied)
+};
+
+// Static pool — eliminates all malloc/free from the BLE advertisement
+// hot path. 6 slots × ~380 bytes ≈ 2.3KB static cost, zero fragmentation.
+#define BLE_POOL_SIZE 4
+static BleEventData ble_pool[BLE_POOL_SIZE];
+// Written only from NimBLE's scan callback (single FreeRTOS task context,
+// never re-entrant). Atomic store ensures the cursor advance is visible
+// to ble_worker_task on Core 1 after the pool slot's in_use flag is set.
+static volatile uint32_t ble_pool_write = 0;
+
+class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+        if (!scanner_ready) return;
+        // Claim a pool slot. If the slot is still being processed by the
+        // worker task, drop this advertisement — better than heap-allocating.
+        uint32_t slot = __atomic_load_n(&ble_pool_write, __ATOMIC_ACQUIRE);
+        uint32_t next = (slot + 1) % BLE_POOL_SIZE;
+
+        // Atomically claim this slot by advancing the write cursor.
+        // If another callback already advanced it, CAS fails — drop this ad.
+        if (!__atomic_compare_exchange_n(&ble_pool_write, &slot, next,
+                                          false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            return;
+        }
+
+        // We now own 'slot' exclusively. If the worker hasn't drained it yet,
+        // drop the advertisement — don't revert the cursor.
+        if (__atomic_load_n(&ble_pool[slot].in_use, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+
+        BleEventData* ev = &ble_pool[slot];
+        memset(ev, 0, sizeof(BleEventData));
+
+        NimBLEAddress addr = advertisedDevice->getAddress();
+        // NimBLE stores addresses little-endian; we display big-endian.
+        // Pulling the raw bytes avoids a heap-allocated std::string and a
+        // sscanf round-trip on every advertisement (50–200/sec under
+        // typical urban traffic — the steady alloc churn was the most
+        // consistent heap-fragmentation source in the code).
+        const uint8_t* native = addr.getNative();
+        for (int i = 0; i < 6; i++) ev->mac[i] = native[5 - i];
+        ev->addr_type = addr.getType();
+
+        ev->rssi          = (int8_t)advertisedDevice->getRSSI();
+        ev->have_tx_power = advertisedDevice->haveTXPower();
+        ev->tx_power      = ev->have_tx_power ? (int8_t)advertisedDevice->getTXPower() : 0;
+
+        ev->have_name = advertisedDevice->haveName();
+        if (ev->have_name) {
+            strncpy(ev->dev_name, advertisedDevice->getName().c_str(), 64);
+            ev->dev_name[64] = '\0';
+        } else {
+            strcpy(ev->dev_name, "Unknown");
+        }
+
+        ev->have_mfg = advertisedDevice->haveManufacturerData();
+        if (ev->have_mfg) {
+            std::string mfg = advertisedDevice->getManufacturerData();
+            ev->mfg_data_len = (uint8_t)(mfg.size() > 64 ? 64 : mfg.size());
+            memcpy(ev->mfg_data, mfg.data(), ev->mfg_data_len);
+        }
+
+        if (advertisedDevice->haveServiceUUID()) {
+            int count = advertisedDevice->getServiceUUIDCount();
+            ev->uuid_count = (uint8_t)(count > 5 ? 5 : count);
+            for (int i = 0; i < ev->uuid_count; i++) {
+                std::string uuid = advertisedDevice->getServiceUUID(i).toString();
+                strncpy(ev->service_uuids[i], uuid.c_str(), 36);
+                ev->service_uuids[i][36] = '\0';
+            }
+        }
+
+        // NimBLE does not reliably expose advertising channel on ESP32.
+        ev->adv_channel = 0;
+
+        // Mark slot as occupied — cursor was already advanced by the CAS above.
+        __atomic_store_n(&ev->in_use, 1u, __ATOMIC_RELEASE);
+
+        // Queue the slot index. If the queue is full, release the slot.
+        uint8_t idx = (uint8_t)slot;
+        if (xQueueSend(ble_event_queue, &idx, 0) != pdTRUE) {
+            __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE);
+        }
+    }
+};
+
+// Single shared instance — passed to setAdvertisedDeviceCallbacks at boot
+// and on every periodic NimBLE restart. Avoids the slow heap leak that
+// `new AdvertisedDeviceCallbacks()` produced every restart cycle.
+static AdvertisedDeviceCallbacks ble_cb_singleton;
+
 // Restore the promiscuous sniffer after export mode is finished or aborted.
 static void export_restore_promiscuous() {
+    // Fully release WiFi resources before NimBLE init — the WiFi station
+    // + TCP stack fragments heap; turning WiFi OFF lets the allocator
+    // coalesce free blocks so NimBLE can get its contiguous 20-30KB.
     WiFi.disconnect(true);
-    delay(100);
+    WiFi.mode(WIFI_OFF);
+    delay(WIFI_MODE_SETTLE_LONG_MS);
+
+    // Reinitialize NimBLE while WiFi is off (maximum heap available)
+    NimBLEDevice::init("");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    pBLEScan = NimBLEDevice::getScan();
+    if (pBLEScan) {
+        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+        pBLEScan->setActiveScan(false);
+        apply_ble_scan_params();
+        pBLEScan->setMaxResults(0);
+    } else {
+        Serial.println("[BLE] getScan() returned null after reinit — BLE unavailable");
+    }
+    last_ble_restart_ms = millis();
+
+    // Now restart WiFi for promiscuous scanning
     WiFi.mode(WIFI_STA);
+    delay(WIFI_MODE_SETTLE_SHORT_MS);
     wifi_promiscuous_filter_t pf_restore;
     pf_restore.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&pf_restore);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+
+    // Resume scanner task and re-subscribe to WDT
+    if (ScannerTaskHandle) {
+        vTaskResume(ScannerTaskHandle);
+        esp_task_wdt_add(ScannerTaskHandle);
+    }
+    scanner_ready = true;
+    last_ble_scan = millis();
 }
 
 // Finish the connect sequence once WiFi.status() == WL_CONNECTED.
@@ -1174,9 +2189,11 @@ static bool export_finalize_connect() {
     IPAddress ip = WiFi.localIP();
     snprintf(export_ip_str, sizeof(export_ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 
+    export_derive_password();
+
     export_server = new(std::nothrow) WebServer(80);
     if (!export_server) {
-        set_toast_direct("EXPORT ALLOC FAIL", CAUTION_COLOR);
+        set_toast_direct("EXPORT ALLOC FAIL", TOAST_WARNING, false);
         export_restore_promiscuous();
         return false;
     }
@@ -1186,9 +2203,12 @@ static bool export_finalize_connect() {
     export_mode_active = true;
     export_mode_started_at = millis();
 
-    char ip_toast[32];
-    snprintf(ip_toast, sizeof(ip_toast), "http://%s", export_ip_str);
-    set_toast_direct(ip_toast, ACCENT_COLOR);
+    // Show IP + password so the user can authenticate from their browser.
+    // Format: "http://192.168.1.5 pw:A3F2"
+    char ip_toast[TOAST_TEXT_LEN];
+    snprintf(ip_toast, sizeof(ip_toast), "http://%s pw:%s",
+             export_ip_str, export_auth_pass);
+    set_toast_direct(ip_toast, TOAST_SUCCESS);
     return true;
 }
 
@@ -1196,22 +2216,46 @@ static bool export_finalize_connect() {
 // caller should not assume export_mode_active is set on return. The
 // non-blocking poll in loop() (export_tick_connect) completes or aborts it.
 bool export_mode_start() {
+    flush_pending_deletes();
     if (export_mode_active || export_connecting) return true;
     if (strlen(export_ssid) == 0) {
-        set_toast_direct("NO WIFI CONFIGURED", CAUTION_COLOR);
+        set_toast_direct("NO WIFI CONFIGURED", TOAST_WARNING, false);
+        return false;
+    }
+    if (esp_get_free_heap_size() < 15000) {
+        set_toast_direct("LOW MEMORY", TOAST_WARNING, false);
         return false;
     }
 
-    // Shut down promiscuous sniffing before joining a network
+    // Shut down all scanning before joining a network
+    scanner_ready = false;
     esp_wifi_set_promiscuous(false);
+    if (ScannerTaskHandle) {
+        esp_task_wdt_delete(ScannerTaskHandle);
+        vTaskSuspend(ScannerTaskHandle);
+    }
+    if (pBLEScan && pBLEScan->isScanning()) {
+        pBLEScan->stop();
+        pBLEScan->clearResults();
+    }
+
+    // Free NimBLE heap (~20-30KB) for WiFi TCP stack
+    xQueueReset(ble_event_queue);
+    for (int i = 0; i < BLE_POOL_SIZE; i++) {
+        __atomic_store_n(&ble_pool[i].in_use, 0u, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&ble_pool_write, 0u, __ATOMIC_RELEASE);
+    NimBLEDevice::deinit(true);
+    pBLEScan = nullptr;
+
     WiFi.disconnect(true);
-    delay(100);
+    delay(WIFI_MODE_SETTLE_MEDIUM_MS);
     WiFi.mode(WIFI_STA);
     WiFi.begin(export_ssid, export_pass);
 
     export_connecting = true;
     export_connect_start_ms = millis();
-    set_toast_direct("CONNECTING...", GPS_COLOR);
+    set_toast_direct("CONNECTING...", TOAST_SUCCESS);
     return true;
 }
 
@@ -1226,7 +2270,7 @@ void export_tick_connect() {
     }
     if (millis() - export_connect_start_ms >= EXPORT_CONNECT_TIMEOUT_MS) {
         export_connecting = false;
-        set_toast_direct("WIFI CONNECT FAIL", CAUTION_COLOR);
+        set_toast_direct("WIFI CONNECT FAIL", TOAST_WARNING, false);
         export_restore_promiscuous();
     }
 }
@@ -1236,7 +2280,7 @@ void export_mode_stop() {
     if (export_connecting) {
         export_connecting = false;
         export_restore_promiscuous();
-        set_toast_direct("EXPORT CANCELLED", DIM_COLOR);
+        set_toast_direct("EXPORT CANCELLED", TOAST_NEUTRAL);
         return;
     }
     if (!export_mode_active) return;
@@ -1247,27 +2291,192 @@ void export_mode_stop() {
     }
     export_restore_promiscuous();
     export_mode_active = false;
-    set_toast_direct("EXPORT MODE OFF", DIM_COLOR);
+    set_toast_direct("EXPORT MODE OFF", TOAST_NEUTRAL);
 }
 
 // ============================================================================
 // PERSISTENCE & TRACKING
 // ============================================================================
+
 void save_detections_to_flash() {
     if (!littlefs_available) return;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     int cnt = capture_history_count;
     CaptureEntry local_hist[CAPTURE_HISTORY_SIZE];
     for (int i = 0; i < cnt; i++) local_hist[i] = capture_history[i];
-    xSemaphoreGive(dataMutex);
-    File f = LittleFS.open(DETECT_FILE, "w");
-    if (!f) return;
-    for (int i = 0; i < cnt; i++) {
-        f.printf("%s|%s|%s|%d|%.6f|%.6f\n",
-            local_hist[i].type, local_hist[i].mac, local_hist[i].name,
-            local_hist[i].confidence, local_hist[i].lat, local_hist[i].lng);
+    xSemaphoreGiveRecursive(dataMutex);
+
+    littlefs_atomic_write(DETECT_FILE, [&](File& f) -> bool {
+        for (int i = 0; i < cnt; i++) {
+            int r = f.printf("%s|%s|%s|%d|%.6f|%.6f\n",
+                local_hist[i].type, local_hist[i].mac, local_hist[i].name,
+                local_hist[i].confidence, local_hist[i].lat, local_hist[i].lng);
+            if (r <= 0) return false;
+        }
+        return true;
+    });
+}
+
+
+static void perform_detection_delete(int idx) {
+    if (!take_data_mutex()) return;
+
+    // Snapshot the target MAC and timestamp before mutating sd_hist[]
+    char target_mac[18] = "";
+    unsigned long target_uptime_ms = 0;
+    int  target_rssi = 0;
+
+    if (sd_available && idx >= 0 && idx < sd_hist_count) {
+        safe_copy(target_mac, sd_hist[idx].mac, sizeof(target_mac));
+        target_uptime_ms = sd_hist[idx].uptime_ms;
+        target_rssi = sd_hist[idx].rssi;
+        Serial.printf("[DELDIAG] snapshot: idx=%d mac=%s uptime_ms=%lu (sd_hist_count=%d)\n",
+                      idx, target_mac, target_uptime_ms, sd_hist_count);
+
+        // Remove from in-memory sd_hist[] by shifting
+        for (int i = idx; i < sd_hist_count - 1; i++) sd_hist[i] = sd_hist[i + 1];
+        sd_hist_count--;
+
+        // Also remove matching entry from capture_history[] (by MAC)
+        for (int i = 0; i < capture_history_count; i++) {
+            if (strncmp(capture_history[i].mac, target_mac, 17) == 0) {
+                for (int j = i; j < capture_history_count - 1; j++) {
+                    capture_history[j] = capture_history[j + 1];
+                }
+                capture_history_count--;
+                break;
+            }
+        }
+
+        if (history_selected_idx >= sd_hist_count)
+            history_selected_idx = max(0, sd_hist_count - 1);
+        if (history_scroll_offset > max(0, sd_hist_count - HIST_VISIBLE_ROWS))
+            history_scroll_offset = max(0, sd_hist_count - HIST_VISIBLE_ROWS);
+
+    } else if (!sd_available && idx >= 0 && idx < capture_history_count) {
+        // No SD — only the in-memory list exists
+        safe_copy(target_mac, capture_history[idx].mac, sizeof(target_mac));
+        for (int i = idx; i < capture_history_count - 1; i++)
+            capture_history[i] = capture_history[i + 1];
+        capture_history_count--;
+        if (history_selected_idx >= capture_history_count)
+            history_selected_idx = max(0, capture_history_count - 1);
     }
-    f.close();
+
+    // Refresh seen_mac_table so the redetect window restarts
+    if (target_mac[0] != '\0') add_seen_mac(target_mac);
+
+    give_data_mutex();
+
+    // Enqueue for batched rewrite — actual CSV rewrite deferred to
+    // flush_pending_deletes() called on screen-leave or 5s idle.
+    if (sd_available && target_mac[0] != '\0') {
+        if (pending_delete_count < MAX_PENDING_DELETES) {
+            safe_copy(pending_deletes[pending_delete_count].mac,
+                      target_mac, sizeof(pending_deletes[0].mac));
+            pending_deletes[pending_delete_count].uptime_ms = target_uptime_ms;
+            pending_deletes[pending_delete_count].rssi = target_rssi;
+            pending_delete_count++;
+            pending_delete_dirty_ms = millis();
+        }
+    }
+
+    set_toast_direct("DETECTION DELETED", TOAST_WARNING, false);
+}
+
+// Rewrite FlockLog.csv once, removing every MAC in pending_deletes[].
+// Called on screen-leave, 5s idle, export start, or stats clear.
+static void flush_pending_deletes() {
+    if (pending_delete_count == 0) return;
+    Serial.printf("[DELDIAG] flush ENTER: pending=%d\n", pending_delete_count);
+    for (int p = 0; p < pending_delete_count; p++) {
+        Serial.printf("[DELDIAG]   pending[%d]: mac=%s uptime_ms=%lu\n",
+                      p, pending_deletes[p].mac, pending_deletes[p].uptime_ms);
+    }
+    if (!sd_available) { pending_delete_count = 0; pending_delete_dirty_ms = 0; return; }
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) != pdTRUE) return;
+
+    const char* tmp_path = "/FLOCK_FINDER/logs/FlockLog.tmp";
+    const char* bak_path = "/FLOCK_FINDER/logs/FlockLog.bak";
+
+    File src = SD.open(current_log_file, FILE_READ);
+    if (!src) { xSemaphoreGive(sdMutex); return; }
+
+    File dst = SD.open(tmp_path, FILE_WRITE);
+    if (!dst) { src.close(); xSemaphoreGive(sdMutex); return; }
+
+    char line[SD_LINE_LEN];
+    int  skipped = 0;
+
+    while (src.available()) {
+        int len = 0;
+        while (src.available() && len < (int)sizeof(line) - 1) {
+            char c = src.read();
+            if (c == '\n') break;
+            line[len++] = c;
+        }
+        while (len > 0 && (line[len-1] == '\r')) len--;
+        line[len] = '\0';
+        if (len == 0) continue;
+
+        // Always keep the header row
+        if (strncmp(line, "Uptime_ms", 9) == 0) { dst.println(line); continue; }
+
+        // Parse col 7 (MAC) and col 0 (Uptime_ms — raw integer)
+        char row_mac[18] = "";
+        unsigned long row_uptime_ms = 0;
+        int  col = 0, start = 0;
+        for (int i = 0; i <= len; i++) {
+            if (line[i] == ',' || line[i] == '\0') {
+                int flen = i - start;
+                if (col == 0 && flen > 0) {
+                    row_uptime_ms = strtoul(line + start, NULL, 10);
+                } else if (col == 7 && flen == 17) {
+                    memcpy(row_mac, line + start, 17); row_mac[17] = '\0';
+                }
+                col++; start = i + 1;
+            }
+        }
+
+        // Check against every pending delete
+        for (int p = 0; p < pending_delete_count; p++) {
+            if (strncmp(row_mac, pending_deletes[p].mac, 17) == 0) {
+                Serial.printf("[DELDIAG]   MAC match: row_uptime_ms=%lu vs pending=%lu -> %s\n",
+                              row_uptime_ms, pending_deletes[p].uptime_ms,
+                              (row_uptime_ms == pending_deletes[p].uptime_ms) ? "DROP" : "KEEP");
+            }
+        }
+        bool drop = false;
+        for (int p = 0; p < pending_delete_count && !drop; p++) {
+            if (row_uptime_ms == pending_deletes[p].uptime_ms &&
+                strncmp(row_mac, pending_deletes[p].mac, 17) == 0) {
+                drop = true;
+            }
+        }
+        if (drop) { skipped++; continue; }
+        dst.println(line);
+    }
+    src.close();
+    dst.close();
+
+    if (skipped > 0) {
+        if (SD.exists(bak_path)) SD.remove(bak_path);
+        if (!SD.rename(current_log_file, bak_path)) {
+            SD.remove(tmp_path); xSemaphoreGive(sdMutex); return;
+        }
+        if (!SD.rename(tmp_path, current_log_file)) {
+            SD.rename(bak_path, current_log_file);
+            xSemaphoreGive(sdMutex); return;
+        }
+        SD.remove(bak_path);
+    } else {
+        SD.remove(tmp_path);
+    }
+
+    Serial.printf("[DELDIAG] flush EXIT: dropped=%d\n", skipped);
+    pending_delete_count  = 0;
+    pending_delete_dirty_ms = 0;
+    xSemaphoreGive(sdMutex);
 }
 
 void load_detections_from_flash() {
@@ -1298,73 +2507,226 @@ void load_detections_from_flash() {
 
 // Load last SD_HIST_SIZE detections from SD CSV (most recent first in sd_hist[])
 void load_sd_history() {
+    Serial.printf("[DELDIAG] load_sd_history ENTER — heap=%u sd_hist_count=%d\n",
+                  (unsigned)esp_get_free_heap_size(), sd_hist_count);
+    // On no-PSRAM boards, runtime heap is ~6KB after NimBLE init.
+    // The tail buffer needs 2-4KB contiguous. If heap is too low,
+    // preserve existing sd_hist (populated at boot or by log_detection
+    // in-memory pushes) rather than wiping it and failing the malloc.
+    if (esp_get_free_heap_size() < 10000) {
+        if (sd_hist_count > 0) {
+            Serial.printf("[DELDIAG] load_sd_history SKIPPED — heap low (%u), keeping %d cached entries (POSSIBLE STALE DATA)\n",
+                          (unsigned)esp_get_free_heap_size(), sd_hist_count);
+            return;
+        }
+        // First load with no cached data — try with a minimal buffer below
+    }
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     sd_hist_count = 0;
+    xSemaphoreGiveRecursive(dataMutex);
     if (!sd_available) return;
     File f = SD.open(current_log_file, FILE_READ);
     if (!f) return;
 
-    // Ring buffer: keep last SD_HIST_SIZE parsed entries
-    SDHistEntry ring[SD_HIST_SIZE];
-    int ri = 0, total = 0;
-    char buf[SD_LINE_LEN];
+    size_t file_size = f.size();
+    if (file_size == 0) { f.close(); return; }
 
-    while (f.available()) {
-        // Long log files can take many ms to scan — keep the WDT alive every
-        // ~32 lines so a big history load doesn't trip the 30s timeout.
-        if ((total & 0x1F) == 0) esp_task_wdt_reset();
-        int len = 0;
-        while (len < SD_LINE_LEN - 1 && f.available()) {
-            char c = (char)f.read();
-            if (c == '\n' || c == '\r') break;
-            buf[len++] = c;
+    // Read the last TAIL_BYTES of the file. 4KB covers ~20 typical CSV lines
+    // (~200 bytes each), well above the 12 we need. Constant-time regardless
+    // of file size — eliminates the 10s+ freeze on large log files.
+    const size_t TAIL_BYTES_INITIAL = 1536;
+    const size_t TAIL_BYTES_MAX     = 3072;
+
+    size_t tail_bytes = TAIL_BYTES_INITIAL;
+    if (tail_bytes > file_size) tail_bytes = file_size;
+
+    // Prefer PSRAM for the tail buffer — keeps internal heap free for
+    // WiFi/BLE stacks. Falls back to internal SRAM if PSRAM unavailable.
+    char* tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tail_buf) tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_8BIT);
+    if (!tail_buf) {
+        Serial.printf("[SD] load_sd_history: malloc failed (%u bytes, free heap: %u, free PSRAM: %u)\n",
+                      (unsigned)(tail_bytes + 1),
+                      (unsigned)esp_get_free_heap_size(),
+                      (unsigned)ESP.getFreePsram());
+        f.close();
+        return;
+    }
+
+    size_t seek_pos = file_size - tail_bytes;
+    f.seek(seek_pos);
+    size_t bytes_read = f.read((uint8_t*)tail_buf, tail_bytes);
+    tail_buf[bytes_read] = '\0';
+
+    // Skip the first partial line (we seeked into the middle of it).
+    // Find first '\n', then collect line-start positions after each '\n'.
+    size_t first_newline = 0;
+    while (first_newline < bytes_read && tail_buf[first_newline] != '\n') {
+        first_newline++;
+    }
+    if (first_newline >= bytes_read) {
+        // No newline — try a larger read once, then give up.
+        if (tail_bytes < TAIL_BYTES_MAX && tail_bytes < file_size) {
+            free(tail_buf);
+            tail_bytes = TAIL_BYTES_MAX;
+            if (tail_bytes > file_size) tail_bytes = file_size;
+            tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!tail_buf) tail_buf = (char*)heap_caps_malloc(tail_bytes + 1, MALLOC_CAP_8BIT);
+            if (!tail_buf) {
+                Serial.printf("[SD] load_sd_history: retry malloc failed (%u bytes)\n",
+                              (unsigned)(tail_bytes + 1));
+                f.close();
+                return;
+            }
+            seek_pos = file_size - tail_bytes;
+            f.seek(seek_pos);
+            bytes_read = f.read((uint8_t*)tail_buf, tail_bytes);
+            tail_buf[bytes_read] = '\0';
+            first_newline = 0;
+            while (first_newline < bytes_read && tail_buf[first_newline] != '\n') {
+                first_newline++;
+            }
         }
-        buf[len] = '\0';
-        if (len < 10) continue;
+        if (first_newline >= bytes_read) {
+            free(tail_buf);
+            f.close();
+            return;
+        }
+    }
 
-        // CSV: 0=Uptime_ms,1=EpochUTC,2=EpochIsGPS,3=Channel,4=Type,5=Proto,
-        //      6=RSSI,7=MAC,8=Name,9=TXPower,10=Method,11=Conf,...
+    f.close();
+
+    // Collect up to 64 line-start offsets (positions after each '\n').
+    const int MAX_LINE_STARTS = 64;
+    size_t line_starts[MAX_LINE_STARTS];
+    int    line_start_count = 0;
+
+    for (size_t i = first_newline + 1;
+         i < bytes_read && line_start_count < MAX_LINE_STARTS; i++) {
+        if (tail_buf[i - 1] == '\n') {
+            if (i < bytes_read && tail_buf[i] != '\n' && tail_buf[i] != '\r') {
+                line_starts[line_start_count++] = i;
+            }
+        }
+    }
+
+    if (line_start_count == 0) { free(tail_buf); return; }
+
+    // Parse the last SD_HIST_SIZE complete lines (oldest → newest),
+    // then reverse into sd_hist[] so index 0 = most recent.
+    int first_line_idx = line_start_count - SD_HIST_SIZE;
+    if (first_line_idx < 0) first_line_idx = 0;
+
+    SDHistEntry parsed[SD_HIST_SIZE];
+    int parsed_count = 0;
+
+    for (int li = first_line_idx;
+         li < line_start_count && parsed_count < SD_HIST_SIZE; li++) {
+        char* line = &tail_buf[line_starts[li]];
+        int len = 0;
+        while (line_starts[li] + len < bytes_read &&
+               line[len] != '\n' && line[len] != '\r') {
+            len++;
+        }
+        if (len < 10) continue;
+        line[len] = '\0';
+
         int fs[21]; int fc = 0;
         fs[0] = 0;
         for (int ci = 0; ci < len && fc < 20; ci++) {
-            if (buf[ci] == ',') fs[++fc] = ci + 1;
+            if (line[ci] == ',') fs[++fc] = ci + 1;
         }
-        if (fc < 11) { total++; continue; }
+        if (fc < 11) continue;
+        if (strncmp(line, "Uptime_ms", 9) == 0) continue;  // skip CSV header
 
-        // Extract a field: from fs[n] up to the next comma (or end of buf)
         auto copy_f = [&](int n, char* dest, int maxlen) {
             int start = fs[n];
             int end = start;
-            while (end < len && buf[end] != ',') end++;
+            while (end < len && line[end] != ',') end++;
             int flen = end - start;
             if (flen >= maxlen) flen = maxlen - 1;
-            strncpy(dest, buf + start, flen);
+            strncpy(dest, line + start, flen);
             dest[flen] = '\0';
         };
 
-        SDHistEntry& e = ring[ri % SD_HIST_SIZE];
+        SDHistEntry& e = parsed[parsed_count];
         copy_f(4,  e.type,   16);
         copy_f(7,  e.mac,    18);
         copy_f(8,  e.name,   32);
         copy_f(10, e.method, 24);
-        e.rssi       = atoi(buf + fs[6]);
-        e.confidence = atoi(buf + fs[11]);
+        e.rssi       = atoi(line + fs[6]);
+        e.confidence = atoi(line + fs[11]);
+        // DetID is column 20 — only present in newer log files
+        e.id = (fc >= 20) ? atoi(line + fs[20]) : 0;
         {
-            unsigned long uptime = (unsigned long)strtoul(buf + fs[0], NULL, 10);
+            unsigned long uptime = (unsigned long)strtoul(line + fs[0], NULL, 10);
+            e.uptime_ms = uptime;
             format_time_buf(uptime / 1000, e.timestamp, sizeof(e.timestamp));
         }
-
-        ri++;
-        total++;
+        // Parse epoch, lat, lng if columns are present
+        e.epoch_utc = (fc >= 2) ? (uint32_t)strtoul(line + fs[1], NULL, 10) : 0;
+        e.lat = (fc >= 16) ? atof(line + fs[15]) : 0.0;
+        e.lng = (fc >= 17) ? atof(line + fs[16]) : 0.0;
+        // Derive datestamp from epoch if available — apply timezone for local date
+        if (e.epoch_utc > 0) {
+            uint32_t local_ep = e.epoch_utc;
+            if (auto_tz_valid) {
+                local_ep = (uint32_t)((int64_t)local_ep + (int32_t)auto_tz_offset * 3600);
+            }
+            uint32_t y = 1970, m = 1, d = 1;
+            uint32_t days = local_ep / 86400UL;
+            while (true) {
+                bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+                uint32_t dy = leap ? 366 : 365;
+                if (days < dy) break;
+                days -= dy; y++;
+            }
+            static const uint8_t mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+            for (m = 1; m <= 12; m++) {
+                bool leap2 = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+                uint32_t md = mdays[m-1] + (m == 2 && leap2 ? 1 : 0);
+                if (days < md) { d = days + 1; break; }
+                days -= md;
+            }
+            snprintf(e.datestamp, sizeof(e.datestamp), "%02u/%02u/%02u",
+                     (unsigned)m, (unsigned)d, (unsigned)(y % 100));
+        } else {
+            safe_copy(e.datestamp, "--/--/--", sizeof(e.datestamp));
+        }
+        parsed_count++;
     }
-    f.close();
 
-    int count = (total < SD_HIST_SIZE) ? total : SD_HIST_SIZE;
-    sd_hist_count = count;
-    // Reorder so sd_hist[0] = most recent
-    for (int i = 0; i < count; i++) {
-        int ridx = ((ri - 1 - i) % SD_HIST_SIZE + SD_HIST_SIZE) % SD_HIST_SIZE;
-        sd_hist[i] = ring[ridx];
+    free(tail_buf);
+
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    sd_hist_count = parsed_count;
+    for (int i = 0; i < parsed_count; i++) {
+        sd_hist[i] = parsed[parsed_count - 1 - i];
     }
+
+    // Deduplicate by MAC — keep newest (lowest index) per device.
+    // Re-detections after the seen_mac window expires append new CSV lines
+    // for the same device; collapse those to one entry here.
+    {
+        int write = 0;
+        for (int i = 0; i < sd_hist_count; i++) {
+            bool dup = false;
+            for (int j = 0; j < write; j++) {
+                if (strncmp(sd_hist[i].mac, sd_hist[j].mac, 17) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                if (write != i) sd_hist[write] = sd_hist[i];
+                write++;
+            }
+        }
+        sd_hist_count = write;
+    }
+
+    Serial.printf("[DELDIAG] load_sd_history EXIT — sd_hist_count=%d\n", sd_hist_count);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 // Persist worker — runs save_session_to_flash on its own task so the main
@@ -1405,34 +2767,73 @@ static void save_session_to_flash() {
     // and let the next persist tick try again when heap recovers.
     if (esp_get_free_heap_size() < 6000) {
         Serial.println("[FS] Skipping persist — heap too low");
+        last_persist_save = millis();
         return;
     }
 
-    long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes;
-    int l_vol;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes, l_next_id;
+    int l_vol, l_brightness;
+    bool l_night, l_low_power, l_stealth, l_muted, l_turbo;
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
     l_writes = lifetime_flash_writes + 1;
-    xSemaphoreGive(dataMutex);
+    l_next_id = next_detection_id;
+    l_night      = night_mode;
+    l_brightness = brightness_level;
+    l_low_power  = low_power_mode;
+    l_stealth    = stealth_mode;
+    l_muted      = is_muted;
+    l_turbo      = turbo_mode_active;
+    xSemaphoreGiveRecursive(dataMutex);
+
+    // Minimum acceptable byte count for a complete write. Computed from
+    // the 15 lines below assuming empty ssid/pass strings: each line
+    // contributes at least its key + '=' + minimum value + '\n'. A real
+    // write with non-empty fields runs ~180-220 bytes. Anything below
+    // this floor means the write truncated mid-stream.
+    //
+    //   wifi=0\n       (7)   ble=0\n        (6)   seconds=0\n    (10)
+    //   flock=0\n      (8)   volume=0\n     (9)   boots=0\n      (8)
+    //   writes=0\n     (9)   ssid=\n        (6)   pass=\n        (6)
+    //   next_id=0\n    (10)  night=0\n      (8)   brightness=0\n (13)
+    //   low_power=0\n  (12)  stealth=0\n    (10)  muted=0\n      (8)
+    //   Sum: 130 bytes (empty-field floor)
+    static const size_t PERSIST_MIN_BYTES = 130;
 
     bool write_ok = false;
     for (int attempt = 0; attempt < 3 && !write_ok; attempt++) {
-        File f = LittleFS.open(PERSIST_FILE, "w");
-        if (!f) {
-            Serial.printf("[FS] PERSIST_FILE open failed (attempt %d)\n", attempt);
-            delay(5);
-            continue;
-        }
-        size_t written = f.printf("%ld\n%ld\n%lu\n%ld\n%d\n%ld\n%ld\n%s\n%s\n",
-                                  l_wifi, l_ble, l_sec, l_flock, l_vol, l_boots, l_writes,
-                                  export_ssid, export_pass);
-        f.close();
-        if (written > 10) {
+        size_t written = 0;
+        bool any_short = false;
+        bool atomic_ok = littlefs_atomic_write(PERSIST_FILE, [&](File& f) -> bool {
+            auto wp = [&](int r) {
+                if (r <= 0) { any_short = true; return; }
+                written += (size_t)r;
+            };
+            wp(f.printf("wifi=%ld\n",       l_wifi));
+            wp(f.printf("ble=%ld\n",        l_ble));
+            wp(f.printf("seconds=%lu\n",    l_sec));
+            wp(f.printf("flock=%ld\n",      l_flock));
+            wp(f.printf("volume=%d\n",      l_vol));
+            wp(f.printf("boots=%ld\n",      l_boots));
+            wp(f.printf("writes=%ld\n",     l_writes));
+            wp(f.printf("ssid=%s\n",        export_ssid));
+            wp(f.printf("pass=%s\n",        export_pass));
+            wp(f.printf("next_id=%ld\n",    l_next_id));
+            wp(f.printf("night=%d\n",       l_night ? 1 : 0));
+            wp(f.printf("brightness=%d\n",  l_brightness));
+            wp(f.printf("low_power=%d\n",   l_low_power ? 1 : 0));
+            wp(f.printf("stealth=%d\n",     l_stealth ? 1 : 0));
+            wp(f.printf("muted=%d\n",       l_muted ? 1 : 0));
+            wp(f.printf("turbo=%d\n",       l_turbo ? 1 : 0));
+            return !any_short && written >= PERSIST_MIN_BYTES;
+        });
+        if (atomic_ok) {
             write_ok = true;
         } else {
-            Serial.printf("[FS] Write truncated: %u bytes (attempt %d)\n",
-                          (unsigned)written, attempt);
+            Serial.printf("[FS] Write failed: %u bytes (attempt %d, any_short=%d)\n",
+                          (unsigned)written, attempt, any_short ? 1 : 0);
+            delay(5);
         }
     }
 
@@ -1441,20 +2842,20 @@ static void save_session_to_flash() {
         last_persist_save = millis();
         save_detections_to_flash();
         save_stats_to_sd();
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         lifetime_flash_writes = l_writes;
-        xSemaphoreGive(dataMutex);
+        xSemaphoreGiveRecursive(dataMutex);
         // Wear toasts: once at 80K (warning) and once at 100K (critical).
         // Equality checks fire exactly once per crossing.
         if (l_writes == 80000) {
-            set_toast_direct("FLASH WEAR HIGH", CAUTION_COLOR);
+            set_toast_direct("FLASH WEAR HIGH", TOAST_WARNING, false);
         } else if (l_writes == 100000) {
-            set_toast_direct("FLASH WEAR CRIT", CAUTION_COLOR);
+            set_toast_direct("FLASH WEAR CRIT", TOAST_WARNING, false);
         }
     } else {
         flash_write_fail_count++;
         if (flash_write_fail_count >= FLASH_FAIL_TOAST_THRESHOLD) {
-            set_toast_direct("FLASH WRITE FAIL", CAUTION_COLOR);
+            set_toast_direct("FLASH WRITE FAIL", TOAST_WARNING, false);
             last_persist_save = millis();
         }
     }
@@ -1467,14 +2868,14 @@ void save_stats_to_sd() {
     // half-updated set (other tasks bump these counters concurrently).
     long          l_wifi, l_ble, l_flock, l_boots, l_writes;
     unsigned long l_sec;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     l_wifi   = lifetime_wifi;
     l_ble    = lifetime_ble;
     l_sec    = lifetime_seconds;
     l_flock  = lifetime_flock_total;
     l_boots  = lifetime_boots;
     l_writes = lifetime_flash_writes;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     // Timed take — if the lock is held for too long, skip this cycle. The
     // next persist tick will retry. Keeps PersistTask's WDT alive even when
@@ -1528,8 +2929,6 @@ static void sd_check_hotplug() {
         esp_task_wdt_reset();  // SD.begin can take several hundred ms
 
         if (mounted) {
-            sd_available = true;
-
             if (!SD.exists("/FLOCK_FINDER"))          SD.mkdir("/FLOCK_FINDER");
             if (!SD.exists("/FLOCK_FINDER/logs"))     SD.mkdir("/FLOCK_FINDER/logs");
             if (!SD.exists("/FLOCK_FINDER/captures")) SD.mkdir("/FLOCK_FINDER/captures");
@@ -1539,7 +2938,7 @@ static void sd_check_hotplug() {
             if (!SD.exists(current_log_file)) {
                 File f = SD.open(current_log_file, FILE_WRITE);
                 if (f) {
-                    f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM");
+                    f.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM,DetID");
                     f.close();
                 }
             }
@@ -1564,34 +2963,48 @@ static void sd_check_hotplug() {
             ensure_pcap(current_ble_pcap_file, 0x000000fb);  // Bluetooth LE
             esp_task_wdt_reset();
 
-            // load_sd_history & save_stats_to_sd both touch SD. We already
-            // hold sdMutex, so call load_sd_history directly (it doesn't
-            // self-lock) and inline the stats write rather than recursing
-            // into save_stats_to_sd which would try to take the mutex again.
-            load_sd_history();
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            sd_hist_dirty = false;
-            long          l_wifi   = lifetime_wifi;
-            long          l_ble    = lifetime_ble;
-            unsigned long l_sec    = lifetime_seconds;
-            long          l_flock  = lifetime_flock_total;
-            long          l_boots  = lifetime_boots;
-            long          l_writes = lifetime_flash_writes;
-            xSemaphoreGive(dataMutex);
+            // Phase 1 complete — release mutex so flush_sd_buffer and
+            // PersistTask can run between phases.
+            xSemaphoreGive(sdMutex);
 
-            File sf = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
-            if (sf) {
-                sf.printf("lifetime_wifi=%ld\n",          l_wifi);
-                sf.printf("lifetime_ble=%ld\n",           l_ble);
-                sf.printf("lifetime_seconds=%lu\n",       l_sec);
-                sf.printf("lifetime_flock_total=%ld\n",   l_flock);
-                sf.printf("lifetime_boots=%ld\n",         l_boots);
-                sf.printf("lifetime_flash_writes=%ld\n",  l_writes);
-                sf.close();
+            // Only now advertise the card as available — directories and
+            // PCAP headers are confirmed written, so flush_sd_buffer and
+            // PersistTask will find a fully initialized filesystem.
+            sd_available = true;
+            sd_full_warned = false;
+
+            // Phase 2: history load + stats write. Re-acquire with a
+            // longer timeout; if contention persists, skip (PersistTask
+            // writes stats on the next 60s cycle).
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                load_sd_history();
+                xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                sd_hist_dirty = false;
+                long          l_wifi   = lifetime_wifi;
+                long          l_ble    = lifetime_ble;
+                unsigned long l_sec    = lifetime_seconds;
+                long          l_flock  = lifetime_flock_total;
+                long          l_boots  = lifetime_boots;
+                long          l_writes = lifetime_flash_writes;
+                xSemaphoreGiveRecursive(dataMutex);
+
+                File sf = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
+                if (sf) {
+                    sf.printf("lifetime_wifi=%ld\n",          l_wifi);
+                    sf.printf("lifetime_ble=%ld\n",           l_ble);
+                    sf.printf("lifetime_seconds=%lu\n",       l_sec);
+                    sf.printf("lifetime_flock_total=%ld\n",   l_flock);
+                    sf.printf("lifetime_boots=%ld\n",         l_boots);
+                    sf.printf("lifetime_flash_writes=%ld\n",  l_writes);
+                    sf.close();
+                }
+                xSemaphoreGive(sdMutex);
             }
 
-            set_toast_direct("SD CARD MOUNTED", ACCENT_COLOR);
+            sd_was_available = true;
+            set_toast_direct("SD CARD MOUNTED", TOAST_SUCCESS);
             Serial.println("[SD] Hot-plug mount succeeded");
+            return;
         }
     } else {
         // Probe at the controller level — independent of any file existing.
@@ -1601,7 +3014,7 @@ static void sd_check_hotplug() {
         if (SD.cardType() == CARD_NONE && sd_was_available) {
             sd_available = false;
             SD.end();
-            set_toast_direct("SD CARD REMOVED", CAUTION_COLOR);
+            set_toast_direct("SD CARD REMOVED", TOAST_WARNING, false);
             Serial.println("[SD] Card removal detected");
         }
     }
@@ -1615,67 +3028,179 @@ void load_session_from_flash() {
     if (!LittleFS.exists(PERSIST_FILE)) return;
     File f = LittleFS.open(PERSIST_FILE, "r");
     if (!f) return;
-    String line;
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_wifi = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_ble = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_seconds = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flock_total = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt(); 
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
-    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
-    line = f.readStringUntil('\n');
-    if (line.length() > 0 && line.length() < sizeof(export_ssid)) {
-        strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
-        export_ssid[sizeof(export_ssid) - 1] = '\0';
+
+    // Detect format: old positional files start with a digit (the wifi
+    // count); new key=value files start with a letter. Peek at the first
+    // character to choose the parser.
+    int first_char = f.peek();
+    if (first_char < 0) { f.close(); return; }
+
+    if (first_char >= '0' && first_char <= '9') {
+        // ── Legacy positional format — read once, then the next save
+        //    will overwrite with key=value format automatically. ──
+        String line;
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_wifi = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_ble = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_seconds = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flock_total = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) current_volume = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_boots = line.toInt();
+        line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flash_writes = line.toInt();
+        line = f.readStringUntil('\n');
+        if (line.length() > 0 && line.length() < sizeof(export_ssid)) {
+            strncpy(export_ssid, line.c_str(), sizeof(export_ssid) - 1);
+            export_ssid[sizeof(export_ssid) - 1] = '\0';
+        }
+        line = f.readStringUntil('\n');
+        if (line.length() > 0 && line.length() < sizeof(export_pass)) {
+            strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
+            export_pass[sizeof(export_pass) - 1] = '\0';
+        }
+        line = f.readStringUntil('\n');
+        if (line.length() > 0) {
+            long parsed = line.toInt();
+            if (parsed >= 1) next_detection_id = parsed;
+        }
+        f.close();
+        return;
     }
-    line = f.readStringUntil('\n');
-    if (line.length() > 0 && line.length() < sizeof(export_pass)) {
-        strncpy(export_pass, line.c_str(), sizeof(export_pass) - 1);
-        export_pass[sizeof(export_pass) - 1] = '\0';
+
+    // ── Key=value format — order independent, unknown keys ignored ──
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        if (line.length() < 3) continue;
+
+        int eq = line.indexOf('=');
+        if (eq <= 0 || eq >= (int)line.length() - 1) continue;
+
+        String key = line.substring(0, eq);
+        String val = line.substring(eq + 1);
+
+        if      (key == "wifi")       lifetime_wifi = val.toInt();
+        else if (key == "ble")        lifetime_ble = val.toInt();
+        else if (key == "seconds")    lifetime_seconds = val.toInt();
+        else if (key == "flock")      lifetime_flock_total = val.toInt();
+        else if (key == "volume")     current_volume = val.toInt();
+        else if (key == "boots")      lifetime_boots = val.toInt();
+        else if (key == "writes")     lifetime_flash_writes = val.toInt();
+        else if (key == "next_id") {
+            long parsed = val.toInt();
+            if (parsed >= 1) next_detection_id = parsed;
+        }
+        else if (key == "night")      night_mode = (val.toInt() != 0);
+        else if (key == "brightness") { int b = val.toInt(); if (b >= 0 && b <= 2) brightness_level = b; }
+        else if (key == "low_power")  low_power_mode = (val.toInt() != 0);
+        else if (key == "stealth")    stealth_mode = (val.toInt() != 0);
+        else if (key == "muted")      is_muted = (val.toInt() != 0);
+        else if (key == "turbo")      turbo_mode_active = (val.toInt() != 0);
+        else if (key == "ssid") {
+            if (val.length() > 0 && val.length() < sizeof(export_ssid)) {
+                strncpy(export_ssid, val.c_str(), sizeof(export_ssid) - 1);
+                export_ssid[sizeof(export_ssid) - 1] = '\0';
+            }
+        }
+        else if (key == "pass") {
+            if (val.length() > 0 && val.length() < sizeof(export_pass)) {
+                strncpy(export_pass, val.c_str(), sizeof(export_pass) - 1);
+                export_pass[sizeof(export_pass) - 1] = '\0';
+            }
+        }
+        // Unknown keys are silently ignored — forward compatibility
     }
     f.close();
 }
 
-// ── Simple XOR cipher using the ESP32 eFuse MAC as key ──
-// Not cryptographically strong, but prevents casual reading of
-// credentials from a removed SD card or flash dump. The MAC is
-// unique per physical device and lives in one-time-programmable
-// eFuse — not in any user-accessible storage.
-static void xor_cipher(char* data, size_t len) {
+// Derive a 16-byte AES key from the ESP32 eFuse MAC using HMAC-SHA256.
+// The MAC is unique per physical device and lives in one-time-programmable
+// eFuse — not in any user-accessible storage. HMAC with a fixed salt
+// produces a key that cannot be reversed to the MAC without brute force.
+static void derive_aes_key(uint8_t key_out[16]) {
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
-    uint8_t key[16];
-    for (int i = 0; i < 16; i++) {
-        key[i] = mac[i % 6] ^ (uint8_t)(i * 0x5A + 0x37);
+
+    // HMAC-SHA256(key=salt, message=mac) → 32 bytes; truncate to 16.
+    static const uint8_t salt[16] = {
+        0xF1, 0x0C, 0x4D, 0xE7, 0xA9, 0x3B, 0x58, 0x72,
+        0x6E, 0xC0, 0x1F, 0x84, 0xD6, 0x2A, 0x95, 0x4B
+    };
+    uint8_t hmac_out[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+    mbedtls_md_hmac_starts(&ctx, salt, sizeof(salt));
+    mbedtls_md_hmac_update(&ctx, mac, sizeof(mac));
+    mbedtls_md_hmac_finish(&ctx, hmac_out);
+    mbedtls_md_free(&ctx);
+
+    memcpy(key_out, hmac_out, 16);
+}
+
+// PKCS7 pad/unpad helpers for AES-CBC (block size = 16).
+static size_t pkcs7_pad(uint8_t* buf, size_t data_len, size_t buf_size) {
+    size_t pad_len = 16 - (data_len % 16);
+    if (data_len + pad_len > buf_size) return 0;
+    memset(buf + data_len, (uint8_t)pad_len, pad_len);
+    return data_len + pad_len;
+}
+
+static size_t pkcs7_unpad(const uint8_t* buf, size_t padded_len) {
+    if (padded_len == 0 || padded_len % 16 != 0) return 0;
+    uint8_t pad_val = buf[padded_len - 1];
+    if (pad_val == 0 || pad_val > 16) return 0;
+    for (size_t i = 0; i < pad_val; i++) {
+        if (buf[padded_len - 1 - i] != pad_val) return 0;
     }
-    for (size_t i = 0; i < len; i++) {
-        data[i] ^= key[i % 16];
-    }
+    return padded_len - pad_val;
 }
 
 #define WIFI_CRED_FILE "/wifi_cred.dat"
 
 static void save_wifi_credentials() {
     if (!littlefs_available) return;
-    char enc_ssid[33], enc_pass[65];
-    strncpy(enc_ssid, export_ssid, sizeof(enc_ssid) - 1);
-    enc_ssid[sizeof(enc_ssid) - 1] = '\0';
-    strncpy(enc_pass, export_pass, sizeof(enc_pass) - 1);
-    enc_pass[sizeof(enc_pass) - 1] = '\0';
 
-    size_t ssid_len = strlen(enc_ssid);
-    size_t pass_len = strlen(enc_pass);
+    uint8_t key[16];
+    derive_aes_key(key);
 
-    xor_cipher(enc_ssid, ssid_len);
-    xor_cipher(enc_pass, pass_len);
+    // Generate a random IV for each save — ensures identical plaintext
+    // produces different ciphertext across saves.
+    uint8_t iv[16];
+    esp_fill_random(iv, sizeof(iv));
 
-    File f = LittleFS.open(WIFI_CRED_FILE, "w");
-    if (!f) return;
-    f.write((uint8_t)ssid_len);
-    f.write((uint8_t)pass_len);
-    f.write((const uint8_t*)enc_ssid, ssid_len);
-    f.write((const uint8_t*)enc_pass, pass_len);
-    f.close();
+    // Prepare plaintext: [1 byte ssid_len] [ssid] [1 byte pass_len] [pass]
+    size_t ssid_len = strlen(export_ssid);
+    size_t pass_len = strlen(export_pass);
+    size_t plain_len = 1 + ssid_len + 1 + pass_len;
+
+    // Padded buffer — max plaintext is 1+32+1+64 = 98, padded to 112
+    uint8_t plain[128] = {0};
+    plain[0] = (uint8_t)ssid_len;
+    memcpy(plain + 1, export_ssid, ssid_len);
+    plain[1 + ssid_len] = (uint8_t)pass_len;
+    memcpy(plain + 1 + ssid_len + 1, export_pass, pass_len);
+
+    size_t padded_len = pkcs7_pad(plain, plain_len, sizeof(plain));
+    if (padded_len == 0) { memset(key, 0, sizeof(key)); return; }
+
+    uint8_t iv_copy[16];
+    memcpy(iv_copy, iv, 16);  // mbedtls modifies the IV buffer
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 128);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len, iv_copy, plain, plain);
+    mbedtls_aes_free(&aes);
+
+    // Write: [16 bytes IV] [2 bytes padded_len LE] [ciphertext]
+    uint8_t len_bytes[2] = { (uint8_t)(padded_len & 0xFF), (uint8_t)(padded_len >> 8) };
+    littlefs_atomic_write(WIFI_CRED_FILE, [&](File& f) -> bool {
+        if (f.write(iv, 16) != 16) return false;
+        if (f.write(len_bytes, 2) != 2) return false;
+        if (f.write(plain, padded_len) != padded_len) return false;
+        return true;
+    });
+
+    memset(plain, 0, sizeof(plain));
+    memset(key, 0, sizeof(key));
 }
 
 static void load_wifi_credentials() {
@@ -1684,41 +3209,108 @@ static void load_wifi_credentials() {
     File f = LittleFS.open(WIFI_CRED_FILE, "r");
     if (!f) return;
 
-    int ssid_len_raw = f.read();
-    int pass_len_raw = f.read();
-    if (ssid_len_raw < 0 || pass_len_raw < 0) { f.close(); return; }
-    uint8_t ssid_len = (uint8_t)ssid_len_raw;
-    uint8_t pass_len = (uint8_t)pass_len_raw;
+    size_t file_size = f.size();
+    bool loaded = false;
 
-    if (ssid_len > 32 || pass_len > 64) { f.close(); return; }
+    // ── Try AES-CBC format ──
+    if (file_size >= 34) {
+        uint8_t iv[16];
+        if (f.read(iv, 16) == 16) {
+            uint8_t len_bytes[2];
+            if (f.read(len_bytes, 2) == 2) {
+                size_t padded_len = len_bytes[0] | (len_bytes[1] << 8);
+                if (padded_len >= 16 && padded_len <= 128 && padded_len % 16 == 0 &&
+                    file_size >= 18 + padded_len) {
+                    uint8_t cipher[128];
+                    if (f.read(cipher, padded_len) == (int)padded_len) {
+                        uint8_t key[16];
+                        derive_aes_key(key);
 
-    char enc_ssid[33] = {0}, enc_pass[65] = {0};
-    f.readBytes(enc_ssid, ssid_len);
-    f.readBytes(enc_pass, pass_len);
-    f.close();
+                        mbedtls_aes_context aes;
+                        mbedtls_aes_init(&aes);
+                        mbedtls_aes_setkey_dec(&aes, key, 128);
+                        mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, padded_len, iv, cipher, cipher);
+                        mbedtls_aes_free(&aes);
+                        memset(key, 0, sizeof(key));
 
-    xor_cipher(enc_ssid, ssid_len);
-    xor_cipher(enc_pass, pass_len);
-
-    // Validate: if decrypted result contains non-printable chars,
-    // the file is corrupt or from a different device — discard.
-    bool valid = true;
-    for (int i = 0; i < (int)ssid_len; i++) {
-        if ((unsigned char)enc_ssid[i] < 32 || (unsigned char)enc_ssid[i] > 126) {
-            valid = false; break;
+                        size_t plain_len = pkcs7_unpad(cipher, padded_len);
+                        if (plain_len >= 2) {
+                            uint8_t ssid_len = cipher[0];
+                            if (ssid_len <= 32 && 1 + ssid_len + 1 <= plain_len) {
+                                uint8_t pass_len = cipher[1 + ssid_len];
+                                if (pass_len <= 64 && 1 + ssid_len + 1 + pass_len <= plain_len) {
+                                    bool valid = true;
+                                    for (int i = 0; i < (int)ssid_len && valid; i++) {
+                                        if (cipher[1 + i] < 32 || cipher[1 + i] > 126) valid = false;
+                                    }
+                                    if (valid) {
+                                        memcpy(export_ssid, cipher + 1, ssid_len);
+                                        export_ssid[ssid_len] = '\0';
+                                        memcpy(export_pass, cipher + 1 + ssid_len + 1, pass_len);
+                                        export_pass[pass_len] = '\0';
+                                        loaded = true;
+                                    }
+                                }
+                            }
+                        }
+                        memset(cipher, 0, sizeof(cipher));
+                    }
+                }
+            }
         }
     }
-    if (valid) {
-        strncpy(export_ssid, enc_ssid, sizeof(export_ssid) - 1);
-        export_ssid[sizeof(export_ssid) - 1] = '\0';
-        strncpy(export_pass, enc_pass, sizeof(export_pass) - 1);
-        export_pass[sizeof(export_pass) - 1] = '\0';
+
+    // ── Fallback: old XOR format ──
+    if (!loaded) {
+        f.seek(0);
+        int ssid_len_raw = f.read();
+        int pass_len_raw = f.read();
+        if (ssid_len_raw >= 0 && pass_len_raw >= 0) {
+            uint8_t ssid_len = (uint8_t)ssid_len_raw;
+            uint8_t pass_len = (uint8_t)pass_len_raw;
+            if (ssid_len <= 32 && pass_len <= 64) {
+                char enc_ssid[33] = {0}, enc_pass[65] = {0};
+                f.readBytes(enc_ssid, ssid_len);
+                f.readBytes(enc_pass, pass_len);
+
+                // Reconstruct old XOR key
+                uint8_t mac[6];
+                esp_efuse_mac_get_default(mac);
+                uint8_t old_key[16];
+                for (int i = 0; i < 16; i++) {
+                    old_key[i] = mac[i % 6] ^ (uint8_t)(i * 0x5A + 0x37);
+                }
+                for (size_t i = 0; i < ssid_len; i++) enc_ssid[i] ^= old_key[i % 16];
+                for (size_t i = 0; i < pass_len; i++) enc_pass[i] ^= old_key[i % 16];
+
+                bool valid = true;
+                for (int i = 0; i < (int)ssid_len; i++) {
+                    if ((unsigned char)enc_ssid[i] < 32 || (unsigned char)enc_ssid[i] > 126) {
+                        valid = false; break;
+                    }
+                }
+                if (valid) {
+                    strncpy(export_ssid, enc_ssid, sizeof(export_ssid) - 1);
+                    export_ssid[sizeof(export_ssid) - 1] = '\0';
+                    strncpy(export_pass, enc_pass, sizeof(export_pass) - 1);
+                    export_pass[sizeof(export_pass) - 1] = '\0';
+                    loaded = true;
+                }
+            }
+        }
+    }
+
+    f.close();
+
+    // If loaded from old XOR format, re-save in AES format immediately.
+    if (loaded && file_size < 34) {
+        save_wifi_credentials();
     }
 }
 
 void rssi_track_update(const char* mac, int rssi) {
     unsigned long now = millis();
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     for (int i = 0; i < rssi_tracker_count; i++) {
         if (strncmp(rssi_tracker[i].mac, mac, 17) == 0) {
             if (rssi_tracker[i].sample_count < RSSI_TRACK_SAMPLES) {
@@ -1729,10 +3321,10 @@ void rssi_track_update(const char* mac, int rssi) {
                 rssi_tracker[i].scored = false;
             }
             rssi_tracker[i].last_seen = now;
-            if (locator_active && strncmp(rssi_tracker[i].mac, locator_target_mac, 17) == 0) {
-                locator_tracker_idx = i;
+            if (signal_active && strncmp(rssi_tracker[i].mac, signal_target_mac, 17) == 0) {
+                signal_tracker_idx = i;
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
             return;
         }
     }
@@ -1745,12 +3337,12 @@ void rssi_track_update(const char* mac, int rssi) {
         rssi_tracker[rssi_tracker_count].scored = false;
         rssi_tracker_count++;
     }
-    xSemaphoreGive(dataMutex);
+    give_data_mutex();
 }
 
 bool rssi_track_is_stationary(const char* mac) {
     bool result = false;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return false;
     for (int i = 0; i < rssi_tracker_count; i++) {
         if (strncmp(rssi_tracker[i].mac, mac, 17) == 0
             && rssi_tracker[i].sample_count >= 3
@@ -1780,49 +3372,62 @@ bool rssi_track_is_stationary(const char* mac) {
             break;
         }
     }
-    xSemaphoreGive(dataMutex);
+    give_data_mutex();
     return result;
 }
 
 void rssi_track_expire() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     unsigned long now = millis();
     for (int i = rssi_tracker_count - 1; i >= 0; i--) {
         if ((now - rssi_tracker[i].last_seen) > RSSI_TRACK_EXPIRY_MS) {
             for (int j = i; j < rssi_tracker_count - 1; j++) rssi_tracker[j] = rssi_tracker[j + 1];
             rssi_tracker_count--;
-            // Keep locator_tracker_idx consistent across the array shift
-            if (locator_tracker_idx == i)       locator_tracker_idx = -1;
-            else if (locator_tracker_idx > i)   locator_tracker_idx--;
+            // Keep signal_tracker_idx consistent across the array shift
+            if (signal_tracker_idx == i)       signal_tracker_idx = -1;
+            else if (signal_tracker_idx > i)   signal_tracker_idx--;
         }
     }
     // Re-validate after all shifts — defensive against combined adjustments
-    if (locator_tracker_idx >= rssi_tracker_count) {
-        locator_tracker_idx = -1;
+    if (signal_tracker_idx >= rssi_tracker_count) {
+        signal_tracker_idx = -1;
     }
-    xSemaphoreGive(dataMutex);
+    give_data_mutex();
 }
 
-// ============================================================================
-// THREAT EQUALIZER DATA
-// ============================================================================
-#define radar_cx 58
-#define radar_cy 46
-#define radar_r  34
-#define inner_r  14
+// ── SCAN viz device state ─────────────────────────────────────────────
+// Each slot tracks a live device. Angle is derived from MAC hash for
+// spatial stability; radial position maps RSSI → radius via anim_filter.
+// Sweep brightness uses phosphor decay: illuminate on sweep pass, fade.
+#define SCAN_MAX_DEVICES 12
 
-#define NUM_RADIAL_BANDS 36
-float radial_spikes[NUM_RADIAL_BANDS] = {0};
-uint16_t radial_colors[NUM_RADIAL_BANDS] = {0};
-int radial_rssi[NUM_RADIAL_BANDS] = {0};
-unsigned long radial_spike_birth[NUM_RADIAL_BANDS] = {0};
-static float hud_rotation = 0.0f;
+struct ScanDevice {
+    char     mac[18];
+    float    angle;           // repulsion-adjusted target angle
+    float    angle_smooth;    // eased display angle — prevents angular jumps
+    float    dist;            // RSSI-derived target, 0=center 1=edge
+    float    dist_smooth;     // eased distance for smooth radial motion
+    float    sweep_bright;    // 0..1 brightness from sweep contact
+    unsigned long last_sweep_ms;
+    uint8_t  proto;
+    bool     is_flock;
+    int8_t   rssi;
+    bool     occupied;
+    unsigned long last_seen_ms;
+    unsigned long appear_ms;  // timestamp of first appearance — drives fade-in
+    bool     has_appeared;    // true once appear_ms is set (avoids millis()==0 sentinel bug)
+};
 
-#define NUM_PARTICLES 24
-static float noise_r[NUM_PARTICLES] = {0};
-static float noise_a[NUM_PARTICLES] = {0};
-static int noise_life[NUM_PARTICLES] = {0};
-static int noise_max_life[NUM_PARTICLES] = {0};
+static ScanDevice    scan_devs[SCAN_MAX_DEVICES] = {};
+static unsigned long scan_last_refresh_ms = 0;
+static unsigned long scan_last_frame_ms   = 0;
+static float         scan_sweep_angle     = 0.0f;
+static float*        signal_curve_cache   = nullptr; // allocated on enter screen 1, freed on leave
+
+// Byte order detection for direct sprite buffer access.
+// Set once on first call to draw_scanner_viz_scan.
+static bool g_buf_bytes_swapped      = false;
+static bool g_buf_byte_order_detected = false;
 
 static bool feed_recently_pushed(const char* mac) {
     unsigned long now = millis();
@@ -1837,9 +3442,9 @@ static bool feed_recently_pushed(const char* mac) {
 static void feed_push_candidate(const char* mac, const char* name, int rssi,
                                 int proto, bool is_flock) {
     if (!mac || mac[0] == '\0') return;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (feed_recently_pushed(mac)) { xSemaphoreGive(dataMutex); return; }
-    if (feed_pending_valid && rssi <= feed_pending.rssi) { xSemaphoreGive(dataMutex); return; }
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (feed_recently_pushed(mac)) { xSemaphoreGiveRecursive(dataMutex); return; }
+    if (feed_pending_valid && rssi <= feed_pending.rssi) { xSemaphoreGiveRecursive(dataMutex); return; }
 
     strncpy(feed_pending.mac, mac, 17); feed_pending.mac[17] = '\0';
     if (name && name[0] != '\0') {
@@ -1853,36 +3458,32 @@ static void feed_push_candidate(const char* mac, const char* name, int rssi,
     feed_pending.rssi      = (int8_t)rssi;
     feed_pending.proto     = (uint8_t)proto;
     feed_pending.is_flock  = is_flock;
-    feed_pending.timestamp = millis();
+    // timestamp is set in feed_commit_pending() at the moment of commit;
+    // setting it here would be dead-stored.
     feed_pending_valid     = true;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 static void feed_commit_pending() {
     unsigned long now = millis();
-    unsigned long interval = show_feed_expanded ? 667UL : FEED_MIN_PUSH_INTERVAL_MS;
+    unsigned long interval = show_feed_expanded
+                           ? FEED_PUSH_INTERVAL_EXPANDED_MS
+                           : FEED_MIN_PUSH_INTERVAL_MS;
     if (now - last_feed_push_ms < interval) return;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (!feed_pending_valid) { xSemaphoreGive(dataMutex); return; }
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (!feed_pending_valid) { xSemaphoreGiveRecursive(dataMutex); return; }
     feed_head = (feed_head + 1) % FEED_SIZE;
     feed_entries[feed_head] = feed_pending;
     feed_entries[feed_head].timestamp = now;
     if (feed_count < FEED_SIZE) feed_count++;
     feed_pending_valid = false;
     last_feed_push_ms  = now;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 }
 
 void add_blip(uint16_t blip_color, int rssi) {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    (void)blip_color; (void)rssi;
     last_blip_time = millis();
-    int band = random(0, NUM_RADIAL_BANDS);
-    float strength_mult = constrain(map(rssi, -100, -30, 50, 200), 50, 200) / 100.0f;
-    radial_spikes[band]      = 0.5f + strength_mult;
-    radial_colors[band]      = blip_color;
-    radial_rssi[band]        = rssi;
-    radial_spike_birth[band] = millis();
-    xSemaphoreGive(dataMutex);
 }
 
 // ============================================================================
@@ -1897,26 +3498,8 @@ void flush_sd_buffer() {
     int pcap_count = 0;
     int ble_pcap_count = 0;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    log_count = sd_write_count;
-    for (int i = 0; i < log_count; i++) {
-        strncpy(local_log_buf[i], sd_write_buffer[i], SD_LINE_LEN - 1);
-        local_log_buf[i][SD_LINE_LEN - 1] = '\0';
-    }
-    sd_write_count = 0;
-
-    pcap_count = pcap_write_count;
-    for (int i = 0; i < pcap_count; i++) {
-        local_pcap_buf[i] = pcap_write_buffer[i];
-    }
-    pcap_write_count = 0;
-    ble_pcap_count = ble_pcap_write_count;
-    for (int i = 0; i < ble_pcap_count; i++) {
-        local_ble_pcap_buf[i] = ble_pcap_write_buffer[i];
-    }
-    ble_pcap_write_count = 0;
-    xSemaphoreGive(dataMutex);
-
+    // Preconditions FIRST — if any fail, buffered data stays in place
+    // for the next flush attempt rather than being silently discarded.
     if (!sd_available) return;
 
     // Skip flush if heap is critically low — the SD FAT driver mallocs
@@ -1934,19 +3517,44 @@ void flush_sd_buffer() {
         return;
     }
 
+    // Now safe to snapshot and clear — we're guaranteed to write below.
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    log_count = sd_write_count;
+    for (int i = 0; i < log_count; i++) {
+        strncpy(local_log_buf[i], sd_write_buffer[i], SD_LINE_LEN - 1);
+        local_log_buf[i][SD_LINE_LEN - 1] = '\0';
+    }
+    sd_write_count = 0;
+
+    pcap_count = pcap_write_count;
+    for (int i = 0; i < pcap_count; i++) {
+        local_pcap_buf[i] = pcap_write_buffer[i];
+    }
+    pcap_write_count = 0;
+    ble_pcap_count = ble_pcap_write_count;
+    for (int i = 0; i < ble_pcap_count; i++) {
+        local_ble_pcap_buf[i] = ble_pcap_write_buffer[i];
+    }
+    ble_pcap_write_count = 0;
+    xSemaphoreGiveRecursive(dataMutex);
+
     if (log_count > 0) {
         File file = SD.open(current_log_file, FILE_APPEND);
         if (file) {
             for (int i = 0; i < log_count; i++) {
                 if ((i & 0x0F) == 0) esp_task_wdt_reset();  // every 16 lines
-                file.println(local_log_buf[i]);
+                size_t written = file.println(local_log_buf[i]);
+                if (written == 0 && !sd_full_warned) {
+                    sd_full_warned = true;
+                    set_toast_direct("SD CARD FULL", TOAST_WARNING, false);
+                }
             }
             file.close();
         } else if (sd_available) {
             // Soft failure: controller may be doing GC or a brief voltage dip.
             // Don't tear down the SD connection — the 5s hot-plug probe owns the
             // real removal check, and this write will retry on the next flush.
-            set_toast_direct("SD WRITE FAIL", CAUTION_COLOR);
+            set_toast_direct("SD WRITE FAIL", TOAST_WARNING, false);
             Serial.println("[SD] Write failed — retrying next flush cycle");
         }
     }
@@ -1994,65 +3602,44 @@ void flush_sd_buffer() {
 // Thread-safe direct toast setter. Used for single-message notifications
 // (battery warnings, flash errors, export-mode messages) that bypass the queue.
 // Does NOT touch the queue — it only sets the currently-displayed toast.
-static void set_toast_direct(const char* text, uint16_t accent) {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (toast_active && toast_queue_count > 0) {
-        // Replace the head entry so the expiry handler in draw_toast_spr
-        // doesn't pop a phantom slot.
-        strncpy(toast_queue[toast_queue_head].text, text,
-                sizeof(toast_queue[toast_queue_head].text) - 1);
-        toast_queue[toast_queue_head].text[sizeof(toast_queue[toast_queue_head].text) - 1] = '\0';
-        toast_queue[toast_queue_head].accent    = accent;
-        toast_queue[toast_queue_head].is_action = true;
-    } else {
-        // No active toast — push as a new queue entry so expiry accounting
-        // matches. Covers both the toast_queue_count == 0 case and the
-        // !toast_active && toast_queue_count > 0 case (the latter would
-        // otherwise be silently lost: expiry would advance past a queued
-        // toast that was never displayed).
-        if (toast_queue_count >= TOAST_QUEUE_SIZE) {
-            toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
-            toast_queue_count--;
-        }
-        int slot = (toast_queue_head + toast_queue_count) % TOAST_QUEUE_SIZE;
-        strncpy(toast_queue[slot].text, text, sizeof(toast_queue[slot].text) - 1);
-        toast_queue[slot].text[sizeof(toast_queue[slot].text) - 1] = '\0';
-        toast_queue[slot].accent    = accent;
-        toast_queue[slot].is_action = true;
-        toast_queue_count++;
-        // Advance head to the just-pushed entry so the legacy mirror and
-        // expiry pop refer to the same slot we're about to display.
-        toast_queue_head = slot;
+static void set_toast_direct(const char* text, uint16_t accent, bool is_info) {
+    if (!take_data_mutex()) return;
+    ToastEntry& head = toast_queue[toast_queue_head];
+    strncpy(head.text, text, sizeof(head.text) - 1);
+    head.text[sizeof(head.text) - 1] = '\0';
+    head.accent    = accent;
+    head.is_action = is_info;
+    if (!toast_active) {
+        toast_queue_count = 1;
     }
-    strncpy(toast_text, text, sizeof(toast_text) - 1);
-    toast_text[sizeof(toast_text) - 1] = '\0';
-    toast_accent_color = accent;
-    toast_is_action    = true;
-    toast_start        = millis();
-    toast_active       = true;
-    screen_dirty       = true;
-    xSemaphoreGive(dataMutex);
+    toast_start  = millis();
+    toast_active = true;
+    screen_dirty = true;
+    give_data_mutex();
 }
 
 void trigger_toast(const char* type, const char* name, int confidence) {
     uint16_t accent;
-    if      (strncmp(type, "RAVEN",     5) == 0) accent = TEAL_COLOR;
-    else if (strcmp (type, "FLOCK_BLE") == 0)    accent = PURPLE_COLOR;
-    else if (strcmp (type, "TARGET")    == 0)    accent = HEADER_COLOR;
-    else                                          accent = CAUTION_COLOR;
+    if (strcmp(type, "TARGET") == 0) accent = TOAST_SUCCESS;
+    else if (confidence == 0)        accent = TOAST_NEUTRAL;
+    else                             accent = TOAST_WARNING;
 
     const char* src = (name && name[0] != '\0' && strcmp(name, "Hidden") != 0) ? name : type;
     bool is_action = (confidence == 0);
-    char full_text[32];
+    char full_text[TOAST_TEXT_LEN];
     if (is_action) {
-        snprintf(full_text, sizeof(full_text), "%.30s", src);
+        snprintf(full_text, sizeof(full_text), "%.*s",
+                 (int)sizeof(full_text) - 1, src);
     } else {
         char pct_str[6];
         snprintf(pct_str, sizeof(pct_str), " %d%%", confidence);
-        snprintf(full_text, sizeof(full_text), "%.14s%s", src, pct_str);
+        int src_budget = (int)sizeof(full_text) - 1 - (int)strlen(pct_str);
+        if (src_budget < 1) src_budget = 1;
+        snprintf(full_text, sizeof(full_text), "%.*s%s",
+                 src_budget, src, pct_str);
     }
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
 
     // Enqueue; if full, drop oldest to make room
     if (toast_queue_count >= TOAST_QUEUE_SIZE) {
@@ -2068,16 +3655,12 @@ void trigger_toast(const char* type, const char* name, int confidence) {
 
     // If nothing currently showing, activate immediately
     if (!toast_active) {
-        strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
-        toast_text[sizeof(toast_text) - 1] = '\0';
-        toast_accent_color = toast_queue[toast_queue_head].accent;
-        toast_is_action = toast_queue[toast_queue_head].is_action;
-        toast_start = millis();
+        toast_start  = millis();
         toast_active = true;
     }
     screen_dirty = true;
 
-    xSemaphoreGive(dataMutex);
+    give_data_mutex();
 }
 
 void add_to_capture_history(const char* type, const char* mac, const char* name, int rssi, int confidence) {
@@ -2119,20 +3702,27 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     uint32_t ts_epoch = 0;
     bool ts_is_gps = false;
     {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024) {
-            uint32_t epoch = utc_to_epoch(
-                gps.date.year(), gps.date.month(), gps.date.day(),
-                gps.time.hour(), gps.time.minute(), gps.time.second());
-            if (epoch > 0) { ts_epoch = epoch; ts_is_gps = true; }
+        if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2020 && gps.date.year() <= 2099) {
+                uint32_t epoch = utc_to_epoch(
+                    gps.date.year(), gps.date.month(), gps.date.day(),
+                    gps.time.hour(), gps.time.minute(), gps.time.second());
+                if (epoch > 0) { ts_epoch = epoch; ts_is_gps = true; }
+            }
+            xSemaphoreGiveRecursive(dataMutex);
+        } else {
+            Serial.println("[MUTEX] log_detection: GPS epoch window timeout");
         }
-        xSemaphoreGive(dataMutex);
     }
 
     // Brief window 2: is_new check, counters, history, LED
     bool is_new = false;
+    int assigned_det_id = 0;
     uint16_t blip_col = ACCENT_COLOR;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        Serial.println("[MUTEX] log_detection: main window timeout — skipping counters");
+        return;
+    }
     is_new = !is_mac_recently_seen(mac);
 
     if (is_new) {
@@ -2147,13 +3737,14 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         else if (strcmp(proto, "BLE") == 0) { session_flock_ble++; }
         lifetime_flock_total++;
         add_to_capture_history(type, mac, name, rssi, confidence);
-        // NOTE: trigger_toast() is deferred until after we release dataMutex —
-        // it takes dataMutex internally and our mutex is non-recursive.
-        // Flash LED: yellow for WiFi, purple for BLE
-        if (strcmp(proto, "WIFI") == 0) {
-            led_detect_r = 255; led_detect_g = 200; led_detect_b = 0;
-        } else {
-            led_detect_r = 180; led_detect_g = 0; led_detect_b = 255;
+        // trigger_toast() is deferred until after we release dataMutex to minimize
+        // critical section duration.
+        // Flash LED: derive color from palette so night mode stays consistent
+        {
+            uint16_t fc = (strcmp(proto, "WIFI") == 0) ? HEADER_COLOR : PURPLE_COLOR;
+            led_detect_r = ((fc >> 11) & 0x1F) << 3;
+            led_detect_g = ((fc >> 5)  & 0x3F) << 2;
+            led_detect_b = ( fc        & 0x1F) << 3;
         }
         led_detection_flash_until = millis() + 15000;
         led_detect_active = true;
@@ -2162,6 +3753,17 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         // need to re-scan the SD log file. We already hold dataMutex.
         // Without this, every new MAC would trigger a full FlockLog.csv
         // re-read in loop() — which is megabytes after a day of use.
+
+        // Remove any existing entry with the same MAC before inserting.
+        // Keeps one entry per device when re-detected after the seen_mac window.
+        for (int i = 0; i < sd_hist_count; i++) {
+            if (strncmp(sd_hist[i].mac, mac, 17) == 0) {
+                for (int j = i; j < sd_hist_count - 1; j++) sd_hist[j] = sd_hist[j + 1];
+                sd_hist_count--;
+                break;
+            }
+        }
+
         int new_count = (sd_hist_count < SD_HIST_SIZE) ? sd_hist_count + 1 : SD_HIST_SIZE;
         for (int i = new_count - 1; i > 0; i--) sd_hist[i] = sd_hist[i - 1];
         safe_copy(sd_hist[0].type,   type,             sizeof(sd_hist[0].type));
@@ -2170,9 +3772,57 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
         safe_copy(sd_hist[0].method, detection_method, sizeof(sd_hist[0].method));
         sd_hist[0].rssi       = rssi;
         sd_hist[0].confidence = confidence;
+        sd_hist[0].uptime_ms  = now_ms;
         format_time_buf((millis() - session_start_time) / 1000,
                         sd_hist[0].timestamp, sizeof(sd_hist[0].timestamp));
+        // Sequential ID — assigned to both the SD-history mirror and the
+        // in-memory capture_history entry that add_to_capture_history just
+        // pushed at index 0. Counter is persisted in PERSIST_FILE.
+        sd_hist[0].id         = (int)next_detection_id;
+        capture_history[0].id = (int)next_detection_id;
+        assigned_det_id       = (int)next_detection_id;
+        next_detection_id++;
+        if (next_detection_id > 999999) {
+            next_detection_id = 1;
+        }
         if (sd_hist_count < SD_HIST_SIZE) sd_hist_count++;
+        // New fields: datestamp (local time), GPS coordinates, epoch (always UTC)
+        sd_hist[0].epoch_utc = ts_is_gps ? ts_epoch : 0;
+        if (ts_is_gps && ts_epoch > 0 && auto_tz_valid) {
+            // Derive datestamp from local epoch so 11pm Eastern shows today, not tomorrow
+            uint32_t local_epoch = (uint32_t)((int64_t)ts_epoch + (int32_t)auto_tz_offset * 3600);
+            uint32_t days = local_epoch / 86400UL;
+            uint32_t y = 1970, m = 1, d = 1;
+            while (true) {
+                bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+                uint32_t dy = leap ? 366 : 365;
+                if (days < dy) break;
+                days -= dy; y++;
+            }
+            static const uint8_t mdays_ld[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+            for (m = 1; m <= 12; m++) {
+                bool leap2 = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+                uint32_t md = mdays_ld[m-1] + (m == 2 && leap2 ? 1 : 0);
+                if (days < md) { d = days + 1; break; }
+                days -= md;
+            }
+            snprintf(sd_hist[0].datestamp, sizeof(sd_hist[0].datestamp),
+                     "%02u/%02u/%02u", (unsigned)m, (unsigned)d, (unsigned)(y % 100));
+        } else if (gps.date.isValid() && gps.date.year() >= 2020 && gps.date.year() <= 2099) {
+            // Fallback: UTC date (no timezone computed yet)
+            snprintf(sd_hist[0].datestamp, sizeof(sd_hist[0].datestamp),
+                     "%02d/%02d/%02d",
+                     gps.date.month(), gps.date.day(), gps.date.year() % 100);
+        } else {
+            safe_copy(sd_hist[0].datestamp, "--/--/--", sizeof(sd_hist[0].datestamp));
+        }
+        if (gps.location.isValid() && gps.location.age() < 2000) {
+            sd_hist[0].lat = gps.location.lat();
+            sd_hist[0].lng = gps.location.lng();
+        } else {
+            sd_hist[0].lat = 0.0;
+            sd_hist[0].lng = 0.0;
+        }
 
         // Leave sd_hist_dirty alone — the loop's was_dirty path becomes a
         // safety net rather than a normal-flow trigger. (Boot, screen
@@ -2187,12 +3837,22 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     last_cap_rssi       = rssi;
     last_cap_confidence = confidence;
     last_cap_seq_num    = seq_num;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     if (is_new) {
         trigger_toast(type, name, confidence);
         add_blip(blip_col, rssi);
         screen_dirty = true;
+
+        // Scanner-screen reactive animations — consumed inside
+        // draw_scanner_screen(). Tint colour mirrors the LED flash
+        // colour pattern (WiFi=accent, BLE=purple). The spectrum bar
+        // for the active channel highlights based on per-channel
+        // packet counts, so no separate per-detection trigger is
+        // needed for that.
+        scanner_flash_ms    = millis();
+        scanner_flash_color = CAUTION_COLOR;  // all detections flash amber
+        scanner_flash_proto = (strcmp(proto, "WIFI") == 0) ? 0 : 1;
     }
 
     // Heavy work outside mutex
@@ -2207,16 +3867,17 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
         // Brief window: GPS snapshot
         char gps_fields[80];
-        bool gps_fresh; double g_lat=0, g_lng=0; float g_spd=0, g_crs=0, g_alt=0;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        gps_fresh = gps.location.isValid() && (gps.location.age() < 2000);
-        if (gps_fresh) {
-            g_lat = gps.location.lat(); g_lng = gps.location.lng();
-            g_spd = gps.speed.isValid()    ? gps.speed.mph()       : 0.0f;
-            g_crs = gps.course.isValid()   ? gps.course.deg()      : 0.0f;
-            g_alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0f;
+        bool gps_fresh = false; double g_lat=0, g_lng=0; float g_spd=0, g_crs=0, g_alt=0;
+        if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            gps_fresh = gps.location.isValid() && (gps.location.age() < 2000);
+            if (gps_fresh) {
+                g_lat = gps.location.lat(); g_lng = gps.location.lng();
+                g_spd = gps.speed.isValid()    ? gps.speed.mph()       : 0.0f;
+                g_crs = gps.course.isValid()   ? gps.course.deg()      : 0.0f;
+                g_alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0f;
+            }
+            xSemaphoreGiveRecursive(dataMutex);
         }
-        xSemaphoreGive(dataMutex);
 
         if (gps_fresh)
             snprintf(gps_fields, sizeof(gps_fields), "%.6f,%.6f,%.1f,%.1f,%.1f", g_lat, g_lng, g_spd, g_crs, g_alt);
@@ -2225,29 +3886,27 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
         char local_line[SD_LINE_LEN];
         snprintf(local_line, SD_LINE_LEN,
-            "%lu,%u,%d,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s",
+            "%lu,%u,%d,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s,%d",
             now_ms, ts_epoch, ts_is_gps ? 1 : 0, channel, type, proto, rssi, mac, clean_name,
             tx_power, detection_method, confidence,
-            confidence_label(confidence), clean_extra, seq_num, gps_fields);
+            confidence_label(confidence), clean_extra, seq_num, gps_fields, assigned_det_id);
 
         // Brief window 3: commit line to sd_write_buffer
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (sd_write_count < MAX_LOG_BUFFER) {
-            strncpy(sd_write_buffer[sd_write_count], local_line, SD_LINE_LEN - 1);
-            sd_write_buffer[sd_write_count][SD_LINE_LEN - 1] = '\0';
-            sd_write_count++;
+        if (xSemaphoreTakeRecursive(dataMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (sd_write_count < MAX_LOG_BUFFER) {
+                strncpy(sd_write_buffer[sd_write_count], local_line, SD_LINE_LEN - 1);
+                sd_write_buffer[sd_write_count][SD_LINE_LEN - 1] = '\0';
+                sd_write_count++;
+            }
+            xSemaphoreGiveRecursive(dataMutex);
+        } else {
+            Serial.println("[MUTEX] log_detection: SD write buffer timeout — detection dropped from log");
         }
-        xSemaphoreGive(dataMutex);
     }
 }
 
 // ============================================================================
-// LOCATOR ENGINE
 // ============================================================================
-double rssi_to_weight(int rssi) { 
-    if (rssi > -20) rssi = -20; if (rssi < -100) rssi = -100; return pow(10.0, (double)(rssi + 100) / 20.0); 
-}
-
 double haversine_m(double lat1, double lon1, double lat2, double lon2) {
     double dLat = radians(lat2 - lat1);
     double dLon = radians(lon2 - lon1);
@@ -2267,122 +3926,101 @@ float bearing_to(double lat1, double lon1, double lat2, double lon2) {
     return (float)brng;
 }
 
-// Returns -1 if distance is decreasing (closer), +1 if increasing (farther), 0 if stable.
-static int locator_distance_trend() {
-    if (locator_dist_history_count < 4) return 0;
-    int n = locator_dist_history_count;
-    int half = n / 2;
-    float old_avg = 0, new_avg = 0;
-    for (int i = 0; i < half; i++) {
-        int idx_old = (locator_dist_history_head - n + i + LOC_TREND_SAMPLES * 2) % LOC_TREND_SAMPLES;
-        int idx_new = (locator_dist_history_head - half + i + LOC_TREND_SAMPLES * 2) % LOC_TREND_SAMPLES;
-        old_avg += locator_dist_history[idx_old];
-        new_avg += locator_dist_history[idx_new];
-    }
-    old_avg /= half;
-    new_avg /= half;
-    float diff = new_avg - old_avg;
-    if (diff < -2.0f) return -1;
-    if (diff >  2.0f) return  1;
-    return 0;
+static const char* bearing_to_compass(float degrees_val) {
+    float norm = fmodf(degrees_val, 360.0f);
+    if (norm < 0.0f) norm += 360.0f;
+    int idx = ((int)(norm + 22.5f) % 360) / 45;
+    static const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+    return dirs[idx & 7];
 }
 
-void locator_add_sample(const char* mac, int rssi) {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (!locator_active || strncmp(mac, locator_target_mac, 17) != 0) {
-        xSemaphoreGive(dataMutex);
-        return;
-    }
-    if (millis() - locator_last_sample < LOC_SAMPLE_INTERVAL) {
-        xSemaphoreGive(dataMutex);
-        return;
-    }
-    if (!gps.location.isValid() || gps.location.age() > 2000) {
-        xSemaphoreGive(dataMutex);
-        return;
+// Called under dataMutex (caller already holds it recursively).
+// Feeds an RSSI sample into the tracker, trace buffer, and peak bookmark.
+static void signal_feed_rssi(const char* mac, int rssi) {
+    rssi_track_update(mac, rssi);
+
+    unsigned long now = millis();
+    if (sig_trace_count == 0 || (now - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
+        sig_trace[sig_trace_head].rssi = (int8_t)(rssi < -128 ? -128 : rssi > 127 ? 127 : rssi);
+        sig_trace_head = (sig_trace_head + 1) % SIG_TRACE_SIZE;
+        if (sig_trace_count < SIG_TRACE_SIZE) sig_trace_count++;
+        sig_trace_last_sample = now;
     }
 
-    int idx = locator_sample_count;
-    if (idx >= LOC_MAX_SAMPLES) {
-        const unsigned long LOC_EVICT_AGE_MS = 300000UL;
-        unsigned long now_ms = millis();
-        int worst = 0;
-        float worst_score = 1e9f;
-        for (int i = 0; i < LOC_MAX_SAMPLES; i++) {
-            float r = (float)(locator_samples[i].rssi + 100) / 80.0f;
-            if (r < 0) r = 0; if (r > 1) r = 1;
-            unsigned long age = now_ms - locator_samples[i].timestamp;
-            float rec = 1.0f - (float)age / (float)LOC_EVICT_AGE_MS;
-            if (rec < 0) rec = 0;
-            float combined = r * rec;
-            if (combined < worst_score) { worst_score = combined; worst = i; }
-        }
-        float new_r   = (float)(rssi + 100) / 80.0f;
-        if (new_r < 0) new_r = 0; if (new_r > 1) new_r = 1;
-        float new_score = new_r * 1.0f;
-        if (new_score > worst_score) { idx = worst; }
-        else { xSemaphoreGive(dataMutex); return; }
-    } else { locator_sample_count++; }
-
-    locator_samples[idx] = {gps.location.lat(), gps.location.lng(), rssi, millis()};
-    locator_last_sample = millis();
-    locator_newest_sample_ms = millis();
-    if (rssi > locator_peak_rssi) locator_peak_rssi = rssi;
-
-    if (locator_sample_count >= LOC_MIN_SAMPLES_EST) {
-        double sum_wlat = 0, sum_wlng = 0, sum_w = 0;
-        for (int i = 0; i < locator_sample_count; i++) {
-            double w = rssi_to_weight(locator_samples[i].rssi);
-            sum_wlat += locator_samples[i].lat * w; sum_wlng += locator_samples[i].lng * w; sum_w += w;
-        }
-        if (sum_w > 0) {
-            locator_est_lat = sum_wlat / sum_w; locator_est_lng = sum_wlng / sum_w; locator_has_estimate = true;
-            if (gps.location.isValid()) {
-                locator_est_distance = haversine_m(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
-                locator_bearing = bearing_to(gps.location.lat(), gps.location.lng(), locator_est_lat, locator_est_lng);
-            }
-            double sum_wd2 = 0;
-            for (int i = 0; i < locator_sample_count; i++) {
-                double d = haversine_m(locator_samples[i].lat, locator_samples[i].lng, locator_est_lat, locator_est_lng);
-                double w = rssi_to_weight(locator_samples[i].rssi); sum_wd2 += w * d * d;
-            }
-            locator_confidence_radius = sqrt(sum_wd2 / sum_w);
-            if (!locator_estimate_announced) {
-                locator_estimate_announced = true;
-                locator_announce_pending = true;
+    if (rssi > signal_peak_rssi) {
+        signal_peak_rssi = rssi;
+        if (gps.location.isValid() && gps.location.age() < 2000) {
+            double lat = gps.location.lat();
+            double lng = gps.location.lng();
+            if (!isnan(lat) && !isnan(lng) && !isinf(lat) && !isinf(lng)) {
+                signal_peak_lat     = lat;
+                signal_peak_lng     = lng;
+                signal_peak_has_gps = true;
             }
         }
     }
-    xSemaphoreGive(dataMutex);
+
+    signal_newest_sample_ms = now;
 }
 
-void locator_start(const char* mac, const char* name, const char* type = "") {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    locator_active = true;
-    safe_copy(locator_target_mac,  mac,  sizeof(locator_target_mac));
-    safe_copy(locator_target_name, name, sizeof(locator_target_name));
-    safe_copy(locator_target_type, type, sizeof(locator_target_type));
-    locator_sample_count = 0; locator_has_estimate = false; locator_peak_rssi = -120;
-    locator_estimate_announced = false;
-    locator_est_distance = 0; locator_bearing = 0; locator_confidence_radius = 0;
-    locator_newest_sample_ms = 0;
-    locator_dist_history_count = 0;
-    locator_dist_history_head = 0;
-    locator_last_trend_sample_ms = 0;
-    locator_tracker_idx = -1;
-    xSemaphoreGive(dataMutex);
+void signal_start(const char* mac, const char* name, const char* type = "", int id = 0) {
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+
+    signal_active = false;
+
+    sig_trace_head = 0; sig_trace_count = 0; sig_trace_last_sample = 0;
+    memset(sig_trace_smooth, 0, sizeof(sig_trace_smooth));
+    sig_trace_last_frame_ms = 0;
+    last_rendered_trace_head  = -1;
+    last_rendered_trace_count = 0;
+    signal_bar_smooth = 0.0f;
+    signal_bar_seeded = false;
+
+    signal_peak_rssi = -120;
+    signal_peak_lat = 0.0; signal_peak_lng = 0.0; signal_peak_has_gps = false;
+
+    signal_tracker_idx = -1;
+    signal_newest_sample_ms = 0;
+
+    strncpy(signal_target_mac,  mac,  17); signal_target_mac[17]  = '\0';
+    strncpy(signal_target_name, name, sizeof(signal_target_name) - 1);
+    signal_target_name[sizeof(signal_target_name) - 1] = '\0';
+    strncpy(signal_target_type, type, sizeof(signal_target_type) - 1);
+    signal_target_type[sizeof(signal_target_type) - 1] = '\0';
+    signal_target_id = id;
+
+    signal_active = true;
+
+    xSemaphoreGiveRecursive(dataMutex);
+    screen_dirty = true;
 }
 
-void locator_stop() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    locator_active = false; locator_has_estimate = false; locator_sample_count = 0;
-    locator_newest_sample_ms = 0;
-    locator_estimate_announced = false;
-    locator_dist_history_count = 0;
-    locator_dist_history_head = 0;
-    locator_last_trend_sample_ms = 0;
-    locator_tracker_idx = -1;
-    xSemaphoreGive(dataMutex);
+void signal_stop() {
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+
+    signal_active = false;
+
+    signal_target_mac[0]  = '\0';
+    signal_target_name[0] = '\0';
+    signal_target_type[0] = '\0';
+    signal_target_id      = 0;
+
+    signal_peak_rssi = -120;
+    signal_peak_lat = 0.0; signal_peak_lng = 0.0; signal_peak_has_gps = false;
+
+    signal_tracker_idx = -1;
+    signal_newest_sample_ms = 0;
+
+    sig_trace_head = 0; sig_trace_count = 0; sig_trace_last_sample = 0;
+    memset(sig_trace_smooth, 0, sizeof(sig_trace_smooth));
+    sig_trace_last_frame_ms = 0;
+    last_rendered_trace_head  = -1;
+    last_rendered_trace_count = 0;
+    signal_bar_smooth = 0.0f;
+    signal_bar_seeded = false;
+
+    xSemaphoreGiveRecursive(dataMutex);
+    screen_dirty = true;
 }
 
 // ============================================================================
@@ -2406,24 +4044,34 @@ struct WifiEvent {
     char     ssid[33];
     bool     is_beacon;
     bool     is_probe_req;   // mgmt subtype 4 — required for the wildcard-probe signature
-    uint8_t  payload_snap[256];
+    uint8_t  payload_snap[128];
     uint16_t payload_snap_len;
     uint16_t orig_len;
-    volatile bool ready;
+    volatile uint32_t ready;
     bool     is_wpa2_psk;
     uint8_t  vendor_ouis[4][3];
     uint8_t  vendor_oui_count;
 };
 
 static WifiEvent wifi_event_queue[WIFI_EVENT_QUEUE_SIZE];
-static volatile uint8_t wifi_eq_write_idx = 0;
-static uint8_t          wifi_eq_read_idx  = 0;
+// Written only from the WiFi promiscuous callback (single task context on Core 0).
+static volatile uint32_t wifi_eq_write_idx = 0;
+static uint8_t           wifi_eq_read_idx  = 0;
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
+    if (!scanner_ready) return;
     if (type != WIFI_PKT_MGMT) return;
     const wifi_promiscuous_pkt_t* ppkt = (wifi_promiscuous_pkt_t*)buff;
     if (ppkt->rx_ctrl.sig_len < 24) return;
-    ambient_packet_count++;
+    __atomic_fetch_add(&ambient_packet_count, 1, __ATOMIC_RELAXED);
+
+    // Per-channel histogram for the SPECTRUM viz on the scanner screen.
+    {
+        uint8_t pkt_ch = ppkt->rx_ctrl.channel;
+        if (pkt_ch >= 1 && pkt_ch <= NUM_WIFI_CHANNELS) {
+            __atomic_fetch_add(&channel_pkt_counts[pkt_ch - 1], 1, __ATOMIC_RELAXED);
+        }
+    }
 
     const wifi_ieee80211_packet_t* ipkt = (wifi_ieee80211_packet_t*)ppkt->payload;
     const wifi_ieee80211_mac_hdr_t* hdr = &ipkt->hdr;
@@ -2437,10 +4085,11 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     // Check the slot we're about to write rather than the next one — the
     // previous "next.ready" gate wasted a slot and capped capacity at 7
     // when the consumer was even one step behind.
-    if (wifi_event_queue[wifi_eq_write_idx].ready) return;
-    uint8_t next = (wifi_eq_write_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
+    uint32_t cur_idx = __atomic_load_n(&wifi_eq_write_idx, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&wifi_event_queue[cur_idx].ready, __ATOMIC_ACQUIRE)) return;
+    uint32_t next = (cur_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
-    WifiEvent* ev = &wifi_event_queue[wifi_eq_write_idx];
+    WifiEvent* ev = &wifi_event_queue[cur_idx];
 
     // Copy only raw metadata and the frame snapshot.
     // SSID extraction, RSN parsing, and vendor OUI collection are
@@ -2454,8 +4103,17 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->seq_num          = (uint16_t)(hdr->sequence_ctrl >> 4);
     ev->is_beacon        = is_beacon;
     ev->is_probe_req     = is_probe_req;
-    ev->orig_len         = (uint16_t)ppkt->rx_ctrl.sig_len;
-    ev->payload_snap_len = (ppkt->rx_ctrl.sig_len < 256) ? (uint16_t)ppkt->rx_ctrl.sig_len : 256;
+    // sig_len is the OTA frame length. Sanity-cap before snapshotting:
+    // values > 512 indicate DMA corruption or a malformed rx_ctrl struct.
+    uint16_t sig_len = (uint16_t)ppkt->rx_ctrl.sig_len;
+    if (sig_len < 24) {
+        // Shouldn't reach here (checked above), but guard the snapshot path.
+        __atomic_store_n(&ev->ready, 0u, __ATOMIC_RELEASE);
+        return;
+    }
+    ev->orig_len         = sig_len;
+    if (sig_len > 512) sig_len = 512;
+    ev->payload_snap_len = (sig_len < sizeof(ev->payload_snap)) ? sig_len : (uint16_t)sizeof(ev->payload_snap);
     memcpy(ev->payload_snap, ppkt->payload, ev->payload_snap_len);
 
     // Clear parsed fields — they'll be populated by parse_wifi_event()
@@ -2463,9 +4121,8 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     ev->is_wpa2_psk = false;
     ev->vendor_oui_count = 0;
 
-    __sync_synchronize();   // release: publish all field writes before `ready`
-    ev->ready = true;
-    wifi_eq_write_idx = next;
+    __atomic_store_n(&ev->ready, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&wifi_eq_write_idx, next, __ATOMIC_RELAXED);
 }
 
 // Parse tagged parameters from a locally-copied WiFi event. Extracts SSID,
@@ -2479,6 +4136,7 @@ static void parse_wifi_event(WifiEvent* ev) {
     //         before tagged parameters.
     // Probe Request: tagged parameters start immediately after MAC header.
     if (ev->payload_snap_len < 24) return;
+    if (ev->payload_snap_len > sizeof(ev->payload_snap)) return;
 
     uint8_t* frame_body = ev->payload_snap + 24;
     uint8_t* tagged_params;
@@ -2492,9 +4150,13 @@ static void parse_wifi_event(WifiEvent* ev) {
         tagged_params = frame_body;
         remaining = (int)ev->payload_snap_len - 24;
     }
-    // Subtract FCS (4 bytes) if present in the snapshot
-    remaining -= 4;
-    if (remaining < 0) remaining = 0;
+    // Subtract FCS (4 bytes) only when the full frame fits in the snapshot.
+    // Truncated frames (payload_snap_len < orig_len) don't contain the FCS;
+    // subtracting 4 would discard real tagged parameter data at the tail.
+    if (ev->payload_snap_len >= ev->orig_len) {
+        remaining -= 4;
+        if (remaining < 0) remaining = 0;
+    }
 
     // ── SSID extraction (tag 0) ──
     memset(ev->ssid, 0, sizeof(ev->ssid));
@@ -2522,17 +4184,19 @@ static void parse_wifi_event(WifiEvent* ev) {
                 int rsn_len = tag_len;
                 if (rsn_len >= 8) {
                     uint16_t pw_count = rsn[6] | (rsn[7] << 8);
-                    int akm_off = 8 + pw_count * 4;
-                    if (akm_off + 2 <= rsn_len) {
-                        uint16_t akm_count = rsn[akm_off] | (rsn[akm_off + 1] << 8);
-                        int akm_list = akm_off + 2;
-                        for (uint16_t a = 0; a < akm_count && akm_list + 4 <= rsn_len; a++) {
-                            if (rsn[akm_list] == 0x00 && rsn[akm_list+1] == 0x0F
-                                && rsn[akm_list+2] == 0xAC && rsn[akm_list+3] == 0x02) {
-                                ev->is_wpa2_psk = true;
-                                break;
+                    if (pw_count <= 10) {
+                        int akm_off = 8 + pw_count * 4;
+                        if (akm_off + 2 <= rsn_len) {
+                            uint16_t akm_count = rsn[akm_off] | (rsn[akm_off + 1] << 8);
+                            int akm_list = akm_off + 2;
+                            for (uint16_t a = 0; a < akm_count && akm_list + 4 <= rsn_len; a++) {
+                                if (rsn[akm_list] == 0x00 && rsn[akm_list+1] == 0x0F
+                                    && rsn[akm_list+2] == 0xAC && rsn[akm_list+3] == 0x02) {
+                                    ev->is_wpa2_psk = true;
+                                    break;
+                                }
+                                akm_list += 4;
                             }
-                            akm_list += 4;
                         }
                     }
                 }
@@ -2557,17 +4221,17 @@ static void parse_wifi_event(WifiEvent* ev) {
 }
 
 void process_wifi_event_queue() {
-    // Cap drained events per call so a packet burst (e.g. crowded
-    // conference center) cannot starve the rest of loop().
-    int budget = 4;
-    while (budget-- > 0 && wifi_event_queue[wifi_eq_read_idx].ready) {
+    // Drain the full queue each call — parse_wifi_event is light (~0.1ms/event)
+    // and budget=4 dropped events in dense RF environments (8-slot queue overflows
+    // at >240 events/sec when only half drains per 60fps loop iteration).
+    int budget = WIFI_EVENT_QUEUE_SIZE;
+    while (budget-- > 0 &&
+           __atomic_load_n(&wifi_event_queue[wifi_eq_read_idx].ready, __ATOMIC_ACQUIRE)) {
         WifiEvent* ev = &wifi_event_queue[wifi_eq_read_idx];
-        __sync_synchronize();   // acquire: pair with producer's release below
 
         WifiEvent local;
         memcpy(&local, ev, sizeof(WifiEvent));
-        __sync_synchronize();   // release: ensure memcpy of *ev completes before producer can reuse slot
-        ev->ready = false;
+        __atomic_store_n(&ev->ready, 0u, __ATOMIC_RELEASE);
         wifi_eq_read_idx = (wifi_eq_read_idx + 1) % WIFI_EVENT_QUEUE_SIZE;
 
         if (local.rssi < IGNORE_WEAK_RSSI) continue;
@@ -2588,19 +4252,27 @@ void process_wifi_event_queue() {
         bool is_random_mac = (local.mac[0] & 0x02) != 0;
         int  mac_score     = is_random_mac ? 0 : check_mac_prefix_tiered(local.mac);
 
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+            local.mac[0], local.mac[1], local.mac[2],
+            local.mac[3], local.mac[4], local.mac[5]);
+
         // Push to live feed (every observed device, preview flock status)
         {
-            char mac_str_feed[18];
-            snprintf(mac_str_feed, sizeof(mac_str_feed),
-                     "%02x:%02x:%02x:%02x:%02x:%02x",
-                     local.mac[0], local.mac[1], local.mac[2],
-                     local.mac[3], local.mac[4], local.mac[5]);
             const char* feed_name = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
             bool preview_is_flock  = (strlen(local.ssid) > 0
                                       && (is_flock_ssid_format(local.ssid)
                                           || check_ssid_pattern(local.ssid)))
                                      || mac_score == 1;
-            feed_push_candidate(mac_str_feed, feed_name, local.rssi, 0, preview_is_flock);
+            feed_push_candidate(mac_str, feed_name, local.rssi, 0, preview_is_flock);
+        }
+
+        // Feed RSSI to the Signal screen for any active target, regardless of confidence.
+        if (signal_active) {
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            if (signal_active && strncmp(mac_str, signal_target_mac, 17) == 0)
+                signal_feed_rssi(mac_str, local.rssi);
+            xSemaphoreGiveRecursive(dataMutex);
         }
 
         int  confidence    = 0;
@@ -2635,10 +4307,6 @@ void process_wifi_event_queue() {
             confidence += 10;
         }
 
-        char mac_str[18];
-        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-            local.mac[0], local.mac[1], local.mac[2],
-            local.mac[3], local.mac[4], local.mac[5]);
         const char* name_str       = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
         const char* frame_type_str = local.is_beacon ? "Beacon" : "ProbeReq";
 
@@ -2654,7 +4322,7 @@ void process_wifi_event_queue() {
 
             if (!addr1_multicast && !addr1_random && !addr1_broadcast) {
                 int addr1_mac_score = check_mac_prefix_tiered(local.addr1);
-                if (addr1_mac_score > 0 && confidence == 0) {
+                if (addr1_mac_score > 0 && mac_score == 0) {
                     // addr1 matched but addr2 didn't — sleeping-device hit.
                     if (addr1_mac_score == 1) {
                         confidence = SCORE_STRONG;
@@ -2676,13 +4344,10 @@ void process_wifi_event_queue() {
         }
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            channel_lock_until = millis() + 10000;
-            xSemaphoreGive(dataMutex);
+            __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_str, local.rssi);
             if (rssi_track_is_stationary(mac_str)) confidence += SCORE_BONUS_STAT;
             if (confidence > 100) confidence = 100;
-            locator_add_sample(mac_str, local.rssi);
 
             int mlen = strlen(methods);
             if (mlen > 0 && methods[mlen - 1] == ' ') methods[mlen - 1] = '\0';
@@ -2703,17 +4368,19 @@ void process_wifi_event_queue() {
             char extra_combined[80];
             snprintf(extra_combined, sizeof(extra_combined), "%s %s", frame_type_str, vendor_str);
 
-            log_detection("FLOCK_WIFI", "WIFI", local.rssi, mac_str, name_str,
-                          local.channel, 0, extra_combined, methods, confidence, local.seq_num);
-            write_threat_pcap(local.payload_snap, local.payload_snap_len);
+            if (!is_mac_whitelisted(mac_str)) {
+                log_detection("FLOCK_WIFI", "WIFI", local.rssi, mac_str, name_str,
+                              local.channel, 0, extra_combined, methods, confidence, local.seq_num);
+                write_threat_pcap(local.payload_snap, local.payload_snap_len);
 
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
-                trigger_alarm_confidence = confidence;
-                trigger_alarm_source = 0;  // WiFi
-                last_buzzer_time = millis();
+                xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
+                    trigger_alarm_confidence = confidence;
+                    trigger_alarm_source = 0;  // WiFi
+                    last_buzzer_time = millis();
+                }
+                xSemaphoreGiveRecursive(dataMutex);
             }
-            xSemaphoreGive(dataMutex);
         }
     }
 }
@@ -2721,28 +4388,9 @@ void process_wifi_event_queue() {
 // ============================================================================
 // BLE CALLBACK — STACK-SAFE DEFERRED PROCESSING
 // ============================================================================
-struct BleEventData {
-    uint8_t  mac[6];
-    uint8_t  addr_type;
-    int8_t   rssi;
-    int8_t   tx_power;
-    bool     have_tx_power;
-    char     dev_name[65];
-    bool     have_name;
-    uint8_t  mfg_data[64];
-    uint8_t  mfg_data_len;
-    bool     have_mfg;
-    char     service_uuids[8][37];
-    uint8_t  uuid_count;
-    uint8_t  adv_channel;  // 37/38/39 if available, 0 if unknown
-    volatile bool in_use;  // pool slot occupancy flag
-};
-
-// Static pool — eliminates all malloc/free from the BLE advertisement
-// hot path. 12 slots × ~380 bytes ≈ 4.5KB static cost, zero fragmentation.
-#define BLE_POOL_SIZE 12
-static BleEventData ble_pool[BLE_POOL_SIZE];
-static volatile uint8_t ble_pool_write = 0;
+// (BleEventData struct, BLE_POOL_SIZE, ble_pool, ble_pool_write,
+//  AdvertisedDeviceCallbacks, and ble_cb_singleton are declared above the
+//  export server functions so export_mode_start can reference them.)
 
 static void ble_worker_task(void* pvParameters) {
     bool wdt_subscribed = false;
@@ -2758,7 +4406,7 @@ static void ble_worker_task(void* pvParameters) {
 
         BleEventData* ev = &ble_pool[pool_idx];
 
-        if (ev->rssi < IGNORE_WEAK_RSSI) { ev->in_use = false; continue; }
+        if (ev->rssi < IGNORE_WEAK_RSSI) { __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE); continue; }
 
         int  confidence   = 0;
         char methods[64]  = {0};
@@ -2794,6 +4442,13 @@ static void ble_worker_task(void* pvParameters) {
             feed_push_candidate(mac_str_feed,
                                 ev->have_name ? dev_name_char : "",
                                 ev->rssi, 1, preview_is_flock);
+            // Feed RSSI to the Signal screen for any active target, regardless of confidence.
+            if (signal_active) {
+                xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                if (signal_active && strncmp(mac_str_feed, signal_target_mac, 17) == 0)
+                    signal_feed_rssi(mac_str_feed, ev->rssi);
+                xSemaphoreGiveRecursive(dataMutex);
+            }
         }
 
         if (ev->have_mfg) {
@@ -2849,12 +4504,9 @@ static void ble_worker_task(void* pvParameters) {
             ev->mac[3], ev->mac[4], ev->mac[5]);
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            channel_lock_until = millis() + 10000;
-            xSemaphoreGive(dataMutex);
+            __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_string, ev->rssi);
             if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
-            locator_add_sample(mac_string, ev->rssi);
         }
         if (confidence > 100) confidence = 100;
 
@@ -2924,93 +4576,24 @@ static void ble_worker_task(void* pvParameters) {
             ble_pdu[len_idx] = pdu_off - 2;
             write_ble_pcap(ble_pdu, pdu_off);
 
-            log_detection(capture_type, "BLE", ev->rssi, mac_string, dev_name_char,
-                          ev->adv_channel, ev->have_tx_power ? ev->tx_power : 0,
-                          extra_data, methods, confidence, -1);
+            if (!is_mac_whitelisted(mac_string)) {
+                log_detection(capture_type, "BLE", ev->rssi, mac_string, dev_name_char,
+                              ev->adv_channel, ev->have_tx_power ? ev->tx_power : 0,
+                              extra_data, methods, confidence, -1);
 
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
-                trigger_alarm_confidence = confidence;
-                trigger_alarm_source = 1;  // BLE
-                last_buzzer_time = millis();
+                xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
+                    trigger_alarm_confidence = confidence;
+                    trigger_alarm_source = 1;  // BLE
+                    last_buzzer_time = millis();
+                }
+                xSemaphoreGiveRecursive(dataMutex);
             }
-            xSemaphoreGive(dataMutex);
         }
 
-        ev->in_use = false;
+        __atomic_store_n(&ev->in_use, 0u, __ATOMIC_RELEASE);
     }
 }
-
-class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-        // Claim a pool slot. If the slot is still being processed by the
-        // worker task, drop this advertisement — better than heap-allocating.
-        uint8_t slot = ble_pool_write;
-        if (ble_pool[slot].in_use) return;  // pool exhausted, drop
-
-        BleEventData* ev = &ble_pool[slot];
-        memset(ev, 0, sizeof(BleEventData));
-
-        NimBLEAddress addr = advertisedDevice->getAddress();
-        // NimBLE stores addresses little-endian; we display big-endian.
-        // Pulling the raw bytes avoids a heap-allocated std::string and a
-        // sscanf round-trip on every advertisement (50–200/sec under
-        // typical urban traffic — the steady alloc churn was the most
-        // consistent heap-fragmentation source in the code).
-        const uint8_t* native = addr.getNative();
-        for (int i = 0; i < 6; i++) ev->mac[i] = native[5 - i];
-        ev->addr_type = addr.getType();
-
-        ev->rssi          = (int8_t)advertisedDevice->getRSSI();
-        ev->have_tx_power = advertisedDevice->haveTXPower();
-        ev->tx_power      = ev->have_tx_power ? (int8_t)advertisedDevice->getTXPower() : 0;
-
-        ev->have_name = advertisedDevice->haveName();
-        if (ev->have_name) {
-            strncpy(ev->dev_name, advertisedDevice->getName().c_str(), 64);
-            ev->dev_name[64] = '\0';
-        } else {
-            strcpy(ev->dev_name, "Unknown");
-        }
-
-        ev->have_mfg = advertisedDevice->haveManufacturerData();
-        if (ev->have_mfg) {
-            std::string mfg = advertisedDevice->getManufacturerData();
-            ev->mfg_data_len = (uint8_t)(mfg.size() > 64 ? 64 : mfg.size());
-            memcpy(ev->mfg_data, mfg.data(), ev->mfg_data_len);
-        }
-
-        if (advertisedDevice->haveServiceUUID()) {
-            int count = advertisedDevice->getServiceUUIDCount();
-            ev->uuid_count = (uint8_t)(count > 8 ? 8 : count);
-            for (int i = 0; i < ev->uuid_count; i++) {
-                std::string uuid = advertisedDevice->getServiceUUID(i).toString();
-                strncpy(ev->service_uuids[i], uuid.c_str(), 36);
-                ev->service_uuids[i][36] = '\0';
-            }
-        }
-
-        // NimBLE does not reliably expose advertising channel on ESP32.
-        ev->adv_channel = 0;
-
-        // Mark slot as occupied and advance the write cursor BEFORE queuing —
-        // the worker dereferences ble_pool[idx] directly and relies on
-        // in_use to know the slot is valid.
-        ev->in_use = true;
-        ble_pool_write = (slot + 1) % BLE_POOL_SIZE;
-
-        // Queue the slot index. If the queue is full, release the slot.
-        uint8_t idx = slot;
-        if (xQueueSend(ble_event_queue, &idx, 0) != pdTRUE) {
-            ev->in_use = false;
-        }
-    }
-};
-
-// Single shared instance — passed to setAdvertisedDeviceCallbacks at boot
-// and on every periodic NimBLE restart. Avoids the slow heap leak that
-// `new AdvertisedDeviceCallbacks()` produced every restart cycle.
-static AdvertisedDeviceCallbacks ble_cb_singleton;
 
 // ============================================================================
 // DEDICATED TASKS (DUAL CORE)
@@ -3025,18 +4608,19 @@ void ScannerLoopTask(void* pvParameters) {
         }
         if (wdt_subscribed) esp_task_wdt_reset();
         unsigned long now = millis();
-        if ((long)(now - channel_lock_until) > 0) {
-            unsigned long dwell = low_power_mode ? 800UL : CHANNEL_DWELL_MS;
+        unsigned long lock_until = __atomic_load_n(&channel_lock_until, __ATOMIC_RELAXED);
+        if ((long)(now - lock_until) > 0) {
+            unsigned long dwell = current_channel_hop_interval();
             if (now - last_channel_hop > dwell) {
-                current_channel++; 
+                current_channel++;
                 if (current_channel > MAX_CHANNEL) current_channel = 1;
-                esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); 
+                esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
                 last_channel_hop = now;
             }
         }
 
         unsigned long base_interval = low_power_mode ? 6000UL : BLE_SCAN_INTERVAL;
-        unsigned long ble_interval = ((long)(now - channel_lock_until) < 0)
+        unsigned long ble_interval = ((long)(now - lock_until) < 0)
             ? BLE_SCAN_INTERVAL_LOCK
             : base_interval;
 
@@ -3089,11 +4673,11 @@ void GPSLoopTask(void* pvParameters) {
         if (avail > 0) {
             uint8_t buf[128];
             int bytes_read = SerialGPS.readBytes(buf, min(avail, 128));
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             for(int i = 0; i < bytes_read; i++) {
                 gps.encode(buf[i]);
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
@@ -3142,27 +4726,16 @@ void AlarmTask(void* pvParameters) {
     vTaskDelete(NULL);
 }
 
-void LocatorChimeTask(void* pvParameters) {
-    esp_task_wdt_add(NULL);
-
-    // Same I2S flush as AlarmTask — see comment there.
-    M5Cardputer.Speaker.stop();
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-
-    if (!stealth_mode && !is_muted) {
-        M5Cardputer.Speaker.tone(660, 70);
-        vTaskDelay(80 / portTICK_PERIOD_MS);
-        M5Cardputer.Speaker.tone(880, 90);
-    }
-    esp_task_wdt_delete(NULL);
-    vTaskDelete(NULL);
-}
-
 void play_escalated_alarm(int confidence, int source) {
     if (stealth_mode || is_muted || is_alarming) return;
     is_alarming = true;
     intptr_t param = ((intptr_t)confidence & 0xFFFF) | ((intptr_t)(source & 0x1) << 16);
-    xTaskCreate(AlarmTask, "AlarmTask", 2048, (void*)param, 2, NULL);
+    if (xTaskCreate(AlarmTask, "AlarmTask", 1536, (void*)param, 2, NULL) != pdPASS) {
+        // Spawn failed (heap pressure); reset the gate so future alarms
+        // can still fire instead of being permanently suppressed.
+        is_alarming = false;
+        Serial.println("[ALARM] xTaskCreate failed — alarm skipped");
+    }
 }
 
 // ============================================================================
@@ -3170,219 +4743,169 @@ void play_escalated_alarm(int confidence, int source) {
 // ============================================================================
 void draw_header_spr(int screen_num) {
     static const char* screen_names[NUM_SCREENS] = {
-        "SCANNER", "LOCATOR", "DETECTIONS", "GPS", "STATS"
+        "SCANNER", "SIGNAL", "DETECTIONS", "GPS", "STATS"
     };
     if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
 
     spr.fillRect(0, 0, DISP_W, 20, BG_COLOR);
-    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(4, 5); kprint(spr, screen_names[screen_num]);
+    spr.setTextColor(HEADER_COLOR, BG_COLOR); spr.setTextSize(TS_BODY);
+    spr.setCursor(TEXT_LEFT, 5); kprint(spr, screen_names[screen_num]);
 
-    // ── Status icon row ──────────────────────────────────────────────────────
-    const uint16_t ICON_COL = lgfx::color565(255, 255, 255);
+    // ── Status pill row ─────────────────────────────────────────────────────
+    // Right-aligned pills: mode badges, counts, status indicators.
+    // Each pill renders right-to-left, tracking icon_right as the cursor.
 
     bool gps_lock_now;
-    bool cooldown_now;
-    unsigned long cooldown_elapsed = 0;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
-    cooldown_elapsed = millis() - last_buzzer_time;
-    cooldown_now = (last_buzzer_time > 0) && (cooldown_elapsed < BUZZER_COOLDOWN);
-    xSemaphoreGive(dataMutex);
+    long pill_det  = lifetime_flock_total;
+    long pill_wifi = session_flock_wifi;
+    long pill_ble  = session_flock_ble;
+    give_data_mutex();
     bool muted_now = is_muted;
 
-    ease_muted += ((muted_now ? 1.0f : 0.0f) - ease_muted) * 0.12f;
-
-    static float ease_cooldown = 0.0f;
-    ease_cooldown += ((cooldown_now ? 1.0f : 0.0f) - ease_cooldown) * 0.08f;
-
-    static float ease_gps_missing = 0.0f;
-    ease_gps_missing += ((!gps_lock_now ? 1.0f : 0.0f) - ease_gps_missing) * 0.08f;
-
-    int icon_right = DISP_W - 6;
+    int icon_right = DISP_W - 4;
     int icon_y = 4;
 
-    auto lerp_icon = [&](float t) -> uint16_t {
-        return lerp_col16(BG_COLOR, ICON_COL, t);
-    };
-    auto should_draw = [](float t) -> bool { return t > 0.05f; };
-
-    // Unified mode indicators — N / S / L text pills
+    // Mode badges: A / N / S / L / P — same as before but using drawPill.
+    // 'A' (ambient) is dim and intentionally subtle — it just confirms
+    // the dim screen is intentional, not a freeze or low-brightness mode.
     {
         struct ModeBadge {
             bool active;
             const char* letter;
             uint16_t color;
-            bool pulse;
         };
-        ModeBadge badges[4] = {
-            { night_mode,      "N", HEADER_COLOR, false },
-            { stealth_mode,    "S", DIM_COLOR,    false },
-            { locator_active,  "L", HEADER_COLOR, true  },
-            { low_power_mode,  "P", ACCENT_COLOR, false },
+        ModeBadge badges[6] = {
+            { ambient_mode,      "A", DIM_COLOR },
+            { night_mode,        "N", HEADER_COLOR },
+            { stealth_mode,      "S", DIM_COLOR },
+            { signal_active,    "L", CAUTION_COLOR },
+            { low_power_mode,    "P", ACCENT_COLOR },
+            { turbo_mode_active, "T", CAUTION_COLOR },
         };
-
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 6; i++) {
             if (!badges[i].active) continue;
-
-            uint16_t fg = badges[i].color;
-            if (badges[i].pulse) {
-                float pulse = anim_pulse(UI_PULSE_MEDIUM);
-                fg = lerp_col16(badges[i].color, ACCENT_COLOR, pulse * 0.5f);
-            }
-            uint16_t bg = lerp_col16(BG_COLOR, fg, 0.18f);
-
-            int pill_x = icon_right - 12;
-            spr.fillRoundRect(pill_x, icon_y, 11, 11, 2, bg);
-            spr.setTextColor(fg, bg);
-            spr.setTextSize(1.2);
-            spr.setCursor(pill_x + 3, icon_y + 2);
-            spr.print(badges[i].letter);
-            icon_right = pill_x - 3;
+            int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
+            drawPill(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
+            icon_right -= pw + 2;
         }
     }
 
-    // WiFi connected indicator — small 10px arcs + dot, green when active
+    // Export mode indicator
     if (export_mode_active) {
-        int ix = icon_right - 12;
-        uint16_t wc = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.9f);
-        spr.drawPixel(ix + 5, icon_y + 9, wc);
-        spr.drawPixel(ix + 5, icon_y + 8, wc);
-        spr.drawLine(ix + 3, icon_y + 6, ix + 5, icon_y + 4, wc);
-        spr.drawLine(ix + 5, icon_y + 4, ix + 7, icon_y + 6, wc);
-        spr.drawLine(ix + 1, icon_y + 5, ix + 5, icon_y + 1, wc);
-        spr.drawLine(ix + 5, icon_y + 1, ix + 9, icon_y + 5, wc);
-        icon_right -= 16;
+        drawPill(icon_right - 27, icon_y, "EXP", CAUTION_COLOR, 0.0f, true);
+        icon_right -= 29;
     }
 
-    // Muted icon — larger 10×10 speaker with slash
-    if (should_draw(ease_muted)) {
-        int ix = icon_right - 12;
-        uint16_t c = lerp_icon(ease_muted);
-        // Speaker body (rectangle + triangle cone)
-        spr.fillRect(ix + 1, icon_y + 4, 3, 4, c);
-        spr.fillTriangle(ix + 4, icon_y + 2, ix + 8, icon_y, ix + 8, icon_y + 10, c);
-        // Slash through it
-        spr.drawLine(ix, icon_y, ix + 10, icon_y + 10, c);
-        spr.drawLine(ix + 1, icon_y, ix + 10, icon_y + 9, c);
-        icon_right -= 16;
+    // Muted indicator
+    if (muted_now) {
+        drawPill(icon_right - 13, icon_y, "M", DIM_COLOR);
+        icon_right -= 15;
     }
 
-    // SD missing indicator (always occupies the slot; does not consume ease)
+    // SD missing
     if (system_fully_booted && !sd_available) {
-        int ix = icon_right - 8;
-        uint16_t c = lgfx::color565(180, 40, 40);
-        spr.drawRect(ix + 1, icon_y + 1, 8, 9, c);
-        spr.drawLine(ix + 1, icon_y + 1, ix + 8, icon_y + 9, c);
-        icon_right -= 14;
+        uint16_t sd_warn = lgfx::color565(180, 40, 40);
+        drawPill(icon_right - 20, icon_y, "SD", sd_warn);
+        icon_right -= 22;
     }
 
-    // GPS-missing amber pin (ease_gps_missing fades in when lock is lost)
-    if (should_draw(ease_gps_missing)) {
-        int ix = icon_right - 8;
-        uint16_t c = lerp_col16(BG_COLOR, CAUTION_COLOR, ease_gps_missing);
-        spr.fillCircle(ix + 4, icon_y + 3, 3, c);
-        spr.fillTriangle(ix + 2, icon_y + 5, ix + 6, icon_y + 5, ix + 4, icon_y + 9, c);
-        spr.fillCircle(ix + 4, icon_y + 3, 1, BG_COLOR);
-        icon_right -= 16;
+    // GPS missing
+    if (!gps_lock_now) {
+        drawPill(icon_right - 27, icon_y, "GPS", CAUTION_COLOR);
+        icon_right -= 29;
     }
 
-    // Detection counter pill
+    // Detection count pill — filled accent, inverted text
     {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        uint32_t det_total = lifetime_flock_total;
-        xSemaphoreGive(dataMutex);
-
         char det_str[8];
-        snprintf(det_str, sizeof(det_str), "%lu", det_total);
-        int det_w = (int)strlen(det_str) * 8 + 6;
-        uint16_t pill_bg = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.18f);
-        spr.fillRoundRect(icon_right - det_w, icon_y, det_w, 11, 3, pill_bg);
-        spr.setTextColor(lgfx::color565(255, 255, 255), pill_bg);
-        spr.setTextSize(1.2);
-        spr.setCursor(icon_right - det_w + 3, icon_y + 2);
-        spr.print(det_str);
-        icon_right -= det_w + 2;
+        snprintf(det_str, sizeof(det_str), "D%lu", (unsigned long)pill_det);
+        int dw = (int)strlen(det_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill(icon_right - dw, icon_y, det_str, ACCENT_COLOR, 0.0f, true);
+        icon_right -= dw + 2;
     }
 
-    // Alert slot: EXP takes priority over cooldown
-    if (export_mode_active) {
-        uint16_t c = lgfx::color565(255, 140, 0);
-        spr.fillRoundRect(icon_right - 22, icon_y, 22, 11, 3, c);
-        spr.setTextColor(lgfx::color565(0, 0, 0), c);
-        spr.setTextSize(1.2);
-        spr.setCursor(icon_right - 19, icon_y + 2);
-        spr.print("EXP");
-        icon_right -= 26;
-    } else if (should_draw(ease_cooldown) && cooldown_now) {
-        int ix = icon_right - 8;
-        float progress = (float)cooldown_elapsed / (float)BUZZER_COOLDOWN;
-        unsigned long period = (unsigned long)(UI_PULSE_FAST + progress * 1500.0f);
-        float pulse = anim_pulse(period);
-        uint8_t intensity = (uint8_t)(120 + pulse * 80);
-        uint16_t c = lerp_col16(BG_COLOR, lgfx::color565(intensity, intensity, intensity), ease_cooldown);
-        spr.drawCircle(ix + 4, icon_y + 5, 4, c);
-        spr.drawCircle(ix + 4, icon_y + 5, 5, lerp_col16(BG_COLOR, c, 0.4f));
-        spr.drawLine(ix + 1, icon_y + 2, ix + 7, icon_y + 8, c);
-        icon_right -= 14;
+    // WiFi + BLE session count pills — outline style, subordinate to detection pill
+    {
+        char b_str[8];
+        snprintf(b_str, sizeof(b_str), "B%ld", pill_ble);
+        int bw = (int)strlen(b_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill(icon_right - bw, icon_y, b_str, DIM_COLOR);
+        icon_right -= bw + 2;
+
+        char w_str[8];
+        snprintf(w_str, sizeof(w_str), "W%ld", pill_wifi);
+        int ww = (int)strlen(w_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill(icon_right - ww, icon_y, w_str, DIM_COLOR);
+        icon_right -= ww + 2;
     }
 
+    // Battery percentage pill — with charging indicator
+    {
+        int32_t bat_mv = get_filtered_voltage();
+        int bat_pct = voltage_to_percent(bat_mv);
+        bool charging = M5Cardputer.Power.isCharging();
 
+        char bat_str[10];
+        if (charging) {
+            snprintf(bat_str, sizeof(bat_str), "%d%%+", bat_pct);
+        } else {
+            snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct);
+        }
+        int pw = (int)strlen(bat_str) * ts_char_w(TS_MICRO) + 6;
+        uint16_t bat_col = charging    ? GPS_COLOR
+                         : (bat_pct <= 10) ? CAUTION_COLOR
+                         : (bat_pct <= 25) ? lerp_col16(DIM_COLOR, CAUTION_COLOR, 0.5f)
+                         :                   DIM_COLOR;
+        drawPill(icon_right - pw, icon_y, bat_str, bat_col);
+    }
 }
 
 void draw_toast_spr() {
-    // Snapshot all toast state under mutex before rendering. Producer tasks
-    // on either core can write toast_text mid-strncpy; rendering from live
-    // globals would read torn data and crash spr.print() when it walks past
-    // a missing null terminator.
+    // Snapshot all toast state under mutex before rendering.
     bool          active_snap;
-    char          text_snap[32];
-    uint16_t      accent_snap    = 0;
-    bool          is_action_snap = false;
-    unsigned long start_snap     = 0;
+    char          text_snap[TOAST_TEXT_LEN];
+    uint16_t      accent_snap      = 0;
+    bool          is_info_snap     = true;
+    unsigned long start_snap       = 0;
     int           queue_count_snap = 0;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     active_snap = toast_active;
     if (active_snap) {
-        strncpy(text_snap, toast_text, sizeof(text_snap) - 1);
+        const ToastEntry& head = toast_queue[toast_queue_head];
+        strncpy(text_snap, head.text, sizeof(text_snap) - 1);
         text_snap[sizeof(text_snap) - 1] = '\0';
-        accent_snap      = toast_accent_color;
-        is_action_snap   = toast_is_action;
+        accent_snap      = head.accent;
+        is_info_snap     = head.is_action;
         start_snap       = toast_start;
         queue_count_snap = toast_queue_count;
     }
-    xSemaphoreGive(dataMutex);
+    give_data_mutex();
 
     if (!active_snap) return;
 
     unsigned long elapsed = millis() - start_snap;
 
-    // Expiration handling — advance queue or clear under mutex
+    // Expiration — advance queue or clear under mutex
     if (elapsed > TOAST_DURATION_MS) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (!take_data_mutex()) return;
         if (toast_queue_count > 0) {
             toast_queue_head = (toast_queue_head + 1) % TOAST_QUEUE_SIZE;
             toast_queue_count--;
         }
         if (toast_queue_count > 0) {
-            strncpy(toast_text, toast_queue[toast_queue_head].text, sizeof(toast_text) - 1);
-            toast_text[sizeof(toast_text) - 1] = '\0';
-            toast_accent_color = toast_queue[toast_queue_head].accent;
-            toast_is_action    = toast_queue[toast_queue_head].is_action;
-            toast_start        = millis();
-            toast_active       = true;
+            toast_start  = millis();
+            toast_active = true;
         } else {
             toast_active = false;
         }
-        xSemaphoreGive(dataMutex);
+        give_data_mutex();
         return;
     }
 
-    // Render from snapshot — no global toast_* access below this point.
-    int y_pos = DISP_H - 34;
-
-    // Fade in over UI_FADE_IN_MS, hold, fade out over UI_FADE_OUT_MS.
+    // Fade alpha
     float toast_alpha;
     if (elapsed < UI_FADE_IN_MS) {
         toast_alpha = ui_ease((float)elapsed / (float)UI_FADE_IN_MS);
@@ -3397,21 +4920,63 @@ void draw_toast_spr() {
     auto ta = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, toast_alpha); };
 
     uint16_t accent = accent_snap ? accent_snap : CAUTION_COLOR;
-    int t_w = 210; int t_x = (DISP_W - t_w) / 2;
 
-    spr.fillRect(t_x, y_pos, t_w, 26, ta(CARD_COLOR));
-    spr.drawRect(t_x, y_pos, t_w, 26, ta(CARD_BORDER));
+    // ── Centered pip+pill layout ──
+    int text_len = (int)strlen(text_snap);
+    int char_w   = ts_char_w(TS_BODY);
+    int text_w   = text_len * char_w;
+    int pip_w    = 7;
+    int gap      = 3;
+    int pad_lr   = 8;
+    int th       = 16;
 
-    spr.setTextColor(ta(accent), ta(CARD_COLOR)); spr.setTextSize(1);
-    spr.setCursor(t_x + 6, y_pos + 9); spr.print(is_action_snap ? "[i]" : "[!]");
-    spr.setTextColor(ta(TEXT_COLOR), ta(CARD_COLOR));
-    spr.setCursor(t_x + 26, y_pos + 9); spr.print(text_snap);
+    char queue_str[6] = "";
+    int queue_w = 0;
     if (queue_count_snap > 1) {
-        char qnum[6];
-        snprintf(qnum, sizeof(qnum), "+%d", queue_count_snap - 1);
-        spr.setTextColor(ta(DIM_COLOR), ta(CARD_COLOR));
-        spr.setCursor(t_x + t_w - 22, y_pos + 9);
-        spr.print(qnum);
+        snprintf(queue_str, sizeof(queue_str), " +%d", queue_count_snap - 1);
+        queue_w = (int)strlen(queue_str) * char_w;
+    }
+
+    int content_w = pip_w + gap + text_w + queue_w;
+    int tw = content_w + pad_lr * 2;
+    int tx = (DISP_W - tw) / 2;
+    int ty = DISP_H - 26;
+    int tr = th / 2;
+
+    uint16_t pill_bg = ta(lerp_col16(BG_COLOR, accent, 0.15f));
+    spr.fillRoundRect(tx, ty, tw, th, tr, pill_bg);
+    spr.drawRoundRect(tx, ty, tw, th, tr, ta(accent));
+
+    // Pip
+    int content_start = tx + pad_lr;
+    int pip_cx = content_start + pip_w / 2;
+    int pip_cy = ty + th / 2;
+
+    if (!is_info_snap) {
+        // Warning: filled triangle pointing up
+        spr.fillTriangle(
+            pip_cx,      pip_cy - 3,
+            pip_cx + 3,  pip_cy + 2,
+            pip_cx - 3,  pip_cy + 2,
+            ta(accent));
+    } else {
+        // Info/success: filled circle
+        spr.fillCircle(pip_cx, pip_cy, 2, ta(accent));
+    }
+
+    // Text
+    spr.setTextColor(ta(TEXT_COLOR), pill_bg);
+    spr.setTextSize(TS_BODY);
+    int text_x = content_start + pip_w + gap;
+    spr.setCursor(text_x, ty + 4);
+    spr.print(text_snap);
+
+    // Queue suffix
+    if (queue_w > 0) {
+        spr.setTextColor(ta(DIM_COLOR), pill_bg);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(text_x + text_w + 2, ty + 5);
+        spr.print(queue_str);
     }
 }
 
@@ -3434,35 +4999,72 @@ void draw_vol_overlay() {
 
     auto va = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
 
-    const int bar_w = 160;
-    const int bar_h = 10;
-    const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = DISP_H - bar_h - 8;
-    const int bar_r = bar_h / 2;
+    detect_buffer_byte_order(spr);
 
-    int vol_pct = is_muted ? 0 : map(current_volume, 0, 255, 0, 100);
-    char vol_str[12];
-    if (is_muted) {
-        snprintf(vol_str, sizeof(vol_str), "MUTED");
-    } else {
-        snprintf(vol_str, sizeof(vol_str), "VOL %d%%", vol_pct);
+    // ── Dimmed backdrop below header ──
+    {
+        float dim_strength = 0.45f * alpha;
+        int dim_alpha_i = (int)(dim_strength * 256.0f);
+        uint16_t* sbuf = (uint16_t*)spr.getBuffer();
+        if (sbuf) {
+            for (int py = 18; py < DISP_H; py++) {
+                int row = py * DISP_W;
+                for (int px = 0; px < DISP_W; px++) {
+                    int idx = row + px;
+                    uint16_t existing = read_pixel_logical(sbuf, idx);
+                    uint16_t dimmed   = lerp_col16_i(existing, BG_COLOR, dim_alpha_i);
+                    write_pixel_logical(sbuf, idx, dimmed);
+                }
+            }
+        }
     }
-    spr.setTextColor(va(is_muted ? DIM_COLOR : HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
-    spr.setTextDatum(TC_DATUM);
-    spr.drawString(vol_str, DISP_W / 2, bar_y - 14);
-    spr.setTextDatum(TL_DATUM);
 
-    spr.drawRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, va(HEADER_COLOR));
+    // ── Pill layout ──
+    uint16_t accent = is_muted ? DIM_COLOR : HEADER_COLOR;
+    int vol_pct = is_muted ? 0 : (int)map(current_volume, 0, 255, 0, 100);
 
-    int fill_w = is_muted ? 0 : (current_volume * (bar_w - 4)) / 255;
-    if (fill_w > 0) {
-        int fill_r = (bar_h - 4) / 2;
-        if (fill_r < 1) fill_r = 1;
-        if (fill_w < fill_r * 2) {
-            spr.fillRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, va(HEADER_COLOR));
-        } else {
-            spr.fillRoundRect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, fill_r, va(HEADER_COLOR));
+    char label[12];
+    if (is_muted) {
+        snprintf(label, sizeof(label), "MUTED");
+    } else {
+        snprintf(label, sizeof(label), "VOL %d%%", vol_pct);
+    }
+
+    int char_w   = ts_char_w(TS_BODY);
+    int label_w  = (int)strlen(label) * char_w;
+    int pad_lr   = 8;
+    int th       = 16;
+    int bar_gap  = 5;
+    int bar_w    = 50;
+    int bar_h    = 4;
+    bool show_bar = !is_muted;
+
+    int tw = pad_lr + label_w + (show_bar ? bar_gap + bar_w : 0) + pad_lr;
+    int tx = (DISP_W - tw) / 2;
+    int ty = DISP_H / 2 - 1;
+    int tr = th / 2;
+
+    uint16_t pill_bg = va(lerp_col16(BG_COLOR, accent, 0.15f));
+    spr.fillRoundRect(tx, ty, tw, th, tr, pill_bg);
+    spr.drawRoundRect(tx, ty, tw, th, tr, va(accent));
+
+    int label_x = tx + pad_lr;
+    spr.setTextColor(va(is_muted ? DIM_COLOR : TEXT_COLOR), pill_bg);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(label_x, ty + 4);
+    spr.print(label);
+
+    if (show_bar) {
+        int bar_x = tx + pad_lr + label_w + bar_gap;
+        int bar_y = ty + (th - bar_h) / 2;
+        int fill_w = (vol_pct * bar_w) / 100;
+        spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, 2, va(CARD_BORDER));
+        if (fill_w > 0) {
+            if (fill_w < 4) {
+                spr.fillRect(bar_x, bar_y, fill_w, bar_h, va(accent));
+            } else {
+                spr.fillRoundRect(bar_x, bar_y, fill_w, bar_h, 2, va(accent));
+            }
         }
     }
 }
@@ -3471,91 +5073,456 @@ void drawCard(int x, int y, int w, int h) {
     spr.fillRect(x, y, w, h, CARD_COLOR); spr.drawRect(x, y, w, h, CARD_BORDER);
 }
 
-void draw_scroll_fade(int region_y, int region_h, int fade_height, bool top) {
-    for (int i = 0; i < fade_height; i++) {
-        int y = top ? (region_y + i) : (region_y + region_h - 1 - i);
-        float t = 1.0f - ((float)i / (float)fade_height);
-        uint16_t fade_col = lerp_col16(BG_COLOR, lgfx::color565(0, 0, 0), t * 0.6f);
-        for (int x = 0; x < DISP_W; x += 2) {
-            if ((x + i) & 1) spr.drawPixel(x, y, fade_col);
+// Draw a header-bar status pill: rounded rect with text inside.
+// bg_accent_pct: how much of accent_col to mix into BG (0.0–1.0).
+// filled: if true, the pill is solid accent_col with BG-colored text.
+static void drawPill(int x, int y, const char* text, uint16_t accent_col,
+                     float bg_accent_pct, bool filled) {
+    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 6;
+    int th = 11;
+    uint16_t bg = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, bg_accent_pct);
+    uint16_t fg = filled ? BG_COLOR : TEXT_COLOR;
+    uint16_t border = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, 0.4f);
+    spr.fillRoundRect(x, y, tw, th, 3, bg);
+    spr.drawRoundRect(x, y, tw, th, 3, border);
+    spr.setTextColor(fg, bg);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(x + 3, y + 2);
+    spr.print(text);
+}
+
+// ── LCD-direct rendering helpers (Phase 1 of sprite-split) ──────────
+// These mirror kprint / drawPill but target M5Cardputer.Display instead
+// of the sprite. Used by draw_header_lcd(). Nothing else changes yet.
+
+static void kprint_lcd(const char* text, int extra = 1) {
+    auto& lcd = M5Cardputer.Display;
+    int cx = lcd.getCursorX(), cy = lcd.getCursorY();
+    for (const char* p = text; *p; p++) {
+        char ch[2] = {*p, '\0'};
+        lcd.setCursor(cx, cy);
+        lcd.print(ch);
+        cx += 6 + extra;
+    }
+}
+
+static void drawPill_lcd(int x, int y, const char* text, uint16_t accent_col,
+                         float bg_accent_pct = 0.18f, bool filled = false) {
+    auto& lcd = M5Cardputer.Display;
+    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 6;
+    int th = 11;
+    uint16_t bg = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, bg_accent_pct);
+    uint16_t fg = filled ? BG_COLOR : TEXT_COLOR;
+    uint16_t border = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, 0.4f);
+    lcd.fillRoundRect(x, y, tw, th, 3, bg);
+    lcd.drawRoundRect(x, y, tw, th, 3, border);
+    lcd.setTextColor(fg, bg);
+    lcd.setTextSize(TS_MICRO);
+    lcd.setCursor(x + 3, y + 2);
+    lcd.print(text);
+}
+
+void draw_header_lcd(int screen_num) {
+    auto& lcd = M5Cardputer.Display;
+    static const char* screen_names[NUM_SCREENS] = {
+        "SCANNER", "SIGNAL", "DETECTIONS", "GPS", "STATS"
+    };
+    if (screen_num < 0 || screen_num >= NUM_SCREENS) screen_num = 0;
+
+    lcd.fillRect(0, 0, DISP_W, CONTENT_Y, BG_COLOR);
+    lcd.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+    lcd.setTextColor(HEADER_COLOR, BG_COLOR);
+    lcd.setTextSize(TS_BODY);
+    lcd.setCursor(TEXT_LEFT, 5);
+    kprint_lcd(screen_names[screen_num]);
+
+    // ── Status pill row (mirrors draw_header_spr exactly) ──
+    bool gps_lock_now;
+    if (!take_data_mutex()) return;
+    gps_lock_now = gps.satellites.isValid() && gps.satellites.value() >= 1;
+    long pill_det  = lifetime_flock_total;
+    long pill_wifi = session_flock_wifi;
+    long pill_ble  = session_flock_ble;
+    give_data_mutex();
+    bool muted_now = is_muted;
+
+    int icon_right = DISP_W - 4;
+    int icon_y = 4;
+
+    // Mode badges
+    {
+        struct ModeBadge { bool active; const char* letter; uint16_t color; };
+        ModeBadge badges[6] = {
+            { ambient_mode,      "A", DIM_COLOR },
+            { night_mode,        "N", HEADER_COLOR },
+            { stealth_mode,      "S", DIM_COLOR },
+            { signal_active,    "L", CAUTION_COLOR },
+            { low_power_mode,    "P", ACCENT_COLOR },
+            { turbo_mode_active, "T", CAUTION_COLOR },
+        };
+        for (int i = 0; i < 6; i++) {
+            if (!badges[i].active) continue;
+            int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
+            drawPill_lcd(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
+            icon_right -= pw + 2;
         }
     }
+
+    // Export mode indicator
+    if (export_mode_active) {
+        drawPill_lcd(icon_right - 27, icon_y, "EXP", CAUTION_COLOR, 0.0f, true);
+        icon_right -= 29;
+    }
+
+    // Muted indicator
+    if (muted_now) {
+        drawPill_lcd(icon_right - 13, icon_y, "M", DIM_COLOR);
+        icon_right -= 15;
+    }
+
+    // SD missing
+    if (system_fully_booted && !sd_available) {
+        uint16_t sd_warn = lgfx::color565(180, 40, 40);
+        drawPill_lcd(icon_right - 20, icon_y, "SD", sd_warn);
+        icon_right -= 22;
+    }
+
+    // GPS missing
+    if (!gps_lock_now) {
+        drawPill_lcd(icon_right - 27, icon_y, "GPS", CAUTION_COLOR);
+        icon_right -= 29;
+    }
+
+    // Detection count pill
+    {
+        char det_str[8];
+        snprintf(det_str, sizeof(det_str), "D%lu", (unsigned long)pill_det);
+        int dw = (int)strlen(det_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill_lcd(icon_right - dw, icon_y, det_str, ACCENT_COLOR, 0.0f, true);
+        icon_right -= dw + 2;
+    }
+
+    // WiFi + BLE session count pills
+    {
+        char b_str[8];
+        snprintf(b_str, sizeof(b_str), "B%ld", pill_ble);
+        int bw = (int)strlen(b_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill_lcd(icon_right - bw, icon_y, b_str, DIM_COLOR);
+        icon_right -= bw + 2;
+
+        char w_str[8];
+        snprintf(w_str, sizeof(w_str), "W%ld", pill_wifi);
+        int ww = (int)strlen(w_str) * ts_char_w(TS_MICRO) + 6;
+        drawPill_lcd(icon_right - ww, icon_y, w_str, DIM_COLOR);
+        icon_right -= ww + 2;
+    }
+
+    // Battery percentage pill
+    {
+        int32_t bat_mv = get_filtered_voltage();
+        int bat_pct = voltage_to_percent(bat_mv);
+        bool charging = M5Cardputer.Power.isCharging();
+
+        char bat_str[10];
+        if (charging) {
+            snprintf(bat_str, sizeof(bat_str), "%d%%+", bat_pct);
+        } else {
+            snprintf(bat_str, sizeof(bat_str), "%d%%", bat_pct);
+        }
+        int pw = (int)strlen(bat_str) * ts_char_w(TS_MICRO) + 6;
+        uint16_t bat_col = charging       ? GPS_COLOR
+                         : (bat_pct <= 10) ? CAUTION_COLOR
+                         : (bat_pct <= 25) ? lerp_col16(DIM_COLOR, CAUTION_COLOR, 0.5f)
+                         :                   DIM_COLOR;
+        drawPill_lcd(icon_right - pw, icon_y, bat_str, bat_col);
+    }
+}
+
+static void draw_overlay_header_lcd(const char* label) {
+    auto& lcd = M5Cardputer.Display;
+    lcd.fillRect(0, 0, DISP_W, CONTENT_Y, BG_COLOR);
+    lcd.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+    lcd.setTextColor(HEADER_COLOR, BG_COLOR);
+    lcd.setTextSize(TS_BODY);
+    lcd.setCursor(TEXT_LEFT, 5);
+    kprint_lcd(label);
+}
+
+static void render_frame() {
+    auto& lcd = M5Cardputer.Display;
+    lcd.startWrite();
+
+    // ── Dirty-track header state — only redraw when something changes ──
+    static bool     first_call          = true;
+    static int      last_screen         = -1;
+    static long     last_det            = -1;
+    static long     last_wifi           = -1;
+    static long     last_ble            = -1;
+    static int      last_bat_pct        = -1;
+    static bool     last_charging       = false;
+    static bool     last_gps_lock       = false;
+    static bool     last_muted          = false;
+    static bool     last_ambient        = false;
+    static bool     last_night          = false;
+    static bool     last_stealth        = false;
+    static bool     last_signal_active  = false;
+    static bool     last_low_power      = false;
+    static bool     last_turbo          = false;
+    static bool     last_sd             = true;
+    static bool     last_export         = false;
+    static bool     last_menu           = false;
+    static bool     last_help           = false;
+    static bool     last_wifi_cfg       = false;
+    static bool     last_feed_exp       = false;
+
+    // Sample current state under mutex
+    long cur_det = 0, cur_wifi = 0, cur_ble = 0;
+    bool cur_gps = false;
+    if (take_data_mutex()) {
+        cur_det  = lifetime_flock_total;
+        cur_wifi = session_flock_wifi;
+        cur_ble  = session_flock_ble;
+        cur_gps  = gps.satellites.isValid() && gps.satellites.value() >= 1;
+        give_data_mutex();
+    }
+    int  cur_bat      = voltage_to_percent(get_filtered_voltage());
+    bool cur_charging = M5Cardputer.Power.isCharging();
+
+    bool header_dirty = first_call
+        || (current_screen     != last_screen)
+        || (cur_det            != last_det)
+        || (cur_wifi           != last_wifi)
+        || (cur_ble            != last_ble)
+        || (cur_bat            != last_bat_pct)
+        || (cur_charging       != last_charging)
+        || (cur_gps            != last_gps_lock)
+        || (is_muted           != last_muted)
+        || (ambient_mode       != last_ambient)
+        || (night_mode         != last_night)
+        || (stealth_mode       != last_stealth)
+        || (signal_active      != last_signal_active)
+        || (low_power_mode     != last_low_power)
+        || (turbo_mode_active  != last_turbo)
+        || (sd_available       != last_sd)
+        || (export_mode_active != last_export)
+        || (menu_open          != last_menu)
+        || (show_help_overlay  != last_help)
+        || (wifi_config_open   != last_wifi_cfg)
+        || (show_feed_expanded != last_feed_exp);
+
+    if (header_dirty) {
+        first_call     = false;
+        last_screen    = current_screen;
+        last_det       = cur_det;
+        last_wifi      = cur_wifi;
+        last_ble       = cur_ble;
+        last_bat_pct   = cur_bat;
+        last_charging  = cur_charging;
+        last_gps_lock  = cur_gps;
+        last_muted     = is_muted;
+        last_ambient   = ambient_mode;
+        last_night     = night_mode;
+        last_stealth   = stealth_mode;
+        last_signal_active = signal_active;
+        last_low_power = low_power_mode;
+        last_turbo     = turbo_mode_active;
+        last_sd        = sd_available;
+        last_export    = export_mode_active;
+        last_menu      = menu_open;
+        last_help      = show_help_overlay;
+        last_wifi_cfg  = wifi_config_open;
+        last_feed_exp  = show_feed_expanded;
+
+        if (menu_open) {
+            draw_overlay_header_lcd("MENU");
+        } else if (show_help_overlay) {
+            draw_overlay_header_lcd("HELP");
+        } else if (wifi_config_open) {
+            draw_overlay_header_lcd("WIFI CONFIG");
+        } else if (export_mode_active) {
+            draw_overlay_header_lcd("EXPORT");
+        } else {
+            draw_header_lcd(current_screen);
+            if (show_feed_expanded) {
+                lcd.setTextColor(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f), BG_COLOR);
+                lcd.setTextSize(TS_BODY);
+                lcd.setCursor(56, 5);
+                kprint_lcd("/ FEED");
+            }
+        }
+    }
+
+    // Push content rows via DMA — buffer already in native swap565 byte order,
+    // lgfx::swap565_t* cast bypasses per-pixel conversion and goes direct DMA.
+    uint16_t* buf = (uint16_t*)spr.getBuffer();
+    if (buf) {
+        lcd.pushImageDMA(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y,
+                         (lgfx::swap565_t*)(buf + CONTENT_Y * DISP_W));
+    }
+
+    lcd.endWrite();
 }
 
 void draw_help_overlay() {
     float alpha = ui_progress(help_ease_start, UI_FADE_IN_MS);
     if (alpha < 0.02f) return;
 
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+    bool fully_faded = (alpha >= 1.0f);
+    auto ea = [&](uint16_t c) -> uint16_t { return fully_faded ? c : lerp_col16(BG_COLOR, c, alpha); };
 
     // Solid backdrop below header (like expanded feed)
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
     // Subtitle in header area (overwrite screen name)
-    spr.fillRect(0, 0, 80, 18, BG_COLOR);
+    spr.fillRect(0, 0, 90, CONTENT_Y, BG_COLOR);
     spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(4, 5);
-    kprint(spr, "KEYS");
+    kprint(spr, "HELP");
 
     struct HelpKey { const char* key; const char* desc; };
     const HelpKey* keys;
     int key_count;
 
     static const HelpKey global_keys[] = {
-        {"m",    "Menu"},
-        {"</>",  "Prev/Next"},
-        {"ESC",  "Home"},
-        {"DEL",  "Back/Close"},
-        {"`",    "Mute"},
-        {"-/+",  "Volume"},
-        {"s",    "Stealth"},
-        {"\\",   "LED"},
-        {"f",    "Feed view"},
-        {"TAB",  "This help"},
+        {"</>",  "screens"},
+        {"-/+",  "volume"},
+        {"`",    "mute"},
+        {"n",    "night"},
+        {"DEL",  "back"},
+        {"ESC",  "home"},
+        {"f",    "feed"},
     };
 
     static const HelpKey scanner_keys[] = {
-        {"x", "Simulate"},
-        {"t", "Locate"},
+        {"v",   "cycle viz"},
+#if DEBUG_KEYS
+        {"x",   "simulate"},
+#endif
+        {"f",   "expand feed"},
+        {"t",   "locate"},
+        {"m",   "dock"},
     };
-    static const HelpKey locator_keys[] = {
-        {"l", "Start/stop"},
-        {"t", "Cycle target"},
-        {"n", "N-mode"},
+    static const HelpKey signal_keys[] = {
+        {"f",   "feed / select target"},
+        {"t",   "target device"},
+        {"l",   "stop tracking"},
     };
     static const HelpKey detections_keys[] = {
-        {"^/v", "Navigate"},
-        {"ENT", "Detail"},
-        {"DEL", "Close"},
+        {"^/v", "navigate"},
+        {"ENT", "detail"},
+        {"d",   "delete"},
     };
     static const HelpKey gps_keys[] = {
-        {"", "No keys"},
+        {"",    "no keys"},
     };
     static const HelpKey devinfo_keys[] = {
-        {"^/v", "Scroll"},
+        {"^/v", "scroll"},
+        {"m",   "menu (clear)"},
     };
 
     switch (current_screen) {
         case 0: keys = scanner_keys;    key_count = sizeof(scanner_keys)/sizeof(scanner_keys[0]);       break;
-        case 1: keys = locator_keys;    key_count = sizeof(locator_keys)/sizeof(locator_keys[0]);       break;
+        case 1: keys = signal_keys;     key_count = sizeof(signal_keys)/sizeof(signal_keys[0]);         break;
         case 2: keys = detections_keys; key_count = sizeof(detections_keys)/sizeof(detections_keys[0]); break;
         case 3: keys = gps_keys;        key_count = sizeof(gps_keys)/sizeof(gps_keys[0]);               break;
         case 4: keys = devinfo_keys;    key_count = sizeof(devinfo_keys)/sizeof(devinfo_keys[0]);       break;
         default: keys = scanner_keys; key_count = 0; break;
     }
 
+    // Screen 4 swaps the standard THIS SCREEN / GLOBAL layout for a
+    // dedicated stat guide — there are 13 cards to explain and the
+    // standard layout has no room for descriptions.
+    if (current_screen == 4) {
+        const int col_lx = UI_PAD_SM;
+        const int col_rx = DISP_W / 2 + 4;
+        int y = 24;
+
+        // Compact key list at top
+        spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(col_lx, y);
+        kprint(spr, "KEYS");
+        y += 11;
+        for (int i = 0; i < key_count; i++) {
+            spr.setTextSize(TS_BODY);
+            spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+            spr.setCursor(col_lx, y);
+            spr.print(keys[i].key);
+            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+            spr.setCursor(col_lx + 28, y);
+            spr.print(keys[i].desc);
+            y += 10;
+        }
+        y += 2;
+
+        // Stat guide — two columns, 8 rows × 2 = 15 cells (last cell blank).
+        struct Desc { const char* name; const char* desc; };
+        static const Desc descs[] = {
+            {"SESS DET", "session"},
+            {"LIFE DET", "lifetime"},
+            {"WIFI",     "wifi"},
+            {"BLE",      "ble"},
+            {"RAVEN",    "raven"},
+            {"SESSION",  "uptime"},
+            {"LIFETIME", "total up"},
+            {"BATTERY",  "voltage"},
+            {"HEAP",     "free mem"},
+            {"PACKETS",  "scanned"},
+            {"SD CARD",  "capacity"},
+            {"BOOTS",    "boots"},
+            {"FLASH",    "writes"},
+            {"VERSION",  "firmware"},
+            {"VOLTAGE",  "raw mV"},
+        };
+        const int n_desc = sizeof(descs) / sizeof(descs[0]);
+        const int rows   = (n_desc + 1) / 2;  // 7
+
+        spr.setTextSize(TS_MICRO);
+        for (int r = 0; r < rows && y < DISP_H - 11; r++) {
+            // Left column entry
+            int li = r;
+            spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+            spr.setCursor(col_lx, y);
+            spr.print(descs[li].name);
+            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+            spr.setCursor(col_lx + 54, y);
+            spr.print(descs[li].desc);
+
+            // Right column entry (skip if past end)
+            int ri = r + rows;
+            if (ri < n_desc) {
+                spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+                spr.setCursor(col_rx, y);
+                spr.print(descs[ri].name);
+                spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
+                spr.setCursor(col_rx + 54, y);
+                spr.print(descs[ri].desc);
+            }
+            y += 8;
+        }
+
+        // Footer
+        spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(UI_PAD_SM, DISP_H - 10);
+        spr.print("TAB close  M=clear stats");
+        spr.setCursor(DISP_W - 30, DISP_H - 10);
+        spr.print(VERSION_SHORT);
+        return;
+    }
+
     const int ROW_H = 10;
-    const int col_left_x  = 6;
+    const int col_left_x  = UI_PAD_SM;
     const int col_right_x = DISP_W / 2 + 4;
     int row_y;
 
     // ── Left column: screen-specific keys ──
     row_y = 24;
     spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(col_left_x, row_y);
-    kprint(spr, "SCREEN");
+    kprint(spr, "THIS SCREEN");
     row_y += ROW_H + 2;
 
     for (int i = 0; i < key_count && row_y < DISP_H - 12; i++) {
@@ -3571,7 +5538,7 @@ void draw_help_overlay() {
     // ── Right column: global keys ──
     row_y = 24;
     spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(col_right_x, row_y);
     kprint(spr, "GLOBAL");
     row_y += ROW_H + 2;
@@ -3589,20 +5556,12 @@ void draw_help_overlay() {
 
     // Footer
     spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(6, DISP_H - 10);
-    spr.print("TAB or DEL to close");
-}
-
-// Draw a dithered darkening overlay — fast checkerboard pattern that
-// darkens every-other pixel toward a target color, creating the visual
-// effect of semi-transparency without per-pixel alpha blending.
-static void draw_dither_overlay(int x0, int y0, int w, int h, uint16_t dark_color) {
-    for (int y = y0; y < y0 + h; y++) {
-        for (int x = x0 + ((y & 1) ? 1 : 0); x < x0 + w; x += 2) {
-            spr.drawPixel(x, y, dark_color);
-        }
-    }
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
+    spr.print("TAB to close");
+    // Version tag, right-aligned
+    spr.setCursor(DISP_W - 30, DISP_H - 10);
+    spr.print(VERSION_SHORT);
 }
 
 // Soft UI click — brief tone that reads as a tactile tick.
@@ -3611,154 +5570,409 @@ static void menu_click() {
     M5Cardputer.Speaker.tone(660, 5);  // soft mechanical-keyboard tick
 }
 
-void draw_menu_overlay() {
-    unsigned long now_ms = millis();
-    float alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+// ── Menu icon primitives (10px cell, drawn at ix, iy) ───────────────
 
-    // Solid backdrop matching the rest of the app
-    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
-
-    // Overwrite the screen name area with "MENU"
-    spr.fillRect(0, 0, 80, 18, BG_COLOR);
-    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);  // matches draw_header_spr style
-    spr.setCursor(4, 5);
-    kprint(spr, "MENU");
-
-    struct MenuLine {
-        const char* label;
-        uint16_t    accent;
-    };
-
-    char night_label[20], lp_label[20], mute_label[20], export_label[28];
-    snprintf(night_label, sizeof(night_label), "Night Mode: %s", night_mode ? "ON" : "OFF");
-    snprintf(lp_label,    sizeof(lp_label),    "Low Power: %s",  low_power_mode ? "ON" : "OFF");
-    snprintf(mute_label,  sizeof(mute_label),  "Mute: %s",       is_muted ? "ON" : "OFF");
-    if (export_mode_active) {
-        snprintf(export_label, sizeof(export_label), "Export: %s", export_ip_str);
-    } else {
-        snprintf(export_label, sizeof(export_label), "Export Data");
-    }
-
-    MenuLine items[MENU_ITEM_COUNT] = {
-        {"Scanner",       HEADER_COLOR},
-        {"Locator",       HEADER_COLOR},
-        {"Detections",    HEADER_COLOR},
-        {"GPS",           HEADER_COLOR},
-        {"Stats",         HEADER_COLOR},
-        {night_label,     DIM_COLOR},
-        {lp_label,        DIM_COLOR},
-        {mute_label,      DIM_COLOR},
-        {"WiFi Config",   DIM_COLOR},
-        {export_label,    export_mode_active ? ACCENT_COLOR : DIM_COLOR},
-        {"Clear Stats",   CAUTION_COLOR},
-    };
-
-    if (menu_selected < 0) menu_selected = 0;
-    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
-
-    const int row_h    = 18;  // textSize 2 = 16px tall + 2px breathing room
-    const int row_gap  = 4;
-    const int start_y  = 20;
-
-    // Scrollable viewport — compute how many items fit between start_y and bottom
-    // (footer was removed; the row space extends to the bottom of the screen).
-    const int footer_y = DISP_H - 2;
-    const int visible_h = footer_y - start_y;
-    const int menu_visible_count = visible_h / (row_h + row_gap);
-
-    if (menu_selected < menu_scroll_offset) {
-        menu_scroll_offset = menu_selected;
-    }
-    if (menu_selected >= menu_scroll_offset + menu_visible_count) {
-        menu_scroll_offset = menu_selected - menu_visible_count + 1;
-    }
-    if (menu_scroll_offset < 0) menu_scroll_offset = 0;
-    int max_scroll = MENU_ITEM_COUNT - menu_visible_count;
-    if (max_scroll < 0) max_scroll = 0;
-    if (menu_scroll_offset > max_scroll) menu_scroll_offset = max_scroll;
-
-    // Eased highlight — target is the screen position of the selected item
-    int sel_vi = menu_selected - menu_scroll_offset;
-    float target_y = (float)(start_y + sel_vi * (row_h + row_gap));
-    if (!menu_highlight_init) {
-        menu_highlight_ease_y = target_y;
-        menu_highlight_init = true;
-    } else {
-        menu_highlight_ease_y = target_y;
-    }
-    int ease_y = (int)(menu_highlight_ease_y + 0.5f);
-
-    // ── Row grid — only draw visible items ──
-    for (int vi = 0; vi < menu_visible_count && (vi + menu_scroll_offset) < MENU_ITEM_COUNT; vi++) {
-        int i = vi + menu_scroll_offset;
-        int y = start_y + vi * (row_h + row_gap);
-
-        spr.fillRect(0, y, DISP_W, row_h, BG_COLOR);
-
-        int text_x = 16;  // padded to clear the selection-indicator dash area
-        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-        spr.setTextSize(2);
-        spr.setCursor(text_x, y + 1);  // center 16px text in 18px row
-        spr.print(items[i].label);  // no kerning at size 2 — keeps glyphs crisp
-    }
-
-    // ── Eased highlight bar ──
-    {
-        uint16_t sel_bg = BG_COLOR;
-
-        // Selection indicator: 6×2px horizontal dash, vertically centered.
-        int dash_y = ease_y + row_h / 2;
-        spr.drawFastHLine(4, dash_y,     6, ea(HEADER_COLOR));
-        spr.drawFastHLine(4, dash_y - 1, 6, ea(HEADER_COLOR));
-
-        // Redraw selected item text on highlight.
-        int text_x = 16;
-        spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-        spr.setTextSize(2);
-        spr.setCursor(text_x, ease_y + 1);
-        spr.print(items[menu_selected].label);  // see row-grid path
-    }
-
-    // ── Scrollbar — only show if list exceeds viewport ──
-    if (MENU_ITEM_COUNT > menu_visible_count) {
-        const int track_x = DISP_W - 4;
-        const int track_y = start_y;
-        const int track_h = menu_visible_count * (row_h + row_gap) - row_gap;
-
-        spr.drawFastVLine(track_x + 1, track_y, track_h, ea(CARD_BORDER));
-
-        int thumb_h = max(8, (track_h * menu_visible_count) / MENU_ITEM_COUNT);
-        float scroll_t = (max_scroll > 0) ? (float)menu_scroll_offset / (float)max_scroll : 0.0f;
-        int thumb_y = track_y + (int)(scroll_t * (float)(track_h - thumb_h));
-
-        spr.fillRect(track_x, thumb_y, 3, thumb_h, ea(HEADER_COLOR));
-    }
-
-    // Footer removed — extra row space goes to menu items. The keys are
-    // documented in the help overlay (TAB) and are intuitive: ; / . scroll,
-    // ENTER selects, DEL closes.
+static void menu_icon_scanner(int x, int y, uint16_t col) {
+    spr.drawTriangle(x, y+9, x+9, y+9, x+4, y, col);
 }
 
+static void menu_icon_signal(int x, int y, uint16_t col) {
+    spr.drawFastHLine(x, y+4, 10, col);
+    spr.drawFastVLine(x+4, y, 10, col);
+    spr.drawPixel(x+1, y+1, col); spr.drawPixel(x+7, y+1, col);
+    spr.drawPixel(x+1, y+7, col); spr.drawPixel(x+7, y+7, col);
+}
+
+static void menu_icon_detections(int x, int y, uint16_t col) {
+    spr.fillRect(x,   y+6, 3, 4,  col);
+    spr.fillRect(x+3, y+3, 3, 7,  col);
+    spr.fillRect(x+7, y,   3, 10, col);
+}
+
+static void menu_icon_gps(int x, int y, uint16_t col) {
+    spr.drawCircle(x+4, y+3, 3, col);
+    spr.drawLine(x+1, y+6, x+4, y+9, col);
+    spr.drawLine(x+7, y+6, x+4, y+9, col);
+}
+
+static void menu_icon_stats(int x, int y, uint16_t col) {
+    spr.fillRect(x,   y,   4, 4, col);
+    spr.fillRect(x+5, y,   4, 4, col);
+    spr.fillRect(x,   y+5, 4, 4, col);
+    spr.fillRect(x+5, y+5, 4, 4, col);
+}
+
+static void menu_icon_night(int x, int y, uint16_t col) {
+    spr.drawCircle(x+4, y+4, 4, col);
+    spr.fillCircle(x+6, y+3, 4, BG_COLOR);
+}
+
+static void menu_icon_power(int x, int y, uint16_t col) {
+    spr.drawCircle(x+4, y+4, 4, col);
+    spr.fillRect(x+3, y, 3, 3, BG_COLOR);
+    spr.drawFastVLine(x+4, y, 5, col);
+}
+
+static void menu_icon_mute(int x, int y, uint16_t col) {
+    spr.fillRect(x, y+3, 3, 4, col);
+    spr.drawLine(x+3, y+1, x+3, y+8, col);
+    spr.drawLine(x+5, y+1, x+8, y+7, col);
+    spr.drawLine(x+5, y+7, x+8, y+1, col);
+}
+
+static void menu_icon_wifi(int x, int y, uint16_t col) {
+    spr.drawPixel(x+4, y+9, col);
+    spr.drawPixel(x+2, y+7, col); spr.drawPixel(x+6, y+7, col);
+    spr.drawPixel(x+1, y+4, col); spr.drawPixel(x+7, y+4, col);
+    spr.drawPixel(x,   y+1, col); spr.drawPixel(x+8, y+1, col);
+}
+
+static void menu_icon_export(int x, int y, uint16_t col) {
+    spr.drawLine(x+4, y, x, y+4, col);
+    spr.drawLine(x+4, y, x+8, y+4, col);
+    spr.drawFastVLine(x+4, y+1, 8, col);
+}
+
+static void menu_icon_trash(int x, int y, uint16_t col) {
+    spr.drawFastHLine(x, y, 10, col);
+    spr.fillRect(x+1, y+2, 8, 7, col);
+    spr.drawFastVLine(x+3, y+3, 5, BG_COLOR);
+    spr.drawFastVLine(x+6, y+3, 5, BG_COLOR);
+}
+
+static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
+    switch (flat_idx) {
+        case 0:  menu_icon_scanner(x, y, col);    break;
+        case 1:  menu_icon_signal(x, y, col);      break;
+        case 2:  menu_icon_detections(x, y, col); break;
+        case 3:  menu_icon_gps(x, y, col);        break;
+        case 4:  menu_icon_stats(x, y, col);      break;
+        case 5:  menu_icon_night(x, y, col);      break;
+        case 6:  menu_icon_power(x, y, col);      break;
+        case 7:  menu_icon_mute(x, y, col);       break;
+        case 8:  menu_icon_signal(x, y, col);     break;
+        case 9:  menu_icon_wifi(x, y, col);       break;
+        case 10: menu_icon_export(x, y, col);     break;
+        case 11: menu_icon_trash(x, y, col);      break;
+    }
+}
+
+static void draw_title_card_overlay(float alpha) {
+    if (alpha <= 0.01f) return;
+
+    // ── Animated grid background ──
+    {
+        float grid_alpha = alpha * 0.16f;
+        uint16_t grid_col = lerp_col16(BG_COLOR, HEADER_COLOR, grid_alpha);
+
+        int spacing = 20;
+
+        // Pick a random direction once, keep it forever
+        static float grid_dx = 0.0f, grid_dy = 0.0f;
+        static bool grid_dir_set = false;
+        if (!grid_dir_set) {
+            float angle = (float)random(0, 628) / 100.0f;  // 0 to 2*PI
+            grid_dx = cosf(angle) * 14.0f;  // pixels per second
+            grid_dy = sinf(angle) * 14.0f;
+            grid_dir_set = true;
+        }
+
+        float t = (float)millis() / 1000.0f;
+        int off_x = ((int)(t * grid_dx) % spacing + spacing) % spacing;
+        int off_y = ((int)(t * grid_dy) % spacing + spacing) % spacing;
+
+        for (int y = off_y - spacing; y < DISP_H; y += spacing) {
+            spr.drawFastHLine(0, y, DISP_W, grid_col);
+        }
+        for (int x = off_x - spacing; x < DISP_W; x += spacing) {
+            spr.drawFastVLine(x, 0, DISP_H, grid_col);
+        }
+    }
+
+    // ── Pill with title ──
+    spr.setTextSize(2);
+    int title_w = spr.textWidth("FLOCK FINDER");
+    int title_h = spr.fontHeight();
+
+    int pad_x = 26, pad_y = 18;
+    int pill_w = title_w + pad_x;
+    int pill_h = title_h + pad_y;
+    int pill_r = pill_h / 2;
+    int pill_x = (DISP_W - pill_w) / 2;
+    int pill_y = (DISP_H - pill_h) / 2 - 6;
+
+    uint16_t pill_fill  = lerp_col16(BG_COLOR, lerp_col16(BG_COLOR, HEADER_COLOR, 0.15f), alpha);
+    uint16_t border_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+    uint16_t title_col  = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
+    uint16_t ver_col    = lerp_col16(BG_COLOR, TEXT_COLOR, alpha);
+
+    spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, pill_fill);
+    spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, border_col);
+
+    spr.setTextDatum(MC_DATUM);
+    spr.setTextColor(title_col, pill_fill);
+    spr.drawString("FLOCK FINDER", pill_x + pill_w / 2, pill_y + pill_h / 2);
+
+    spr.setTextSize(TS_MICRO);
+    spr.setTextColor(ver_col, BG_COLOR);
+    spr.setTextDatum(TC_DATUM);
+    spr.drawString(VERSION_SHORT, DISP_W / 2, pill_y + pill_h + 6);
+
+    spr.setTextDatum(TL_DATUM);
+}
+
+static void draw_title_card() {
+    unsigned long elapsed = millis() - title_card_start_ms;
+    unsigned long total = TITLE_CARD_HOLD_MS + TITLE_CARD_FADE_MS;
+
+    if (elapsed >= total) {
+        title_card_active = false;
+        return;
+    }
+
+    float alpha = 1.0f;
+    if (elapsed > TITLE_CARD_HOLD_MS) {
+        alpha = 1.0f - (float)(elapsed - TITLE_CARD_HOLD_MS) / (float)TITLE_CARD_FADE_MS;
+    }
+
+    draw_title_card_overlay(alpha);
+}
+
+// ── Fullscreen single-column scrollable menu ────────────────────────
+static void draw_menu_overlay() {
+    float alpha = ui_progress(menu_open_ms, UI_FADE_IN_MS);
+    if (alpha < 0.02f) return;
+
+    bool fully_faded = (alpha >= 1.0f);
+    auto ea = [&](uint16_t c) -> uint16_t {
+        return fully_faded ? c : lerp_col16(BG_COLOR, c, alpha);
+    };
+
+    // Solid backdrop + header
+    spr.fillRect(0, 0, DISP_W, DISP_H, BG_COLOR);
+    spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(TEXT_LEFT, 5);
+    kprint(spr, "MENU");
+    spr.drawFastHLine(0, 18, DISP_W, ea(CARD_BORDER));
+    drawPill(DISP_W - 40, 4, VERSION_SHORT, ea(DIM_COLOR), 0.0f, false);
+
+    // Layout
+    const int ROW_H    = 17;
+    const int VIEW_TOP = CONTENT_Y;
+    const int FOOTER_H = 12;
+    const int VIEW_H   = DISP_H - VIEW_TOP - FOOTER_H;
+    const int ICON_X   = UI_PAD_SM + 2;
+    const int LABEL_X  = ICON_X + 16;
+    const int ROW_LEFT = UI_PAD_SM - 2;
+    const int ROW_W    = DISP_W - UI_PAD_SM * 2 + 4;
+    const int SECT_H   = 15;
+    const int GAP_H    = 5;
+
+    // Row map: type 0=section header, 1=item, 2=gap
+    struct MRow { int type; int idx; const char* text; };
+    static const MRow mrows[] = {
+        {0, -1, "SCREENS"},
+        {1,  0, "Scanner"},
+        {1,  1, "Signal"},
+        {1,  2, "Detections"},
+        {1,  3, "GPS"},
+        {1,  4, "Stats"},
+        {2, -1, ""},
+        {0, -1, "SETTINGS"},
+        {1,  5, "Night Mode"},
+        {1,  6, "Low Power"},
+        {1,  7, "Mute Beeps"},
+        {1,  8, "Turbo Mode"},
+        {2, -1, ""},
+        {0, -1, "ACTIONS"},
+        {1,  9, "WiFi Config"},
+        {1, 10, "Export Mode"},
+        {1, 11, "Clear All"},
+    };
+    const int NROWS = 17;
+
+    // Compute virtual y for each row
+    int virt_y[17];
+    int cy = 0;
+    for (int i = 0; i < NROWS; i++) {
+        virt_y[i] = cy;
+        if      (mrows[i].type == 0) cy += SECT_H;
+        else if (mrows[i].type == 2) cy += GAP_H;
+        else                         cy += ROW_H;
+    }
+    int total_h = cy;
+
+    // Smooth scroll easing + eased selection highlight
+    {
+        unsigned long now = millis();
+        float dt = (menu_last_frame_ms == 0) ? 16.0f
+                 : (float)(now - menu_last_frame_ms);
+        if (dt > 100.0f) dt = 100.0f;
+        menu_last_frame_ms = now;
+        menu_scroll_y_f = anim_filter(menu_scroll_y_f,
+                                      (float)menu_scroll_offset, 80.0f, dt);
+        // Find selected item's virtual Y and ease highlight toward it
+        int sel_virt_y = 0;
+        for (int i = 0; i < NROWS; i++) {
+            if (mrows[i].type == 1 && mrows[i].idx == menu_selected) {
+                sel_virt_y = virt_y[i];
+                break;
+            }
+        }
+        int cur_scroll_y = (int)(menu_scroll_y_f + 0.5f);
+        float sel_target_y = (float)(VIEW_TOP + sel_virt_y - cur_scroll_y);
+        menu_sel_y_f = anim_filter_seed(menu_sel_y_f, sel_target_y, 80.0f, dt, &menu_sel_y_seeded);
+    }
+    int scroll_y = (int)(menu_scroll_y_f + 0.5f);
+
+    // Auto-scroll to keep selection visible
+    {
+        int sel_y = 0;
+        for (int i = 0; i < NROWS; i++) {
+            if (mrows[i].type == 1 && mrows[i].idx == menu_selected) {
+                sel_y = virt_y[i]; break;
+            }
+        }
+        if (sel_y < menu_scroll_offset)
+            menu_scroll_offset = sel_y;
+        if (sel_y + ROW_H > menu_scroll_offset + VIEW_H)
+            menu_scroll_offset = sel_y + ROW_H - VIEW_H;
+        int max_scroll = total_h - VIEW_H;
+        if (max_scroll < 0) max_scroll = 0;
+        if (menu_scroll_offset < 0) menu_scroll_offset = 0;
+        if (menu_scroll_offset > max_scroll) menu_scroll_offset = max_scroll;
+    }
+
+    // Render rows (clipped to view area)
+    spr.setClipRect(0, VIEW_TOP, DISP_W, VIEW_H);
+
+    for (int i = 0; i < NROWS; i++) {
+        int ry = VIEW_TOP + virt_y[i] - scroll_y;
+        int rh = (mrows[i].type == 0) ? SECT_H
+               : (mrows[i].type == 2) ? GAP_H : ROW_H;
+
+        if (ry + rh < VIEW_TOP || ry > VIEW_TOP + VIEW_H) continue;
+        if (mrows[i].type == 2) continue;
+
+        if (mrows[i].type == 0) {
+            spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(UI_PAD_SM, ry + 1);
+            kprint(spr, mrows[i].text);
+            spr.drawFastHLine(UI_PAD_SM, ry + SECT_H - 2,
+                              DISP_W - UI_PAD_SM * 2, ea(CARD_BORDER));
+        } else {
+            int idx = mrows[i].idx;
+            bool sel = (menu_selected == idx);
+            bool danger = (idx == 11);
+            bool export_active_row = (idx == 10 && (export_mode_active || export_connecting));
+
+            // Icon
+            uint16_t icon_col = ea(export_active_row ? CAUTION_COLOR
+                               : danger             ? CAUTION_COLOR
+                               : sel                ? HEADER_COLOR : DIM_COLOR);
+            menu_draw_icon(idx, ICON_X, ry + 3, icon_col);
+
+            // Label — dynamic for export toggle
+            const char* label_text = mrows[i].text;
+            if (export_active_row) label_text = "Stop Export";
+            uint16_t text_col = ea(export_active_row ? CAUTION_COLOR
+                               : danger             ? CAUTION_COLOR
+                               : sel                ? TEXT_COLOR : DIM_COLOR);
+            spr.setTextColor(text_col, BG_COLOR);
+            spr.setTextSize(TS_STRONG);
+            spr.setCursor(LABEL_X, ry + 2);
+            spr.print(label_text);
+
+            // Current screen indicator — small filled circle after label
+            if (idx >= 0 && idx <= 4 && idx == current_screen) {
+                int label_len = (int)strlen(label_text);
+                int dot_x = LABEL_X + label_len * ts_char_w(TS_STRONG) + 6;
+                spr.fillCircle(dot_x, ry + ROW_H / 2, 2, ea(HEADER_COLOR));
+            }
+
+            // Toggle pills for settings (idx 5-8)
+            if (idx >= 5 && idx <= 8) {
+                bool on = (idx == 5) ? night_mode
+                        : (idx == 6) ? low_power_mode
+                        : (idx == 7) ? is_muted
+                        : turbo_mode_active;
+                if (on) {
+                    int pw = 14, ph = 9;
+                    int px = DISP_W - pw - UI_PAD_SM - 4;
+                    spr.fillRoundRect(px, ry + 4, pw, ph, 2, ea(HEADER_COLOR));
+                    spr.setTextColor(BG_COLOR, ea(HEADER_COLOR));
+                    spr.setTextSize(TS_MICRO);
+                    spr.setCursor(px + 2, ry + 5);
+                    spr.print("ON");
+                } else {
+                    int pw = 18, ph = 9;
+                    int px = DISP_W - pw - UI_PAD_SM - 4;
+                    spr.drawRoundRect(px, ry + 4, pw, ph, 2, ea(DIM_COLOR));
+                    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+                    spr.setTextSize(TS_MICRO);
+                    spr.setCursor(px + 2, ry + 5);
+                    spr.print("OFF");
+                }
+            }
+        }
+    }
+
+    spr.clearClipRect();
+
+    // ── Eased selection highlight (drawn on top of all rows) ──
+    {
+        int sel_draw_y = (int)(menu_sel_y_f + 0.5f);
+        if (sel_draw_y + ROW_H > VIEW_TOP && sel_draw_y < VIEW_TOP + VIEW_H) {
+            spr.setClipRect(0, VIEW_TOP, DISP_W, VIEW_H);
+            bool danger = (menu_selected == 11);
+            bool export_active_sel = (menu_selected == 10 && (export_mode_active || export_connecting));
+            uint16_t accent = (danger || export_active_sel) ? CAUTION_COLOR : HEADER_COLOR;
+            spr.drawRect(ROW_LEFT, sel_draw_y, ROW_W, ROW_H, ea(accent));
+            spr.fillRect(ROW_LEFT, sel_draw_y, 2, ROW_H, ea(accent));
+            spr.clearClipRect();
+        }
+    }
+
+    // Scrollbar (matches stats screen style)
+    if (total_h > VIEW_H) {
+        int sb_x = DISP_W - 4;
+        spr.drawFastVLine(sb_x, VIEW_TOP, VIEW_H, ea(CARD_BORDER));
+        int thumb_h = (VIEW_H * VIEW_H) / total_h;
+        if (thumb_h < 8) thumb_h = 8;
+        int max_scr = total_h - VIEW_H;
+        if (max_scr < 1) max_scr = 1;
+        int thumb_y = VIEW_TOP + (scroll_y * (VIEW_H - thumb_h)) / max_scr;
+        spr.fillRect(sb_x - 1, thumb_y, 3, thumb_h, ea(DIM_COLOR));
+    }
+
+    // Footer
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
+    spr.print("arrows  ENT select  M close  TAB help");
+}
 void draw_wifi_config_overlay() {
     float alpha = ui_progress(wifi_config_open_ms, UI_FADE_IN_MS);
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, alpha); };
+    bool fully_faded = (alpha >= 1.0f);
+    auto ea = [&](uint16_t c) -> uint16_t { return fully_faded ? c : lerp_col16(BG_COLOR, c, alpha); };
 
     // Solid backdrop
     spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
 
     // Overwrite header with "WIFI CONFIG"
-    spr.fillRect(0, 0, 100, 18, BG_COLOR);
+    spr.fillRect(0, 0, 90, CONTENT_Y, BG_COLOR);
     spr.setTextColor(ea(HEADER_COLOR), BG_COLOR);
-    spr.setTextSize(1.2);
+    spr.setTextSize(TS_BODY);
     spr.setCursor(4, 5);
     kprint(spr, "WIFI CONFIG");
 
-    // Card background
-    int cx = 4, cy = 22, cw = DISP_W - 8, ch = DISP_H - 26;
-    spr.fillRoundRect(cx, cy, cw, ch, 4, ea(CARD_COLOR));
-    spr.drawRoundRect(cx, cy, cw, ch, 4, ea(CARD_BORDER));
+    // Outer card — outline only on BG, matching the lighter feel of the
+    // stats and detections screens. Selected fields/buttons are
+    // distinguished by border color, never by fill.
+    int cx = 4, cy = CONTENT_Y + UI_PAD_XS, cw = DISP_W - 8, ch = DISP_H - CONTENT_Y - UI_PAD_SM;
+    spr.drawRoundRect(cx, cy, cw, ch, 4, ea(HEADER_COLOR));
 
     unsigned long now_ms = millis();
     bool cursor_visible = ((now_ms / 500) % 2 == 0);
@@ -3768,24 +5982,20 @@ void draw_wifi_config_overlay() {
     bool ssid_selected = (wifi_config_field == 0);
     bool ssid_editing = ssid_selected && wifi_config_editing;
 
-    spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
-    spr.setTextSize(1);
+    spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, field_y);
     kprint(spr, "SSID");
 
     int input_y = field_y + 12;
-    uint16_t field_bg = ssid_selected ? ea(lerp_col16(CARD_COLOR, HEADER_COLOR, 0.08f)) : ea(CARD_COLOR);
-    uint16_t field_border = ssid_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
-    spr.fillRect(cx + 6, input_y, cw - 12, 16, field_bg);
-    spr.drawRect(cx + 6, input_y, cw - 12, 16, field_border);
+    uint16_t ssid_border = ssid_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
+    spr.drawRect(cx + 6, input_y, cw - 12, 16, ssid_border);
 
-    const char* ssid_display = (wifi_config_editing && ssid_selected)
-        ? wifi_config_ssid_buf
-        : export_ssid;
+    const char* ssid_display = wifi_config_ssid_buf;
     bool ssid_empty = (strlen(ssid_display) == 0);
 
-    spr.setTextColor(ssid_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
-    spr.setTextSize(1);
+    spr.setTextColor(ssid_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 9, input_y + 4);
 
     if (ssid_empty && !ssid_editing) {
@@ -3796,7 +6006,7 @@ void draw_wifi_config_overlay() {
         display[32] = '\0';
         spr.print(display);
         if (ssid_editing && cursor_visible) {
-            int cursor_x = cx + 9 + wifi_config_cursor * 6;
+            int cursor_x = cx + 9 + wifi_config_cursor * ts_char_w(TS_MICRO);
             spr.drawFastVLine(cursor_x, input_y + 3, 10, ea(HEADER_COLOR));
         }
     }
@@ -3806,30 +6016,29 @@ void draw_wifi_config_overlay() {
     bool pass_selected = (wifi_config_field == 1);
     bool pass_editing = pass_selected && wifi_config_editing;
 
-    spr.setTextColor(ea(ACCENT_COLOR), ea(CARD_COLOR));
-    spr.setTextSize(1);
+    spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, field_y);
-    kprint(spr, "PASSWORD");
+    kprint(spr, "PASS");
 
     input_y = field_y + 12;
-    field_bg = pass_selected ? ea(lerp_col16(CARD_COLOR, HEADER_COLOR, 0.08f)) : ea(CARD_COLOR);
-    field_border = pass_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
-    spr.fillRect(cx + 6, input_y, cw - 12, 16, field_bg);
-    spr.drawRect(cx + 6, input_y, cw - 12, 16, field_border);
+    uint16_t pass_border = pass_selected ? ea(HEADER_COLOR) : ea(CARD_BORDER);
+    spr.drawRect(cx + 6, input_y, cw - 12, 16, pass_border);
 
-    const char* pass_src = (wifi_config_editing && pass_selected)
-        ? wifi_config_pass_buf
-        : export_pass;
+    const char* pass_src = wifi_config_pass_buf;
     bool pass_empty = (strlen(pass_src) == 0);
 
-    spr.setTextColor(pass_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), field_bg);
-    spr.setTextSize(1);
+    spr.setTextColor(pass_empty ? ea(DIM_COLOR) : ea(TEXT_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 9, input_y + 4);
 
     if (pass_empty && !pass_editing) {
         spr.print("(not set)");
     } else {
-        if (pass_editing) {
+        // Show plaintext when (a) actively editing, or (b) the user has
+        // toggled reveal mode with 's'. Otherwise mask with asterisks.
+        bool show_plain = pass_editing || wifi_config_show_pass;
+        if (show_plain) {
             char display[66];
             strncpy(display, pass_src, 64);
             display[64] = '\0';
@@ -3839,12 +6048,12 @@ void draw_wifi_config_overlay() {
             for (int i = 0; i < plen && i < 32; i++) spr.print("*");
         }
         if (pass_editing && cursor_visible) {
-            int cursor_x = cx + 9 + wifi_config_cursor * 6;
+            int cursor_x = cx + 9 + wifi_config_cursor * ts_char_w(TS_MICRO);
             spr.drawFastVLine(cursor_x, input_y + 3, 10, ea(HEADER_COLOR));
         }
     }
 
-    // ── Action buttons: Save / Clear ──
+    // ── Action buttons: Save / Clear (outline only) ──
     int btn_y = input_y + 24;
     int btn_w = 70;
     int btn_h = 16;
@@ -3853,68 +6062,92 @@ void draw_wifi_config_overlay() {
     int btn_x2 = btn_x1 + btn_w + btn_gap;
 
     bool save_sel = (wifi_config_field == 2);
-    uint16_t save_bg = save_sel ? ea(lerp_col16(CARD_COLOR, ACCENT_COLOR, 0.2f)) : ea(CARD_COLOR);
     uint16_t save_border = save_sel ? ea(ACCENT_COLOR) : ea(CARD_BORDER);
-    spr.fillRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_bg);
     spr.drawRoundRect(btn_x1, btn_y, btn_w, btn_h, 3, save_border);
-    spr.setTextColor(save_sel ? ea(ACCENT_COLOR) : ea(TEXT_COLOR), save_bg);
-    spr.setTextSize(1);
+    spr.setTextColor(save_sel ? ea(ACCENT_COLOR) : ea(TEXT_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(btn_x1 + 18, btn_y + 4);
     spr.print("SAVE");
 
     bool clear_sel = (wifi_config_field == 3);
-    uint16_t clear_bg = clear_sel ? ea(lerp_col16(CARD_COLOR, CAUTION_COLOR, 0.2f)) : ea(CARD_COLOR);
     uint16_t clear_border = clear_sel ? ea(CAUTION_COLOR) : ea(CARD_BORDER);
-    spr.fillRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_bg);
     spr.drawRoundRect(btn_x2, btn_y, btn_w, btn_h, 3, clear_border);
-    spr.setTextColor(clear_sel ? ea(CAUTION_COLOR) : ea(TEXT_COLOR), clear_bg);
-    spr.setTextSize(1);
+    spr.setTextColor(clear_sel ? ea(CAUTION_COLOR) : ea(TEXT_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(btn_x2 + 14, btn_y + 4);
     spr.print("CLEAR");
 
     // Footer hint
-    spr.setTextColor(ea(DIM_COLOR), ea(CARD_COLOR));
-    spr.setTextSize(1);
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
     spr.setCursor(cx + 6, cy + ch - 11);
     if (wifi_config_editing) {
-        spr.print("type to edit  ENTER done  DEL bksp");
+        spr.print("type  <> move  ENT done  DEL bksp");
+    } else if (wifi_config_field == 1) {
+        // Password field selected — surface the show/hide affordance.
+        spr.print(wifi_config_show_pass ? "ENT edit  s hide  ESC close"
+                                        : "ENT edit  s show  ESC close");
     } else {
-        spr.print("ENTER edit/select  DEL close");
+        spr.print("ENT edit  ^/v field  ESC close");
     }
+}
+
+static void set_turbo_mode(bool on) {
+    if (on == turbo_mode_active) return;
+    turbo_mode_active = on;
+    if (on) {
+        if (low_power_mode) {
+            low_power_mode = false;
+            apply_ble_scan_params();
+        }
+        setCpuFrequencyMhz(240);
+        set_toast_direct("TURBO ON", TOAST_SUCCESS);
+    } else {
+        setCpuFrequencyMhz(160);
+        set_toast_direct("TURBO OFF", TOAST_NEUTRAL);
+    }
+    schedule_persist();
+    screen_dirty = true;
 }
 
 void handle_menu_select() {
     switch (menu_selected) {
         case 0: case 1: case 2: case 3: case 4: {
             int target = menu_selected;
-            show_menu = false;
             transition_screen(target, (target >= current_screen) ? 1 : -1);
             break;
         }
         case 5:
             night_mode = !night_mode;
             apply_color_palette();
-            draw_current_screen(); spr.pushSprite(0, 0);
+            schedule_persist();
+            screen_dirty = true;
             break;
         case 6:
             low_power_mode = !low_power_mode;
             if (low_power_mode) {
+                if (turbo_mode_active) turbo_mode_active = false;
                 setCpuFrequencyMhz(80);
-                set_toast_direct("LOW POWER ON", ACCENT_COLOR);
+                set_toast_direct("LOW POWER ON", TOAST_SUCCESS);
             } else {
                 setCpuFrequencyMhz(160);
-                set_toast_direct("LOW POWER OFF", DIM_COLOR);
+                set_toast_direct("LOW POWER OFF", TOAST_NEUTRAL);
             }
             apply_ble_scan_params();
-            draw_current_screen(); spr.pushSprite(0, 0);
+            schedule_persist();
+            screen_dirty = true;
             break;
         case 7:
             is_muted = !is_muted;
             if (!is_muted) beep(600, 50);
-            draw_current_screen(); spr.pushSprite(0, 0);
+            schedule_persist();
+            screen_dirty = true;
             break;
         case 8:
-            show_menu = false;
+            set_turbo_mode(!turbo_mode_active);
+            break;
+        case 9:
+            show_feed_expanded = false;
             wifi_config_open = true;
             wifi_config_open_ms = millis();
             wifi_config_field = 0;
@@ -3924,28 +6157,20 @@ void handle_menu_select() {
             strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
             wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
             wifi_config_cursor = 0;
-            draw_current_screen(); spr.pushSprite(0, 0);
+            draw_current_screen(); render_frame();
             break;
-        case 9:
-            if (export_mode_active) {
-                // First tap while active: show IP reminder; DEL or second tap to stop
-                char ip_toast[32];
-                snprintf(ip_toast, sizeof(ip_toast), "http://%s", export_ip_str);
-                set_toast_direct(ip_toast, ACCENT_COLOR);
-                draw_current_screen(); spr.pushSprite(0, 0);
-            } else if (export_connecting) {
-                show_menu = false;
+        case 10:
+            if (export_mode_active || export_connecting) {
                 export_mode_stop();
-                draw_current_screen(); spr.pushSprite(0, 0);
             } else {
-                show_menu = false;
                 export_mode_start();
-                draw_current_screen(); spr.pushSprite(0, 0);
             }
+            screen_dirty = true;
             break;
-        case 10: {
+        case 11: {
             // Clear all stats — session and lifetime
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            flush_pending_deletes();
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             session_wifi = 0; session_ble = 0;
             session_flock_wifi = 0; session_flock_ble = 0;
             session_raven = 0;
@@ -3955,14 +6180,14 @@ void handle_menu_select() {
             lifetime_boots = 0;
             lifetime_flash_writes = 0;
             session_start_time = millis();
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
             // Hand the write off to PersistTask on Core 1 so the main
             // loop doesn't freeze for the LittleFS + SD round-trip
             // (~200-800ms, longer on a slow card). schedule_persist
             // already no-ops if a write is in flight.
             schedule_persist();
-            set_toast_direct("STATS CLEARED", CAUTION_COLOR);
-            draw_current_screen(); spr.pushSprite(0, 0);
+            set_toast_direct("STATS CLEARED", TOAST_WARNING, false);
+            screen_dirty = true;
             break;
         }
     }
@@ -3971,1294 +6196,2456 @@ void handle_menu_select() {
 // ============================================================================
 // UI RENDERING - SCREENS 
 // ============================================================================
-void draw_scanner_screen() {
-    int divider_x = 112;
+// ── Layout constants for the scanner screen ──
+// Viz panel fills the entire left side; W/B counts moved to header pills.
+// Feed runs full-height down the right side of the divider.
+// ── Scanner screen layout ───────────────────────────────────────────
+// Every value derived from the spacing system. No magic numbers.
+//
+//   Screen edge margins:  UI_PAD_SM (6px) both sides
+//   Divider gutters:      UI_PAD_XS (2px) symmetric
+//   Label row inset:      UI_PAD_XS * 2 (4px) from CONTENT_Y
+//
+// Horizontal map (pixels):
+//   0  [6px margin]  6..137 viz  [2px] 140 div [2px] 143..233 feed  [6px margin] 240
+//
+static const int DIVIDER_X     = 140;
+static const int DIVIDER_GAP   = UI_PAD_XS;                          // 2 — gutter each side of divider
+static const int VIZ_X         = UI_PAD_SM;                           // 6 — left screen margin
+static const int VIZ_W         = DIVIDER_X - VIZ_X - DIVIDER_GAP;    // 132
+static const int VIZ_RIGHT     = VIZ_X + VIZ_W;                       // 138
+static const int FEED_X        = DIVIDER_X + 1 + DIVIDER_GAP;         // 143 — 1px line + gutter
+static const int FEED_RIGHT    = DISP_W - UI_PAD_SM;                  // 234 — right screen margin
+static const int LABEL_ROW_H   = 16;                                   // fits TS_BODY + vertical padding
+static const int LABEL_TEXT_Y  = CONTENT_Y + UI_PAD_XS * 2;           // 24 — text cursor y
+static const int LABEL_MICRO_Y = LABEL_TEXT_Y + UI_PAD_XS;            // 26 — TS_MICRO baseline-aligned
+static const int VIZ_Y         = CONTENT_Y + LABEL_ROW_H;              // 36 — viz/feed content top
+static const int VIZ_H         = DISP_H - VIZ_Y;                       // 99
+static const int VIZ_BOTTOM    = VIZ_Y + VIZ_H;                        // 135 (== DISP_H)
+static const int FEED_FIRST_Y  = VIZ_Y;                                // 36 — feed rows start here
+
+// ── SCAN viz angle LUT ─────────────────────────────────────────────
+// One-time precomputed angle (in radians, quantized to 0..255) from
+// each 2×2 block center to the scan-viz center. Replaces the per-frame
+// fast_atan2f calls in the phosphor trail loop. ~3.2KB in PSRAM.
+//
+// Index: row * SCAN_LUT_COLS + col
+//   row = (py - VIZ_Y) / 2
+//   col = (px - VIZ_X) / 2
+// Value: angle * 256 / (2π), so multiply back by (2π/256) for radians.
+static const int SCAN_LUT_COLS = (VIZ_W + 1) / 2;
+static const int SCAN_LUT_ROWS = (VIZ_H + 1) / 2;
+static const int SCAN_LUT_SIZE = SCAN_LUT_COLS * SCAN_LUT_ROWS;
+static const float SCAN_LUT_INV_SCALE = (2.0f * (float)M_PI) / 256.0f;
+
+static void scan_angle_lut_build() {
+    if (scan_angle_lut_ready) return;
+
+    scan_angle_lut = (uint8_t*)heap_caps_malloc(SCAN_LUT_SIZE,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scan_angle_lut) {
+        scan_angle_lut = (uint8_t*)heap_caps_malloc(SCAN_LUT_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (!scan_angle_lut) {
+        Serial.println("[SCAN] angle LUT alloc failed — falling back to atan2 path");
+        return;
+    }
+
+    const int CX = VIZ_X + VIZ_W / 2;
+    const int CY = VIZ_Y + VIZ_H / 2;
+    const float PI2f  = 2.0f * (float)M_PI;
+    const float SCALE = 256.0f / PI2f;
+
+    for (int row = 0; row < SCAN_LUT_ROWS; row++) {
+        int py = VIZ_Y + row * 2;
+        for (int col = 0; col < SCAN_LUT_COLS; col++) {
+            int px = VIZ_X + col * 2;
+            float dx = (float)(px - CX);
+            float dy = (float)(py - CY);
+            float ang = atan2f(dy, dx);
+            if (ang < 0.0f) ang += PI2f;
+            int quant = (int)(ang * SCALE + 0.5f);
+            if (quant < 0)   quant = 0;
+            if (quant > 255) quant = 255;
+            scan_angle_lut[row * SCAN_LUT_COLS + col] = (uint8_t)quant;
+        }
+    }
+    scan_angle_lut_ready = true;
+    Serial.printf("[SCAN] angle LUT built (%d entries, %u bytes)\n",
+                  SCAN_LUT_SIZE, (unsigned)SCAN_LUT_SIZE);
+}
+
+// Compute sine and cosine of the same angle. Currently just calls sinf
+// and cosf separately — the name reflects what it does, not a promise
+// of optimization. If this becomes a hot path, consider a sin LUT plus
+// cos derived from sqrtf(1 - sin²) with sign tracking.
+static inline void compute_sincos(float angle, float* s, float* c) {
+    *s = sinf(angle);
+    *c = cosf(angle);
+}
+
+// Polynomial atan2 approximation — ~0.002 rad error, ~5× faster than atan2f.
+static inline float fast_atan2f(float y, float x) {
+    float ax = fabsf(x), ay = fabsf(y);
+    float mn = (ax < ay) ? ax : ay;
+    float mx = (ax < ay) ? ay : ax;
+    float a = mn / (mx + 1e-10f);
+    float s = a * a;
+    float r = ((-0.0464964749f * s + 0.15931422f) * s - 0.327622764f) * s * a + a;
+    if (ay > ax) r = 1.5707963f - r;
+    if (x < 0.0f) r = 3.14159265f - r;
+    if (y < 0.0f) r = -r;
+    return r;
+}
+
+
+
+// ── Timeline bin management ───────────────────────────────────────────────
+static void timeline_shift_bins(unsigned long frame_ms) {
+    for (int i = 0; i < TIMELINE_BIN_COUNT - 1; i++) {
+        tl_bins[i]       = tl_bins[i + 1];
+        tl_flock_fade[i] = tl_flock_fade[i + 1];
+    }
+
+    uint16_t wifi_count = 0;
+    uint16_t ble_count  = 0;
+    bool     found_flock = false;
+    uint8_t  flock_proto = 0;
+    int16_t  wifi_rssi_sum = 0;
+    int16_t  ble_rssi_sum  = 0;
+    uint8_t  wifi_rssi_cnt = 0;
+    uint8_t  ble_rssi_cnt  = 0;
+
+    for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
+        int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
+        if (e.mac[0] == '\0') continue;
+        if ((frame_ms - e.timestamp) > TIMELINE_BIN_MS * 2) continue;
+        if (e.proto == 0) {
+            wifi_count++;
+            wifi_rssi_sum += e.rssi;
+            wifi_rssi_cnt++;
+        } else {
+            ble_count++;
+            ble_rssi_sum += e.rssi;
+            ble_rssi_cnt++;
+        }
+        if (e.is_flock && !found_flock) { found_flock = true; flock_proto = e.proto; }
+    }
+
+    if (!found_flock && scanner_flash_ms > 0 &&
+        (frame_ms - scanner_flash_ms) < TIMELINE_BIN_MS) {
+        found_flock = true;
+        flock_proto = scanner_flash_proto;
+    }
+
+    int newest = TIMELINE_BIN_COUNT - 1;
+    tl_bins[newest].wifi            = wifi_count;
+    tl_bins[newest].ble             = ble_count;
+    tl_bins[newest].has_flock       = found_flock;
+    tl_bins[newest].flock_proto     = flock_proto;
+    tl_bins[newest].timestamp       = frame_ms;
+    tl_bins[newest].wifi_rssi_sum   = wifi_rssi_sum;
+    tl_bins[newest].ble_rssi_sum    = ble_rssi_sum;
+    tl_bins[newest].wifi_rssi_count = wifi_rssi_cnt;
+    tl_bins[newest].ble_rssi_count  = ble_rssi_cnt;
+    tl_flock_fade[newest]           = found_flock ? 1.0f : 0.0f;
+    tl_last_bin_ms = frame_ms;
+}
+
+static void timeline_init(unsigned long frame_ms) {
+    for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+        tl_bins[i].wifi            = 0;
+        tl_bins[i].ble             = 0;
+        tl_bins[i].has_flock       = false;
+        tl_bins[i].flock_proto     = 0;
+        tl_bins[i].timestamp       = frame_ms - (unsigned long)(TIMELINE_BIN_COUNT - 1 - i) * TIMELINE_BIN_MS;
+        tl_bins[i].wifi_rssi_sum   = 0;
+        tl_bins[i].ble_rssi_sum    = 0;
+        tl_bins[i].wifi_rssi_count = 0;
+        tl_bins[i].ble_rssi_count  = 0;
+        tl_wifi_smooth[i]          = 0.0f;
+        tl_ble_smooth[i]           = 0.0f;
+        tl_flock_fade[i]           = 0.0f;
+    }
+    tl_last_bin_ms = frame_ms;
+    tl_initialized = true;
+}
+
+// ── Export mode info display — replaces scanner content while active ──
+static void draw_export_info() {
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(0);
-    unsigned long frame_ms = millis();
-    spr.setClipRect(0, 18, divider_x, DISP_H - 18);
-    
-    float TILT = 0.55f;
-    int rcx = radar_cx;
-    int rcy = radar_cy;
-    int THICKNESS = 7;
 
-    // Shadow below cylinder
-    spr.fillEllipse(rcx, rcy + THICKNESS + 2, radar_r, radar_r * TILT, lgfx::color565(4, 8, 16));
+    const int LBL_X = UI_PAD_SM + 2;
+    const int VAL_X = 46;
+    int ry = CONTENT_Y + UI_PAD_SM;
 
-    // Cylinder wall: solid gradient fills from bottom to top (lighter toward top)
-    for (int i = THICKNESS; i >= 1; i--) {
-        uint8_t wall_v = 8 + (THICKNESS - i) * 2;
-        spr.fillEllipse(rcx, rcy + i, radar_r, radar_r * TILT,
-                        lgfx::color565(wall_v, wall_v * 2, wall_v * 4));
-    }
-
-    // Left/right edge lines connecting top rim to bottom rim (removed)
-
-    // Top face fill and border — draw ellipse twice (y offset 1) for thicker rim
-    spr.fillEllipse(rcx, rcy, radar_r, radar_r * TILT, lgfx::color565(14, 26, 52));
-    spr.drawEllipse(rcx, rcy,     radar_r, (int)(radar_r * TILT), HEADER_COLOR);
-    spr.drawEllipse(rcx, rcy + 1, radar_r, (int)(radar_r * TILT), HEADER_COLOR);
-
-    // Hatching on both sides of the cylinder rim seam
-
-    // Redraw bottom rim so it shows over the top face fill — doubled for thickness
-    spr.drawEllipse(rcx, rcy + THICKNESS,     radar_r, radar_r * TILT, DIM_COLOR);
-    spr.drawEllipse(rcx, rcy + THICKNESS + 1, radar_r, radar_r * TILT, DIM_COLOR);
-
-    // Structural ribs on left wall removed
-
-    spr.drawEllipse(rcx, rcy,     inner_r, (int)(inner_r * TILT), DIM_COLOR);
-    spr.drawEllipse(rcx, rcy + 1, inner_r, (int)(inner_r * TILT), DIM_COLOR);
-
-    float sweep_rad = (frame_ms / 3000.0f) * (float)M_PI * 2.0f;
-
-    static bool p_init = false;
-    if (!p_init) {
-        for (int i = 0; i < NUM_PARTICLES; i++) {
-            noise_r[i]        = (float)random(inner_r + 4, radar_r - 4);
-            noise_a[i]        = random(0, 628) * 0.01f;
-            noise_max_life[i] = random(1200, 2200);
-            noise_life[i]     = 0;
-        }
-        p_init = true;
-    }
-
-    const float TWO_PIf      = (float)M_PI * 2.0f;
-    float sweep_norm = fmodf(sweep_rad, TWO_PIf);
-
-    // Drive particles from real ambient packet activity
+    // Status badge
     {
-        static uint32_t last_ambient_count = 0;
-        static int particle_pending = 0;
-        uint32_t cur_ambient = ambient_packet_count;
-        uint32_t delta = cur_ambient - last_ambient_count;
-        last_ambient_count = cur_ambient;
-        // Each packet contributes 1–3 particles (clamped)
-        particle_pending += (int)delta * 2;
-        if (particle_pending > NUM_PARTICLES * 3) particle_pending = NUM_PARTICLES * 3;
-        // Activate up to particle_pending idle particles this frame
-        for (int i = 0; i < NUM_PARTICLES && particle_pending > 0; i++) {
-            if (noise_life[i] <= 0) {
-                noise_r[i]    = (float)random(inner_r + 4, radar_r - 4);
-                noise_a[i]    = random(0, 628) * 0.01f;
-                noise_life[i] = noise_max_life[i];
-                particle_pending--;
+        const char* status_str = "EXPORT ACTIVE";
+        int bw = (int)strlen(status_str) * ts_char_w(TS_BODY) + 12;
+        uint16_t sfill = lerp_col16(BG_COLOR, HEADER_COLOR, 0.22f);
+        spr.fillRoundRect(LBL_X, ry, bw, 16, 5, sfill);
+        spr.drawRoundRect(LBL_X, ry, bw, 16, 5, HEADER_COLOR);
+        spr.setTextColor(HEADER_COLOR, sfill);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(LBL_X + 6, ry + 4);
+        kprint(spr, status_str);
+    }
+    ry += 24;
+
+    // URL
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(LBL_X, ry);
+    kprint(spr, "URL");
+    ry += 11;
+
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(LBL_X, ry);
+    {
+        char url[32];
+        snprintf(url, sizeof(url), "http://%s", export_ip_str);
+        kprint(spr, url);
+    }
+    ry += 16;
+
+    // User + Password side by side
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(LBL_X, ry);
+    kprint(spr, "USER");
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setCursor(VAL_X, ry);
+    spr.print(export_auth_user);
+
+    int pass_x = 120;
+    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+    spr.setCursor(pass_x, ry);
+    kprint(spr, "PASS");
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setCursor(pass_x + 36, ry);
+    spr.print(export_auth_pass);
+    ry += 16;
+
+    // Time remaining
+    {
+        unsigned long elapsed = millis() - export_mode_started_at;
+        unsigned long remaining_ms = (elapsed < EXPORT_MODE_MAX_MS)
+                                   ? (EXPORT_MODE_MAX_MS - elapsed) : 0;
+        unsigned int rm = (unsigned int)(remaining_ms / 60000UL);
+        unsigned int rs = (unsigned int)((remaining_ms / 1000UL) % 60);
+
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, ry);
+        kprint(spr, "TIME");
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(VAL_X, ry);
+        char time_buf[12];
+        snprintf(time_buf, sizeof(time_buf), "%um %02us", rm, rs);
+        spr.print(time_buf);
+    }
+    ry += 16;
+
+    // WiFi scanning paused notice
+    spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(LBL_X, ry);
+    spr.print("All scanning paused");
+
+    // Footer
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
+    spr.print("M menu  ESC home");
+}
+
+void draw_scanner_screen() {
+    // Show connection details instead of scanner while export is active
+    if (export_mode_active) {
+        draw_export_info();
+        return;
+    }
+
+    unsigned long frame_ms = millis();
+
+    // Keep timeline bins populated regardless of which viz is active
+    // so the timeline has history when the user first visits it.
+    if (!tl_initialized) {
+        timeline_init(frame_ms);
+    }
+    if (frame_ms - tl_last_bin_ms >= TIMELINE_BIN_MS) {
+        timeline_shift_bins(frame_ms);
+    }
+
+    // Step 1: clear
+    spr.fillSprite(BG_COLOR);
+
+    // Header divider — full width, separates the SCANNER strip from content.
+    spr.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
+
+    // Step 2: vertical divider
+    spr.drawFastVLine(DIVIDER_X, 18, DISP_H - 18, CARD_BORDER);
+
+    // Step 3: shared label row — viz title (left) | N/4 right-aligned | FEED (right)
+    {
+        static const char* viz_titles[] = {"SCAN", "LINE", "TIME"};
+        const char* vt = viz_titles[scanner_viz_mode];
+
+        // Viz title — aligned with header text
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(TEXT_LEFT, LABEL_TEXT_Y);
+        kprint(spr, vt);
+
+        // N/4 indicator — right-aligned within viz panel
+        {
+            char ind_str[6];
+            snprintf(ind_str, sizeof(ind_str), "%d/%d",
+                     scanner_viz_mode + 1, SCANNER_VIZ_COUNT);
+            int ind_w = (int)strlen(ind_str) * ts_char_w(TS_MICRO);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(VIZ_RIGHT - UI_PAD_SM - ind_w, LABEL_MICRO_Y);
+            spr.print(ind_str);
+        }
+
+        // FEED label — right column, aligned with content left edge
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(FEED_X + DIVIDER_GAP + 1, LABEL_TEXT_Y);
+        kprint(spr, "FEED");
+    }
+
+    // Step 4: viz panel
+    spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+    update_channel_histogram();
+
+    // Keep spectrum smooth data warm across all modes so LINE starts live.
+    {
+        float sdt = (spectrum_last_frame == 0) ? 16.0f
+                  : (float)(frame_ms - spectrum_last_frame);
+        if (sdt > 100.0f) sdt = 100.0f;
+        spectrum_last_frame = frame_ms;
+        scan_line_last_frame = frame_ms;  // keep scan line timestamp warm across viz modes
+        for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+            float target = (channel_peak > 0 && channel_pkt_display[i] > 0)
+                          ? (float)channel_pkt_display[i] / (float)channel_peak
+                          : 0.0f;
+            spectrum_smooth[i] = anim_filter(spectrum_smooth[i], target, 300.0f, sdt);
+        }
+    }
+
+    // Keep timeline smooth data warm across all modes so TIME starts live.
+    {
+        float tdt = (tl_last_frame_ms == 0) ? 16.0f
+                  : (float)(frame_ms - tl_last_frame_ms);
+        if (tdt > 100.0f) tdt = 100.0f;
+        tl_last_frame_ms = frame_ms;
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+            float wifi_target = 0.0f;
+            if (tl_bins[i].wifi_rssi_count > 0) {
+                float avg = (float)tl_bins[i].wifi_rssi_sum / (float)tl_bins[i].wifi_rssi_count;
+                wifi_target = (avg + 90.0f) / 60.0f;
+                if (wifi_target < 0.0f) wifi_target = 0.0f;
+                if (wifi_target > 1.0f) wifi_target = 1.0f;
+                if (tl_bins[i].wifi > 0) { wifi_target += 0.15f; if (wifi_target > 1.0f) wifi_target = 1.0f; }
+            }
+            float ble_target = 0.0f;
+            if (tl_bins[i].ble_rssi_count > 0) {
+                float avg = (float)tl_bins[i].ble_rssi_sum / (float)tl_bins[i].ble_rssi_count;
+                ble_target = (avg + 90.0f) / 60.0f;
+                if (ble_target < 0.0f) ble_target = 0.0f;
+                if (ble_target > 1.0f) ble_target = 1.0f;
+                if (tl_bins[i].ble > 0) { ble_target += 0.15f; if (ble_target > 1.0f) ble_target = 1.0f; }
+            }
+            tl_wifi_smooth[i] = anim_filter(tl_wifi_smooth[i], wifi_target, 400.0f, tdt);
+            tl_ble_smooth[i]  = anim_filter(tl_ble_smooth[i],  ble_target,  400.0f, tdt);
+            if (tl_flock_fade[i] > 0.0f) {
+                tl_flock_fade[i] -= tdt / 3000.0f;
+                if (tl_flock_fade[i] < 0.0f) tl_flock_fade[i] = 0.0f;
             }
         }
     }
 
-    // Static to avoid stack pressure — rendering is single-threaded from loop().
-    static float local_spikes[NUM_RADIAL_BANDS];
-    static uint16_t local_colors[NUM_RADIAL_BANDS];
-
-    static const float SPIKE_DECAY_PER_MS = 0.00004f;
-    static unsigned long last_decay_ms = 0;
-    unsigned long now_ms = millis();
-    float decay_amount = SPIKE_DECAY_PER_MS * (float)(now_ms - last_decay_ms);
-
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    unsigned long time_since_blip = now_ms - last_blip_time;
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        // Enforce 2-minute max detection lifetime
-        if (radial_spike_birth[i] > 0 && (now_ms - radial_spike_birth[i]) > 120000UL) {
-            radial_spikes[i]      = 0;
-            radial_spike_birth[i] = 0;
-        }
-        local_spikes[i] = radial_spikes[i];
-        local_colors[i] = radial_colors[i];
-        radial_spikes[i] -= decay_amount;
-        if (radial_spikes[i] < 0) radial_spikes[i] = 0;
+    switch (scanner_viz_mode) {
+        case 0: draw_scanner_viz_scan(frame_ms);         break;
+        case 1: draw_scanner_viz_spectrum(frame_ms);     break;
+        case 2: draw_scanner_viz_timeline(frame_ms);     break;
     }
-    xSemaphoreGive(dataMutex);
-    last_decay_ms = now_ms;
-
-    static unsigned long last_particle_ms = 0;
-    unsigned long dt_ms = now_ms - last_particle_ms;
-    if (dt_ms > 100) dt_ms = 100;
-    last_particle_ms = now_ms;
-
-    float noise_dimming = 1.0f;
-    if (time_since_blip < 10000) {
-        noise_dimming = 0.0f;
-    } else if (time_since_blip < 13000) {
-        noise_dimming = (time_since_blip - 10000) / 3000.0f;
-    }
-
-    if (noise_dimming > 0.01f) {
-        for (int i = 0; i < NUM_PARTICLES; i++) {
-            if (noise_life[i] <= 0) continue;
-
-            noise_life[i] -= (int)dt_ms;
-            if (noise_life[i] < 0) noise_life[i] = 0;
-
-            float fade = (float)noise_life[i] / (float)noise_max_life[i];
-            int intensity = (int)(fade * 180.0f * noise_dimming);
-            if (intensity > 200) intensity = 200;
-            if (intensity < 20) continue;
-
-            // Sweep-tied brightness: particle brightens dramatically when sweep line
-            // passes over its angle, dims otherwise. Makes the sweep feel like it's
-            // "illuminating" the ambient RF environment.
-            float pa = fmodf(noise_a[i], TWO_PIf);
-            float diff_sweep = sweep_norm - pa;
-            if (diff_sweep >  (float)M_PI) diff_sweep -= TWO_PIf;
-            if (diff_sweep < -(float)M_PI) diff_sweep += TWO_PIf;
-            // Only show particles in the sweep's wake (behind the sweep line)
-            // diff_sweep > 0 means sweep has passed this angle
-            float trail_arc = 2.0f;  // radians of visible trail behind sweep
-            if (diff_sweep < 0) diff_sweep += TWO_PIf;  // normalize to [0, 2π]
-            if (diff_sweep > trail_arc) continue;  // too far behind sweep — not visible
-            float sweep_proximity = 1.0f - (diff_sweep / trail_arc);  // 1 at sweep, 0 at trail_arc behind
-            int sweep_boost = (int)(sweep_proximity * 80);
-            int total_intensity = intensity + sweep_boost;
-            if (total_intensity > 255) total_intensity = 255;
-
-            int px = rcx + (int)(noise_r[i] * cosf(noise_a[i]));
-            int py = rcy + (int)(noise_r[i] * sinf(noise_a[i]) * TILT);
-
-            // Color based on intensity — cyan-green family for day, red-orange for night
-            // Day: mint-cyan tinted particles. Night: warmer red tint.
-            uint16_t p_col = night_mode
-                ? lgfx::color565(total_intensity, total_intensity / 8, total_intensity / 12)
-                : lgfx::color565(total_intensity / 3, (total_intensity * 7) / 8, (total_intensity * 5) / 6);
-
-            // Draw small upward triangle (matches detection triangle vocabulary but smaller)
-            // Size 3: base 3px, height 3px
-            spr.drawTriangle(px - 1, py + 1,
-                             px + 1, py + 1,
-                             px,     py - 2,
-                             p_col);
-
-            // Extra bright near sweep: fill the triangle for emphasis
-            if (sweep_proximity > 0.5f) {
-                spr.drawPixel(px, py - 1, p_col);
-                spr.drawPixel(px, py, p_col);
-            }
-        }
-    }
-
-    float breathe = anim_pulse(UI_PULSE_MEDIUM) * 2.0f - 1.0f;  // remap to -1..1
-    uint16_t modulated_col = (breathe > 0) ? HEADER_COLOR : DIM_COLOR;
-    int dynamic_r   = (radar_r - 6) + (int)(4 * breathe);
-    float cos_rot   = cosf(hud_rotation);
-    float sin_rot   = sinf(hud_rotation);
-    spr.drawLine(rcx - dynamic_r * cos_rot, rcy - dynamic_r * sin_rot * TILT,
-                 rcx + dynamic_r * cos_rot, rcy + dynamic_r * sin_rot * TILT, modulated_col);
-    spr.drawLine(rcx - dynamic_r * -sin_rot, rcy - dynamic_r * cos_rot * TILT,
-                 rcx + dynamic_r * -sin_rot, rcy + dynamic_r * cos_rot * TILT, modulated_col);
-
-    for (int i = 1; i <= 24; i++) {
-        float trail_angle = sweep_rad - (i * 0.05f);
-        float ratio = (24.0f - i) / 24.0f;
-        int tr = 10 + (0   - 10)  * ratio;
-        int tg = 20 + (238 - 20)  * ratio;
-        int tb = 48 + (255 - 48)  * ratio;
-        uint16_t fade_col = night_mode ? lgfx::color565(tb, 0, 0) : lgfx::color565(tr, tg, tb);
-        for (int r_step = inner_r + 2; r_step < radar_r; r_step += 4) {
-            spr.drawPixel(rcx + (int)(r_step * cosf(trail_angle)),
-                          rcy + (int)(r_step * sinf(trail_angle) * TILT), fade_col);
-        }
-    }
-    spr.drawLine(rcx, rcy,
-                 rcx + (int)((radar_r - 1) * cosf(sweep_rad)),
-                 rcy + (int)((radar_r - 1) * sinf(sweep_rad) * TILT), HEADER_COLOR);
-
-    float angle_step = (float)M_PI * 2.0f / NUM_RADIAL_BANDS;
-
-    const float BLIP_RELIGHT_ARC = 0.20f;
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        if (local_spikes[i] < 0.05f) continue;
-        float band_angle = fmodf(i * angle_step, TWO_PIf);
-        float diff = sweep_norm - band_angle;
-        if (diff >  (float)M_PI) diff -= TWO_PIf;
-        if (diff < -(float)M_PI) diff += TWO_PIf;
-        if (diff >= 0.0f && diff < BLIP_RELIGHT_ARC) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            if (radial_spikes[i] > 0.05f) {
-                radial_spikes[i] = min(radial_spikes[i] * 1.4f, 1.5f);
-            }
-            xSemaphoreGive(dataMutex);
-        }
-    }
-
-    for (int i = 0; i < NUM_RADIAL_BANDS; i++) {
-        float a = i * angle_step;
-        if (local_spikes[i] > 0) {
-            bool is_strong = (local_spikes[i] > 0.8f);
-
-            int spike_len = (int)((radar_r - inner_r) * local_spikes[i] * 0.7f);
-            if (spike_len < 2)  spike_len = 2;
-            if (spike_len > 22) spike_len = 22; // cap — prevents jarring tall spike on first detection
-
-            float dist_ratio = constrain(map(radial_rssi[i], -100, -30, 100, 0), 0, 100) / 100.0f;
-            int blip_dist = inner_r + 4 + (int)((radar_r - inner_r - 6) * dist_ratio);
-
-            int base_x = rcx + (int)(blip_dist * cosf(a));
-            int base_y = rcy + (int)(blip_dist * sinf(a) * TILT);
-            uint16_t line_col = local_colors[i];
-
-            if (is_strong) {
-                // Stop the stem line at the shape's bottom edge so it doesn't
-                // cut through the icon. Triangle bottom = tip_y+7, diamond
-                // bottom = tip_y+8 — use 8 to cover both.
-                int shape_bottom = base_y - spike_len + 8;
-                if (shape_bottom < base_y) {
-                    spr.drawLine(base_x, base_y, base_x, shape_bottom, line_col);
-                }
-                // Shape encodes protocol — filled, larger for visibility
-                // against the busy sweep/particle background.
-                // BLE = diamond (◆), WiFi = triangle (▲)
-                bool is_ble_blip = (line_col == PURPLE_COLOR);
-                int tip_y = base_y - spike_len;
-                if (is_ble_blip) {
-                    // Outline-only 9px symmetric diamond
-                    int cx_d = base_x, cy_d = tip_y + 4, bhr = 4;
-                    spr.drawLine(cx_d,       cy_d - bhr, cx_d + bhr, cy_d,       line_col);
-                    spr.drawLine(cx_d + bhr, cy_d,       cx_d,       cy_d + bhr, line_col);
-                    spr.drawLine(cx_d,       cy_d + bhr, cx_d - bhr, cy_d,       line_col);
-                    spr.drawLine(cx_d - bhr, cy_d,       cx_d,       cy_d - bhr, line_col);
-                } else {
-                    // Outline-only 9px upward triangle
-                    spr.drawTriangle(base_x - 4, tip_y + 7,
-                                     base_x + 4, tip_y + 7,
-                                     base_x,     tip_y, line_col);
-                }
-            } else {
-                // Small noise-style dash for weak signals
-                spr.drawLine(base_x - 1, base_y, base_x + 1, base_y, line_col);
-            }
-        }
-    }
-    hud_rotation = fmodf(hud_rotation + 0.0033f, 2.0f * (float)M_PI);
-
     spr.clearClipRect();
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    long sw = session_flock_wifi; long sb = session_flock_ble;
-    xSemaphoreGive(dataMutex);
+    if (!show_feed_expanded && (frame_ms - scan_feed_last_snapshot >= 500 || scan_feed_last_snapshot == 0)) {
+        if (take_data_mutex()) {
+            scan_local_count = feed_count;
+            scan_local_head  = feed_head;
+            for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
+            give_data_mutex();
+            scan_feed_last_snapshot = frame_ms;
+        }
+    }
 
-    int right_text_x = divider_x + 5;
+    const int feed_row_h    = 14;
+    const int feed_last_y   = DISP_H - 1;
+    const int max_feed_rows = (feed_last_y - FEED_FIRST_Y) / feed_row_h;
+    unsigned long feed_now  = frame_ms;
 
-    bool ble_active = pBLEScan ? pBLEScan->isScanning() : false;
-    bool wifi_active = !ble_active;
+    // Detect a new top entry → trigger a slide-down. Skip the very
+    // first frame after the screen opens (prev_head == -1) so we
+    // don't slide on the initial render.
+    if (scan_local_head != feed_anim_prev_head && feed_anim_prev_head != -1) {
+        feed_anim_shift_ms = frame_ms;
+    }
+    feed_anim_prev_head = scan_local_head;
 
-    uint16_t inactive_col = CARD_BORDER;
+    float slide_t = 1.0f;
+    if (feed_anim_shift_ms > 0 && (frame_ms - feed_anim_shift_ms) < FEED_SHIFT_ANIM_MS) {
+        slide_t = ui_ease((float)(frame_ms - feed_anim_shift_ms)
+                          / (float)FEED_SHIFT_ANIM_MS);
+    }
+    int slide_offset = (int)((1.0f - slide_t) * (float)feed_row_h);
 
-    // Smooth easing for indicator color transitions
-    static float wf_ease = 0.0f;
-    static float ble_ease = 0.0f;
-    wf_ease  += ((wifi_active ? 1.0f : 0.0f) - wf_ease)  * 0.2f;
-    ble_ease += ((ble_active  ? 1.0f : 0.0f) - ble_ease) * 0.2f;
+    int feed_clip_x = FEED_X + DIVIDER_GAP + 1;
+    spr.setClipRect(feed_clip_x, FEED_FIRST_Y,
+                    FEED_RIGHT - feed_clip_x, DISP_H - FEED_FIRST_Y);
 
-    uint16_t wf_col  = lerp_col16(inactive_col, CAUTION_COLOR, wf_ease);
-    uint16_t ble_col = lerp_col16(inactive_col, PURPLE_COLOR,  ble_ease);
+    if (scan_local_count == 0) {
+        char dots[4];
+        anim_ellipsis(dots, sizeof(dots));
+        char scanning[20];
+        snprintf(scanning, sizeof(scanning), "Scanning%s", dots);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(FEED_X + DIVIDER_GAP + 1, FEED_FIRST_Y + UI_PAD_SM + UI_PAD_XS);
+        spr.print(scanning);
+    }
 
-    // ── Combined segmented pill: [WiFi: ch / BLE] ──
-    // Each segment fills its full half including the diagonal slash region —
-    // the slash is drawn last as a divider line over the seam, not as a fill
-    // boundary. This eliminates the unfilled triangular gaps.
-    // Pad channel to 2 digits for fixed pill width (prevents layout jumps
-    // when cycling between channel 9 and 10)
-    char wf_label[14]; snprintf(wf_label, sizeof(wf_label), "WiFi:%2d", current_channel);
-    bool wf_locked = (frame_ms < channel_lock_until);
-    // Fixed width: "WiFi: 12" = 8 chars + optional " L" (2) padding always applied
-    int wf_seg_w = 10 * 6 + 14;  // +4 more horizontal
-    int ble_seg_w = 40;            // +4 more horizontal
+    for (int i = 0; i < scan_local_count && i < max_feed_rows; i++) {
+        int idx = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
+        int ry = FEED_FIRST_Y + i * feed_row_h - slide_offset;
 
-    bool ble_pulse_on = ble_active && (((frame_ms / 500) % 2) == 0);
-    float ble_pulse_t = ble_active ? (ble_pulse_on ? 1.0f : 0.35f) : 0.18f;
-    uint16_t ble_badge_col = lerp_col16(CARD_BORDER, ble_col, ble_pulse_t);
+        unsigned long age = feed_now - e.timestamp;
+        float af;
+        if (age < FEED_AGE_FULL_MS) {
+            af = 1.0f;
+        } else if (age < FEED_AGE_GONE_MS) {
+            af = 1.0f - (float)(age - FEED_AGE_FULL_MS)
+                       / (float)(FEED_AGE_GONE_MS - FEED_AGE_FULL_MS);
+        } else {
+            af = 0.0f;
+        }
+        if (af < 0.1f) continue;
 
-    uint16_t wf_fill  = lerp_col16(BG_COLOR, CAUTION_COLOR, wf_ease  * 0.22f);
-    uint16_t ble_fill = lerp_col16(BG_COLOR, PURPLE_COLOR,  ble_ease * 0.22f);
+        // Symbol — shape=protocol, color=threat status (amber if flock)
+        int sym_x = FEED_X + DIVIDER_GAP + 1;
+        int sym_y = ry + 3;
+        uint16_t base_proto_col = e.is_flock  ? CAUTION_COLOR
+                                : (e.proto == 0) ? HEADER_COLOR
+                                                 : PURPLE_COLOR;
+        uint16_t proto_col = lerp_col16(BG_COLOR, base_proto_col, af);
 
-    int badge_x = right_text_x + 2;
-    int badge_y = 22;
-    int badge_h = 18;
-    int total_w = wf_seg_w + ble_seg_w;
-    uint16_t outer_border = lerp_col16(wf_col, ble_badge_col, 0.5f);
+        if (e.proto == 0) {
+            spr.drawTriangle(sym_x,     sym_y + 7,
+                             sym_x + 8, sym_y + 7,
+                             sym_x + 4, sym_y,
+                             proto_col);
+        } else {
+            int ecx = sym_x + 4, ecy = sym_y + 4, ehr = 4;
+            spr.drawLine(ecx,       ecy - ehr, ecx + ehr, ecy,       proto_col);
+            spr.drawLine(ecx + ehr, ecy,       ecx,       ecy + ehr, proto_col);
+            spr.drawLine(ecx,       ecy + ehr, ecx - ehr, ecy,       proto_col);
+            spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
+        }
 
-    // Step 1: clear pill area
-    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 8, BG_COLOR);
+        int name_x = sym_x + UI_PAD_MD;
 
-    // Step 2: fill BLE segment (right) FIRST as full pill — gives it the
-    // rounded right corners
-    spr.fillRoundRect(badge_x, badge_y, total_w, badge_h, 8, ble_fill);
+        spr.setTextColor(lerp_col16(BG_COLOR, TEXT_COLOR, af), BG_COLOR);
+        spr.setTextSize(TS_BODY);
 
-    // Step 3: overdraw WiFi segment (left) — extends slightly past the
-    // diagonal seam so no BLE color leaks through the slash region
-    {
-        int seam_x = badge_x + wf_seg_w;
-        // Fill the WiFi-side rounded area
-        spr.fillRoundRect(badge_x, badge_y, wf_seg_w, badge_h, 8, wf_fill);
-        // Square off the right edge of WiFi segment up to the slash midpoint,
-        // covering the seam fully. Use a triangle that extends past the
-        // diagonal so no BLE color shows through.
-        spr.fillRect(badge_x + wf_seg_w - 7, badge_y, 7, badge_h, wf_fill);
-        // Diagonal "wedge" of WiFi color extending into the seam area —
-        // matches the slope of the slash divider so the fill respects the
-        // diagonal boundary, eliminating triangle gaps.
-        for (int dy = 0; dy < badge_h; dy++) {
-            // Slash goes from (seam_x + 4, badge_y + 2) to (seam_x - 4, badge_y + badge_h - 3)
-            // For each y row, compute the x where the slash crosses
-            float t = (float)(dy - 2) / (float)(badge_h - 5);
-            t = (t < 0.0f) ? 0.0f : (t > 1.0f ? 1.0f : t);
-            int slash_x = (int)(seam_x + 4 - t * 8.0f);
-            // Fill from previous WiFi edge up to slash_x with WiFi color
-            int wfill_right = badge_x + wf_seg_w;
-            if (slash_x > wfill_right) {
-                spr.drawFastHLine(wfill_right, badge_y + dy,
-                                  slash_x - wfill_right, wf_fill);
+        int max_chars = (FEED_RIGHT - name_x - 2) / ts_char_w(TS_BODY);
+        if (max_chars > 14) max_chars = 14;
+        if (max_chars < 1)  max_chars = 1;
+        char nd[16];
+        strncpy(nd, e.name, max_chars);
+        nd[max_chars] = '\0';
+        spr.setCursor(name_x, ry + 3);
+        spr.print(nd);
+
+        // Signal strength dot after the name — color maps to RSSI proximity
+        {
+            uint16_t dot_base;
+            if      (e.rssi > -55) dot_base = HEADER_COLOR;
+            else if (e.rssi > -75) dot_base = DIM_COLOR;
+            else                   dot_base = CARD_BORDER;
+
+            int dot_x = name_x + (int)strlen(nd) * ts_char_w(TS_BODY) + UI_PAD_XS * 2;
+            if (dot_x + 2 < FEED_RIGHT) {
+                spr.fillCircle(dot_x, ry + 6, 1, lerp_col16(BG_COLOR, dot_base, af));
+            }
+        }
+
+        // Row separator — fades with row age
+        {
+            uint16_t sep_col = lerp_col16(BG_COLOR, CARD_BORDER, af * 0.25f);
+            int sep_y2 = ry + feed_row_h - 1;
+            if (sep_y2 < DISP_H) {
+                int sep_x = FEED_X + DIVIDER_GAP + 1;
+                spr.drawFastHLine(sep_x, sep_y2,
+                                  FEED_RIGHT - sep_x, sep_col);
+            }
+        }
+
+        // ── Radar glow sync: if this device is lit on the scan radar,
+        // draw a faint accent bar on the left edge of the feed row ──
+        if (scanner_viz_mode == 0) {
+            for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                if (!scan_devs[pi].occupied) continue;
+                if (scan_devs[pi].sweep_bright < 0.10f) continue;
+                if (strncmp(scan_devs[pi].mac, e.mac, 17) != 0) continue;
+                float sync_alpha = scan_devs[pi].sweep_bright * af * 0.6f;
+                if (sync_alpha > 0.05f) {
+                    uint16_t sync_col = lerp_col16(BG_COLOR, base_proto_col, sync_alpha);
+                    spr.fillRect(FEED_X + UI_PAD_SM, ry, 2, feed_row_h - 1, sync_col);
+                }
+                break;
             }
         }
     }
 
-    // Step 4: outer rounded outline
-    spr.drawRoundRect(badge_x, badge_y, total_w, badge_h, 8, outer_border);
+    spr.clearClipRect();
+    feed_commit_pending();
+}
 
-    // Step 5: 45° slash divider drawn on top of fills
-    {
-        int sx = badge_x + wf_seg_w;
-        int sy_top = badge_y + 2;
-        int sy_bot = badge_y + badge_h - 3;
-        spr.drawLine(sx + 3, sy_top, sx - 3, sy_bot, outer_border);
-        spr.drawLine(sx + 4, sy_top, sx - 2, sy_bot, outer_border);
-    }
+// ── SCAN viz: device-list refresh (also used by ambient radar) ────────────
+static void prox_radar_refresh(unsigned long frame_ms) {
+    if (frame_ms - scan_last_refresh_ms < 200 && scan_last_refresh_ms != 0) return;
+    scan_last_refresh_ms = frame_ms;
 
-    // WiFi text — centered in WiFi segment
-    spr.setTextColor(wf_col, wf_fill); spr.setTextSize(1.2);
-    {
-        int wf_base_w = (int)strlen(wf_label) * 7;
-        int wf_lock_w = wf_locked ? 14 : 0;
-        int wf_text_w = wf_base_w + wf_lock_w;
-        int wf_text_x = badge_x + (wf_seg_w - wf_text_w) / 2;
-        spr.setCursor(wf_text_x, badge_y + 5);
-        spr.print(wf_label);
-        if (wf_locked) {
-            spr.setTextColor(CAUTION_COLOR, wf_fill);
-            spr.print(" L");
-        }
-    }
+    const float PI2f = 2.0f * (float)M_PI;
+    bool matched[SCAN_MAX_DEVICES] = {false};
 
-    // BLE text — centered in BLE segment
-    spr.setTextColor(ble_badge_col, ble_fill);
-    {
-        int ble_text_w = 3 * 7;
-        int ble_text_x = badge_x + wf_seg_w + (ble_seg_w - ble_text_w) / 2;
-        spr.setCursor(ble_text_x, badge_y + 5);
-        spr.print("BLE");
-    }
+    for (int fi = 0; fi < scan_local_count && fi < FEED_SIZE; fi++) {
+        int idx = (scan_local_head - fi + FEED_SIZE * 2) % FEED_SIZE;
+        FeedEntry& e = scan_local_feed[idx];
+        if (e.mac[0] == '\0') continue;
+        if ((frame_ms - e.timestamp) > 60000UL) continue;
 
-    // ── Ambient packet counter — kerned green label + white number, with
-    // throttled roll-up animation when the displayed value updates ──
-    // Sits between the WiFi/BLE pill and the stats scorecards.
-    {
-        uint32_t pkts = ambient_packet_count;
-        char pkt_str[12];
-
-        // Roll-up animation state — throttled so the count doesn't animate
-        // every frame as new packets arrive.
-        static uint32_t pkt_display_val = 0;
-        static unsigned long pkt_anim_start = 0;
-        static unsigned long pkt_last_update = 0;
-        const unsigned long PKT_UPDATE_INTERVAL = 3000;
-        const unsigned long PKT_ROLL_MS = 300;
-
-        if (frame_ms - pkt_last_update >= PKT_UPDATE_INTERVAL || pkt_display_val == 0) {
-            if (pkts != pkt_display_val) {
-                pkt_display_val = pkts;
-                pkt_anim_start = frame_ms;
+        bool dup = false;
+        for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+            if (scan_devs[pi].occupied && matched[pi] &&
+                strncmp(scan_devs[pi].mac, e.mac, 17) == 0) {
+                dup = true; break;
             }
-            pkt_last_update = frame_ms;
         }
-        snprintf(pkt_str, sizeof(pkt_str), "%lu", (unsigned long)pkt_display_val);
+        if (dup) continue;
 
-        int pkt_label_y = badge_y + badge_h + 4;  // 4px below the WiFi/BLE pill
-
-        // Line 1: green label, kerned
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(1);
-        {
-            const char* label = "PACKETS SCANNED";
-            int label_x = right_text_x + 2;
-            spr.setTextDatum(TL_DATUM);
-            spr.setCursor(label_x, pkt_label_y);
-            kprint(spr, label);
+        int slot = -1;
+        for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+            if (scan_devs[pi].occupied &&
+                strncmp(scan_devs[pi].mac, e.mac, 17) == 0) {
+                slot = pi; matched[pi] = true; break;
+            }
         }
 
-        // Line 2: white number with optional roll-up animation.
-        {
-            int num_x = right_text_x + 2;
-            int num_y = pkt_label_y + 10;
-            int num_h = 8;  // textSize 1 height
+        float rssi_norm = (float)(e.rssi - (-95)) / (float)((-25) - (-95));
+        if (rssi_norm < 0.0f) rssi_norm = 0.0f;
+        if (rssi_norm > 1.0f) rssi_norm = 1.0f;
+        // Compress radial range so icons cluster toward center.
+        // sqrt curve means weak signals still spread out but strong
+        // signals group tightly near the center dot.
+        float target_dist = (1.0f - rssi_norm) * 0.90f;
 
-            spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-            spr.setTextSize(1);
+        if (slot >= 0) {
+            scan_devs[slot].dist       = target_dist;
+            scan_devs[slot].proto      = e.proto;
+            scan_devs[slot].is_flock   = e.is_flock;
+            scan_devs[slot].last_seen_ms = frame_ms;
+            scan_devs[slot].rssi       = e.rssi;
+        } else {
+            for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                if (!scan_devs[pi].occupied) { slot = pi; break; }
+            }
+            if (slot < 0) {
+                unsigned long oldest_time = ULONG_MAX;
+                int oldest_idx = 0;
+                for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+                    if (scan_devs[pi].last_seen_ms < oldest_time) {
+                        oldest_time = scan_devs[pi].last_seen_ms;
+                        oldest_idx = pi;
+                    }
+                }
+                slot = oldest_idx;
+            }
+            ScanDevice& d = scan_devs[slot];
+            d.occupied     = true;
+            strncpy(d.mac, e.mac, 17); d.mac[17] = '\0';
+            d.proto        = e.proto;
+            d.is_flock     = e.is_flock;
+            d.rssi         = e.rssi;
+            d.last_seen_ms = frame_ms;
+            d.dist         = target_dist;
+            d.dist_smooth  = target_dist;
+            d.sweep_bright = 0.0f;
 
-            spr.setClipRect(num_x, num_y, DISP_W - num_x, num_h);
-            spr.fillRect(num_x, num_y, DISP_W - num_x, num_h, BG_COLOR);
-            spr.setTextDatum(TL_DATUM);
-            int draw_y = anim_slide_in(num_y, num_h, pkt_anim_start, PKT_ROLL_MS);
-            spr.setCursor(num_x, draw_y);
-            spr.print(pkt_str);
-            spr.clearClipRect();
-        }
-
-        spr.setTextDatum(TL_DATUM);
-    }
-
-    // ── Stats block — labels above, symbol + number inline below ──
-    // Both blocks left-aligned at a fixed column split. Symbols are
-    // filled + outlined for legibility against the dark background.
-    {
-        long sw_local = sw;
-        long sb_local = sb;
-
-        const int stats_label_y = 62;       // top of size-1 labels
-        const int stats_num_y   = 78;       // top of size-3 numbers
-        const int sd_left       = right_text_x + 2;
-        const int col1_x        = sd_left + 2;
-        const int col2_x        = sd_left + 56;  // BLE column, fixed left-aligned split
-
-        char wifi_num[6];
-        snprintf(wifi_num, sizeof(wifi_num), "%ld", sw_local);
-        char ble_num[6];
-        snprintf(ble_num, sizeof(ble_num), "%ld", sb_local);
-
-        // Roll-in animation: when count changes, new number slides up into place
-        static long prev_sw = 0, prev_sb = 0;
-        static unsigned long sw_anim_start = 0, sb_anim_start = 0;
-        const unsigned long ROLL_DURATION = 300;
-        if (sw_local != prev_sw) { sw_anim_start = frame_ms; prev_sw = sw_local; }
-        if (sb_local != prev_sb) { sb_anim_start = frame_ms; prev_sb = sb_local; }
-
-        // ── WIFI label ──
-        spr.setTextSize(1.2);
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(col1_x, stats_label_y);
-        kprint(spr, "WIFI");
-
-        // WIFI triangle symbol
-        int wtri_x = col1_x + 2;
-        int wtri_y = stats_num_y + 3;
-        spr.drawTriangle(wtri_x,      wtri_y + 10,
-                         wtri_x + 10, wtri_y + 10,
-                         wtri_x + 5,  wtri_y,
-                         CAUTION_COLOR);
-
-        // WIFI number with roll animation
-        {
-            const int num_h = 24;  // textSize(3) height
-            spr.setClipRect(col1_x + 20, stats_num_y, 40, num_h);
-            spr.fillRect(col1_x + 20, stats_num_y, 40, num_h, BG_COLOR);
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(3);
-            int draw_y = anim_slide_in(stats_num_y, num_h, sw_anim_start, ROLL_DURATION);
-            spr.setCursor(col1_x + 20, draw_y);
-            spr.print(wifi_num);
-            spr.clearClipRect();
-        }
-
-        // ── BLE label ──
-        spr.setTextSize(1.2);
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setCursor(col2_x, stats_label_y);
-        kprint(spr, "BLE");
-
-        // BLE diamond symbol
-        int dia_x = col2_x;
-        int dia_y = stats_num_y;
-        int dcx = dia_x + 6, dcy = dia_y + 7, dhr = 7;
-        spr.drawLine(dcx,       dcy - dhr, dcx + dhr, dcy,       PURPLE_COLOR);
-        spr.drawLine(dcx + dhr, dcy,       dcx,       dcy + dhr, PURPLE_COLOR);
-        spr.drawLine(dcx,       dcy + dhr, dcx - dhr, dcy,       PURPLE_COLOR);
-        spr.drawLine(dcx - dhr, dcy,       dcx,       dcy - dhr, PURPLE_COLOR);
-
-        // BLE number with roll animation
-        {
-            const int num_h = 24;
-            spr.setClipRect(col2_x + 20, stats_num_y, 40, num_h);
-            spr.fillRect(col2_x + 20, stats_num_y, 40, num_h, BG_COLOR);
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(3);
-            int draw_y = anim_slide_in(stats_num_y, num_h, sb_anim_start, ROLL_DURATION);
-            spr.setCursor(col2_x + 20, draw_y);
-            spr.print(ble_num);
-            spr.clearClipRect();
+            d.last_sweep_ms = 0;
+            uint32_t h = hash_mac(e.mac);
+            d.angle        = ((float)(h % 10000) / 10000.0f) * PI2f;
+            d.angle_smooth = d.angle;
+            d.appear_ms    = frame_ms;
+            d.has_appeared = true;
+            matched[slot] = true;
         }
     }
 
-    // ── Live device feed (right column) ──
-    // List is anchored at the BOTTOM of the column. Existing rows stay still.
-    // When a new entry arrives, it appears at the top: fades in with slight
-    // slide-down from the section header. When the buffer overflows, the
-    // bottom (oldest) row fades out as it scrolls off. This matches the
-    // mental model of a notification/activity feed (Twitter, Slack, etc).
+    for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+        if (scan_devs[pi].occupied && !matched[pi]) {
+            if ((frame_ms - scan_devs[pi].last_seen_ms) > 22000UL) {
+                scan_devs[pi].occupied = false;
+            }
+        }
+    }
+
+    // Angular repulsion — push overlapping icons apart.
+    // Single pass: for each pair within MIN_ANGLE_SEP, split the difference.
+    // Stable because angles are hash-derived (don't drift) and the nudge
+    // is capped at MAX_NUDGE so icons can't migrate to the wrong quadrant.
     {
-        const int feed_col_left   = 4;
-        const int feed_col_right  = divider_x - 4;
-        const int feed_row_h      = 12;
-        const int max_visible     = 3;
-        const int feed_top_y      = 104;
+        const float MIN_ANGLE_SEP = 0.40f;  // ~23° — minimum angular gap
+        const float MAX_NUDGE     = 0.12f;  // ~7° — max displacement per frame
+        const float PI2f = 2.0f * (float)M_PI;
 
-        // Throttled display snapshot — only refreshes every 2 seconds.
-        // Eliminates flicker caused by rapid feed_entries mutations between frames.
-        static FeedEntry display_feed[FEED_SIZE];
-        static int display_count = 0;
-        static int display_head = 0;
-        static unsigned long display_last_refresh = 0;
-        static bool display_ever_populated = false;
-        static char display_prev_top_mac[18] = "";
-        static unsigned long display_shift_ms = 0;
-        static bool display_first_shown = false;
+        for (int i = 0; i < SCAN_MAX_DEVICES; i++) {
+            if (!scan_devs[i].occupied) continue;
+            for (int j = i + 1; j < SCAN_MAX_DEVICES; j++) {
+                if (!scan_devs[j].occupied) continue;
 
-        unsigned long local_now = frame_ms;
-        const unsigned long FEED_DISPLAY_REFRESH_MS = 2000;
+                float dist_diff = fabsf(scan_devs[i].dist_smooth - scan_devs[j].dist_smooth);
+                if (dist_diff > 0.35f) continue;
 
-        if ((local_now - display_last_refresh) >= FEED_DISPLAY_REFRESH_MS || !display_ever_populated) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            display_count = feed_count;
-            display_head = feed_head;
-            // feed_entries is a ring keyed by feed_head; entries past
-            // display_count still hold valid live data the renderer
-            // will reach via its (head - i) modular index. Copy the
-            // whole array so the snapshot matches the renderer's view.
-            for (int i = 0; i < FEED_SIZE; i++) display_feed[i] = feed_entries[i];
-            xSemaphoreGive(dataMutex);
-            display_last_refresh = local_now;
-            if (display_count > 0) {
-                display_ever_populated = true;
-                int top_idx = (display_head + FEED_SIZE * 2) % FEED_SIZE;
-                if (strcmp(display_feed[top_idx].mac, display_prev_top_mac) != 0) {
-                    strncpy(display_prev_top_mac, display_feed[top_idx].mac, 17);
-                    display_prev_top_mac[17] = '\0';
-                    if (display_first_shown) {
-                        display_shift_ms = local_now;
-                    } else {
-                        display_shift_ms = 0;
-                        display_first_shown = true;
+                float diff = scan_devs[i].angle - scan_devs[j].angle;
+                if (diff >  (float)M_PI) diff -= PI2f;
+                if (diff < -(float)M_PI) diff += PI2f;
+                float abs_diff = fabsf(diff);
+
+                if (abs_diff < MIN_ANGLE_SEP) {
+                    float push = (MIN_ANGLE_SEP - abs_diff) * 0.5f;
+                    if (push > MAX_NUDGE) push = MAX_NUDGE;
+                    float sign = (diff >= 0.0f) ? 1.0f : -1.0f;
+                    scan_devs[i].angle += sign * push;
+                    scan_devs[j].angle -= sign * push;
+
+                    if (scan_devs[i].angle < 0.0f)  scan_devs[i].angle += PI2f;
+                    if (scan_devs[i].angle >= PI2f)  scan_devs[i].angle -= PI2f;
+                    if (scan_devs[j].angle < 0.0f)  scan_devs[j].angle += PI2f;
+                    if (scan_devs[j].angle >= PI2f)  scan_devs[j].angle -= PI2f;
+                }
+            }
+        }
+    }
+}
+
+// Detect whether the sprite buffer stores RGB565 byte-swapped.
+// Writes a known logical color via drawPixel, reads back the raw buffer.
+// If the raw value doesn't match what we wrote, bytes are swapped.
+static inline void detect_buffer_byte_order(M5Canvas& sprite) {
+    if (g_buf_byte_order_detected) return;
+    uint16_t* buf = (uint16_t*)sprite.getBuffer();
+    if (!buf) return;
+    uint16_t saved = buf[0];
+    sprite.drawPixel(0, 0, 0xF800);  // pure logical red
+    g_buf_bytes_swapped = (buf[0] != 0xF800);
+    buf[0] = saved;
+    g_buf_byte_order_detected = true;
+    Serial.printf("[GFX] Buffer bytes_swapped=%d\n", (int)g_buf_bytes_swapped);
+}
+
+// Read a pixel from the sprite buffer in LOGICAL RGB565 format.
+static inline uint16_t read_pixel_logical(const uint16_t* buf, int idx) {
+    uint16_t raw = buf[idx];
+    return g_buf_bytes_swapped ? (uint16_t)((raw >> 8) | (raw << 8)) : raw;
+}
+
+// Write a pixel to the sprite buffer from a LOGICAL RGB565 value.
+static inline void write_pixel_logical(uint16_t* buf, int idx, uint16_t logical) {
+    buf[idx] = g_buf_bytes_swapped
+             ? (uint16_t)((logical >> 8) | (logical << 8))
+             : logical;
+}
+
+// ── Viz mode 0: SCAN (proximity radar) ────────────────────────────────────
+static void draw_scanner_viz_scan(unsigned long frame_ms) {
+    detect_buffer_byte_order(spr);
+
+    const float PI2f = 2.0f * (float)M_PI;
+
+    const int CX = VIZ_X + VIZ_W / 2;
+    const int CY = VIZ_Y + VIZ_H / 2;
+    const int R  = (int)((float)VIZ_H * 1.40f);
+
+    float dt = (scan_last_frame_ms == 0) ? 16.0f
+             : (float)(frame_ms - scan_last_frame_ms);
+    if (dt > 100.0f) dt = 100.0f;
+    scan_last_frame_ms = frame_ms;
+
+    // Two overlapping sine waves: primary at 0.7× rotation, secondary at 1.3×.
+    // The secondary adds asymmetry — the sweep doesn't just speed up and slow
+    // down symmetrically, it lingers in some quadrants more than others.
+    // Stronger swing: primary ±25%, secondary ±12%.
+    // The sweep visibly pauses in some quadrants and accelerates
+    // through others. Total range: ±37% at rare beat peaks.
+    float swing = 1.0f
+                + 0.25f * sinf(scan_sweep_angle * 0.7f)
+                + 0.12f * sinf(scan_sweep_angle * 1.3f);
+    scan_sweep_angle += 0.0015f * dt * swing;
+    if (scan_sweep_angle >= PI2f) scan_sweep_angle -= PI2f;
+
+    // ── 1. Phosphor trail (lowest layer) ─────────────────────────────────
+    // Per-pixel alpha blend in 2×2 blocks — composites over existing
+    // content (rings, background) instead of overwriting with flat blocks.
+    // Quadratic falloff: bright near the line, smooth monotonic decay to
+    // invisible at the tail. Angle-to-center lookups use scan_angle_lut[]
+    // built once at first render; falls back to fast_atan2f if alloc failed.
+    {
+        scan_angle_lut_build();  // no-op after first call
+
+        const float TRAIL_ARC = 1.8f;   // radians behind sweep (~103°)
+        const float PEAK      = 0.28f;  // max blend alpha right behind line
+        const float GAP       = 0.04f;  // skip the line itself
+        const float R2_max    = (float)(R * R) * 1.10f;
+        const float inv_range = 1.0f / (TRAIL_ARC - GAP);
+
+        uint16_t* sbuf = (uint16_t*)spr.getBuffer();
+        const int sbuf_w = DISP_W;
+
+        // Normalize sweep angle to [0, 2π) once per frame.
+        float sweep_norm = scan_sweep_angle;
+        if (sweep_norm < 0.0f)           sweep_norm += 2.0f * (float)M_PI;
+        if (sweep_norm >= 2.0f * (float)M_PI) sweep_norm -= 2.0f * (float)M_PI;
+
+        int row_idx = 0;
+        for (int py = VIZ_Y; py < VIZ_Y + VIZ_H; py += 2, row_idx++) {
+            int col_idx = 0;
+            for (int px = VIZ_X; px < VIZ_X + VIZ_W; px += 2, col_idx++) {
+                float dx = (float)(px - CX);
+                float dy = (float)(py - CY);
+                if (dx * dx + dy * dy > R2_max) continue;
+
+                float ang;
+                if (scan_angle_lut_ready) {
+                    uint8_t q = scan_angle_lut[row_idx * SCAN_LUT_COLS + col_idx];
+                    ang = (float)q * SCAN_LUT_INV_SCALE;
+                } else {
+                    ang = fast_atan2f(dy, dx);
+                    if (ang < 0.0f) ang += 2.0f * (float)M_PI;
+                }
+
+                float diff = sweep_norm - ang;
+                if (diff < 0.0f) diff += 2.0f * (float)M_PI;
+                // diff is now in [0, 2π) — angular distance behind the sweep.
+
+                if (diff < GAP)       continue;    // within the line
+                if (diff > TRAIL_ARC) continue;    // past the tail (ahead-of-sweep wraps here)
+
+                float t = (diff - GAP) * inv_range; // 0..1 (0 = near line, 1 = tail)
+                float fade = 1.0f - t;
+                float alpha = PEAK * fade * fade;   // quadratic falloff
+                if (alpha < 0.008f) continue;
+
+                // Blend 2×2 block — reads existing pixel, mixes, writes back
+                for (int by = 0; by < 2; by++) {
+                    int ry = py + by;
+                    if (ry >= VIZ_Y + VIZ_H) break;
+                    int row = ry * sbuf_w;
+                    for (int bx = 0; bx < 2; bx++) {
+                        int rx = px + bx;
+                        if (rx >= VIZ_X + VIZ_W) break;
+                        int idx = row + rx;
+                        uint16_t existing = read_pixel_logical(sbuf, idx);
+                        uint16_t blended  = lerp_col16(existing, HEADER_COLOR, alpha);
+                        write_pixel_logical(sbuf, idx, blended);
                     }
                 }
             }
         }
+    }
 
-        FeedEntry* local_feed = display_feed;
-        int local_count = display_count;
-        int local_head = display_head;
+    // ── 2. Range rings (on top of glow) ──────────────────────────────────
+    // Ring radii sized to fit the panel — outermost ring is a complete circle.
+    // R stays large for sweep/glow/device math; rings are visual guides only.
+    uint16_t ring_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.30f);
+    for (int i = 1; i <= 4; i++) {
+        spr.drawCircle(CX, CY, R * i / 4, ring_col);
+    }
 
-        // Feed section label
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(feed_col_left, feed_top_y - 12);
-        kprint(spr, "LIVE FEED");
+    // ── 3. Sweep line (on top of rings) ──────────────────────────────────
+    {
+        int ex = CX + (int)((float)R * cosf(scan_sweep_angle));
+        int ey = CY + (int)((float)R * sinf(scan_sweep_angle));
+        spr.drawLine(CX, CY, ex, ey, lerp_col16(BG_COLOR, HEADER_COLOR, 0.70f));
+    }
 
-        // Always render feed — overlay covers it during startup warm-up
-        spr.setClipRect(feed_col_left, feed_top_y - 1,
-                        feed_col_right - feed_col_left,
-                        DISP_H - (feed_top_y - 1));
+    // ── 4. Device icons ───────────────────────────────────────────────────
+    prox_radar_refresh(frame_ms);
+
+    for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
+        if (!scan_devs[pi].occupied) continue;
+        ScanDevice& d = scan_devs[pi];
+
+        // Smooth radial + angular motion
+        d.dist_smooth = anim_filter(d.dist_smooth, d.dist, 800.0f, dt);
+
+        // Ease the display angle toward the repulsion-adjusted target.
+        // Wraps correctly around 0/2π so icons don't spin the long way.
+        {
+            float diff = d.angle - d.angle_smooth;
+            if (diff >  (float)M_PI) diff -= PI2f;
+            if (diff < -(float)M_PI) diff += PI2f;
+            d.angle_smooth += diff * (1.0f - expf(-dt / 400.0f));
+            if (d.angle_smooth < 0.0f)  d.angle_smooth += PI2f;
+            if (d.angle_smooth >= PI2f) d.angle_smooth -= PI2f;
+        }
+
+        // Sweep contact — signed angular diff; trigger on trailing side only
+        float diff = scan_sweep_angle - d.angle;
+        if (diff >  (float)M_PI) diff -= PI2f;
+        if (diff < -(float)M_PI) diff += PI2f;
+        float behind = (diff >= 0.0f) ? diff : (PI2f + diff);
+        const float sweep_zone = PI2f * 0.12f;
+
+        if (behind < sweep_zone) {
+            float t      = behind / sweep_zone;
+            float target = (1.0f - t) * (1.0f - t) * (1.0f - t);
+            if (target > d.sweep_bright) d.sweep_bright = target;
+            d.last_sweep_ms = frame_ms;
+        } else if (frame_ms - d.last_sweep_ms > 1000) {
+            d.sweep_bright *= powf(0.9975f, (float)dt);
+            if (d.sweep_bright < 0.0f) d.sweep_bright = 0.0f;
+        }
+
+        // Position — uses eased angle for smooth angular motion
+        float draw_dist = 0.05f + d.dist_smooth * 0.70f;
+        float ds, dc;
+        compute_sincos(d.angle_smooth, &ds, &dc);
+        int dpx = CX + (int)(draw_dist * (float)R * dc);
+        int dpy = CY + (int)(draw_dist * (float)R * ds);
+
+        // Clamp to panel so icons never disappear off-screen
+        const int MARGIN = 2;
+        if (dpx < VIZ_X + MARGIN)          dpx = VIZ_X + MARGIN;
+        if (dpx > VIZ_X + VIZ_W - MARGIN)  dpx = VIZ_X + VIZ_W - MARGIN;
+        if (dpy < VIZ_Y + MARGIN)          dpy = VIZ_Y + MARGIN;
+        if (dpy > VIZ_Y + VIZ_H - MARGIN)  dpy = VIZ_Y + VIZ_H - MARGIN;
+
+        // Master opacity — handles appear fade-in and exit fade-out.
+        // Target is 1.0 while alive, decays through exit phases.
+        float opacity_target = 1.0f;
+        unsigned long age = frame_ms - d.last_seen_ms;
+        if (age > 15000UL) {
+            // Phase 3 (15–22s): flicker — rapid oscillation on fading alpha
+            float exit_t = (float)(age - 15000UL) / 7000.0f;
+            if (exit_t > 1.0f) exit_t = 1.0f;
+            float fade = 0.3f * (1.0f - exit_t);
+            float flicker = 0.5f + 0.5f * sinf((float)frame_ms * 0.02f);
+            opacity_target = fade * flicker;
+        } else if (age > 8000UL) {
+            // Phase 2 (8–15s): smooth fade from 1.0 → 0.3
+            float fade_t = (float)(age - 8000UL) / 7000.0f;
+            opacity_target = 1.0f - fade_t * 0.7f;
+        }
+
+        // Appear: ease opacity from 0→target over 400ms
+        float appear_t = d.has_appeared
+            ? (float)(frame_ms - d.appear_ms) / 400.0f
+            : 1.0f;
+        if (appear_t > 1.0f) appear_t = 1.0f;
+        float appear_ease = appear_t * appear_t * (3.0f - 2.0f * appear_t);
+        opacity_target *= appear_ease;
+
+        float age_af = opacity_target;
+        if (age_af < 0.02f) continue;  // skip drawing invisible icons
+
+        // Color — on sweep contact, outline shifts toward white
+        uint16_t base_col = d.is_flock ? CAUTION_COLOR
+                          : (d.proto == 0 ? HEADER_COLOR : PURPLE_COLOR);
+        uint16_t icon_col;
+        if (d.sweep_bright > 0.05f) {
+            uint16_t bright_col = lerp_col16(base_col, TEXT_COLOR, d.sweep_bright * 0.40f);
+            icon_col = (age_af >= 1.0f) ? bright_col
+                     : lerp_col16(BG_COLOR, bright_col, age_af);
+        } else {
+            icon_col = (age_af >= 1.0f) ? base_col
+                     : lerp_col16(BG_COLOR, base_col, age_af);
+        }
+
+        // Size — flock icons pulse continuously, non-flock static.
+        // Appear animation scales from 0 → full over the first 400ms.
+        int base_sz = d.is_flock ? 7 : 6;
+        float pulse_factor = 0.0f;
+        if (d.is_flock) {
+            float breath = 0.5f + 0.5f * sinf((float)frame_ms * 2.0f * (float)M_PI / 1200.0f);
+            pulse_factor = (breath - 0.5f) * 0.16f;
+        }
+        float appear_scale = appear_ease;  // 0→1 smoothstep from opacity block
+        int sz = (int)((float)base_sz * (1.0f + pulse_factor) * appear_scale);
+        if (sz < 1) sz = 1;
+
+        // ── Sweep glow: per-pixel alpha blend, byte-order-corrected ──
+        // Reads pixel from buffer, swaps to logical format if needed,
+        // blends in logical RGB565 (where lerp_col16 works correctly),
+        // swaps back, writes to buffer. Result: correct colors guaranteed.
+        if (d.sweep_bright > 0.08f) {
+            float glow_t = d.sweep_bright * d.sweep_bright * (3.0f - 2.0f * d.sweep_bright);
+
+            uint16_t* sbuf = (uint16_t*)spr.getBuffer();
+            const int sbuf_w = DISP_W;
+
+            int   glow_r    = sz + 11;
+            float glow_r2   = (float)(glow_r * glow_r);
+            float glow_peak = glow_t * 0.38f;
+
+            int gx0 = dpx - glow_r; if (gx0 < VIZ_X) gx0 = VIZ_X;
+            int gx1 = dpx + glow_r; if (gx1 >= VIZ_X + VIZ_W) gx1 = VIZ_X + VIZ_W - 1;
+            int gy0 = dpy - glow_r; if (gy0 < VIZ_Y) gy0 = VIZ_Y;
+            int gy1 = dpy + glow_r; if (gy1 >= VIZ_Y + VIZ_H) gy1 = VIZ_Y + VIZ_H - 1;
+
+            for (int gy = gy0; gy <= gy1; gy++) {
+                int row_off = gy * sbuf_w;
+                for (int gx = gx0; gx <= gx1; gx++) {
+                    float dx = (float)(gx - dpx);
+                    float dy = (float)(gy - dpy);
+                    float dist2 = dx * dx + dy * dy;
+                    if (dist2 >= glow_r2) continue;
+
+                    float falloff = 1.0f - dist2 / glow_r2;
+                    float alpha = glow_peak * falloff * falloff;
+                    if (alpha < 0.015f) continue;
+
+                    int idx = row_off + gx;
+                    uint16_t existing_logical = read_pixel_logical(sbuf, idx);
+                    uint16_t blended_logical  = lerp_col16(existing_logical,
+                                                           base_col, alpha);
+                    write_pixel_logical(sbuf, idx, blended_logical);
+                }
+            }
+        }
+
+        // Flock icons get a semi-transparent fill — threat stands out from ambient traffic
+        if (d.is_flock) {
+            uint16_t fill_col = lerp_col16(BG_COLOR, icon_col, 0.45f);
+            if (d.proto == 0) {
+                spr.fillTriangle(
+                    dpx,                       dpy - sz,
+                    dpx - (int)(sz * 0.85f),  dpy + (int)(sz * 0.65f),
+                    dpx + (int)(sz * 0.85f),  dpy + (int)(sz * 0.65f),
+                    fill_col);
+            } else {
+                spr.fillTriangle(dpx, dpy - sz, dpx + sz, dpy, dpx, dpy + sz, fill_col);
+                spr.fillTriangle(dpx, dpy - sz, dpx - sz, dpy, dpx, dpy + sz, fill_col);
+            }
+        }
+
+        // Shape outline (drawn on top of fill for all devices)
+        if (d.proto == 0) {
+            // WiFi: outlined triangle, point up
+            spr.drawTriangle(
+                dpx,                       dpy - sz,
+                dpx - (int)(sz * 0.85f),  dpy + (int)(sz * 0.65f),
+                dpx + (int)(sz * 0.85f),  dpy + (int)(sz * 0.65f),
+                icon_col);
+        } else {
+            // BLE: outlined diamond
+            spr.drawLine(dpx,      dpy - sz, dpx + sz, dpy,      icon_col);
+            spr.drawLine(dpx + sz, dpy,      dpx,      dpy + sz, icon_col);
+            spr.drawLine(dpx,      dpy + sz, dpx - sz, dpy,      icon_col);
+            spr.drawLine(dpx - sz, dpy,      dpx,      dpy - sz, icon_col);
+        }
+
+    }
+
+    // ── 5. Center dot in box frame (topmost) ─────────────────────────────
+    {
+        const int box_sz = 7;
+        spr.drawRect(CX - box_sz, CY - box_sz, box_sz * 2, box_sz * 2,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.35f));
+        spr.drawRect(CX - box_sz + 1, CY - box_sz + 1, box_sz * 2 - 2, box_sz * 2 - 2,
+                     lerp_col16(BG_COLOR, HEADER_COLOR, 0.25f));
+        spr.fillCircle(CX, CY, 2, lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f));
+    }
+}
+
+// ── Viz mode 1: SPECTRUM ───────────────────────────────────────────────────
+// 13-bar 2.4 GHz channel histogram driven by channel_pkt_counts[],
+// incremented in the WiFi sniffer ISR. Display values refresh every 2 s
+// with a 2/3 decay so the bars represent a rolling window. Current
+// Maintain the per-channel packet histogram used by the SPECTRUM viz.
+// Called regularly regardless of which viz mode is active so counts don't
+// accumulate unbounded while SPECTRUM is off-screen.
+static void update_channel_histogram() {
+    unsigned long now = millis();
+    if (now - channel_display_last_update < 5000) return;
+
+    channel_peak = 1;
+    for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+        channel_pkt_display[i] = channel_pkt_counts[i];
+        channel_pkt_counts[i]  = channel_pkt_counts[i] / 2;
+        if (channel_pkt_display[i] > channel_peak)
+            channel_peak = channel_pkt_display[i];
+    }
+    channel_display_last_update = now;
+}
+
+// hopping channel renders bright with a triangle marker; flock
+// detections briefly flash the peak bar in CAUTION_COLOR.
+static void draw_scanner_viz_spectrum(unsigned long frame_ms) {
+    // Smoothing is now done in draw_scanner_screen() warm-keep block.
+
+    // Ambient waviness — two overlapping sines per channel at different
+    // frequencies and per-channel phase offsets so the curve undulates
+    // organically when data is flat. Amplitudes (0.04 + 0.025) are
+    // small enough not to distort real packet ratios.
+    float spectrum_display[NUM_WIFI_CHANNELS];
+    for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+        float wave_phase  = (float)i * 0.8f + (float)frame_ms * 0.002f;
+        float wave2_phase = (float)i * 1.3f + (float)frame_ms * 0.0013f;
+        float ambient_wave = sinf(wave_phase) * 0.04f + sinf(wave2_phase) * 0.025f;
+        float v = spectrum_smooth[i] + ambient_wave;
+        if (v < 0.02f) v = 0.02f;  // never fully flatlines
+        if (v > 1.0f)  v = 1.0f;
+        spectrum_display[i] = v;
+    }
+
+    // BLE presence — checked once per second; drives baseline indicator,
+    // channel label tinting, and curve color blending.
+    static bool ble_active = false;
+    {
+        static unsigned long ble_check_ms = 0;
+        if (frame_ms - ble_check_ms > 1000) {
+            ble_check_ms = frame_ms;
+            ble_active = false;
+            for (int i = 0; i < scan_local_count && i < FEED_SIZE; i++) {
+                int idx2 = (scan_local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+                if (scan_local_feed[idx2].proto == 1) { ble_active = true; break; }
+            }
+        }
+    }
+
+    // Ease the curve color toward purple when BLE is scanning.
+    // Uses the live BLE scan state, not the 1s-polled ble_active flag,
+    // so the transition tracks the actual radio activity.
+    {
+        bool ble_scanning = (pBLEScan && pBLEScan->isScanning());
+        float ble_target = ble_scanning ? 1.0f : 0.0f;
+        static unsigned long ble_blend_last_frame = 0;
+        float sdt = (ble_blend_last_frame == 0) ? 16.0f
+                  : (float)(frame_ms - ble_blend_last_frame);
+        if (sdt > 100.0f) sdt = 100.0f;
+        ble_blend_last_frame = frame_ms;
+        spectrum_ble_blend = anim_filter(spectrum_ble_blend, ble_target, 250.0f, sdt);
+    }
+
+    // Plot area — 8px reserved at bottom for channel labels (1, 6, 11, 13).
+    const int plot_x      = VIZ_X + 2;
+    const int plot_w      = VIZ_W - 4;
+    const int plot_y      = VIZ_Y + 2;
+    const int plot_h      = VIZ_H - 12;
+    const int plot_bottom = plot_y + plot_h;
+
+    // ── Diagonal hatch background ──
+    // Bold 2px diagonal stripes at 8px spacing — deliberate tactical-grid
+    // texture, easy to read on the LCD. Tightened clip keeps the hatch
+    // inside the panel; we restore the outer scanner clip afterwards so
+    // the rest of the spectrum renders against the same bounds.
+    {
+        uint16_t hatch_col = HATCH_COLOR;
+        // Clip hatch to plot area only — channel labels below sit on clean BG
+        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, plot_bottom - VIZ_Y);
+        for (int d = -VIZ_H; d < VIZ_W + VIZ_H; d += 8) {
+            int x0 = VIZ_X + d;
+            int y0 = VIZ_Y;
+            int x1 = x0 + VIZ_H;
+            int y1 = VIZ_Y + VIZ_H;
+            spr.drawLine(x0,     y0, x1,     y1, hatch_col);
+            spr.drawLine(x0 + 1, y0, x1 + 1, y1, hatch_col);
+        }
+        spr.setClipRect(VIZ_X, VIZ_Y, VIZ_W, VIZ_H);
+    }
+
+    spr.drawFastHLine(plot_x, plot_bottom, plot_w, GRID_LINE_DIM);
+
+    // BLE band baseline indicator — purple line under channels 1–11
+    if (ble_active) {
+        int ble_x0 = plot_x;
+        int ble_x1 = plot_x + (10 * plot_w) / 12;  // ch 11 = index 10
+        spr.drawFastHLine(ble_x0, plot_bottom, ble_x1 - ble_x0, PURPLE_COLOR);
+    }
+
+    // Channel labels below baseline: 1, 6, 11, 13
+    {
+        spr.setTextSize(TS_MICRO);
+        const int label_chs[] = {1, 6, 11, 13};
+        for (int li = 0; li < 4; li++) {
+            int ch_idx = label_chs[li] - 1;
+            int lx = plot_x + (ch_idx * plot_w) / 12;
+            char ch_label[4];
+            snprintf(ch_label, sizeof(ch_label), "%d", label_chs[li]);
+            int label_w = (int)strlen(ch_label) * ts_char_w(TS_MICRO);
+            bool in_ble = (label_chs[li] <= 11);
+            spr.setTextColor((ble_active && in_ble) ? PURPLE_COLOR : DIM_COLOR, BG_COLOR);
+            spr.setCursor(lx - label_w / 2, plot_bottom + 2);
+            spr.print(ch_label);
+        }
+    }
+
+    const float MAX_HEIGHT = (float)plot_h * 0.58f;
+    auto val_to_y = [&](float val) -> int {
+        return plot_bottom - (int)(val * MAX_HEIGHT);
+    };
+
+    // If a flock detection landed recently, mark the busiest channel as
+    // the "flock" channel so curve and fill near it tint CAUTION.
+    bool recent_detection = (scanner_flash_ms > 0 && (frame_ms - scanner_flash_ms) < 3000);
+    int  flock_ch_idx = -1;
+    if (recent_detection) {
+        uint32_t max_val = 0;
+        for (int i = 0; i < NUM_WIFI_CHANNELS; i++) {
+            if (channel_pkt_display[i] > max_val) {
+                max_val = channel_pkt_display[i];
+                flock_ch_idx = i;
+            }
+        }
+    }
+
+    // Inline Catmull-Rom evaluator — used by both the fill and the
+    // curve passes so they trace exactly the same path.
+    auto eval_curve = [&](int px_col) -> float {
+        float ch_f = (float)px_col / (float)plot_w * 12.0f;
+        int ch_i = (int)ch_f;
+        float t = ch_f - (float)ch_i;
+        int i0 = max(0, ch_i - 1);
+        int i1 = min(12, ch_i);
+        int i2 = min(12, ch_i + 1);
+        int i3 = min(12, ch_i + 2);
+        float p0 = spectrum_display[i0];
+        float p1 = spectrum_display[i1];
+        float p2 = spectrum_display[i2];
+        float p3 = spectrum_display[i3];
+        float t2 = t * t, t3 = t2 * t;
+        float val = 0.5f * ((-p0 + 3.0f*p1 - 3.0f*p2 + p3) * t3
+                          + (2.0f*p0 - 5.0f*p1 + 4.0f*p2 - p3) * t2
+                          + (-p0 + p2) * t
+                          + 2.0f*p1);
+        if (val < 0.0f) val = 0.0f;
+        if (val > 1.0f) val = 1.0f;
+        return val;
+    };
+
+    // Pre-evaluate the spline into a cache so fill, line, and dot passes
+    // read from memory instead of recomputing 8 FP muls per pixel.
+    float curve_cache[VIZ_W + 2];
+    for (int px_col = 0; px_col <= plot_w; px_col++) {
+        curve_cache[px_col] = eval_curve(px_col);
+    }
+
+
+    // Gradient fill under the curve. Channels 1-11 blend toward PURPLE_COLOR
+    // at the bottom when BLE devices are active, indicating band overlap.
+    for (int px_col = 0; px_col <= plot_w; px_col++) {
+        float ch_f = (float)px_col / (float)plot_w * 12.0f;
+        int ch_i = (int)ch_f;
+        bool flock_fill = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
+        uint16_t fill_base = flock_fill ? CAUTION_COLOR
+                           : lerp_col16(HEADER_COLOR, PURPLE_COLOR, spectrum_ble_blend);
+
+        float val = curve_cache[px_col];
+        int cx = plot_x + px_col;
+        int cy = val_to_y(val);
+
 
         {
-            int rows_to_draw = (local_count < max_visible) ? local_count : max_visible;
-
-            for (int i = 0; i < rows_to_draw; i++) {
-                int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-                FeedEntry& e = local_feed[idx];
-
-                int row_y;
-                if (i == 0 && display_shift_ms != 0) {
-                    // New entry slides DOWN into target from above (existing
-                    // rows shift down to make room) — negative slide distance.
-                    row_y = anim_slide_in(feed_top_y, -feed_row_h, display_shift_ms, 300);
-                } else {
-                    row_y = feed_top_y + i * feed_row_h;
+            int fy = cy + 1;
+            while (fy < plot_bottom) {
+                float fill_t = (float)(fy - cy) / (float)(plot_bottom - cy);
+                float fill_alpha = (1.0f - fill_t * fill_t) * 0.35f;
+                if (fill_alpha < 0.02f) break;
+                uint16_t col = lerp_col16(BG_COLOR, fill_base, fill_alpha);
+                int run_end = fy + 1;
+                while (run_end < plot_bottom) {
+                    float ft2 = (float)(run_end - cy) / (float)(plot_bottom - cy);
+                    float fa2 = (1.0f - ft2 * ft2) * 0.30f;
+                    if (fa2 < 0.01f) break;
+                    if (lerp_col16(BG_COLOR, fill_base, fa2) != col) break;
+                    run_end++;
                 }
-
-
-                // Age-based fade-out (separate from shift animation)
-                unsigned long age = local_now - e.timestamp;
-                float age_fade;
-                if      (age < 30000UL) age_fade = 1.0f;
-                else if (age < 90000UL) age_fade = 1.0f - (float)(age - 30000UL) / 60000.0f;
-                else                    age_fade = 0.0f;
-                if (age_fade < 0.10f) continue;
-
-                float total_alpha = age_fade;
-
-                // Type prefix color
-                uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
-                if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
-                proto_col = lerp_col16(BG_COLOR, proto_col, total_alpha);
-
-                uint16_t name_col = lerp_col16(BG_COLOR, TEXT_COLOR, total_alpha);
-
-                spr.setTextSize(1.2);
-
-                // Prefix is a small colored symbol (filled triangle/diamond)
-                // instead of a bracketed letter — more visually distinctive,
-                // uses less width, frees name space.
-                int sym_x = feed_col_left;
-                int sym_y = row_y + 1;
-                uint16_t sym_col = proto_col;
-                if (e.proto == 0) {
-                    // Outline-only triangle (△) — WiFi — matches stats icons
-                    spr.drawTriangle(sym_x,     sym_y + 5,
-                                     sym_x + 5, sym_y + 5,
-                                     sym_x + 2, sym_y,
-                                     sym_col);
-                } else {
-                    // Outline-only symmetric diamond (◇) — BLE — matches stats icons
-                    int fcx = sym_x + 3, fcy = sym_y + 3, fhr = 4;
-                    spr.drawLine(fcx,       fcy - fhr, fcx + fhr, fcy,       sym_col);
-                    spr.drawLine(fcx + fhr, fcy,       fcx,       fcy + fhr, sym_col);
-                    spr.drawLine(fcx,       fcy + fhr, fcx - fhr, fcy,       sym_col);
-                    spr.drawLine(fcx - fhr, fcy,       fcx,       fcy - fhr, sym_col);
-                }
-                // Flock indicator: small asterisk after the symbol
-                if (e.is_flock) {
-                    spr.setTextColor(lerp_col16(BG_COLOR, ACCENT_COLOR, total_alpha), BG_COLOR);
-                    spr.setTextSize(1.2);
-                    spr.setCursor(sym_x + 7, row_y);
-                    spr.print("*");
-                }
-
-                // Name — full width available now that strength column is gone
-                int name_x = feed_col_left + (e.is_flock ? 14 : 10);
-                int name_x_end = feed_col_right - 2;
-                int name_max_chars = (name_x_end - name_x) / 7;
-                if (name_max_chars > 14) name_max_chars = 14;
-                if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
-                if (name_max_chars < 1) name_max_chars = 1;
-
-                char name_disp[20];
-                strncpy(name_disp, e.name, name_max_chars);
-                name_disp[name_max_chars] = '\0';
-                spr.setTextSize(1.2);
-                spr.setTextColor(name_col, BG_COLOR);
-                spr.setCursor(name_x, row_y);
-                spr.print(name_disp);
-
+                spr.fillRect(cx, fy, 1, run_end - fy, col);
+                fy = run_end;
             }
-
         }
+    }
 
-        spr.clearClipRect();
 
-        // Show "scanning..." only until the first snapshot captures data
-        if (!display_ever_populated) {
-            spr.fillRect(feed_col_left, feed_top_y,
-                         feed_col_right - feed_col_left,
-                         max_visible * feed_row_h, BG_COLOR);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(1.2);
-            int load_y = feed_top_y + (max_visible * feed_row_h) / 2 - 4;
-            char dots[4];
-            anim_ellipsis(dots, sizeof(dots));
-            char load_str[20];
-            snprintf(load_str, sizeof(load_str), "scanning%s", dots);
-            spr.setCursor(feed_col_left + 8, load_y);
-            spr.print(load_str);
+    // Smooth scan line — eased x slides between channel positions
+    // instead of snapping when the hopper advances. On wrap from a high
+    // channel back to ch1, snap the eased position to just past the left
+    // edge so the line resets and sweeps in from the left rather than
+    // easing backwards across the chart.
+    static int scan_prev_channel = 0;
+    bool channel_wrapped = (current_channel == 1 && scan_prev_channel > 10);
+    scan_prev_channel = current_channel;
+
+    float scan_target_x = (float)plot_x +
+        (float)(current_channel - 1) / 12.0f * (float)plot_w;
+    if (scan_line_last_frame == 0) scan_line_x_f = scan_target_x;
+    if (channel_wrapped)           scan_line_x_f = (float)(plot_x - 4);
+    float scan_dt = (scan_line_last_frame == 0) ? 16.0f
+                  : (float)(frame_ms - scan_line_last_frame);
+    if (scan_dt > 100.0f) scan_dt = 100.0f;
+    // scan_line_last_frame updated in draw_scanner_screen() warm-keep block
+    scan_line_x_f = anim_filter(scan_line_x_f, scan_target_x, 120.0f, scan_dt);
+    int scan_x = (int)(scan_line_x_f + 0.5f);
+
+    // Trailing wake — 8 vertical pixels left of the scan line, fading
+    // from 25% to 0% so the scanning direction reads as "→". Drawn
+    // before the main line so the line sits brightest on top.
+    const int WAKE_LENGTH = 8;
+    for (int wi = 1; wi <= WAKE_LENGTH; wi++) {
+        int wake_x = scan_x - wi;
+        if (wake_x < plot_x || wake_x > plot_x + plot_w) continue;
+        float wake_t = (float)wi / (float)WAKE_LENGTH;
+        float wake_alpha = (1.0f - wake_t) * 0.25f;
+        spr.drawFastVLine(wake_x, plot_y, plot_h,
+                          lerp_col16(BG_COLOR, HEADER_COLOR, wake_alpha));
+    }
+    spr.drawFastVLine(scan_x, plot_y, plot_h, SWEEP_LINE_COLOR);
+
+    // Catmull-Rom curve, walked pixel by pixel. Single 1px drawLine per
+    // segment in full HEADER_COLOR (CAUTION_COLOR near flock detection).
+    int prev_px = -1, prev_py = -1;
+    for (int px_col = 0; px_col <= plot_w; px_col++) {
+        float ch_f = (float)px_col / (float)plot_w * 12.0f;
+        int ch_i = (int)ch_f;
+        float val = curve_cache[px_col];
+        int cx = plot_x + px_col;
+        int cy = val_to_y(val);
+
+        if (prev_px >= 0) {
+            bool near_flock = (flock_ch_idx >= 0 && abs(ch_i - flock_ch_idx) <= 1);
+            uint16_t base_line = near_flock ? CAUTION_COLOR
+                               : lerp_col16(HEADER_COLOR, PURPLE_COLOR, spectrum_ble_blend);
+            spr.drawLine(prev_px, prev_py, cx, cy, base_line);
         }
+        prev_px = cx;
+        prev_py = cy;
+    }
+
+    // Intersection dot
+    {
+        int dot_col_px = scan_x - plot_x;
+        if (dot_col_px < 0)      dot_col_px = 0;
+        if (dot_col_px > plot_w) dot_col_px = plot_w;
+        float dot_val = curve_cache[dot_col_px];
+        int dot_y = val_to_y(dot_val);
+        uint16_t dot_col = lerp_col16(HEADER_COLOR, PURPLE_COLOR, spectrum_ble_blend);
+        spr.fillCircle(scan_x, dot_y, 1, dot_col);
+        spr.drawCircle(scan_x, dot_y, 2, dot_col);
+    }
+
+    // Band pill — below LINE title, dark background over hatch
+    {
+        const char* band_label = "2.4GHz";
+        int pill_w = (int)strlen(band_label) * ts_char_w(TS_MICRO) + UI_PAD_SM;
+        int pill_x = TEXT_LEFT + UI_PAD_XS;
+        int pill_y = VIZ_Y + UI_PAD_SM;
+        int pill_h = 11;
+        spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, 3, BG_COLOR);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(pill_x + 3, pill_y + 2);
+        spr.print(band_label);
     }
 }
 
-void draw_locator_screen() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    bool active=locator_active, has_est=locator_has_estimate;
-    char target_mac[18];  safe_copy(target_mac,  locator_target_mac,  sizeof(target_mac));
-    char target_name[65]; safe_copy(target_name, locator_target_name, sizeof(target_name));
-    float dist=locator_est_distance, brng=locator_bearing;
-    bool gps_valid = gps.course.isValid() && gps.speed.isValid() && gps.speed.mph() > 2.0;
-    bool has_loc   = gps.location.isValid();
-    float gps_course = gps.course.deg();
-    int sample_count = locator_sample_count;
-    int target_rssi = 0; bool has_rssi = false;
-    if (locator_tracker_idx >= 0 && locator_tracker_idx < rssi_tracker_count
-        && rssi_tracker[locator_tracker_idx].sample_count > 0) {
-        target_rssi = rssi_tracker[locator_tracker_idx].samples[
-            rssi_tracker[locator_tracker_idx].sample_count - 1];
-        has_rssi = true;
-    }
-    xSemaphoreGive(dataMutex);
+// ── Viz mode 3: LAYERED TIMELINE ─────────────────────────────────────────
+// Max interpolated points: 50 bins × 6 sub-steps + 1 = 295
+#define TL_INTERP_FACTOR  6
+#define TL_SMOOTH_MAX     ((TIMELINE_BIN_COUNT - 1) * TL_INTERP_FACTOR + 1)
 
-    bool demo = !active;
+static void draw_scanner_viz_timeline(unsigned long frame_ms) {
+    // Smoothing is done in draw_scanner_screen() warm-keep block.
 
-    spr.fillSprite(BG_COLOR); draw_header_spr(1);
+    // ════════════════════════════════════════════════════════════════════
+    // CATMULL-ROM SMOOTHING
+    // ════════════════════════════════════════════════════════════════════
+    // Interpolate 5× between the 50 raw bins → 246 smooth points.
+    // Values are already [0..1] from RSSI mapping; sqrtf lifts valleys.
 
-    // ── Diagonal-scrolling infinite grid — smaller cells and narrower panel ──
-    const int GRID_RIGHT = 78;
-    const int GRID_STEP  = 14;
-    unsigned long now_ms = millis();
+    // Static: avoid stack overflow — fully overwritten each frame, single-threaded.
+    static float norm_buf[TIMELINE_BIN_COUNT];
 
-    // Direction slowly reverses every ~10s for radar feel
-    static float  grid_speed = 1.0f;   // +1 or -1, eases between
-    static float  grid_spd_target = 1.0f;
-    static unsigned long grid_dir_ms = 0;
-    if (now_ms - grid_dir_ms > 9500) {
-        grid_dir_ms = now_ms;
-        if ((now_ms / 9500) % 3 == 0) grid_spd_target = -grid_spd_target;
-    }
-    grid_speed += (grid_spd_target - grid_speed) * 0.004f; // very slow ease
-
-    // Accumulate offset per-frame so direction reversals ease smoothly (no jump)
-    static float  cumulative_grid_offset = 0.0f;
-    static unsigned long last_grid_ms = 0;
-    if (last_grid_ms == 0) last_grid_ms = now_ms;
-    unsigned long grid_dt = now_ms - last_grid_ms;
-    if (grid_dt > 100) grid_dt = 100;  // cap on first call or long gaps
-    last_grid_ms = now_ms;
-    cumulative_grid_offset += grid_speed * (float)grid_dt / (1500.0f / GRID_STEP);
-
-    int grid_o = (int)fmodf(cumulative_grid_offset, (float)GRID_STEP);
-    if (grid_o < 0) grid_o += GRID_STEP;
-    // Wrap the accumulator after sampling so it cannot grow without
-    // bound — at multi-hour timescales the float loses sub-pixel
-    // precision and the grid stutters or jumps.
-    cumulative_grid_offset = fmodf(cumulative_grid_offset, (float)GRID_STEP);
-
-    for (int gx = grid_o - GRID_STEP; gx <= GRID_RIGHT; gx += GRID_STEP)
-        spr.drawLine(gx, 18, gx, DISP_H - 1, CARD_BORDER);
-    for (int gy = 18 + grid_o - GRID_STEP; gy < DISP_H; gy += GRID_STEP)
-        if (gy >= 18) spr.drawLine(0, gy, GRID_RIGHT, gy, CARD_BORDER);
-    // Solid vertical separator on right edge of grid panel
-    spr.drawFastVLine(GRID_RIGHT, 18, DISP_H - 18, CARD_BORDER);
-
-    const int cx = 39, cy = 62;
-
-    // ── Arrow heading (GPS bearing when tracking, slow drift otherwise) ──
-    static float ease_arrow = 0.0f;
-    static unsigned long last_ar_ms = 0;
-    unsigned long ar_dt = now_ms - last_ar_ms;
-    if (ar_dt > 100) ar_dt = 15;
-    last_ar_ms = now_ms;
-
-    if (north_mode && gps_valid) {
-        // Compass mode while moving: rotate by the negative of travel heading
-        // so the arrow always points to true north regardless of orientation.
-        float tgt = radians(-gps_course - 90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.08f * d;
-    } else if (north_mode && !gps_valid) {
-        // No GPS heading available — arrow defaults to "up" (screen-relative north).
-        float tgt = radians(-90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        ease_arrow += 0.08f * d;
-    } else if (active && has_est) {
-        float rel = brng - (gps_valid ? gps_course : 0.0f);
-        float tgt = radians(rel - 90.0f);
-        float d = tgt - ease_arrow;
-        while (d >  (float)M_PI) d -= 2.0f*(float)M_PI;
-        while (d < -(float)M_PI) d += 2.0f*(float)M_PI;
-        // Slower lock-on (was 0.09) — arrow visibly swings and settles
-        // toward the target rather than snapping into place.
-        ease_arrow += 0.06f * d;
-    } else {
-        // Clockwise drift: 1 rev per 8s — gives a more visible "searching" feel.
-        ease_arrow += (float)ar_dt * (2.0f*(float)M_PI / 8000.0f);
-        if (ease_arrow > 2.0f*(float)M_PI) ease_arrow -= 2.0f*(float)M_PI;
-    }
-    float ang = ease_arrow;
-
-    // ── Compass rose ring ──
-    spr.drawCircle(cx, cy, 18, CARD_BORDER);
-    spr.drawCircle(cx, cy, 19, BG_COLOR);  // thin separation from arrow
-
-    // ── Arrow: cursor/pointer shape — 7-point polygon ──
-    auto rotpt = [&](float lx, float ly, float a, int* ox, int* oy) {
-        float ca = cosf(a), sa = sinf(a);
-        *ox = cx + (int)roundf(lx * ca - ly * sa);
-        *oy = cy + (int)roundf(lx * sa + ly * ca);
+    // Inline Catmull-Rom: for each span [i, i+1], emit TL_INTERP_FACTOR
+    // sub-samples using the standard cubic basis.
+    auto catmull_rom_fill = [](const float* src, int src_n, float* dst, int* dst_n) {
+        int out = 0;
+        for (int i = 0; i < src_n - 1; i++) {
+            float p0 = src[max(0, i - 1)];
+            float p1 = src[i];
+            float p2 = src[min(src_n - 1, i + 1)];
+            float p3 = src[min(src_n - 1, i + 2)];
+            for (int s = 0; s < TL_INTERP_FACTOR; s++) {
+                float t  = (float)s / (float)TL_INTERP_FACTOR;
+                float t2 = t * t;
+                float t3 = t2 * t;
+                float v  = 0.5f * ((-p0 + 3.0f*p1 - 3.0f*p2 + p3) * t3
+                                  + (2.0f*p0 - 5.0f*p1 + 4.0f*p2 - p3) * t2
+                                  + (-p0 + p2) * t
+                                  + 2.0f * p1);
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                dst[out++] = v;
+            }
+        }
+        dst[out++] = src[src_n - 1];  // final point
+        *dst_n = out;
     };
-    // Local-space vertices (pointing up before rotation):
-    //   0=tip, 1=right-outer, 2=right-inner, 3=right-base, 4=left-base, 5=left-inner, 6=left-outer
-    const float A_TIP_Y   = -20.5f, A_SHLDR_Y = -5.7f, A_BASE_Y = 13.0f;
-    const float A_HEAD_HW = 11.4f,  A_STEM_HW =  5.7f;
-    const float lx7[7] = {  0,          A_HEAD_HW,  A_STEM_HW,  A_STEM_HW, -A_STEM_HW, -A_STEM_HW, -A_HEAD_HW };
-    const float ly7[7] = { A_TIP_Y, A_SHLDR_Y, A_SHLDR_Y, A_BASE_Y,  A_BASE_Y, A_SHLDR_Y,  A_SHLDR_Y };
-    int ax7[7], ay7[7];
-    for (int vi = 0; vi < 7; vi++) rotpt(lx7[vi], ly7[vi], ang, &ax7[vi], &ay7[vi]);
 
-    // BG fill: arrowhead triangle + stem rectangle (two triangles)
-    spr.fillTriangle(ax7[0], ay7[0], ax7[1], ay7[1], ax7[6], ay7[6], BG_COLOR);
-    spr.fillTriangle(ax7[2], ay7[2], ax7[3], ay7[3], ax7[4], ay7[4], BG_COLOR);
-    spr.fillTriangle(ax7[2], ay7[2], ax7[4], ay7[4], ax7[5], ay7[5], BG_COLOR);
+    static float smooth_buf[TL_SMOOTH_MAX];
 
-    // Hatching: narrow spacing near tip, wider toward base (quadratic from tip)
-    {
-        uint16_t hatch_col = lgfx::color565(45, 135, 210);
-        for (int hi = 1; hi < 16; hi++) {
-            float ly = A_TIP_Y + 0.4f * (float)(hi * hi);  // quadratic from tip → base
-            if (ly > A_BASE_Y) break;
-            // Half-width at this y level
-            float hw;
-            if (ly <= A_SHLDR_Y) {
-                float t = (ly - A_TIP_Y) / (A_SHLDR_Y - A_TIP_Y);
-                hw = A_HEAD_HW * t;
-            } else {
-                hw = A_STEM_HW;
+    // ════════════════════════════════════════════════════════════════════════
+    // TRUE ISOMETRIC PROJECTION — 30° axes (cos30 / sin30)
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // Three axes 120° apart.  Time goes upper-left at 30°, depth goes
+    // upper-right at 30°, value goes straight up.  Value axis X = 0, so
+    // fill columns are perfectly vertical — no skewed rasterization needed.
+
+    const float C30 = 0.866f;
+    const float S30 = 0.5f;
+
+    const float ox = (float)(VIZ_X + 12);           // bottom-left — newest data enters here
+    const float oy = (float)(VIZ_Y + VIZ_H - 6);
+
+    const float T_LEN = 130.0f;   // time span — far end bleeds past upper-right edge
+    const float D_LEN =  24.0f;   // depth span (just enough to separate ribbons)
+    const float V_LEN =  42.0f;   // value span (max curve height)
+
+    const float TDX = +C30 * T_LEN;   // time   → upper-right (old data recedes)
+    const float TDY = -S30 * T_LEN;
+    const float DDX = -C30 * D_LEN;   // depth  → upper-left (iso perspective)
+    const float DDY = -S30 * D_LEN;
+    const float VDY = -V_LEN;         // value  → straight up (VDX = 0)
+
+    #define PX(tt, dtt)      (int)(ox + (tt)*TDX + (dtt)*DDX)
+    #define PY(tt, dtt, vt)  (int)(oy + (tt)*TDY + (dtt)*DDY + (vt)*VDY)
+    #define PXf(tt, dtt)     (ox + (tt)*TDX + (dtt)*DDX)
+    #define PYf(tt, dtt, vt) (oy + (tt)*TDY + (dtt)*DDY + (vt)*VDY)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ISOMETRIC DIAMOND GRID — fills entire viz panel
+    // ════════════════════════════════════════════════════════════════════════
+    // Two families of parallel lines at 30° from horizontal forming the
+    // classic isometric diamond pattern. Pure integer math — no float
+    // endpoints — prevents the dotted aliasing from sub-pixel rounding.
+
+    uint16_t grid_col = lerp_col16(BG_COLOR, CARD_BORDER,  0.28f);
+
+    const int GRID_SPACING = 12;
+    const int cx = VIZ_X + VIZ_W / 2;
+    const int cy = VIZ_Y + VIZ_H / 2;
+
+    // ── Family A: upper-left lines (parallel to time axis) ──
+    // Direction (-0.866, -0.5). Normal (+0.5, -0.866).
+    // Step origin along normal by k * GRID_SPACING.
+    for (int k = -20; k <= 20; k++) {
+        int ox_a = cx + (k * GRID_SPACING * 500) / 1000;
+        int oy_a = cy - (k * GRID_SPACING * 866) / 1000;
+        int x0 = ox_a - (200 * 866) / 1000;
+        int y0 = oy_a - (200 * 500) / 1000;
+        int x1 = ox_a + (200 * 866) / 1000;
+        int y1 = oy_a + (200 * 500) / 1000;
+        spr.drawLine(x0, y0, x1, y1, grid_col);
+    }
+
+    // ── Family B: upper-right lines (parallel to depth axis) ──
+    // Direction (+0.866, -0.5). Normal (-0.5, -0.866).
+    for (int k = -20; k <= 20; k++) {
+        int ox_b = cx - (k * GRID_SPACING * 500) / 1000;
+        int oy_b = cy - (k * GRID_SPACING * 866) / 1000;
+        int x0 = ox_b - (200 * 866) / 1000;
+        int y0 = oy_b + (200 * 500) / 1000;
+        int x1 = ox_b + (200 * 866) / 1000;
+        int y1 = oy_b - (200 * 500) / 1000;
+        spr.drawLine(x0, y0, x1, y1, grid_col);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // RIBBON RENDERING — back-to-front (BLE then WiFi)
+    // ════════════════════════════════════════════════════════════════════════
+
+    struct RibbonDef {
+        float    depth;
+        uint16_t curve_col;
+        uint16_t bright_col;
+        uint16_t mid_col;
+        uint16_t dark_col;
+        uint16_t base_col;
+        uint8_t  flock_proto;
+    };
+
+    RibbonDef ribbons[2];
+
+    // WiFi (back)
+    ribbons[0].depth      = 1.0f;
+    ribbons[0].curve_col  = HEADER_COLOR;
+    ribbons[0].bright_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
+    ribbons[0].mid_col    = lerp_col16(BG_COLOR, HEADER_COLOR, 0.20f);
+    ribbons[0].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(20, 80, 65), 0.35f);
+    ribbons[0].base_col   = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
+    ribbons[0].flock_proto = 0;
+
+    // BLE (front)
+    ribbons[1].depth      = 0.0f;
+    ribbons[1].curve_col  = PURPLE_COLOR;
+    ribbons[1].bright_col = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.50f);
+    ribbons[1].mid_col    = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.20f);
+    ribbons[1].dark_col   = lerp_col16(BG_COLOR, lgfx::color565(45, 35, 80), 0.35f);
+    ribbons[1].base_col   = lerp_col16(BG_COLOR, PURPLE_COLOR, 0.18f);
+    ribbons[1].flock_proto = 1;
+
+    for (int ri = 0; ri < 2; ri++) {
+        const RibbonDef& R = ribbons[ri];
+        const float d = R.depth;
+
+        // Fill shared norm + smooth buffers for this ribbon
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+            int rev = TIMELINE_BIN_COUNT - 1 - i;
+            norm_buf[i] = (ri == 0) ? tl_wifi_smooth[rev] : tl_ble_smooth[rev];
+            if (norm_buf[i] > 1.0f) norm_buf[i] = 1.0f;
+        }
+        int n = 0;
+        catmull_rom_fill(norm_buf, TIMELINE_BIN_COUNT, smooth_buf, &n);
+
+        // ── Step A: Precompute projected coordinates ──
+        static float rx[TL_SMOOTH_MAX];
+        static float cy[TL_SMOOTH_MAX];
+        static float by[TL_SMOOTH_MAX];
+
+        for (int i = 0; i < n; i++) {
+            float tt = -0.10f + (float)i / (float)(n - 1) * 1.30f;
+            rx[i] = PXf(tt, d);
+            cy[i] = PYf(tt, d, smooth_buf[i]);
+            by[i] = PYf(tt, d, 0.0f);
+        }
+
+        // ── Step C: 3-band gradient fill (occludes prior ribbon via overwrite) ──
+        for (int i = 0; i < n - 1; i++) {
+            float x0 = rx[i], x1 = rx[i + 1];
+            float yt0 = cy[i], yt1 = cy[i + 1];
+            float yb0 = by[i], yb1 = by[i + 1];
+            int steps = max(1, (int)ceilf(fabsf(x1 - x0)) + 1);
+            for (int px = 0; px < steps; px++) {
+                float lt = (float)px / (float)steps;
+                int sx  = (int)(x0 + (x1 - x0) * lt);
+                int top = (int)(yt0 + (yt1 - yt0) * lt);
+                int bot = (int)(yb0 + (yb1 - yb0) * lt);
+                int fh  = bot - top;
+                if (fh < 1) continue;
+
+                int bh = max(1, fh * 28 / 100);
+                int mh = max(1, fh * 35 / 100);
+                int dh = fh - bh - mh;
+                if (dh < 0) dh = 0;
+
+                spr.fillRect(sx, top,           1, bh, R.bright_col);
+                spr.fillRect(sx, top + bh,      1, mh, R.mid_col);
+                if (dh > 0)
+                    spr.fillRect(sx, top + bh + mh, 1, dh, R.dark_col);
             }
-            if (hw < 0.5f) continue;
-            int hx0, hy0, hx1, hy1;
-            rotpt(-hw, ly, ang, &hx0, &hy0);
-            rotpt( hw * 0.5f, ly, ang, &hx1, &hy1);  // stop at 3/4 of total width
-            spr.drawLine(hx0, hy0, hx1, hy1, hatch_col);
+        }
+
+        // ── Step E: Curve line ON TOP (2px thick) ──
+        for (int i = 0; i < n - 1; i++) {
+            spr.drawLine((int)rx[i],   (int)cy[i],
+                         (int)rx[i+1], (int)cy[i+1], R.curve_col);
+            spr.drawLine((int)rx[i],   (int)cy[i] + 1,
+                         (int)rx[i+1], (int)cy[i+1] + 1, R.curve_col);
+        }
+
+        // ── Step E2: Leading edge glow — pulsing dot at newest (index 0) ──
+        {
+            int dot_x = (int)rx[0];
+            int dot_y = (int)cy[0];
+            float pulse = 0.7f + 0.3f * sinf((float)frame_ms * 2.0f * 3.14159f / 600.0f);
+            spr.fillCircle(dot_x, dot_y, 3, lerp_col16(BG_COLOR, R.curve_col, 0.15f * pulse));
+            spr.fillCircle(dot_x, dot_y, 2, lerp_col16(BG_COLOR, R.curve_col, 0.35f * pulse));
+            spr.fillCircle(dot_x, dot_y, 1, lerp_col16(BG_COLOR, R.curve_col, 0.80f * pulse));
+        }
+
+        // ── Step F: Baseline edge ──
+        for (int i = 0; i < n - 1; i++) {
+            spr.drawLine((int)rx[i],   (int)by[i],
+                         (int)rx[i+1], (int)by[i+1], R.base_col);
+        }
+
+        // ── Step G: Flock detection pips ──
+        for (int i = 0; i < TIMELINE_BIN_COUNT; i++) {
+            if (tl_flock_fade[i] <= 0.0f) continue;
+            if (!tl_bins[i].has_flock) continue;
+            if (tl_bins[i].flock_proto != R.flock_proto) continue;
+
+            // Map raw bin index to reversed smoothed array index
+            // (tl_bins[0]=oldest → smooth_pts[n-1], tl_bins[49]=newest → smooth_pts[0])
+            int si = (TIMELINE_BIN_COUNT - 1 - i) * TL_INTERP_FACTOR;
+            if (si >= n) si = n - 1;
+
+            float fade = tl_flock_fade[i];
+            uint16_t pip_col = lerp_col16(BG_COLOR, CAUTION_COLOR, fade * 0.85f);
+            spr.fillCircle((int)rx[si], (int)cy[si] - 1, 2, pip_col);
         }
     }
 
-    // GPS_COLOR outline — draw all 7 edges
-    for (int vi = 0; vi < 7; vi++) {
-        int ni = (vi + 1) % 7;
-        spr.drawLine(ax7[vi], ay7[vi], ax7[ni], ay7[ni], GPS_COLOR);
-    }
+    #undef PX
+    #undef PY
+    #undef PXf
+    #undef PYf
 
-    // ── Sample acquisition boxes — bottom of grid panel ──
+    // Time marks along the isometric baseline: "now" → "-5m"
+    #define TMX(tt) (int)(ox + (tt)*TDX)
+    #define TMY(tt) (int)(oy + (tt)*TDY)
     {
-        int sc_count = active ? sample_count : 0;
-        const int BOX     = 9;
-        const int BOX_GAP = 5;
-        int total_box_w   = LOC_MIN_SAMPLES_EST * BOX + (LOC_MIN_SAMPLES_EST - 1) * BOX_GAP;
-        int bx0 = cx - total_box_w / 2;
-        int by0 = DISP_H - BOX - 6;
-
-        for (int di = 0; di < LOC_MIN_SAMPLES_EST; di++) {
-            int bxi = bx0 + di * (BOX + BOX_GAP);
-            bool filled = di < sc_count;
-
-            uint16_t box_col;
-            if (filled) {
-                float pulse_t = anim_pulse(UI_PULSE_MEDIUM);
-                uint16_t dark_accent = lerp_col16(BG_COLOR, ACCENT_COLOR, 0.4f);
-                box_col = lerp_col16(dark_accent, ACCENT_COLOR, pulse_t);
-            } else {
-                box_col = lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
-            }
-
-            spr.drawRect(bxi, by0, BOX, BOX, box_col);
-            if (filled) {
-                spr.drawLine(bxi + 1, by0 + 1, bxi + BOX - 2, by0 + BOX - 2, box_col);
-                spr.drawLine(bxi + BOX - 2, by0 + 1, bxi + 1, by0 + BOX - 2, box_col);
-            }
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        struct TimeMark { float t_norm; const char* label; };
+        static const TimeMark marks[] = {
+            { 0.0f, "now" },
+            { 0.2f, "-1m" },
+            { 0.4f, "-2m" },
+            { 0.6f, "-3m" },
+            { 0.8f, "-4m" },
+            { 1.0f, "-5m" },
+        };
+        for (int mi = 0; mi < 6; mi++) {
+            float tt = -0.10f + marks[mi].t_norm * 1.30f;
+            int mx = TMX(tt);
+            int my = TMY(tt) + UI_PAD_SM;  // offset below ribbon baseline
+            if (mx < VIZ_X || mx > VIZ_X + VIZ_W) continue;
+            if (my + UI_PAD_SM < VIZ_Y || my > VIZ_Y + VIZ_H - UI_PAD_XS) continue;
+            spr.drawFastVLine(mx, my, 3, DIM_COLOR);
+            int label_w = (int)strlen(marks[mi].label) * ts_char_w(TS_MICRO);
+            int lx = mx - label_w / 2;
+            if (lx < VIZ_X) lx = VIZ_X;
+            spr.setCursor(lx, my + UI_PAD_XS + 2);
+            spr.print(marks[mi].label);
         }
     }
+    #undef TMX
+    #undef TMY
+}
 
-    // ── Right panel ──
-    int rx = 82;
-    int rpx = rx + 4;
+// ============================================================================
+// EXPANDED FEED OVERLAY — fullscreen activity feed view
+// ============================================================================
+void draw_feed_expanded_overlay() {
+    // Read directly from the scanner's frozen snapshot — scan_local_feed is not
+    // updated while show_feed_expanded is true, so it matches exactly what the
+    // 't' key targeting code reads. No mutex needed; no per-frame copy.
+    int local_count = scan_local_count;
+    int local_head  = scan_local_head;
+    unsigned long local_now = millis();
 
-    // ── Status badge ──
-    const char* status_base; uint16_t status_col; bool status_anim = false;
-    if (north_mode) {
-        status_base = "N Mode";  status_col = GPS_COLOR;
-    } else if (!has_loc && !gps_valid) {
-        status_base = "GPS";         status_col = GPS_COLOR;     status_anim = true;
-    } else if (!active) {
-        status_base = "Need Target"; status_col = CAUTION_COLOR; status_anim = true;
-    } else {
-        status_base = "Hunting";     status_col = ACCENT_COLOR;
+    // Slide-in animation state — tracks new entries arriving while overlay is open
+    static int           expand_prev_head   = -1;
+    static unsigned long expand_shift_ms    = 0;
+    static unsigned long expand_open_ms_last = 0;
+    static float         feed_sel_y_f       = 0.0f;
+    static unsigned long feed_sel_last_frame = 0;
+
+    if (feed_expand_ms != expand_open_ms_last) {
+        expand_open_ms_last = feed_expand_ms;
+        expand_prev_head    = local_head;
+        expand_shift_ms     = 0;
+        feed_sel_last_frame = 0;
     }
-    char status_str[26];
-    if (status_anim) {
-        char dots[4];
-        anim_ellipsis(dots, sizeof(dots));
-        snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
-    } else {
-        safe_copy(status_str, status_base, sizeof(status_str));
+    if (local_count > 0 && expand_prev_head != -1 && local_head != expand_prev_head) {
+        expand_shift_ms  = local_now;
+        expand_prev_head = local_head;
+    } else if (expand_prev_head == -1 && local_count > 0) {
+        expand_prev_head = local_head;
     }
-    {
-        int max_chars_sb = (int)strlen(status_base) + (status_anim ? 3 : 0);
-        int box_w = max_chars_sb * 8 + 12;
-        int avail_w = DISP_W - rpx - 2;
-        if (box_w > avail_w) box_w = avail_w;
-        uint16_t status_fill = lerp_col16(BG_COLOR, status_col, 0.22f);
-        spr.fillRoundRect(rpx, 23, box_w, 16, 5, status_fill);
-        spr.drawRoundRect(rpx, 23, box_w, 16, 5, status_col);
-        spr.setTextColor(status_col, status_fill); spr.setTextSize(1.2);
-        spr.setClipRect(rpx + 1, 24, box_w - 2, 14);
-        spr.setCursor(rpx + 6, 27); kprint(spr, status_str);
+
+    float expand_alpha = ui_progress(feed_expand_ms, UI_FADE_OUT_MS);
+    bool fully_faded = (expand_alpha >= 1.0f);
+    auto ea = [&](uint16_t c) -> uint16_t { return fully_faded ? c : lerp_col16(BG_COLOR, c, expand_alpha); };
+
+    // Solid backdrop
+    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
+
+    // Subtitle appended to header bar ("SCANNER / FEED")
+    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), ea(BG_COLOR));
+    spr.setTextSize(TS_BODY);
+    spr.setCursor(56, 5);
+    kprint(spr, "/ FEED");
+
+    // Gate content rendering until fade-in is underway
+    if (expand_alpha < 0.3f) return;
+
+    // Empty state
+    if (local_count == 0) {
+        spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        const char* msg = "no activity yet";
+        int mw = (int)strlen(msg) * ts_char_w(TS_BODY);
+        spr.setCursor((DISP_W - mw) / 2, DISP_H / 2 - 4);
+        kprint(spr, msg);
+    } else {
+        // Column layout (240px wide, 4px side padding = 232 usable):
+        //   x=4    type symbol (9px) + flock star (6px) = ~18px
+        //   x=26   DEVICE name (12 chars = 84px)
+        //   x=114  RSSI ("-XXdBm" = 6 chars = 42px)
+        //   x=162  SIGNAL (STRONG/MEDIUM/WEAK = up to 6 chars = 42px)
+        //   x=210  AGE (short form like "1m" or "45s" = 20px)
+
+        const int col_sym    = UI_PAD_SM;
+        const int col_rssi   = 140;
+        const int col_sig    = 195;
+
+        // Column headers (faded in)
+        const int hdr_y = 23;
+        spr.setTextSize(TS_BODY);
+        spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
+        spr.setCursor(col_sym, hdr_y); kprint(spr, "DEVICE");
+        spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
+        spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
+
+        // Render rows
+        const int row_top    = hdr_y + 12;
+        const int avail_h    = DISP_H - row_top;
+        const int max_rows   = 6;
+        const int row_h      = avail_h / max_rows;
+        const int row_pad    = avail_h - (max_rows * row_h);
+        const int row_top_adj = row_top + row_pad / 2;
+
+        // Clamp selection to visible rows (handles feed shrinking while overlay is open)
+        {
+            int visible_count = local_count < max_rows ? local_count : max_rows;
+            if (visible_count < 1) visible_count = 1;
+            if (feed_expanded_selected >= visible_count)
+                feed_expanded_selected = visible_count - 1;
+        }
+
+        // Eased selection highlight Y
+        float sel_target_y = (float)(row_top_adj + feed_expanded_selected * row_h);
+        {
+            float sdt = (feed_sel_last_frame == 0) ? 0.0f
+                      : (float)(local_now - feed_sel_last_frame);
+            if (sdt > 100.0f) sdt = 100.0f;
+            feed_sel_last_frame = local_now;
+            feed_sel_y_f = (sdt == 0.0f) ? sel_target_y
+                         : anim_filter(feed_sel_y_f, sel_target_y, 80.0f, sdt);
+        }
+
+        // Shared slide offset — when a new entry arrives every row shifts
+        // down together, mirroring the scanner-feed-preview animation.
+        float expand_slide_t = 1.0f;
+        if (expand_shift_ms > 0 && (local_now - expand_shift_ms) < 250) {
+            expand_slide_t = ui_ease((float)(local_now - expand_shift_ms) / 250.0f);
+        }
+        int expand_slide_offset = (int)((1.0f - expand_slide_t) * (float)row_h);
+
+        // Clip to row area to prevent slide animation from bleeding into headers
+        spr.setClipRect(0, row_top_adj, DISP_W, DISP_H - row_top_adj);
+        int rendered = 0;
+        for (int i = 0; i < local_count && rendered < max_rows; i++) {
+            int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
+            FeedEntry& e = scan_local_feed[idx];
+            int row_y = row_top_adj + rendered * row_h - expand_slide_offset;
+
+            bool is_sel = (rendered == feed_expanded_selected);
+            uint16_t row_bg = is_sel ? lerp_col16(BG_COLOR, CARD_COLOR, 0.5f) : BG_COLOR;
+
+            // Selection highlight
+            if (is_sel) {
+                int sel_y = (int)feed_sel_y_f - expand_slide_offset;
+                spr.fillRect(0, sel_y, DISP_W, row_h, ea(row_bg));
+                spr.drawFastHLine(0, sel_y,            DISP_W, ea(ACCENT_COLOR));
+                spr.drawFastHLine(0, sel_y + row_h - 1, DISP_W, ea(ACCENT_COLOR));
+            }
+
+            // Type symbol color (flock entries tinted toward amber), faded in
+            uint16_t proto_col = e.is_flock  ? CAUTION_COLOR
+                               : (e.proto == 0) ? HEADER_COLOR
+                                                : PURPLE_COLOR;
+            proto_col = ea(proto_col);
+
+            // Small stats-style symbols: outline-only triangle (WiFi) or diamond (BLE)
+            int sym_x = col_sym;
+            int sym_y = row_y + 3;
+            if (e.proto == 0) {
+                spr.drawTriangle(sym_x,     sym_y + 7,
+                                 sym_x + 8, sym_y + 7,
+                                 sym_x + 4, sym_y,
+                                 proto_col);
+            } else {
+                int ecx = sym_x + 4, ecy = sym_y + 4, ehr = 4;
+                spr.drawLine(ecx,       ecy - ehr, ecx + ehr, ecy,       proto_col);
+                spr.drawLine(ecx + ehr, ecy,       ecx,       ecy + ehr, proto_col);
+                spr.drawLine(ecx,       ecy + ehr, ecx - ehr, ecy,       proto_col);
+                spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
+            }
+            // DEVICE name — matches scanner feed preview spacing
+            int name_start_x = sym_x + UI_PAD_MD;
+            int name_max_chars = (col_rssi - name_start_x - 4) / ts_char_w(TS_BODY);
+            if (name_max_chars > 14) name_max_chars = 14;
+            if (name_max_chars < 1) name_max_chars = 1;
+            if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
+            char name_disp[20];
+            strncpy(name_disp, e.name, name_max_chars);
+            name_disp[name_max_chars] = '\0';
+            spr.setTextColor(ea(TEXT_COLOR), ea(row_bg));
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(name_start_x, row_y + 3);
+            spr.print(name_disp);
+
+            // RSSI in dBm with units — right-aligned within the RSSI column
+            char rssi_str[10];
+            snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
+            spr.setTextColor(ea(TEXT_COLOR), ea(row_bg));
+            spr.setCursor(col_rssi, row_y + 3);
+            spr.print(rssi_str);
+
+            // SIGNAL (spelled out)
+            const char* strength_str;
+            uint16_t strength_col;
+            if (e.rssi > -60)      { strength_str = "STRONG"; strength_col = ACCENT_COLOR; }
+            else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
+            else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
+            spr.setTextColor(ea(strength_col), ea(row_bg));
+            spr.setCursor(col_sig, row_y + 3);
+            spr.print(strength_str);
+
+            rendered++;
+        }
         spr.clearClipRect();
     }
 
-    // ── TARGET (prominent — larger value text) ──
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(rpx, 46); kprint(spr, "TARGET");
-    {
-        char tname[18];
-        if (north_mode) {
-            safe_copy(tname, "North", sizeof(tname));
-        } else if (active) {
-            bool nok = (target_name[0] != '\0'
-                        && strcmp(target_name, "Hidden")  != 0
-                        && strcmp(target_name, "Unknown") != 0);
-            const char* src = nok ? target_name
-                                   : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
-            safe_copy(tname, src, sizeof(tname));
-        } else {
-            safe_copy(tname, "No Target", sizeof(tname));
-        }
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1.5);
-        spr.setCursor(rpx, 58); spr.print(tname);
-    }
+    // Footer hint
+    spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(UI_PAD_SM, DISP_H - 10);
+    spr.print("arrows select  t target  f close");
 
-    // ── DISTANCE + SIGNAL on same line ──
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
-    spr.setCursor(rpx, 80); kprint(spr, "DIST");
-
-    {
-        int trend = (active && has_est) ? locator_distance_trend() : 0;
-        if (trend != 0) {
-            int tx = rpx + 34;
-            int ty = 80;
-            if (trend < 0) {
-                spr.fillTriangle(tx, ty, tx + 5, ty, tx + 2, ty + 5, ACCENT_COLOR);
-            } else {
-                spr.fillTriangle(tx, ty + 5, tx + 5, ty + 5, tx + 2, ty, CAUTION_COLOR);
-            }
-        }
-    }
-    {
-        float sd = (active && has_est && !north_mode) ? dist : -1.0f;
-        float sd_ft = sd * 3.28084f;
-        spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(2);
-        spr.setCursor(rpx, 92);
-        if (sd < 0) {
-            spr.print("--");
-            spr.setTextSize(1.2);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.print("ft");
-        } else {
-            char db[12];
-            if (sd < 300) {
-                snprintf(db, sizeof(db), "%.0f", sd_ft);
-                spr.print(db);
-                spr.setTextSize(1.2);
-                spr.setTextColor(DIM_COLOR, BG_COLOR);
-                spr.print("ft");
-            } else {
-                snprintf(db, sizeof(db), "%.1f", sd / 1000.0f);
-                spr.print(db);
-                spr.setTextSize(1.2);
-                spr.setTextColor(DIM_COLOR, BG_COLOR);
-                spr.print("km");
-            }
-        }
-    }
-
-    {
-        int sig_x = rpx + 80;
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1.2);
-        spr.setCursor(sig_x, 80); kprint(spr, "SIGNAL");
-
-        int sr = (active && has_rssi && !north_mode) ? target_rssi : -999;
-        uint16_t sig_col;
-        const char* sig_str;
-        if      (sr == -999) { sig_str = "--";     sig_col = DIM_COLOR; }
-        else if (sr > -60)   { sig_str = "STRONG"; sig_col = ACCENT_COLOR; }
-        else if (sr > -80)   { sig_str = "MED";    sig_col = CAUTION_COLOR; }
-        else                 { sig_str = "WEAK";   sig_col = DIM_COLOR; }
-
-        spr.setTextColor(sig_col, BG_COLOR); spr.setTextSize(1.2);
-        spr.setCursor(sig_x, 92); spr.print(sig_str);
-    }
 }
 
-static int history_scroll_offset = 0;
-
-// Helper: extract type-label and protocol color from type string
-static void hist_type_info(const char* type, const char** lbl, uint16_t* col) {
-    if (strstr(type, "WIFI")) { *lbl = "WiFi"; *col = TEAL_COLOR; }
-    else if (strstr(type, "BLE") || strstr(type, "RAVEN")) { *lbl = "BLE";  *col = GPS_COLOR; }
-    else { *lbl = "SYS"; *col = DIM_COLOR; }
-}
-
+// ============================================================================
+// DETECTIONS SCREEN (screen 2)
+// ============================================================================
 void draw_capture_history_screen() {
-    // Use SD history when available, fall back to in-memory capture_history
-    bool use_sd = sd_available && sd_hist_count > 0;
+    unsigned long now = millis();
 
-    // Build a unified view pointer array (avoid copying large structs)
-    // We work directly from sd_hist or capture_history
-    int total = use_sd ? sd_hist_count : 0;
-    if (!use_sd) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        total = capture_history_count;
-        xSemaphoreGive(dataMutex);
+    // Smooth selection cursor
+    float dt_f = (hist_last_frame_ms == 0) ? 16.0f : (float)(now - hist_last_frame_ms);
+    if (dt_f > 200.0f) dt_f = 200.0f;
+    hist_last_frame_ms = now;
+
+    int hist_total = sd_available ? sd_hist_count : capture_history_count;
+
+    int target_y = CONTENT_Y + (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
+    hist_sel_y_f = anim_filter(hist_sel_y_f, (float)target_y, HIST_SEL_TC, dt_f);
+
+    spr.fillSprite(BG_COLOR);
+
+    if (hist_detail_open && hist_total > 0) {
+        // ── Detail overlay — refined layout ───────────────────────────────
+        int idx = history_selected_idx;
+
+        // Pull fields from sd_hist or capture_history
+        const char* d_type      = "";
+        const char* d_mac       = "";
+        const char* d_name      = "";
+        const char* d_method    = "";
+        const char* d_timestamp = "";
+        const char* d_datestamp = "--/--/--";
+        int          d_rssi     = 0;
+        int          d_conf     = 0;
+        int          d_id       = 0;
+        double       d_lat      = 0.0, d_lng = 0.0;
+
+        if (sd_available && idx < sd_hist_count) {
+            SDHistEntry& e = sd_hist[idx];
+            d_type = e.type; d_mac = e.mac; d_name = e.name;
+            d_method = e.method; d_timestamp = e.timestamp;
+            d_datestamp = e.datestamp;
+            d_rssi = e.rssi; d_conf = e.confidence; d_id = e.id;
+            d_lat = e.lat; d_lng = e.lng;
+        } else if (idx < capture_history_count) {
+            CaptureEntry& e = capture_history[idx];
+            d_type = e.type; d_mac = e.mac; d_name = e.name;
+            d_timestamp = e.time;
+            d_rssi = e.rssi; d_conf = e.confidence; d_id = e.id;
+            d_lat = e.lat; d_lng = e.lng;
+        }
+
+        bool is_wifi = (strstr(d_type, "WIFI") != NULL || strstr(d_type, "WiFi") != NULL);
+        bool is_flock = (strstr(d_type, "FLOCK") != NULL || strstr(d_type, "RAVEN") != NULL);
+
+        // Protocol symbol color: amber for confirmed flock, protocol color otherwise
+        uint16_t proto_col = is_flock ? CAUTION_COLOR
+                           : (is_wifi ? HEADER_COLOR : PURPLE_COLOR);
+
+        // Confidence color and label
+        uint16_t conf_col;
+        const char* conf_label_str;
+        if      (d_conf >= CONFIDENCE_CERTAIN)         { conf_col = HEADER_COLOR;  conf_label_str = "CERTAIN"; }
+        else if (d_conf >= CONFIDENCE_HIGH)            { conf_col = CAUTION_COLOR; conf_label_str = "HIGH"; }
+        else if (d_conf >= CONFIDENCE_ALARM_THRESHOLD) { conf_col = CAUTION_COLOR; conf_label_str = "MEDIUM"; }
+        else                                           { conf_col = DIM_COLOR;     conf_label_str = "LOW"; }
+
+        const int LBL_X  = 8;     // label column x
+        const int VAL_X  = 50;    // value column x — aligns all data
+        const int ROW_H  = 14;    // matches scanner feed row height
+
+        // ── Row 1: [symbol] Device Name ........... [conf bar] LABEL ──
+        int ry = CONTENT_Y + 3;
+
+        // Protocol symbol: triangle (WiFi) or diamond (BLE)
+        if (is_wifi) {
+            spr.drawTriangle(12, ry, 12 + 8, ry + 7, 12 + 4, ry - 1, proto_col);
+        } else {
+            int dcx = 12 + 4, dcy = ry + 4, dhr = 4;
+            spr.drawLine(dcx,       dcy - dhr, dcx + dhr, dcy,       proto_col);
+            spr.drawLine(dcx + dhr, dcy,       dcx,       dcy + dhr, proto_col);
+            spr.drawLine(dcx,       dcy + dhr, dcx - dhr, dcy,       proto_col);
+            spr.drawLine(dcx - dhr, dcy,       dcx,       dcy - dhr, proto_col);
+        }
+
+        // Device name — hero, white, right after symbol
+        {
+            bool name_ok = (d_name[0] != '\0'
+                            && strcmp(d_name, "Hidden") != 0
+                            && strcmp(d_name, "Unknown") != 0);
+            char hero[20];
+            if (name_ok) {
+                safe_copy(hero, d_name, sizeof(hero));
+            } else {
+                // No useful name — show MAC tail or "Hidden"
+                if (strlen(d_mac) > 8) {
+                    safe_copy(hero, d_mac + 9, sizeof(hero));
+                } else {
+                    safe_copy(hero, d_name[0] ? d_name : d_mac, sizeof(hero));
+                }
+            }
+            // Truncate to fit before the confidence bar
+            int max_hero_chars = 18;  // leaves room for conf bar on right
+            if ((int)strlen(hero) > max_hero_chars) hero[max_hero_chars] = '\0';
+
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(22, ry + 1);
+            spr.print(hero);
+        }
+
+        // Confidence bar + label — right-aligned
+        {
+            int conf_label_w = (int)strlen(conf_label_str) * ts_char_w(TS_MICRO);
+            int conf_label_x = DISP_W - 6 - conf_label_w;
+            int conf_bar_w   = 44;
+            int conf_bar_x   = conf_label_x - conf_bar_w - 4;
+            int conf_bar_y   = ry + 2;
+
+            // Bar background
+            spr.fillRect(conf_bar_x, conf_bar_y, conf_bar_w, 5, CARD_COLOR);
+            // Bar fill
+            int fill_w = (int)((float)conf_bar_w * (float)d_conf / 100.0f);
+            if (fill_w > conf_bar_w) fill_w = conf_bar_w;
+            spr.fillRect(conf_bar_x, conf_bar_y, fill_w, 5, conf_col);
+
+            // Label
+            spr.setTextColor(conf_col, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(conf_label_x, ry + 1);
+            spr.print(conf_label_str);
+        }
+
+        // ── Separator ──
+        ry += 15;
+        spr.drawFastHLine(LBL_X, ry, DISP_W - LBL_X * 2, CARD_BORDER);
+        ry += 7;
+
+        // ── Row 2: MAC (left, white) .................. #ID (right, white) ──
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, ry);
+        spr.print(d_mac);
+
+        if (d_id > 0) {
+            char id_str[8];
+            snprintf(id_str, sizeof(id_str), "#%03d", d_id);
+            int id_w = (int)strlen(id_str) * ts_char_w(TS_MICRO);
+            spr.setCursor(DISP_W - LBL_X - id_w, ry);
+            spr.print(id_str);
+        }
+        ry += ROW_H;
+
+        // ── Row 3: SIG — dBm + strength label ──
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, ry);
+        kprint(spr, "SIG");
+
+        {
+            char rssi_str[10];
+            snprintf(rssi_str, sizeof(rssi_str), "%ddBm", d_rssi);
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(VAL_X, ry);
+            spr.print(rssi_str);
+
+            // Strength label — colored by tier
+            const char* sig_str;
+            uint16_t sig_col;
+            if      (d_rssi > -60) { sig_str = "STRONG"; sig_col = HEADER_COLOR; }
+            else if (d_rssi > -80) { sig_str = "MED";    sig_col = CAUTION_COLOR; }
+            else                   { sig_str = "WEAK";   sig_col = TEXT_COLOR; }
+
+            int rssi_w = (int)strlen(rssi_str) * ts_char_w(TS_MICRO);
+            spr.setTextColor(sig_col, BG_COLOR);
+            spr.setCursor(VAL_X + rssi_w + 6, ry);
+            spr.print(sig_str);
+        }
+        ry += ROW_H;
+
+        // ── Row 4: MATCH — detection method ──
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, ry);
+        kprint(spr, "MATCH");
+
+        {
+            char human[48];
+            methods_to_human(d_method, human, sizeof(human));
+            // Truncate to fit screen width
+            int max_match = (DISP_W - VAL_X - LBL_X) / ts_char_w(TS_MICRO);
+            if ((int)strlen(human) > max_match) human[max_match] = '\0';
+
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(VAL_X, ry);
+            spr.print(human);
+        }
+        ry += ROW_H;
+
+        // ── Row 5: TIME — timestamp + date ──
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, ry);
+        kprint(spr, "TIME");
+
+        {
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(VAL_X, ry);
+            spr.print(d_timestamp);
+
+            // Date after timestamp with a gap
+            int ts_w = (int)strlen(d_timestamp) * ts_char_w(TS_MICRO);
+            spr.setCursor(VAL_X + ts_w + 8, ry);
+            spr.print(d_datestamp);
+        }
+        ry += ROW_H;
+
+        // ── Row 6: GPS — coordinates ──
+        spr.setTextColor(HEADER_COLOR, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, ry);
+        kprint(spr, "GPS");
+
+        {
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(VAL_X, ry);
+            if (d_lat != 0.0 || d_lng != 0.0) {
+                char gps_str[24];
+                snprintf(gps_str, sizeof(gps_str), "%.4f, %.4f", d_lat, d_lng);
+                spr.print(gps_str);
+            } else {
+                spr.print("No GPS fix");
+            }
+        }
+
+        // ── Footer ──
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(LBL_X, DISP_H - 10);
+        if (hist_delete_confirming) {
+            spr.setTextColor(CAUTION_COLOR, BG_COLOR);
+            spr.print("DELETE? ENT/d yes  DEL cancel");
+        } else {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.print("d del  t track  w wl  DEL close");
+        }
+
+    } else {
+        // ── List view ─────────────────────────────────────────────────────
+        if (hist_total == 0) {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(8, CONTENT_Y + 30);
+            spr.print("No detections yet.");
+            return;
+        }
+
+        spr.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
+
+        for (int i = 0; i < HIST_VISIBLE_ROWS + 1 && i + history_scroll_offset < hist_total; i++) {
+            int real_idx = i + history_scroll_offset;
+            int row_y = CONTENT_Y + (real_idx - history_scroll_offset) * HIST_ROW_H;
+
+            // Row background
+            bool selected = (real_idx == history_selected_idx);
+            uint16_t row_bg = selected ? lerp_col16(BG_COLOR, CARD_COLOR, 0.5f) : BG_COLOR;
+            spr.fillRect(0, row_y, DISP_W, HIST_ROW_H - 1, row_bg);
+            if (selected) {
+                // Rows stay fixed; highlight bars use eased Y for smooth glide
+                int sel_draw_y = (int)(hist_sel_y_f + 0.5f);
+                spr.drawFastHLine(0, sel_draw_y,                  DISP_W, ACCENT_COLOR);
+                spr.drawFastHLine(0, sel_draw_y + HIST_ROW_H - 2, DISP_W, ACCENT_COLOR);
+            }
+
+            const char* e_type = ""; const char* e_mac = ""; const char* e_name = "";
+            int e_rssi = 0, e_conf = 0; bool e_is_flock = false;
+
+            if (sd_available && real_idx < sd_hist_count) {
+                SDHistEntry& e = sd_hist[real_idx];
+                e_type = e.type; e_mac = e.mac; e_name = e.name;
+                e_rssi = e.rssi; e_conf = e.confidence;
+                e_is_flock = (strstr(e.type, "FLOCK") != NULL || strstr(e.type, "RAVEN") != NULL);
+            } else if (real_idx < capture_history_count) {
+                CaptureEntry& e = capture_history[real_idx];
+                e_type = e.type; e_mac = e.mac; e_name = e.name;
+                e_rssi = e.rssi; e_conf = e.confidence;
+                e_is_flock = (strstr(e.type, "FLOCK") != NULL || strstr(e.type, "RAVEN") != NULL);
+            }
+
+            bool is_w = (strstr(e_type, "WIFI") != NULL || strstr(e_type, "WiFi") != NULL);
+            uint16_t proto_col_r = is_w ? HEADER_COLOR : PURPLE_COLOR;
+            if (e_is_flock) proto_col_r = CAUTION_COLOR;
+
+            // Confidence bar (left edge)
+            int bar_h = (int)((float)(HIST_ROW_H - 4) * (float)e_conf / 100.0f);
+            spr.fillRect(0, row_y + 2, 3, bar_h, proto_col_r);
+
+            // Name
+            spr.setTextColor(proto_col_r, row_bg);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(6, row_y + 5);
+            char nd[20]; safe_copy(nd, e_name[0] ? e_name : e_mac, sizeof(nd));
+            spr.print(nd);
+
+            // RSSI right-aligned
+            char rssi_str[8];
+            snprintf(rssi_str, sizeof(rssi_str), "%d", e_rssi);
+            int rssi_w = (int)strlen(rssi_str) * ts_char_w(TS_MICRO);
+            spr.setTextColor(DIM_COLOR, row_bg);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(DISP_W - rssi_w - 4, row_y + 7);
+            spr.print(rssi_str);
+
+            // Type label
+            spr.setTextColor(DIM_COLOR, row_bg);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(6, row_y + 17);
+            // Shorten type string: strip "FLOCK_" prefix if present
+            const char* type_disp = e_type;
+            if (strncmp(type_disp, "FLOCK_", 6) == 0) type_disp += 6;
+            char td[14]; safe_copy(td, type_disp, sizeof(td));
+            spr.print(td);
+        }
+
+        spr.clearClipRect();
+
+        // Scroll indicator
+        if (hist_total > HIST_VISIBLE_ROWS) {
+            int bar_total = DISP_H - CONTENT_Y - 4;
+            int bar_h = bar_total * HIST_VISIBLE_ROWS / hist_total;
+            if (bar_h < 6) bar_h = 6;
+            int bar_y = CONTENT_Y + 2 + (bar_total - bar_h)
+                        * history_scroll_offset / max(1, hist_total - HIST_VISIBLE_ROWS);
+            spr.fillRect(DISP_W - 2, bar_y, 2, bar_h, DIM_COLOR);
+        }
+    }
+}
+
+
+void draw_signal_screen() {
+    unsigned long frame_ms = millis();
+
+    // ── Snapshot state under mutex ──
+    bool  active;
+    char  target_mac[18], target_name[65], target_type[16];
+    int   target_id, peak_rssi, tracker_idx;
+    unsigned long newest_ms;
+    int   target_rssi = 0;
+    bool  has_rssi    = false;
+    int   tracker_sample_count = 0;
+    int   tracker_samples[RSSI_TRACK_SAMPLES];
+    static SigTraceEntry trace_snap[SIG_TRACE_SIZE];
+    int trace_head, trace_count;
+
+    if (!take_data_mutex()) return;
+    active       = signal_active;
+    safe_copy(target_mac,  signal_target_mac,  sizeof(target_mac));
+    safe_copy(target_name, signal_target_name, sizeof(target_name));
+    safe_copy(target_type, signal_target_type, sizeof(target_type));
+    target_id    = signal_target_id;
+    peak_rssi    = signal_peak_rssi;
+    tracker_idx  = signal_tracker_idx;
+    newest_ms    = signal_newest_sample_ms;
+    if (tracker_idx >= 0 && tracker_idx < rssi_tracker_count
+        && rssi_tracker[tracker_idx].sample_count > 0
+        && strncmp(rssi_tracker[tracker_idx].mac, target_mac, 17) == 0) {
+        int sc = rssi_tracker[tracker_idx].sample_count;
+        target_rssi = rssi_tracker[tracker_idx].samples[sc - 1];
+        tracker_sample_count = sc;
+        memcpy(tracker_samples, rssi_tracker[tracker_idx].samples, sc * sizeof(int));
+        has_rssi = (frame_ms - newest_ms < 15000);
+    }
+    memcpy(trace_snap, sig_trace, sizeof(sig_trace));
+    trace_head  = sig_trace_head;
+    trace_count = sig_trace_count;
+    give_data_mutex();
+
+    // ── Per-frame dt — computed once, shared by all smoothers ──
+    float frame_dt = (sig_trace_last_frame_ms == 0) ? 16.0f
+                   : (float)(frame_ms - sig_trace_last_frame_ms);
+    if (frame_dt > 100.0f) frame_dt = 100.0f;
+    sig_trace_last_frame_ms = frame_ms;
+
+    // ── Smooth trace values for fluid curve motion ──
+    for (int i = 0; i < trace_count; i++) {
+        int slot = (trace_head - trace_count + i + SIG_TRACE_SIZE) % SIG_TRACE_SIZE;
+        float raw = (float)((int)trace_snap[slot].rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
+        if (raw < 0.0f) raw = 0.0f;
+        if (raw > 1.0f) raw = 1.0f;
+        sig_trace_smooth[i] = anim_filter(sig_trace_smooth[i], raw, 300.0f, frame_dt);
     }
 
-    // Clamp selection and scroll
-    if (total == 0) { history_selected_idx = 0; history_scroll_offset = 0; }
-    else {
-        if (history_selected_idx >= total)  history_selected_idx = total - 1;
-        if (history_selected_idx < 0)       history_selected_idx = 0;
-        if (history_selected_idx < history_scroll_offset)          history_scroll_offset = history_selected_idx;
-        if (history_selected_idx >= history_scroll_offset + 4)     history_scroll_offset = history_selected_idx - 3;
-        int max_scroll = max(0, total - 4);
-        if (history_scroll_offset > max_scroll) history_scroll_offset = max_scroll;
+    // ── Trend: slope over tracker sample window ──
+    int trend = 0;
+    if (has_rssi && tracker_sample_count >= 3) {
+        int diff = tracker_samples[tracker_sample_count - 1] - tracker_samples[0];
+        if (diff > 3)       trend =  1;
+        else if (diff < -3) trend = -1;
     }
 
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(2);
 
-    if (total == 0) {
-        for (int i = 0; i < 4; i++) {
-            int y = 19 + i * 28;
-            spr.fillRect(0, y, 3, 27, CARD_BORDER);
-            spr.fillRect(3, y, DISP_W - 3, 27, (i % 2 == 0) ? CARD_COLOR : BG_COLOR);
-            spr.setTextColor(CARD_BORDER, (i % 2 == 0) ? CARD_COLOR : BG_COLOR); spr.setTextSize(1);
-            spr.setCursor(10, y + 9); spr.print(use_sd ? "-- No SD log --" : "-- Listening...");
+    const int TL = TEXT_LEFT;
+
+    // ── Row 1: TARGET label (left) + status badge (right) ──
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(TL, CONTENT_Y + UI_PAD_SM);
+    kprint(spr, "TARGET");
+
+    {
+        bool is_flock = (strncmp(target_type, "FLOCK", 5) == 0
+                      || strncmp(target_type, "RAVEN", 5) == 0);
+        const char* badge_text;
+        uint16_t    badge_col;
+        if (!active) { badge_text = "No Target"; badge_col = DIM_COLOR; }
+        else         { badge_text = is_flock ? "Hunting" : "Tracking";
+                       badge_col = is_flock ? HEADER_COLOR : CAUTION_COLOR; }
+        int bw = (int)strlen(badge_text) * (ts_char_w(TS_MICRO) + 1) + 12;
+        int bh = 16;
+        int bx = DISP_W - TL - bw;
+        int by = CONTENT_Y + UI_PAD_XS;
+        uint16_t sfill = lerp_col16(BG_COLOR, badge_col, 0.22f);
+        spr.fillRoundRect(bx, by, bw, bh, 5, sfill);
+        spr.drawRoundRect(bx, by, bw, bh, 5, badge_col);
+        spr.setTextColor(badge_col, sfill);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(bx + 6, by + 4);
+        kprint(spr, badge_text);
+    }
+
+    // ── Row 2: Target name ──
+    int name_y = CONTENT_Y + UI_PAD_XS + 16 + UI_PAD_XS;  // 2px below badge bottom
+    {
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(TL, name_y);
+        if (!active) {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.print("No Target");
+        } else {
+            bool nok = target_name[0] != '\0'
+                       && strcmp(target_name, "Hidden")  != 0
+                       && strcmp(target_name, "Unknown") != 0;
+            const char* raw_name = nok ? target_name
+                                 : ((strlen(target_mac) > 8) ? target_mac + 9 : target_mac);
+            char id_buf[10] = "";
+            if (target_id > 0)
+                snprintf(id_buf, sizeof(id_buf), " (#%03d)", target_id);
+            int id_w      = (int)strlen(id_buf) * ts_char_w(TS_BODY);
+            int avail_w   = DISP_W - TL * 2 - id_w;
+            int max_chars = avail_w / ts_char_w(TS_BODY);
+            char disp[65];
+            strncpy(disp, raw_name, max_chars);
+            disp[max_chars] = '\0';
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.print(disp);
+            if (id_buf[0]) {
+                spr.setTextColor(DIM_COLOR, BG_COLOR);
+                spr.print(id_buf);
+            }
         }
+    }
+
+    // ── No-target early exit ──
+    if (!active) {
+        const char* hint = "open feed [f] and press [t] to target";
+        int hint_w = (int)strlen(hint) * (ts_char_w(TS_MICRO) + 1);
+        int hint_x = (DISP_W - hint_w) / 2;
+        int hint_y = name_y + 10 + (DISP_H - name_y - 10) / 2;
+        spr.setTextSize(TS_MICRO);
+        spr.setTextColor(DIM_COLOR, BG_COLOR);
+        spr.setCursor(hint_x, hint_y);
+        kprint(spr, hint);
         return;
     }
 
-    // Snapshot in-memory history if needed
-    CaptureEntry mem_hist[CAPTURE_HISTORY_SIZE];
-    if (!use_sd) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        for (int i = 0; i < total; i++) mem_hist[i] = capture_history[i];
-        xSemaphoreGive(dataMutex);
-    }
+    // ── Row 3: LIVE SIGNAL label ──
+    int live_y = name_y + 10 + UI_PAD_MD;
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(TL, live_y);
+    kprint(spr, "LIVE SIGNAL");
 
-    int rows_shown = 0;
-    for (int i = history_scroll_offset; i < total && rows_shown < 4; i++, rows_shown++) {
-        int y = 19 + rows_shown * 28;
-        bool selected = (i == history_selected_idx);
-
-        // Pull fields from whichever source
-        const char* e_type;
-        char e_mac[18], e_name[32], e_method[24];
-        int e_rssi, e_conf;
-
-        if (use_sd) {
-            e_type = sd_hist[i].type;
-            strncpy(e_mac,    sd_hist[i].mac,    17); e_mac[17]    = '\0';
-            strncpy(e_name,   sd_hist[i].name,   31); e_name[31]   = '\0';
-            strncpy(e_method, sd_hist[i].method, 23); e_method[23] = '\0';
-            e_rssi = sd_hist[i].rssi;
-            e_conf = sd_hist[i].confidence;
-        } else {
-            e_type = mem_hist[i].type;
-            strncpy(e_mac,  mem_hist[i].mac,  17); e_mac[17]  = '\0';
-            strncpy(e_name, mem_hist[i].name, 31); e_name[31] = '\0';
-            e_method[0] = '\0';
-            e_rssi = mem_hist[i].rssi;
-            e_conf = mem_hist[i].confidence;
-        }
-
-        const char* proto_lbl; uint16_t proto_col;
-        hist_type_info(e_type, &proto_lbl, &proto_col);
-
-        // Row background: selected = slightly lighter
-        uint16_t row_bg = selected ? CARD_BORDER : ((rows_shown % 2 == 0) ? CARD_COLOR : BG_COLOR);
-        spr.fillRect(0, y, 4, 27, proto_col);
-        spr.fillRect(4, y, DISP_W - 4, 27, row_bg);
-
-        if (selected) {
-            spr.fillRect(0, y, 6, 27, HEADER_COLOR);
-            int ay_mid = y + 14;
-            for (int p = 0; p < 4; p++) {
-                spr.drawLine(7 + p, ay_mid - (3 - p), 7 + p, ay_mid + (3 - p), HEADER_COLOR);
-            }
-            spr.drawRect(0, y, DISP_W, 27, HEADER_COLOR);
-        }
-
-        if (selected) {
-            // "Has detail" chevron in right gutter
-            int chevron_x = DISP_W - 8;
-            int chevron_y_mid = y + 14;
-            spr.drawLine(chevron_x,     chevron_y_mid - 3, chevron_x + 3, chevron_y_mid,     HEADER_COLOR);
-            spr.drawLine(chevron_x + 3, chevron_y_mid,     chevron_x,     chevron_y_mid + 3, HEADER_COLOR);
-            spr.drawLine(chevron_x - 1, chevron_y_mid - 3, chevron_x + 2, chevron_y_mid,     HEADER_COLOR);  // 2px thick
-            spr.drawLine(chevron_x + 2, chevron_y_mid,     chevron_x - 1, chevron_y_mid + 3, HEADER_COLOR);
-        }
-
-        int content_x = selected ? 14 : 10;
-
-        // Protocol label in proto_col
-        spr.setTextColor(proto_col, row_bg); spr.setTextSize(1);
-        spr.setCursor(content_x, y + 4); spr.print(proto_lbl);
-
-        // Name (or last MAC octets)
-        bool name_ok = (e_name[0] != '\0' &&
-                        strcmp(e_name, "Hidden")  != 0 &&
-                        strcmp(e_name, "Unknown") != 0);
-        char nom[13] = "";
-        if (name_ok) { strncpy(nom, e_name, 12); nom[12] = '\0'; }
-        else { const char* sm = (strlen(e_mac) > 8) ? e_mac + 9 : e_mac; strncpy(nom, sm, 12); nom[12] = '\0'; }
-
-        spr.setTextColor(TEXT_COLOR, row_bg); spr.setTextSize(1);
-        spr.setCursor(content_x + 28, y + 4); spr.print(nom);
-
-        // Right-aligned timestamp
-        const char* ts_src = use_sd ? sd_hist[i].timestamp : "";
-        if (ts_src[0]) {
-            spr.setTextColor(DIM_COLOR, row_bg);
-            int ts_x = selected ? DISP_W - 62 : DISP_W - 52;
-            spr.setCursor(ts_x, y + 4); spr.print(ts_src);
-        }
-
-        // Second line: MAC + method for selected; stats otherwise
-        spr.setTextColor(DIM_COLOR, row_bg);
-        spr.setCursor(content_x, y + 17);
-        if (selected) {
-            char det_buf[30];
-            snprintf(det_buf, sizeof(det_buf), "%s  %s", e_mac, e_method[0] ? e_method : "");
-            spr.print(det_buf);
-        } else {
-            char stat_buf[22];
-            snprintf(stat_buf, sizeof(stat_buf), "%d%%  %ddBm", e_conf, e_rssi);
-            spr.print(stat_buf);
-        }
-    }
-
+    // ── Row 4: dBm hero + trend indicator ──
+    int hero_y = live_y + 10 + UI_PAD_XS;
     {
-        const int list_y = 19;
-        const int list_h = 4 * 28;
-        if (total > 4) {
-            if (history_scroll_offset > 0)
-                draw_scroll_fade(list_y, list_h, 5, true);
-            if (history_scroll_offset < total - 4)
-                draw_scroll_fade(list_y, list_h, 5, false);
+        spr.setTextSize(TS_STRONG);
+        if (has_rssi) {
+            char num_buf[6];
+            snprintf(num_buf, sizeof(num_buf), "%d", target_rssi);
+            spr.setTextColor(TEXT_COLOR, BG_COLOR);
+            spr.setCursor(TL, hero_y);
+            spr.print(num_buf);
+            int num_w = (int)strlen(num_buf) * ts_char_w(TS_STRONG);
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(TL + num_w + UI_PAD_XS, hero_y + 3);
+            spr.print("dBm");
+        } else {
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setCursor(TL, hero_y);
+            spr.print("--");
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(TL + 2 * ts_char_w(TS_STRONG) + UI_PAD_XS, hero_y + 3);
+            spr.print("dBm");
         }
     }
 
-    // Scroll indicator
-    if (total > 4) {
-        spr.setTextColor(DIM_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(DISP_W - 56, DISP_H - 8);
-        char scr_buf[16]; snprintf(scr_buf, sizeof(scr_buf), "%d/%d -/+", history_selected_idx + 1, total);
-        spr.print(scr_buf);
+    if (has_rssi && trend != 0) {
+        const char* trend_text = (trend > 0) ? "CLOSER" : "FARTHER";
+        uint16_t    trend_col  = (trend > 0) ? HEADER_COLOR : CAUTION_COLOR;
+        int tri_x  = TL + 80;
+        int tri_cy = hero_y + 6;
+        if (trend > 0) {
+            spr.fillTriangle(tri_x, tri_cy + 3, tri_x + 6, tri_cy + 3, tri_x + 3, tri_cy - 3, trend_col);
+        } else {
+            spr.fillTriangle(tri_x, tri_cy - 3, tri_x + 6, tri_cy - 3, tri_x + 3, tri_cy + 3, trend_col);
+        }
+        spr.setTextColor(trend_col, BG_COLOR);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(tri_x + 10, hero_y + 2);
+        kprint(spr, trend_text);
     }
 
-    // Detail overlay — shown when enter was pressed on selected row
-    if (hist_detail_open && total > 0) {
-        int di = history_selected_idx;
-        if (di < 0) di = 0; if (di >= total) di = total - 1;
+    // ── Row 5: Signal bar with micro-jitter ──
+    int bar_y = hero_y + 14 + UI_PAD_SM;
+    {
+        int bar_x = TL;
+        int bar_w = DISP_W - TL * 2;
+        int bar_h = 6;
+        int bar_r = 3;
 
-        const char* d_type;
-        char d_mac[18], d_name[32], d_method[24];
-        int d_rssi, d_conf;
-        if (use_sd) {
-            d_type = sd_hist[di].type;
-            strncpy(d_mac,    sd_hist[di].mac,    17); d_mac[17]    = '\0';
-            strncpy(d_name,   sd_hist[di].name,   31); d_name[31]   = '\0';
-            strncpy(d_method, sd_hist[di].method, 23); d_method[23] = '\0';
-            d_rssi = sd_hist[di].rssi; d_conf = sd_hist[di].confidence;
+        spr.fillRoundRect(bar_x, bar_y, bar_w, bar_h, bar_r, CARD_COLOR);
+
+        if (has_rssi) {
+            float raw_pct = (float)(target_rssi - RSSI_VIS_FLOOR) / (float)RSSI_VIS_RANGE;
+            if (raw_pct < 0.0f) raw_pct = 0.0f;
+            if (raw_pct > 1.0f) raw_pct = 1.0f;
+            signal_bar_smooth = anim_filter_seed(signal_bar_smooth, raw_pct,
+                                                 120.0f, frame_dt, &signal_bar_seeded);
+            float jitter = sinf((float)frame_ms * 0.007f) * 0.008f
+                         + sinf((float)frame_ms * 0.013f) * 0.005f;
+            float display_pct = signal_bar_smooth + jitter;
+            if (display_pct < 0.005f) display_pct = 0.005f;
+            if (display_pct > 1.0f)   display_pct = 1.0f;
+            int fill_w = (int)(display_pct * (float)bar_w);
+            if (fill_w > 0) {
+                int fr = fill_w / 2 < bar_r ? fill_w / 2 : bar_r;
+                spr.fillRoundRect(bar_x, bar_y, fill_w, bar_h, fr, HEADER_COLOR);
+            }
         } else {
-            d_type = mem_hist[di].type;
-            strncpy(d_mac,  mem_hist[di].mac,  17); d_mac[17]  = '\0';
-            strncpy(d_name, mem_hist[di].name, 31); d_name[31] = '\0';
-            d_method[0] = '\0';
-            d_rssi = mem_hist[di].rssi; d_conf = mem_hist[di].confidence;
+            signal_bar_smooth = 0.0f;
+            signal_bar_seeded = false;
+        }
+    }
+
+    // ── Row 6: Trace area ──
+    int trace_top    = bar_y + 6 + UI_PAD_XS + 2;
+    int trace_bottom = DISP_H - 2;
+    int trace_left   = TL;
+    int trace_right  = DISP_W - TL;
+    int trace_w      = trace_right - trace_left;
+    int trace_h      = trace_bottom - trace_top;
+
+    spr.setClipRect(trace_left, trace_top, trace_w, trace_h);
+
+    if (trace_count >= 2) {
+        static float trace_vals[SIG_TRACE_SIZE];
+        int trace_max_rssi = -128, trace_max_idx = -1;
+        for (int i = 0; i < trace_count; i++) {
+            int slot = (trace_head - trace_count + i + SIG_TRACE_SIZE) % SIG_TRACE_SIZE;
+            int rv   = (int)trace_snap[slot].rssi;
+            trace_vals[i] = sig_trace_smooth[i];
+            if (rv > trace_max_rssi) { trace_max_rssi = rv; trace_max_idx = i; }
         }
 
-        const char* proto_lbl; uint16_t proto_col;
-        hist_type_info(d_type, &proto_lbl, &proto_col);
-
-        // Solid backdrop below header — matches menu/help/feed expanded style.
-        spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
-
-        // Override header with detection type (and name when meaningful).
-        spr.fillRect(0, 0, 120, 18, BG_COLOR);
-        spr.setTextColor(proto_col, BG_COLOR);
-        spr.setTextSize(1.2);
-        spr.setCursor(4, 5);
-        bool dn_ok = (d_name[0] != '\0'
-                      && strcmp(d_name, "Hidden")  != 0
-                      && strcmp(d_name, "Unknown") != 0);
-        if (dn_ok) {
-            char hdr_str[32];
-            snprintf(hdr_str, sizeof(hdr_str), "%s / %s", proto_lbl, d_name);
-            kprint(spr, hdr_str);
-        } else {
-            kprint(spr, proto_lbl);
-        }
-
-        // Content rows — ACCENT label + TEXT value, drawn directly on BG.
-        int fy = 26;
-        const int row_gap = 16;
-        const int label_x = 8;
-        const int value_x = 70;
-
-        auto detail_row = [&](const char* lbl, const char* val, uint16_t val_col = TEXT_COLOR) {
-            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-            spr.setTextSize(1.2);
-            spr.setCursor(label_x, fy);
-            kprint(spr, lbl);
-            spr.setTextColor(val_col, BG_COLOR);
-            spr.setCursor(value_x, fy);
-            spr.print(val);
-            fy += row_gap;
+        // Catmull-Rom spline evaluator
+        auto eval_cr = [&](float idx_f) -> float {
+            int ci = (int)idx_f;
+            float t  = idx_f - (float)ci;
+            int i0 = ci > 0              ? ci - 1 : 0;
+            int i1 = ci < trace_count-1  ? ci     : trace_count-1;
+            int i2 = ci+1 < trace_count  ? ci+1   : trace_count-1;
+            int i3 = ci+2 < trace_count  ? ci+2   : trace_count-1;
+            float p0=trace_vals[i0], p1=trace_vals[i1];
+            float p2=trace_vals[i2], p3=trace_vals[i3];
+            float t2=t*t, t3=t2*t;
+            float v = 0.5f*((-p0+3*p1-3*p2+p3)*t3 + (2*p0-5*p1+4*p2-p3)*t2
+                            + (-p0+p2)*t + 2*p1);
+            return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
         };
 
-        detail_row("MAC", d_mac);
+        float* curve_cache = signal_curve_cache;
+        if (!curve_cache) {
+            // Cache alloc failed — show message instead of trace
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            int msg_w = 12 * (ts_char_w(TS_MICRO) + 1);
+            spr.setCursor((DISP_W - msg_w) / 2, trace_top + trace_h / 2 - 4);
+            kprint(spr, "low memory", 1);
+            spr.clearClipRect();
+            return;
+        }
+        for (int px = 0; px <= trace_w && px < 241; px++) {
+            float idx_f = (float)px / (float)trace_w * (float)(trace_count - 1);
+            curve_cache[px] = eval_cr(idx_f);
+        }
 
-        char rssi_str[12];
-        snprintf(rssi_str, sizeof(rssi_str), "%d dBm", d_rssi);
-        uint16_t rssi_col = (d_rssi > -60) ? ACCENT_COLOR
-                          : (d_rssi > -80) ? CAUTION_COLOR
-                                           : DIM_COLOR;
-        detail_row("RSSI", rssi_str, rssi_col);
+        // Fill under curve (6% max alpha — trace is context, not primary)
+        for (int px = 0; px <= trace_w; px++) {
+            float val = curve_cache[px];
+            int   cy  = trace_bottom - (int)(val * (float)trace_h);
+            int   sx  = trace_left + px;
+            for (int fy = cy + 1; fy < trace_bottom; ) {
+                float ft  = (float)(fy - cy) / (float)(trace_bottom - cy);
+                float a   = (1.0f - ft*ft) * 0.06f;
+                if (a < 0.01f) break;
+                uint16_t col = lerp_col16(BG_COLOR, HEADER_COLOR, a);
+                int re = fy + 1;
+                while (re < trace_bottom) {
+                    float ft2 = (float)(re - cy) / (float)(trace_bottom - cy);
+                    float a2  = (1.0f - ft2*ft2) * 0.06f;
+                    if (a2 < 0.01f || lerp_col16(BG_COLOR, HEADER_COLOR, a2) != col) break;
+                    re++;
+                }
+                spr.fillRect(sx, fy, 1, re - fy, col);
+                fy = re;
+            }
+        }
 
+        // Curve — 50% opacity stroke
+        uint16_t curve_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.50f);
+        uint16_t curve_dim = lerp_col16(BG_COLOR, HEADER_COLOR, 0.30f);
+        for (int px = 1; px <= trace_w; px++) {
+            float v0 = curve_cache[px-1], v1 = curve_cache[px];
+            int y0 = trace_bottom - (int)(v0 * (float)trace_h);
+            int y1 = trace_bottom - (int)(v1 * (float)trace_h);
+            spr.drawLine(trace_left+px-1, y0,   trace_left+px, y1,   curve_col);
+            spr.drawLine(trace_left+px-1, y0-1, trace_left+px, y1-1, curve_dim);
+        }
+
+        // Peak diamond
+        if (trace_max_idx >= 0 && trace_max_rssi >= peak_rssi - 2) {
+            int ppx = (int)((float)trace_max_idx / (float)(trace_count-1) * (float)trace_w);
+            float pv = trace_vals[trace_max_idx];
+            int   pdy = trace_bottom - (int)(pv * (float)trace_h);
+            int   sx  = trace_left + ppx;
+            uint16_t dash_col = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.3f);
+            for (int dy = pdy + 4; dy < trace_bottom; dy += 6) {
+                int seg = (dy + 3 < trace_bottom) ? 3 : (trace_bottom - dy);
+                spr.drawFastVLine(sx, dy, seg, dash_col);
+            }
+            spr.fillTriangle(sx, pdy-4, sx+3, pdy, sx-3, pdy, CAUTION_COLOR);
+            spr.fillTriangle(sx, pdy+4, sx+3, pdy, sx-3, pdy, CAUTION_COLOR);
+        }
+
+        // Current-position dot
         {
-            const char* band;
-            uint16_t conf_col;
-            if      (d_conf >= CONFIDENCE_CERTAIN)         { band = "CERTAIN"; conf_col = ACCENT_COLOR;  }
-            else if (d_conf >= CONFIDENCE_HIGH)            { band = "HIGH";    conf_col = ACCENT_COLOR;  }
-            else if (d_conf >= CONFIDENCE_ALARM_THRESHOLD) { band = "MEDIUM";  conf_col = CAUTION_COLOR; }
-            else                                           { band = "LOW";     conf_col = DIM_COLOR;     }
-            char conf_str[24];
-            snprintf(conf_str, sizeof(conf_str), "%d%% %s", d_conf, band);
-            detail_row("CONF", conf_str, conf_col);
+            float vc = curve_cache[trace_w < 240 ? trace_w : 240];
+            int   yc = trace_bottom - (int)(vc * (float)trace_h);
+            spr.drawCircle(trace_right, yc, 4, lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f));
+            spr.fillCircle(trace_right, yc, 2, HEADER_COLOR);
         }
 
-        if (d_method[0]) {
-            char human[48];
-            methods_to_human(d_method, human, sizeof(human));
-            spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-            spr.setTextSize(1.2);
-            spr.setCursor(label_x, fy);
-            kprint(spr, "MATCH");
-            spr.setTextColor(TEXT_COLOR, BG_COLOR);
-            spr.setTextSize(1);
-            spr.setCursor(value_x, fy);
-            spr.print(human);
-            fy += row_gap;
-        }
+    } else if (trace_count == 1) {
+        // Single dot before the curve can form
+        float n = sig_trace_smooth[0];
+        int dot_y = trace_bottom - (int)(n * (float)trace_h);
+        if (dot_y < trace_top)    dot_y = trace_top;
+        if (dot_y > trace_bottom) dot_y = trace_bottom;
+        spr.drawCircle(trace_right, dot_y, 4, lerp_col16(BG_COLOR, HEADER_COLOR, 0.3f));
+        spr.fillCircle(trace_right, dot_y, 2, HEADER_COLOR);
 
-        const char* d_ts = use_sd ? sd_hist[di].timestamp : "";
-        if (d_ts[0]) {
-            detail_row("TIME", d_ts);
-        }
-
-        // Footer hint
+    } else {
+        // No samples — animated scanning indicator
+        char dots[4];
+        anim_ellipsis(dots, sizeof(dots));
+        char scanning[16];
+        snprintf(scanning, sizeof(scanning), "scanning%s", dots);
+        int msg_w = (int)strlen(scanning) * (ts_char_w(TS_MICRO) + 1);
         spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(8, DISP_H - 10);
-        spr.print("DEL or ENTER to close");
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor((DISP_W - msg_w) / 2, trace_top + trace_h / 2 - 4);
+        kprint(spr, scanning);
     }
+
+    spr.clearClipRect();
 }
 
 void draw_gps_screen() {
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(3);
     unsigned long frame_ms = millis();
 
-    bool has_loc, stale, speed_valid;
+    bool has_loc, stale;
     int sats;
     double d_lat, d_lng;
-    float f_spd;
+    float f_hdop;
+    bool hdop_valid, time_valid;
+    int gps_hour, gps_min, gps_sec;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!take_data_mutex()) return;
     has_loc     = gps.location.isValid();
     stale       = has_loc && (gps.location.age() > 2000);
     sats        = gps.satellites.isValid() ? gps.satellites.value() : 0;
     d_lat       = gps.location.lat();
     d_lng       = gps.location.lng();
-    speed_valid = gps.speed.isValid();
-    f_spd       = gps.speed.mph();
-    xSemaphoreGive(dataMutex);
+    hdop_valid  = gps.hdop.isValid();
+    f_hdop      = hdop_valid ? gps.hdop.hdop() : 0.0f;
+    time_valid  = gps.time.isValid();
+    gps_hour    = time_valid ? gps.time.hour()   : 0;
+    gps_min     = time_valid ? gps.time.minute() : 0;
+    gps_sec     = time_valid ? gps.time.second() : 0;
+    give_data_mutex();
 
     // ── Off-axis 3D wireframe globe ──────────────────────────────────────────
     // Solid BG fill, diagonal axis tilt like a real globe on a stand
@@ -5291,7 +8678,42 @@ void draw_gps_screen() {
         return tz;
     };
 
+    // ─ Background starfield ──────────────────────────────────────────────
+    // Single-pixel dots with a gentle per-star twinkle. Static positions,
+    // generated once with UI_PAD_MD clearance from the globe rim and bound
+    // to the left panel so they never reach the right-side text column.
+    {
+        #define NUM_STARS 18
+        static int  star_x[NUM_STARS], star_y[NUM_STARS];
+        static bool stars_init = false;
+        if (!stars_init) {
+            const int min_x = UI_PAD_SM / 2;
+            const int max_x = gx * 2 - UI_PAD_MD;  // stop well before right panel
+            const int min_y = CONTENT_Y + UI_PAD_SM;
+            const int max_y = DISP_H - UI_PAD_SM;
+            const int clear = gr + UI_PAD_MD;
+            for (int i = 0; i < NUM_STARS; i++) {
+                int sx, sy;
+                do {
+                    sx = random(min_x, max_x);
+                    sy = random(min_y, max_y);
+                } while ((sx - gx) * (sx - gx) + (sy - gy) * (sy - gy) <
+                         clear * clear);
+                star_x[i] = sx;
+                star_y[i] = sy;
+            }
+            stars_init = true;
+        }
+        for (int i = 0; i < NUM_STARS; i++) {
+            float twinkle = anim_pulse(1600 + i * 280, (float)i / (float)NUM_STARS);
+            uint8_t b = (uint8_t)(30 + twinkle * 225);
+            uint16_t star_col = lgfx::color565(b, b, b);
+            spr.drawPixel(star_x[i], star_y[i], star_col);
+        }
+    }
+
     // Solid BG fill so globe interior matches screen background
+    // (also erases any starfield pixel that would land inside the rim).
     spr.fillCircle(gx, gy, gr, BG_COLOR);
 
     // ─ Latitude circles (every 30°, 5 lines) ─
@@ -5338,9 +8760,9 @@ void draw_gps_screen() {
 
     // Globe rim
     uint16_t rim_col = stale ? CAUTION_COLOR
-                     : (has_loc ? GPS_COLOR : lgfx::color565(48, 108, 220));
+                     : (has_loc ? GPS_COLOR : DIM_COLOR);
     spr.drawCircle(gx, gy, gr,     rim_col);
-    spr.drawCircle(gx, gy, gr + 1, lgfx::color565(24, 50, 110));
+    spr.drawCircle(gx, gy, gr + 1, CARD_BORDER);
 
     // ── Multi-plane orbital satellite animation ──────────────────────────────
     // Skipped entirely when no GPS lock — the spinning globe alone reads as
@@ -5355,14 +8777,15 @@ void draw_gps_screen() {
             int   n_sats;    // satellites in this plane
             float phase_off; // phase offset for plane
         };
-        const OrbPlane planes[3] = {
-            { radians(55.0f), (float)(gr + 12), 0.0003f,  3, 0.0f },
-            { radians(55.0f), (float)(gr + 16), 0.00025f, 2, 2.09f },
-            { radians(80.0f), (float)(gr + 10), 0.0004f,  2, 1.05f },
+        // Fewer satellites (5 total instead of 7), spread across 2 planes.
+        // Cleaner visual, bigger triangles have room to breathe.
+        const OrbPlane planes[2] = {
+            { radians(55.0f), (float)(gr + 14), 0.00015f, 3, 0.0f },
+            { radians(80.0f), (float)(gr + 10), 0.0002f,  2, 1.05f },
         };
 
         // Per-plane projection lambda — applies globe tilt/roll then inclination
-        for (int pi = 0; pi < 3; pi++) {
+        for (int pi = 0; pi < 2; pi++) {
             const OrbPlane& pl = planes[pi];
             float ci = cosf(pl.inc), si2 = sinf(pl.inc);
 
@@ -5385,524 +8808,559 @@ void draw_gps_screen() {
                 return tz2;
             };
 
-            // Draw dashed orbit ring for this plane
-            const int N_RING = 48;
-            for (int ri = 0; ri < N_RING; ri++) {
-                if (ri % 2 != 0) continue;
-                float a0 = (float)ri       / N_RING * 2.0f * (float)M_PI;
-                float a1 = (float)(ri + 1) / N_RING * 2.0f * (float)M_PI;
-                int px0, py0, px1, py1;
-                float tz0 = orb_proj_p(a0, &px0, &py0);
-                float tz1 = orb_proj_p(a1, &px1, &py1);
-                if ((tz0 + tz1) * 0.5f > 0.0f)
-                    spr.drawLine(px0, py0, px1, py1, lgfx::color565(18, 40, 72));
-            }
-
-            // Draw satellite dots with motion trails
+            // Draw satellites as wireframe triangles tumbling around their
+            // own center. No trails — the tumble + depth scaling carries
+            // the motion. Acquired sats are brighter, unacquired dimmer.
             float orbit_t = (float)frame_ms * pl.speed + pl.phase_off;
             for (int si = 0; si < pl.n_sats; si++) {
                 float base_ang = orbit_t + (float)si / (float)pl.n_sats * 2.0f * (float)M_PI;
-                // Motion trail: 4 ghost dots fading behind
-                for (int tr = 3; tr >= 0; tr--) {
-                    float trail_ang = base_ang - (float)(tr + 1) * 0.12f;
-                    int tpx, tpy;
-                    float ttz = orb_proj_p(trail_ang, &tpx, &tpy);
-                    if (ttz > -0.3f) {
-                        // Smooth fade: full at z>=0.3, transitions to 0 across [-0.3, 0.3].
-                        float depth_fade = (ttz > 0.3f) ? 1.0f : (ttz + 0.3f) / 0.6f;
-                        if (depth_fade < 0.0f) depth_fade = 0.0f;
-                        if (depth_fade > 1.0f) depth_fade = 1.0f;
-                        float fade = 1.0f - (float)(tr + 1) / 5.0f;
-                        fade *= depth_fade;
-                        if (fade > 0.03f) {
-                            bool acquired = (si < sats);
-                            uint16_t trail_col = acquired
-                                ? lerp_col16(BG_COLOR, GPS_COLOR, fade * 0.5f)
-                                : lerp_col16(BG_COLOR, DIM_COLOR, fade * 0.3f);
-                            spr.drawPixel(tpx, tpy, trail_col);
-                        }
-                    }
-                }
-                // Main satellite dot — fades near the horizon for 3D depth.
+
                 int dpx, dpy;
                 float tz2 = orb_proj_p(base_ang, &dpx, &dpy);
                 if (tz2 > -0.3f) {
                     float depth_fade = (tz2 > 0.3f) ? 1.0f : (tz2 + 0.3f) / 0.6f;
                     if (depth_fade < 0.0f) depth_fade = 0.0f;
                     if (depth_fade > 1.0f) depth_fade = 1.0f;
+                    if (depth_fade < 0.05f) continue;
+
                     bool acquired = (si < sats);
-                    uint16_t base_col = acquired
-                        ? lgfx::color565(255, 255, 255)
-                        : lerp_col16(BG_COLOR, DIM_COLOR, 0.5f);
-                    uint16_t sat_col = lerp_col16(BG_COLOR, base_col, depth_fade);
-                    if (depth_fade > 0.05f) {
-                        spr.fillCircle(dpx, dpy, acquired ? 2 : 1, sat_col);
+                    uint16_t sat_col = acquired
+                        ? lerp_col16(BG_COLOR, GPS_COLOR, depth_fade)
+                        : lerp_col16(BG_COLOR, DIM_COLOR, depth_fade * 0.5f);
+
+                    // Depth-based size scaling — front-facing sats larger.
+                    float depth_scale = 0.5f + 0.5f * ((tz2 + 0.3f) / 1.3f);
+                    if (depth_scale < 0.4f) depth_scale = 0.4f;
+                    if (depth_scale > 1.0f) depth_scale = 1.0f;
+
+                    // Wireframe tetrahedron (4 verts, 6 edges) tumbling on
+                    // two axes with phases derived from base_ang so each
+                    // satellite spins independently. Reads as a real 3D
+                    // body in flight rather than a flat icon.
+                    const float sz = 5.0f * depth_scale;
+                    float tet_v[4][3] = {
+                        {  0.0f,    -sz * 1.2f,  0.0f      },  // top
+                        { -sz,       sz * 0.6f, -sz * 0.5f },  // base L-back
+                        {  sz,       sz * 0.6f, -sz * 0.5f },  // base R-back
+                        {  0.0f,     sz * 0.6f,  sz * 0.8f },  // base front
+                    };
+
+                    const float tumble_speed = 0.004f;
+                    float t1 = (float)frame_ms * tumble_speed       + base_ang * 3.0f;
+                    float t2 = (float)frame_ms * tumble_speed * 0.7f + base_ang * 2.0f;
+                    float c1 = cosf(t1), s1 = sinf(t1);
+                    float c2 = cosf(t2), s2 = sinf(t2);
+
+                    int sx[4], sy[4];
+                    for (int vi = 0; vi < 4; vi++) {
+                        float vx = tet_v[vi][0];
+                        float vy = tet_v[vi][1];
+                        float vz = tet_v[vi][2];
+                        // Y-axis roll
+                        float rx = vx * c1 - vz * s1;
+                        float ry = vy;
+                        float rz = vx * s1 + vz * c1;
+                        // X-axis pitch
+                        float px = rx;
+                        float py = ry * c2 - rz * s2;
+                        sx[vi] = dpx + (int)px;
+                        sy[vi] = dpy + (int)py;
                     }
+
+                    // 6 edges: 0-1, 0-2, 0-3, 1-2, 2-3, 3-1
+                    spr.drawLine(sx[0], sy[0], sx[1], sy[1], sat_col);
+                    spr.drawLine(sx[0], sy[0], sx[2], sy[2], sat_col);
+                    spr.drawLine(sx[0], sy[0], sx[3], sy[3], sat_col);
+                    spr.drawLine(sx[1], sy[1], sx[2], sy[2], sat_col);
+                    spr.drawLine(sx[2], sy[2], sx[3], sy[3], sat_col);
+                    spr.drawLine(sx[3], sy[3], sx[1], sy[1], sat_col);
                 }
             }
         }
     }
 
-    // SAT count — single line below the full orbit extent, number in white
-    {
-        int sat_y = gy + (gr + 14) + 9;  // below orbit (orb_r = gr+14)
-        int sat_x = gx - 24;
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-        spr.setCursor(sat_x, sat_y); kprint(spr, "SATS ");
-        spr.setTextColor(lgfx::color565(255, 255, 255), BG_COLOR);
-        spr.setCursor(sat_x + 35, sat_y); spr.print(sats);
-    }
-
-    // ── Right panel: STATUS badge + LAT / LON / SPEED ───────────────────────
-    const int RX = 122, RW = 114;
+    // ── Right panel: STATUS badge + key-value readouts ──────────────────────
+    const int RX = 122;
+    const int RW = DISP_W - RX - 4;  // right margin 4px
     int ry = 25;
 
-    // STATUS badge (top-right, matches scanner/locator badge style)
+    // STATUS badge
     {
         const char* status_base;
         uint16_t    status_col;
         bool        status_anim = false;
-        if      (has_loc && !stale) { status_base = "GPS LOCKED";   status_col = GPS_COLOR; }
-        else if (stale)             { status_base = "SIGNAL LOST";  status_col = CAUTION_COLOR; }
-        else                        { status_base = "GPS";           status_col = GPS_COLOR; status_anim = true; }
+        if      (has_loc && !stale) { status_base = "GPS LOCKED";    status_col = GPS_COLOR; }
+        else if (stale)             { status_base = "REATTEMPTING";  status_col = CAUTION_COLOR; status_anim = true; }
+        else                        { status_base = "Searching";     status_col = GPS_COLOR; status_anim = true; }
         char status_str[22];
         if (status_anim) {
             char dots[4];
             anim_ellipsis(dots, sizeof(dots));
             snprintf(status_str, sizeof(status_str), "%s%s", status_base, dots);
         } else {
-            strncpy(status_str, status_base, sizeof(status_str)-1);
-            status_str[sizeof(status_str)-1] = '\0';
+            strncpy(status_str, status_base, sizeof(status_str) - 1);
+            status_str[sizeof(status_str) - 1] = '\0';
         }
-        int bw = (int)strlen(status_base) * 7 + (status_anim ? 3*7 : 0) + 12;
+        int bw = (int)strlen(status_base) * ts_char_w(TS_BODY) + (status_anim ? 3 * ts_char_w(TS_BODY) : 0) + 12;
         if (bw > RW) bw = RW;
         uint16_t sfill = lerp_col16(BG_COLOR, status_col, 0.22f);
         spr.fillRoundRect(RX, ry, bw, 16, 5, sfill);
         spr.drawRoundRect(RX, ry, bw, 16, 5, status_col);
-        spr.setTextColor(status_col, sfill); spr.setTextSize(1);
-        spr.setClipRect(RX+1, ry+1, bw-2, 14);
-        spr.setCursor(RX+6, ry+4); kprint(spr, status_str);
+        spr.setTextColor(status_col, sfill); spr.setTextSize(TS_MICRO);
+        spr.setClipRect(RX + 1, ry + 1, bw - 2, 14);
+        spr.setCursor(RX + 6, ry + 4); kprint(spr, status_str);
         spr.clearClipRect();
     }
 
+    // Key-value readout rows — label left, value right-justified
+    ry += 22 + UI_PAD_SM;  // 6px standard gap between badge and data
+    const int KV_RIGHT = DISP_W - 6;  // right edge for value text
+
+    auto kv_row = [&](const char* label, const char* value, uint16_t val_col = TEXT_COLOR) {
+        // Label (accent, left-aligned)
+        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(RX, ry);
+        kprint(spr, label);
+
+        // Value (right-aligned)
+        int val_w = (int)strlen(value) * ts_char_w(TS_BODY);
+        spr.setTextColor(val_col, BG_COLOR);
+        spr.setTextSize(TS_BODY);
+        spr.setCursor(KV_RIGHT - val_w, ry);
+        spr.print(value);
+
+        ry += 14;  // row height: 10px text + 4px gap
+    };
+
     // LAT
-    ry += 22;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(RX, ry); kprint(spr, "LAT");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-    char lat_buf[14]; snprintf(lat_buf, sizeof(lat_buf), "%.5f", has_loc ? d_lat : 0.0);
-    spr.setCursor(RX, ry + 11); spr.print(lat_buf);
+    {
+        char lat_buf[14];
+        snprintf(lat_buf, sizeof(lat_buf), "%.4f", has_loc ? d_lat : 0.0);
+        kv_row("LAT", lat_buf);
+    }
 
-    // LON
-    ry += 28;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(RX, ry); kprint(spr, "LON");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-    char lon_buf[14]; snprintf(lon_buf, sizeof(lon_buf), "%.5f", has_loc ? d_lng : 0.0);
-    spr.setCursor(RX, ry + 11); spr.print(lon_buf);
+    // LNG
+    {
+        char lng_buf[14];
+        snprintf(lng_buf, sizeof(lng_buf), "%.4f", has_loc ? d_lng : 0.0);
+        kv_row("LNG", lng_buf);
+    }
 
-    // SPEED
-    ry += 28;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR); spr.setTextSize(1);
-    spr.setCursor(RX, ry); kprint(spr, "SPEED");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR); spr.setTextSize(1);
-    char spd_buf[12]; snprintf(spd_buf, sizeof(spd_buf), "%.1f mph", speed_valid ? f_spd : 0.0f);
-    spr.setCursor(RX, ry + 11); spr.print(spd_buf);
+    // SAT — count only (NEO-6M tracks up to 12 but the cap is implicit)
+    {
+        char sat_buf[8];
+        snprintf(sat_buf, sizeof(sat_buf), "%d", sats);
+        kv_row("SAT", sat_buf);
+    }
+
+    // HDOP — horizontal dilution of precision
+    {
+        char hdop_buf[8];
+        snprintf(hdop_buf, sizeof(hdop_buf), "%.1f", f_hdop);
+        uint16_t hdop_col = (hdop_valid && f_hdop <= 2.0f) ? TEXT_COLOR
+                          : (hdop_valid && f_hdop <= 5.0f) ? CAUTION_COLOR
+                          : DIM_COLOR;
+        kv_row("HDOP", hdop_buf, hdop_col);
+    }
+
+    // TIME — local if timezone available, UTC otherwise
+    {
+        char time_buf[12];
+        if (time_valid) {
+            if (auto_tz_valid) {
+                int local_hour = (gps_hour + auto_tz_offset + 24) % 24;
+                snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d",
+                         local_hour, gps_min, gps_sec);
+            } else {
+                snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d",
+                         gps_hour, gps_min, gps_sec);
+            }
+        } else {
+            strncpy(time_buf, "--:--:--", sizeof(time_buf));
+        }
+        kv_row(auto_tz_valid ? "LOCAL" : "UTC", time_buf, TEXT_COLOR);
+    }
 }
+
+// Draw a single stat card. Outlined only (no fill).
+// Label: TS_MICRO, DIM_COLOR, kprint with extra=2 letter-spacing — hugs top.
+// Value: TS_STRONG by default, TEXT_COLOR — hugs bottom.
+// prev_str / char_anim_ms (size STAT_MAX_CHARS each): per-character
+//   change tracking. The function compares value[ci] against prev_str[ci]
+//   and bumps char_anim_ms[ci] whenever a column's glyph changes, then
+//   draws each glyph at its own y so only the digits that flipped roll
+//   up — the rest stay perfectly still. Pass nullptr/nullptr to draw a
+//   static card with no roll.
+static void draw_stat_card(int x, int y, int w, int h,
+                           const char* label, const char* value,
+                           float value_size = TS_STRONG,
+                           char* prev_str = nullptr,
+                           unsigned long* char_anim_ms = nullptr) {
+    spr.drawRoundRect(x, y, w, h, 4, HEADER_COLOR);
+
+    // 8px inner inset (UI_PAD_SM + UI_PAD_XS) so glyphs aren't crowding
+    // the 1px outline. Same value used for label and value.
+    const int card_inset = UI_PAD_SM + UI_PAD_XS;
+
+    spr.setTextColor(DIM_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(x + card_inset, y + UI_PAD_SM);
+    kprint(spr, label, 2);
+
+    int value_glyph_h  = (int)(value_size * 8.0f);
+    int char_w         = ts_char_w(value_size);
+    int value_target_y = y + h - value_glyph_h - UI_PAD_SM;
+    int value_x        = x + card_inset;
+
+    int len = (int)strlen(value);
+    if (len > STAT_MAX_CHARS) len = STAT_MAX_CHARS;
+
+    unsigned long now = millis();
+
+    // Per-character change detection. Trailing slots compare against
+    // prev_str's matching position so a shrinking value (e.g. "10" → "9")
+    // also triggers a roll on the column that just dropped a digit.
+    if (prev_str && char_anim_ms) {
+        int prev_len = (int)strlen(prev_str);
+        for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
+            char curc  = (ci < len)      ? value[ci]    : '\0';
+            char prevc = (ci < prev_len) ? prev_str[ci] : '\0';
+            if (curc != prevc) {
+                char_anim_ms[ci] = now;
+            }
+        }
+        safe_copy(prev_str, value, STAT_MAX_CHARS);
+    }
+
+    int clip_x = x + 1;
+    int clip_y = (y + 1 > CONTENT_Y) ? (y + 1) : CONTENT_Y;
+    int clip_right  = x + w - 1;
+    int clip_bottom = (y + h - 1 < CONTENT_Y + STATS_VIEW_H)
+                          ? (y + h - 1) : (CONTENT_Y + STATS_VIEW_H);
+    int clip_w = clip_right - clip_x;
+    int clip_h = clip_bottom - clip_y;
+    if (clip_w > 0 && clip_h > 0) {
+        spr.setClipRect(clip_x, clip_y, clip_w, clip_h);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(value_size);
+        for (int ci = 0; ci < len; ci++) {
+            int cx     = value_x + ci * char_w;
+            int draw_y = value_target_y;
+            if (char_anim_ms && char_anim_ms[ci] != 0) {
+                unsigned long elapsed = now - char_anim_ms[ci];
+                if (elapsed < UI_ANIM_QUICK) {
+                    draw_y = anim_slide_in(value_target_y, value_glyph_h,
+                                           char_anim_ms[ci], UI_ANIM_QUICK);
+                }
+            }
+            char ch[2] = { value[ci], '\0' };
+            spr.setCursor(cx, draw_y);
+            spr.print(ch);
+        }
+        spr.clearClipRect();
+    }
+}
+
 
 void draw_device_info_screen() {
     unsigned long frame_ms = millis();
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    long lt = lifetime_flock_total;
-    long sr = session_raven;
-    long sw = session_flock_wifi;
-    long sb = session_flock_ble;
-    long lb = lifetime_boots;
-    long lfw = lifetime_flash_writes;
-    xSemaphoreGive(dataMutex);
+
+    // Snapshot stats under mutex
+    long lt, sr, sw, sb, lb, lfw;
+    unsigned long l_sec;
+    if (!take_data_mutex()) return;
+    lt    = lifetime_flock_total;
+    sr    = session_raven;
+    sw    = session_flock_wifi;
+    sb    = session_flock_ble;
+    lb    = lifetime_boots;
+    lfw   = lifetime_flash_writes;
+    l_sec = lifetime_seconds;
+    give_data_mutex();
+
+    long session_det_total = sw + sb + sr;
+
+    int32_t  bat_mv      = get_filtered_voltage();
+    size_t   free_heap   = esp_get_free_heap_size();
+    uint64_t sd_bytes    = sd_available ? SD.cardSize() : 0;
+    unsigned long sess_s = (frame_ms - session_start_time) / 1000;
+
+    // PACKETS throttle — ambient_packet_count churns every frame, which would
+    // strobe the roll-up animation. Only refresh the displayed value once per
+    // STATS_PKT_REFRESH_MS. The first sample populates immediately so the
+    // card isn't blank.
+    if (stats_pkt_last_update == 0 ||
+        frame_ms - stats_pkt_last_update >= STATS_PKT_REFRESH_MS) {
+        stats_pkt_display     = ambient_packet_count;
+        stats_pkt_last_update = frame_ms;
+    }
 
     spr.fillSprite(BG_COLOR);
-    draw_header_spr(4);
 
-    const int content_top_y = 18;
-    const int content_bottom_y = DISP_H - 1;
-    spr.setClipRect(0, content_top_y, DISP_W - 6, content_bottom_y - content_top_y);
+    // ── Format value strings ──
+    char det_sess_str[10]; snprintf(det_sess_str, sizeof(det_sess_str), "%ld", session_det_total);
+    char det_life_str[10]; snprintf(det_life_str, sizeof(det_life_str), "%ld", lt);
+    char wifi_str[10];  snprintf(wifi_str,  sizeof(wifi_str),  "%ld", sw);
+    char ble_str[10];   snprintf(ble_str,   sizeof(ble_str),   "%ld", sb);
+    char raven_str[10]; snprintf(raven_str, sizeof(raven_str), "%ld", sr);
+    char sess_str[10];  format_time_buf(sess_s, sess_str, sizeof(sess_str));
+    char life_str[10];  format_time_buf(l_sec, life_str, sizeof(life_str));
+    int bat_pct = voltage_to_percent(bat_mv);
+    bool charging = M5Cardputer.Power.isCharging();
+    char volt_str[10];
+    if (charging) {
+        snprintf(volt_str, sizeof(volt_str), "%d%%+", bat_pct);
+    } else {
+        snprintf(volt_str, sizeof(volt_str), "%d%%", bat_pct);
+    }
+    char heap_str[10];  snprintf(heap_str,  sizeof(heap_str),  "%uKB", (unsigned)(free_heap / 1024));
+    char pkt_str[12];   snprintf(pkt_str,   sizeof(pkt_str),   "%lu",  (unsigned long)stats_pkt_display);
+    char sd_str[10];
+    if (sd_available && sd_bytes > 0) {
+        snprintf(sd_str, sizeof(sd_str), "%.1fGB", (double)sd_bytes / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        strncpy(sd_str, "--", sizeof(sd_str));
+    }
+    char boots_str[10];   snprintf(boots_str,   sizeof(boots_str),   "%ld",   lb);
+    char flash_str[10];   snprintf(flash_str,   sizeof(flash_str),   "%ld",   lfw);
+    char voltage_str[10]; snprintf(voltage_str, sizeof(voltage_str), "%.2fV", bat_mv / 1000.0f);
 
-    int yoff = 19 - device_info_scroll;
+    // First-frame seed for per-character roll animation. Copy the freshly
+    // formatted strings into stats_prev_strings without stamping any
+    // char_anim slots, so the initial render doesn't fire 13 simultaneous
+    // rolls. Subsequent frames let draw_stat_card do the per-glyph
+    // comparison and timestamp bumping.
+    if (!stats_values_initialized) {
+        const char* seed[STATS_CARD_COUNT];
+        seed[SC_DET_SESSION] = det_sess_str;
+        seed[SC_DET_LIFETIME] = det_life_str;
+        seed[SC_WIFI]       = wifi_str;
+        seed[SC_BLE]        = ble_str;
+        seed[SC_RAVEN]      = raven_str;
+        seed[SC_SESSION]    = sess_str;
+        seed[SC_LIFETIME]   = life_str;
+        seed[SC_BATTERY]    = volt_str;
+        seed[SC_HEAP]       = heap_str;
+        seed[SC_PACKETS]    = pkt_str;
+        seed[SC_SD]         = sd_str;
+        seed[SC_BOOTS]      = boots_str;
+        seed[SC_FLASH]      = flash_str;
+        seed[SC_VERSION]    = VERSION_SHORT;
+        seed[SC_VOLTAGE]    = voltage_str;
+        for (int i = 0; i < STATS_CARD_COUNT; i++) {
+            strncpy(stats_prev_strings[i], seed[i], STAT_MAX_CHARS - 1);
+            stats_prev_strings[i][STAT_MAX_CHARS - 1] = '\0';
+            for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
+                stats_char_anim[i][ci] = 0;
+            }
+        }
+        stats_values_initialized = true;
+    }
 
-    const int COL_L   = 4;
-    const int COL_R   = 124;
-    const int CARD_W  = 112;
-    const int CARD_H  = 42;
-    const int ROW_GAP = 4;
+    // ── Smooth scroll easing ──
+    // Renderer eases stats_scroll_y_f toward stats_scroll_target each frame.
+    // Frame-rate independent via anim_filter; clamp dt after long gaps.
+    {
+        unsigned long now = millis();
+        float dt = (stats_last_frame_ms == 0) ? 16.0f
+                                              : (float)(now - stats_last_frame_ms);
+        if (dt > 100.0f) dt = 100.0f;
+        stats_last_frame_ms = now;
+        stats_scroll_y_f = anim_filter(stats_scroll_y_f, (float)stats_scroll_target,
+                                        STATS_SCROLL_TC, dt);
+    }
+    int scroll_y = (int)(stats_scroll_y_f + 0.5f);
 
-    // Helper: stat card with kerned ACCENT label + value below.
-    auto stat_card = [&](int x, int y, const char* label, const char* value,
-                         uint16_t val_col = TEXT_COLOR, float val_size = 2.0f) {
-        drawCard(x, y, CARD_W, CARD_H);
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(x + 4, y + 4);
-        kprint(spr, label);
-        spr.setTextColor(val_col, CARD_COLOR);
-        spr.setTextSize(val_size);
-        spr.setCursor(x + 4, y + 18);
-        spr.print(value);
+    // ── Layout: scroll-aware card grid ──
+    // Virtual coordinates (pre-scroll) → screen coordinates via:
+    //   screen_y = CONTENT_Y + virtual_y - scroll_y
+    // Cards entirely outside the viewport are skipped.
+    const int x_full   = 4;        // full-width card x
+    const int w_full   = 224;      // 240 - 8 (right edge at 228, scrollbar gutter 6 + track at 234)
+    const int x_t1     = 4;        // triple-card x positions
+    const int x_t2     = 80;       // x_t1 + 70 + 6 gap
+    const int x_t3     = 156;      // x_t2 + 70 + 6 gap
+    const int w_tA     = 70;       // first two triple widths
+    const int w_tC     = 72;       // last triple — absorbs the rounding
+    const int x_h1     = 4;        // half-card x positions
+    const int x_h2     = 119;      // x_h1 + 109 + 6 gap
+    const int w_half   = 109;
+    const int H_HERO   = 50;       // 6+8+14+16+6 — generous gap (unused, kept for future)
+    const int H_NORMAL = 36;       // 6+8+4+12+6 — TS_STRONG fits in tighter card
+
+    auto card = [&](int vx, int vy, int w, int h, const char* label, const char* value,
+                    int idx, float val_size = TS_STRONG) {
+        int sy = CONTENT_Y + vy - scroll_y;
+        if (sy + h <= CONTENT_Y) return;             // entirely above viewport
+        if (sy >= CONTENT_Y + STATS_VIEW_H) return;  // entirely below viewport
+        draw_stat_card(vx, sy, w, h, label, value, val_size,
+                       stats_prev_strings[idx], stats_char_anim[idx]);
+        // The helper's internal clip rect replaces the outer scroll clip;
+        // restore it so the next card's outline still gets viewport-clipped.
+        spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
     };
 
-    // Row 0: Version (full width, shorter)
-    drawCard(COL_L, yoff, DISP_W - 8, 20);
-    spr.setTextColor(HEADER_COLOR, CARD_COLOR);
-    spr.setTextSize(1);
-    spr.setCursor(10, yoff + 5);
-    spr.print(VERSION_STRING);
+    // Clip drawing to the viewport so partially-visible cards don't bleed
+    // into the header strip or off the bottom edge.
+    spr.setClipRect(0, CONTENT_Y, DISP_W, STATS_VIEW_H);
 
-    int row_y;
+    // Row 1 (vy = 0):   SESS DET | LIFE DET
+    card(x_h1, 0,   w_half, H_NORMAL, "SESS DET", det_sess_str, SC_DET_SESSION);
+    card(x_h2, 0,   w_half, H_NORMAL, "LIFE DET", det_life_str, SC_DET_LIFETIME);
 
-    // Row 1: BOOTS / LIFETIME
-    row_y = yoff + 24;
-    {
-        char boots_str[12];
-        snprintf(boots_str, sizeof(boots_str), "%ld", lb);
-        stat_card(COL_L, row_y, "BOOTS", boots_str);
-    }
-    {
-        char time_str[9];
-        format_time_buf(lifetime_seconds, time_str, sizeof(time_str));
-        stat_card(COL_R, row_y, "LIFETIME", time_str, TEXT_COLOR, 1.5f);
-    }
+    // Row 2 (vy = 42):  WIFI | BLE | RAVEN
+    card(x_t1, 42,  w_tA, H_NORMAL, "WIFI",  wifi_str,  SC_WIFI);
+    card(x_t2, 42,  w_tA, H_NORMAL, "BLE",   ble_str,   SC_BLE);
+    card(x_t3, 42,  w_tC, H_NORMAL, "RAVEN", raven_str, SC_RAVEN);
 
-    // Row 2: SESSION / ALL-TIME
-    row_y += CARD_H + ROW_GAP;
-    {
-        char sess_str[9];
-        format_time_buf((frame_ms - session_start_time) / 1000, sess_str, sizeof(sess_str));
-        stat_card(COL_L, row_y, "SESSION", sess_str, TEXT_COLOR, 1.5f);
-    }
-    {
-        char total_str[12];
-        snprintf(total_str, sizeof(total_str), "%ld", lt);
-        stat_card(COL_R, row_y, "ALL-TIME", total_str, CAUTION_COLOR);
-    }
+    // Row 3 (vy = 84):  SESSION | LIFETIME
+    card(x_h1, 84,  w_half, H_NORMAL, "SESSION",  sess_str, SC_SESSION);
+    card(x_h2, 84,  w_half, H_NORMAL, "LIFETIME", life_str, SC_LIFETIME);
 
-    // Row 3: WIFI SESS / BLE SESS
-    row_y += CARD_H + ROW_GAP;
-    {
-        char wifi_str[12];
-        snprintf(wifi_str, sizeof(wifi_str), "%ld", sw);
-        stat_card(COL_L, row_y, "WIFI SESS", wifi_str, CAUTION_COLOR);
-    }
-    {
-        char ble_str[12];
-        snprintf(ble_str, sizeof(ble_str), "%ld", sb);
-        stat_card(COL_R, row_y, "BLE SESS", ble_str, PURPLE_COLOR);
-    }
+    // Row 4 (vy = 126): BATTERY | HEAP
+    card(x_h1, 126, w_half, H_NORMAL, "BATTERY", volt_str, SC_BATTERY);
+    card(x_h2, 126, w_half, H_NORMAL, "HEAP",    heap_str, SC_HEAP);
 
-    // Row 4: RAVEN / FLASH
-    row_y += CARD_H + ROW_GAP;
-    {
-        char raven_str[12];
-        snprintf(raven_str, sizeof(raven_str), "%ld", sr);
-        stat_card(COL_L, row_y, "RAVEN", raven_str, TEAL_COLOR);
-    }
-    {
-        int wear_pct = (int)((lfw * 100) / 100000);
-        if (wear_pct > 100) wear_pct = 100;
-        uint16_t wear_col = (wear_pct >= 80) ? CAUTION_COLOR : ACCENT_COLOR;
-        char fw_str[12];
-        snprintf(fw_str, sizeof(fw_str), "%ld", lfw);
+    // Row 5 (vy = 168): PACKETS | SD CARD
+    card(x_h1, 168, w_half, H_NORMAL, "PACKETS", pkt_str, SC_PACKETS);
+    card(x_h2, 168, w_half, H_NORMAL, "SD CARD", sd_str,  SC_SD);
 
-        drawCard(COL_R, row_y, CARD_W, CARD_H);
-        spr.setTextColor(ACCENT_COLOR, CARD_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(COL_R + 4, row_y + 4);
-        kprint(spr, "FLASH");
-        spr.setTextColor(TEXT_COLOR, CARD_COLOR);
-        spr.setTextSize(1.5);
-        spr.setCursor(COL_R + 4, row_y + 16);
-        spr.print(fw_str);
+    // Row 6 (vy = 210): BOOTS | FLASH
+    card(x_h1, 210, w_half, H_NORMAL, "BOOTS", boots_str, SC_BOOTS);
+    card(x_h2, 210, w_half, H_NORMAL, "FLASH", flash_str, SC_FLASH);
 
-        // Mini progress bar — runs along the bottom of the card.
-        int bar_x = COL_R + 60, bar_y2 = row_y + 20, bar_w = 46, bar_h2 = 6;
-        spr.drawRect(bar_x, bar_y2, bar_w, bar_h2, CARD_BORDER);
-        int fill = (wear_pct * (bar_w - 2)) / 100;
-        if (fill > 0) spr.fillRect(bar_x + 1, bar_y2 + 1, fill, bar_h2 - 2, wear_col);
-        char pct_str[6];
-        snprintf(pct_str, sizeof(pct_str), "%d%%", wear_pct);
-        spr.setTextColor(wear_col, CARD_COLOR);
-        spr.setTextSize(1);
-        spr.setCursor(bar_x, bar_y2 + bar_h2 + 2);
-        spr.print(pct_str);
-    }
-
-    // Row 5: VOLTAGE / POWER
-    row_y += CARD_H + ROW_GAP;
-    {
-        int32_t bat_mv_snap = get_filtered_voltage();
-        uint16_t v_col;
-        if      (bat_mv_snap >= 3800) v_col = ACCENT_COLOR;
-        else if (bat_mv_snap >= 3600) v_col = CAUTION_COLOR;
-        else                          v_col = lgfx::color565(220, 60, 60);
-        char volt_str[10];
-        snprintf(volt_str, sizeof(volt_str), "%.2fV", bat_mv_snap / 1000.0f);
-        stat_card(COL_L, row_y, "VOLTAGE", volt_str, v_col);
-
-        const char* pwr_label = (bat_mv_snap >= 4200) ? "USB" : "BATTERY";
-        stat_card(COL_R, row_y, "POWER", pwr_label, TEXT_COLOR, 1.5f);
-    }
-
-    // Row 6: SD STATUS (left only — second column reserved for future use)
-    row_y += CARD_H + ROW_GAP;
-    {
-        char sd_str[24];
-        snprintf(sd_str, sizeof(sd_str), "%s  %s",
-                 sd_available ? "MOUNTED" : "NO CARD",
-                 littlefs_available ? "FS OK" : "FS ERR");
-        uint16_t sd_col = sd_available ? ACCENT_COLOR : DIM_COLOR;
-        stat_card(COL_L, row_y, "SD CARD", sd_str, sd_col, 1.0f);
-    }
+    // Row 7 (vy = 252): VERSION | VOLTAGE
+    card(x_h1, 252, w_half, H_NORMAL, "VERSION", VERSION_SHORT, SC_VERSION);
+    card(x_h2, 252, w_half, H_NORMAL, "VOLTAGE", voltage_str,   SC_VOLTAGE);
 
     spr.clearClipRect();
 
-    {
-        const int visible_h = (DISP_H - 1) - 18;
-        const int max_scroll_for_fade = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
-        if (max_scroll_for_fade > 0) {
-            if (device_info_scroll > 0)
-                draw_scroll_fade(21, visible_h, 6, true);
-            if (device_info_scroll < max_scroll_for_fade)
-                draw_scroll_fade(21, visible_h, 6, false);
-        }
+
+    // ── Scrollbar — only when content overflows. Tracks the eased value. ──
+    if (STATS_CONTENT_H > STATS_VIEW_H) {
+        spr.drawFastVLine(DISP_W - 4, CONTENT_Y, STATS_VIEW_H, CARD_BORDER);
+        int thumb_h = (STATS_VIEW_H * STATS_VIEW_H) / STATS_CONTENT_H;
+        if (thumb_h < 8) thumb_h = 8;
+        int thumb_y = CONTENT_Y + (scroll_y * (STATS_VIEW_H - thumb_h)) / STATS_MAX_SCROLL;
+        spr.fillRect(DISP_W - 5, thumb_y, 3, thumb_h, DIM_COLOR);
     }
-
-    const int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - (content_bottom_y - content_top_y);
-    if (max_scroll > 0) {
-        const int track_x = DISP_W - 4;
-        const int track_y = content_top_y + 2;
-        const int track_h = (content_bottom_y - content_top_y) - 4;
-        spr.drawFastVLine(track_x + 1, track_y, track_h, CARD_BORDER);
-        int thumb_h = (track_h * (content_bottom_y - content_top_y)) / DEVICE_INFO_CONTENT_HEIGHT;
-        if (thumb_h < 12) thumb_h = 12;
-        int thumb_y = track_y + ((track_h - thumb_h) * device_info_scroll) / max_scroll;
-        spr.fillRect(track_x, thumb_y, 3, thumb_h, HEADER_COLOR);
-    }
-}
-
-// ============================================================================
-// EXPANDED FEED OVERLAY — fullscreen activity feed view
-// ============================================================================
-void draw_feed_expanded_overlay() {
-    // Snapshot feed under mutex. Static to avoid stack pressure — rendering
-    // is single-threaded from loop().
-    static FeedEntry local_feed[FEED_SIZE];
-    int local_count, local_head;
-    unsigned long local_now;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    local_count = feed_count;
-    local_head = feed_head;
-    // feed_entries is a ring keyed by feed_head; copy the whole array
-    // so the renderer's modular index reaches the actual newest entry.
-    for (int i = 0; i < FEED_SIZE; i++) local_feed[i] = feed_entries[i];
-    local_now = millis();
-    xSemaphoreGive(dataMutex);
-
-    // Slide-in animation state — tracks new entries arriving while overlay is open
-    static int           expand_prev_head   = -1;
-    static unsigned long expand_shift_ms    = 0;
-    static unsigned long expand_open_ms_last = 0;
-
-    if (feed_expand_ms != expand_open_ms_last) {
-        expand_open_ms_last = feed_expand_ms;
-        expand_prev_head    = local_head;
-        expand_shift_ms     = 0;
-    }
-    if (local_count > 0 && expand_prev_head != -1 && local_head != expand_prev_head) {
-        expand_shift_ms  = local_now;
-        expand_prev_head = local_head;
-    } else if (expand_prev_head == -1 && local_count > 0) {
-        expand_prev_head = local_head;
-    }
-
-    float expand_alpha = ui_progress(feed_expand_ms, UI_FADE_OUT_MS);
-    auto ea = [&](uint16_t c) -> uint16_t { return lerp_col16(BG_COLOR, c, expand_alpha); };
-
-    // Solid backdrop
-    spr.fillRect(0, 18, DISP_W, DISP_H - 18, BG_COLOR);
-
-    // Subtitle appended to header bar ("SCANNER / LIVE FEED")
-    spr.setTextColor(ea(lerp_col16(HEADER_COLOR, ACCENT_COLOR, 0.4f)), ea(BG_COLOR));
-    spr.setTextSize(1.2);
-    spr.setCursor(56, 5);
-    kprint(spr, "/ LIVE FEED");
-
-    // Gate content rendering until fade-in is underway
-    if (expand_alpha < 0.3f) return;
-
-    // Empty state
-    if (local_count == 0) {
-        spr.setTextColor(ea(DIM_COLOR), BG_COLOR);
-        spr.setTextSize(1.2);
-        const char* msg = "no activity yet";
-        int mw = (int)strlen(msg) * 7;
-        spr.setCursor((DISP_W - mw) / 2, DISP_H / 2 - 4);
-        kprint(spr, msg);
-    } else {
-        // Column layout (240px wide, 4px side padding = 232 usable):
-        //   x=4    type symbol (9px) + flock star (6px) = ~18px
-        //   x=26   DEVICE name (12 chars = 84px)
-        //   x=114  RSSI ("-XXdBm" = 6 chars = 42px)
-        //   x=162  SIGNAL (STRONG/MEDIUM/WEAK = up to 6 chars = 42px)
-        //   x=210  AGE (short form like "1m" or "45s" = 20px)
-
-        const int col_sym    = 4;
-        const int col_rssi   = 140;
-        const int col_sig    = 195;
-
-        // Column headers (faded in)
-        const int hdr_y = 23;
-        spr.setTextSize(1.2);
-        spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-        spr.setCursor(col_sym, hdr_y); kprint(spr, "DEVICE");
-        spr.setCursor(col_rssi, hdr_y); kprint(spr, "RSSI");
-        spr.setCursor(col_sig,  hdr_y); kprint(spr, "SIGNAL");
-
-        // Render rows
-        const int row_top    = hdr_y + 12;
-        const int avail_h    = DISP_H - row_top;
-        const int max_rows   = 6;
-        const int row_h      = avail_h / max_rows;
-        const int row_pad    = avail_h - (max_rows * row_h);
-        const int row_top_adj = row_top + row_pad / 2;
-
-        // Clip to row area to prevent slide animation from bleeding into headers
-        spr.setClipRect(0, row_top_adj, DISP_W, DISP_H - row_top_adj);
-        int rendered = 0;
-        for (int i = 0; i < local_count && rendered < max_rows; i++) {
-            int idx = (local_head - i + FEED_SIZE * 2) % FEED_SIZE;
-            FeedEntry& e = local_feed[idx];
-            int row_y;
-            if (rendered == 0 && expand_shift_ms > 0) {
-                row_y = anim_slide_in(row_top_adj, -row_h, expand_shift_ms, 300);
-            } else {
-                row_y = row_top_adj + rendered * row_h;
-            }
-
-            // Type symbol color (Flock entries tinted toward ACCENT), faded in
-            uint16_t proto_col = (e.proto == 0) ? CAUTION_COLOR : PURPLE_COLOR;
-            if (e.is_flock) proto_col = lerp_col16(proto_col, ACCENT_COLOR, 0.5f);
-            proto_col = ea(proto_col);
-
-            // Small stats-style symbols: outline-only triangle (WiFi) or diamond (BLE)
-            int sym_x = col_sym;
-            int sym_y = row_y + 3;
-            if (e.proto == 0) {
-                spr.drawTriangle(sym_x,     sym_y + 7,
-                                 sym_x + 8, sym_y + 7,
-                                 sym_x + 4, sym_y,
-                                 proto_col);
-            } else {
-                int ecx = sym_x + 4, ecy = sym_y + 4, ehr = 4;
-                spr.drawLine(ecx,       ecy - ehr, ecx + ehr, ecy,       proto_col);
-                spr.drawLine(ecx + ehr, ecy,       ecx,       ecy + ehr, proto_col);
-                spr.drawLine(ecx,       ecy + ehr, ecx - ehr, ecy,       proto_col);
-                spr.drawLine(ecx - ehr, ecy,       ecx,       ecy - ehr, proto_col);
-            }
-            if (e.is_flock) {
-                spr.setTextColor(ea(ACCENT_COLOR), BG_COLOR);
-                spr.setTextSize(1.2);
-                spr.setCursor(sym_x + 10, row_y + 3);
-                spr.print("*");
-            }
-
-            // DEVICE name — size 2, truncated to fit before RSSI column
-            int name_start_x = col_sym + 15;
-            if (e.is_flock) name_start_x += 8;
-            int name_max_chars = (col_rssi - name_start_x - 4) / 7;
-            if (name_max_chars > 12) name_max_chars = 12;
-            if (name_max_chars < 1) name_max_chars = 1;
-            if (name_max_chars > (int)sizeof(e.name) - 1) name_max_chars = sizeof(e.name) - 1;
-            char name_disp[20];
-            strncpy(name_disp, e.name, name_max_chars);
-            name_disp[name_max_chars] = '\0';
-            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setTextSize(1.2);
-            spr.setCursor(name_start_x, row_y + 3);
-            spr.print(name_disp);
-
-            // RSSI in dBm with units — right-aligned within the RSSI column
-            char rssi_str[10];
-            snprintf(rssi_str, sizeof(rssi_str), "%ddBm", e.rssi);
-            spr.setTextColor(ea(TEXT_COLOR), BG_COLOR);
-            spr.setCursor(col_rssi, row_y + 3);
-            spr.print(rssi_str);
-
-            // SIGNAL (spelled out)
-            const char* strength_str;
-            uint16_t strength_col;
-            if (e.rssi > -60)      { strength_str = "STRONG"; strength_col = ACCENT_COLOR; }
-            else if (e.rssi > -80) { strength_str = "MEDIUM"; strength_col = CAUTION_COLOR; }
-            else                   { strength_str = "WEAK";   strength_col = DIM_COLOR; }
-            spr.setTextColor(ea(strength_col), BG_COLOR);
-            spr.setCursor(col_sig, row_y + 3);
-            spr.print(strength_str);
-
-            rendered++;
-        }
-        spr.clearClipRect();
-    }
-
 }
 
 // ============================================================================
 // MAIN UI CONTROLLER
 // ============================================================================
 void draw_current_screen() {
-    switch (current_screen) {
-        case 0: draw_scanner_screen();         break;
-        case 1: draw_locator_screen();         break;
-        case 2: draw_capture_history_screen(); break;
-        case 3: draw_gps_screen();             break;
-        case 4: draw_device_info_screen();     break;
+    // Fullscreen opaque overlays completely occlude the screen beneath.
+    // Skip the expensive underlying render when one is active.
+    bool fullscreen_overlay = menu_open || show_help_overlay || wifi_config_open;
+
+    if (!fullscreen_overlay) {
+        switch (current_screen) {
+            case 0:
+                draw_scanner_screen();
+                if (title_card_active) draw_title_card();
+                break;
+            case 1: draw_signal_screen();           break;
+            case 2: draw_capture_history_screen(); break;
+            case 3: draw_gps_screen();             break;
+            case 4: draw_device_info_screen();     break;
+        }
+        if (show_feed_expanded) draw_feed_expanded_overlay();
     }
-    
-    if (show_feed_expanded) draw_feed_expanded_overlay();
+
     if (show_vol_overlay) draw_vol_overlay();
     if (show_help_overlay) draw_help_overlay();
-    if (show_menu) draw_menu_overlay();
     if (wifi_config_open) draw_wifi_config_overlay();
+    if (menu_open) draw_menu_overlay();
     draw_toast_spr();
+}
+
+// Push sprite at a horizontal offset. Skips entirely when the visible
+// width is < 2px — prevents the GDMA zero-width null-deref that
+// crashed the original swipe implementation.
+static void push_sprite_offset(int x_offset) {
+    int vis_left  = max(0, x_offset);
+    int vis_right = min((int)DISP_W, x_offset + (int)DISP_W);
+    if (vis_right - vis_left < 2) return;
+    spr.pushSprite(x_offset, 0);
 }
 
 void transition_screen(int new_screen, int dir) {
     screen_dirty = true;
     if (stealth_mode) { current_screen = new_screen; return; }
-    if (!is_muted) {
-        M5Cardputer.Speaker.tone(660, 5);   // soft warm tap, matches menu click
+    if (!is_muted) M5Cardputer.Speaker.tone(660, 5);
+
+    // Flush queued deletes whenever we leave the history screen
+    if (current_screen == 2 && new_screen != 2 && pending_delete_count > 0)
+        flush_pending_deletes();
+
+    // Signal screen curve cache — alloc on enter, free on leave
+    if (new_screen == 1 && !signal_curve_cache)
+        signal_curve_cache = (float*)malloc(241 * sizeof(float));
+    if (current_screen == 1 && new_screen != 1 && signal_curve_cache) {
+        free(signal_curve_cache);
+        signal_curve_cache = nullptr;
+    }
+
+    // Screen-specific setup (same as before)
+    if (new_screen == 0) {
+        feed_anim_prev_head = -1;
+        feed_anim_shift_ms  = 0;
     }
     if (new_screen == 2) {
-        history_scroll_offset = 0;
-        history_selected_idx = 0;
-        hist_detail_open = false;
-        // Short timed take so a stuck PersistTask can't freeze the screen
-        // transition. If we miss this window, the screen renders with the
-        // previous snapshot — sd_hist_dirty stays set so the next loop
-        // iteration retries once the bus frees up.
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-            load_sd_history();
-            xSemaphoreGive(sdMutex);
-            sd_hist_dirty = false;
+        history_scroll_offset  = 0;
+        history_selected_idx   = 0;
+        hist_detail_open       = false;
+        hist_detail_open_ms    = 0;
+        hist_delete_confirming = false;
+        hist_sel_y_f           = (float)CONTENT_Y;
+        hist_last_frame_ms     = 0;
+        if (sd_available) {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                Serial.println("[DELDIAG] === transition_screen(2) — reloading sd_hist with filters ===");
+                load_sd_history();
+                xSemaphoreGive(sdMutex);
+                sd_hist_dirty = false;
+            }
         }
     }
     if (new_screen == 4) {
-        device_info_scroll = 0;
+        stats_scroll_target      = 0;
+        stats_scroll_y_f         = 0.0f;
+        stats_last_frame_ms      = millis();
+        stats_values_initialized = false;
+        for (int i = 0; i < STATS_CARD_COUNT; i++)
+            for (int ci = 0; ci < STAT_MAX_CHARS; ci++)
+                stats_char_anim[i][ci] = 0;
     }
-    if (show_feed_expanded && new_screen != 0) show_feed_expanded = false;
+    if (show_feed_expanded && new_screen != 0 && new_screen != 1) show_feed_expanded = false;
+
+    // ── Swipe animation ──────────────────────────────────────────────
+    // The old screen is already on the display from the previous push.
+    // Draw the new screen into the sprite, then slide it in from the
+    // edge. The old content stays visible on the departing side until
+    // the new sprite covers it — reads as a directional slide.
     current_screen = new_screen;
     draw_current_screen();
-    spr.pushSprite(0, 0);   // single on-screen push — safe
-    (void)dir;              // slide animation removed — first frame at x=DISP_W
-                            // triggered a LovyanGFX GDMA null-deref when the
-                            // clipped destination rect collapsed to zero width.
+
+    const int FRAMES   = 8;
+    const int FRAME_MS = 16;  // ~128ms total
+
+    M5Cardputer.Display.startWrite();
+    M5Cardputer.Display.setClipRect(0, CONTENT_Y, DISP_W, DISP_H - CONTENT_Y);
+    for (int f = 1; f <= FRAMES; f++) {
+        float t = ui_ease((float)f / (float)FRAMES);
+        // Start fully off-screen on the entering side, ease to 0
+        int offset = (int)((1.0f - t) * (float)DISP_W * (float)dir);
+        push_sprite_offset(offset);
+        delay(FRAME_MS);
+    }
+    M5Cardputer.Display.clearClipRect();
+    M5Cardputer.Display.endWrite();
+
+    // Final frame with header
+    render_frame();
 }
 
 // ============================================================================
@@ -5922,30 +9380,27 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     auto& lcd = M5Cardputer.Display;
 
     uint16_t bg     = lgfx::color565(  5,  10,  20);   // matches BG_COLOR (day)
-    uint16_t blue   = lgfx::color565(124, 228, 210);   // matches HEADER_COLOR (mint)
+    uint16_t blue   = lgfx::color565( 77, 219, 194);   // matches HEADER_COLOR (teal)
     uint16_t white  = lgfx::color565(232, 239, 255);   // matches TEXT_COLOR
-    uint16_t dim    = lgfx::color565( 90, 107, 128);   // matches DIM_COLOR
+    uint16_t dim    = lgfx::color565(149, 165, 184);   // matches DIM_COLOR (bright steel)
 
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
-    // Bar geometry — ~10% smaller again (130×20). Single 1px outline
-    // (the inset inner stroke is dropped — looks cleaner at this size).
+    // Bar geometry — 130×20, positioned 13px below the percentage number.
     const int bar_w = 130;
     const int bar_h = 20;
     const int bar_x = (DISP_W - bar_w) / 2;
-    const int bar_y = 78;
+    const int bar_y = (DISP_H - 75) / 2 + 16 + 13;   // num_y + num_h + gap = 59
     const int bar_r = bar_h / 2;
 
-    // Number geometry — textSize 2 (matches stats/values typography stack).
-    // textSize 2 = 12px char width, 16px char height.
-    const int num_y = 49;
+    // Centered layout: (DISP_H - total_h) / 2 where total_h = num(16) + gap(13) + bar(20) + gap(18) + status(8) = 75
+    const int num_y = (DISP_H - 75) / 2;          // = 30
     const int num_w = 80;
     const int num_x = (DISP_W - num_w) / 2;
     const int num_h = 16;
 
-    // Status text geometry — moved up for tighter overall composition.
-    const int status_y = 116;
+    const int status_y = num_y + num_h + 13 + 20 + 18;  // = 97
     const int status_h = 8;
 
     // ── Staggered intro — each element fades in at its own offset ──
@@ -5955,7 +9410,6 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
     //   220ms → bar outline begins drawing over 350ms
     //   500ms → percentage + status text begin allowed to render
     static unsigned long boot_intro_start_ms = 0;
-    static bool          boot_title_drawn    = false;
     static int           boot_outline_drawn_to = 0;  // pixels of outline drawn so far
 
     if (boot_first_draw) {
@@ -5964,48 +9418,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         boot_eased_fill      = 0.0f;
         boot_prev_fill_w     = 0;
         boot_intro_start_ms  = millis();
-        boot_title_drawn     = false;
         boot_outline_drawn_to = 0;
     }
 
     unsigned long intro_elapsed = millis() - boot_intro_start_ms;
-
-    // ── Title: slide down + fade in over 350ms, settled at y=24 ──
-    {
-        // textSize 2 is integer-scaled (6×8 → 12×16) so strokes are uniform.
-        // textSize 1.5 produced uneven strokes — fractional scaling rounds some
-        // pixel rows up and others down. y bumped up to maintain ~13px gaps.
-        const int TITLE_FINAL_Y  = 20;
-        const int TITLE_SLIDE_PX = 10;
-
-        if (intro_elapsed < UI_ANIM_NORMAL) {
-            // Title slides DOWN from above its resting position. Same elapsed
-            // window drives the color fade; both read from the same start.
-            unsigned long start = millis() - intro_elapsed;
-            int y = anim_slide_in(TITLE_FINAL_Y, -TITLE_SLIDE_PX, start, UI_ANIM_NORMAL);
-            float ease = ui_progress(start, UI_ANIM_NORMAL);
-            uint16_t col = lerp_col16(bg, blue, ease);
-
-            lcd.startWrite();
-            lcd.setClipRect(0, 14, DISP_W, 22);
-            lcd.fillRect(0, 14, DISP_W, 22, bg);
-            lcd.setTextColor(col, bg);
-            lcd.setTextSize(1);  // integer-scaled, clean uniform strokes
-            lcd.setTextDatum(TC_DATUM);
-            lcd.drawString(VERSION_STRING, DISP_W / 2, y);
-            lcd.clearClipRect();
-            lcd.endWrite();
-        } else if (!boot_title_drawn) {
-            // Settled: paint once at full color, then never touch again
-            lcd.startWrite();
-            lcd.setTextColor(blue, bg);
-            lcd.setTextSize(1);
-            lcd.setTextDatum(TC_DATUM);
-            lcd.drawString(VERSION_STRING, DISP_W / 2, TITLE_FINAL_Y);
-            lcd.endWrite();
-            boot_title_drawn = true;
-        }
-    }
 
     // ── Bar outline: draws across 350ms starting at +220ms ──
     // Implemented as a left-to-right reveal — each frame extends the drawn
@@ -6152,11 +9568,10 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
             fill_anim_start = millis();
         }
 
-        // Boot bar fill uses a shorter duration than UI_ANIM_NORMAL so the
-        // bar arrives authoritatively rather than creeping. Must be shorter
-        // than BOOT_RUSH approach_max_ms (120) so even the fastest stage
-        // can fully resolve to its target.
-        static const unsigned long BOOT_BAR_FILL_MS = 160;
+        // Boot bar fill matches the digit roll duration (100ms) so both
+        // animations land together. Must be <= BOOT_RUSH approach_max_ms
+        // (120ms) so even the fastest personality fully resolves.
+        static const unsigned long BOOT_BAR_FILL_MS = 100;
         float ease = ui_progress(fill_anim_start, BOOT_BAR_FILL_MS);
         boot_eased_fill = (float)fill_anim_from + (float)(fill_anim_to - fill_anim_from) * ease;
 
@@ -6209,7 +9624,7 @@ void draw_boot_screen(int pct, const char* status_text = nullptr) {
         }
         cur_buf[cur_len] = '\0';
 
-        int cur_w = (cur_len > 0) ? (cur_len * 7 - 1) : 0;
+        int cur_w = (cur_len > 0) ? (cur_len * ts_char_w(TS_BODY) - 1) : 0;
         int cur_x = (DISP_W - cur_w) / 2;
 
         const unsigned long ROLL_MS = 120;
@@ -6341,75 +9756,7 @@ static void apply_ble_scan_params() {
     }
 }
 
-// ── I2C bus recovery ────────────────────────────────────────────────────────
-// If a peripheral holds SDA low (lost state during power transient), the
-// entire I2C bus hangs. Per the I2C spec, clocking SCL 9 times releases
-// any stuck slave because it completes the partial byte transfer.
-//
-// Called only on detected bus failure — zero overhead during normal operation.
-// Uses the default Wire pins from M5Unified (SDA=2, SCL=1 on Cardputer ADV).
-//
-// Returns true if SDA was released (bus recovered), false if still stuck.
-static bool i2c_bus_recover() {
-    // M5Cardputer ADV I2C pins — match M5Unified defaults
-    const int PIN_SDA = 2;
-    const int PIN_SCL = 1;
-
-    // Check if SDA is actually stuck low
-    pinMode(PIN_SDA, INPUT_PULLUP);
-    pinMode(PIN_SCL, INPUT_PULLUP);
-    delayMicroseconds(10);
-
-    if (digitalRead(PIN_SDA) == HIGH) {
-        // SDA is not stuck — bus is fine, no recovery needed
-        return true;
-    }
-
-    Serial.println("[I2C] SDA stuck low — attempting bus recovery");
-
-    // Clock SCL up to 9 times to free the stuck slave
-    pinMode(PIN_SCL, OUTPUT);
-    for (int i = 0; i < 9; i++) {
-        digitalWrite(PIN_SCL, LOW);
-        delayMicroseconds(5);
-        digitalWrite(PIN_SCL, HIGH);
-        delayMicroseconds(5);
-
-        // Check if SDA released
-        pinMode(PIN_SDA, INPUT_PULLUP);
-        delayMicroseconds(5);
-        if (digitalRead(PIN_SDA) == HIGH) {
-            Serial.printf("[I2C] SDA released after %d clock pulses\n", i + 1);
-            break;
-        }
-    }
-
-    // Send a STOP condition (SDA low→high while SCL is high)
-    pinMode(PIN_SDA, OUTPUT);
-    digitalWrite(PIN_SDA, LOW);
-    delayMicroseconds(5);
-    digitalWrite(PIN_SCL, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(PIN_SDA, HIGH);
-    delayMicroseconds(5);
-
-    // Restore pins to I2C function
-    pinMode(PIN_SDA, INPUT_PULLUP);
-    pinMode(PIN_SCL, INPUT_PULLUP);
-
-    bool recovered = (digitalRead(PIN_SDA) == HIGH);
-    if (recovered) {
-        Serial.println("[I2C] Bus recovery successful — reinitializing Wire");
-        // Reinitialize the I2C driver so M5Unified picks up the recovered bus
-        Wire.end();
-        delay(10);
-        Wire.begin(PIN_SDA, PIN_SCL);
-    } else {
-        Serial.println("[I2C] Bus recovery FAILED — SDA still stuck");
-    }
-
-    return recovered;
-}
+SET_LOOP_TASK_STACK_SIZE(7168);
 
 void setup() {
     // ── Safe WDT reconfiguration ────────────────────────────────────
@@ -6437,11 +9784,6 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
-    // Confirm I2C pin assignments at boot — i2c_bus_recover() hardcodes
-    // SDA=2/SCL=1 (M5Cardputer ADV defaults). If this prints different
-    // values, update the constants in i2c_bus_recover().
-    Serial.printf("[I2C] SDA=%d SCL=%d\n", Wire.getSDA(), Wire.getSCL());
-
     // PSRAM availability + heap snapshot. Total PSRAM = 0 means PSRAM
     // isn't enabled in the board config; setPsram(true) will silently fall
     // through to internal RAM and the sprite-fallback path will kick in.
@@ -6454,12 +9796,12 @@ void setup() {
     {
         auto spk_cfg = M5Cardputer.Speaker.config();
         spk_cfg.dma_buf_count = 3;     // default 8
-        spk_cfg.dma_buf_len   = 256;   // default 512
+        spk_cfg.dma_buf_len   = 128;   // default 512; simple sine tones don't need more
         M5Cardputer.Speaker.config(spk_cfg);
     }
 
     // dataMutex MUST be created before any task that uses it is spawned.
-    dataMutex = xSemaphoreCreateMutex();
+    dataMutex = xSemaphoreCreateRecursiveMutex();
     sdMutex   = xSemaphoreCreateMutex();
 
     // Create the draw sprite FIRST, before WiFi / BLE / LittleFS eat internal
@@ -6558,9 +9900,26 @@ void setup() {
         if (!SD.exists("/FLOCK_FINDER/stats"))     SD.mkdir("/FLOCK_FINDER/stats");
         Serial.println("[SD] Directory structure OK");
 
+        // Recover from a power loss mid-delete: if .bak exists but the main file
+        // is missing, restore the backup. If both exist, the rename completed —
+        // just clean up the orphan.
+        {
+            const char* main_path = "/FLOCK_FINDER/logs/FlockLog.csv";
+            const char* bak_path  = "/FLOCK_FINDER/logs/FlockLog.bak";
+            if (SD.exists(bak_path)) {
+                if (!SD.exists(main_path)) {
+                    SD.rename(bak_path, main_path);
+                    Serial.println("[SD] Recovered FlockLog.csv from .bak");
+                } else {
+                    SD.remove(bak_path);
+                    Serial.println("[SD] Cleaned orphan FlockLog.bak");
+                }
+            }
+        }
+
         if (!SD.exists(current_log_file)) {
             File file = SD.open(current_log_file, FILE_WRITE);
-            if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM"); file.close(); }
+            if (file) { file.println("Uptime_ms,EpochUTC,EpochIsGPS,Channel,Type,Proto,RSSI,MAC,Name,TXPower,Method,Conf,ConfLabel,Extra,SeqNum,Lat,Lon,SpeedMPH,HeadingDeg,AltM,DetID"); file.close(); }
         }
         {
             bool need_pcap_header = !SD.exists(current_pcap_file);
@@ -6599,13 +9958,23 @@ void setup() {
     sd_was_available = sd_available;
     last_sd_check_ms = millis();
 
+    // Load detection history from SD so the Detections screen has data
+    // immediately. No mutex needed — tasks haven't been spawned yet.
+    if (sd_available) {
+        Serial.println("[DELDIAG] === EARLY load_sd_history ===");
+        load_sd_history();
+        if (sd_hist_count > 0) {
+            Serial.printf("[SD] Loaded %d detections from history\n", sd_hist_count);
+        }
+    }
+
     delay(100);
     // NMEA sentences max ~82 chars — 1024-byte default RX is 2× too big.
     // setRxBufferSize must be called BEFORE begin() to take effect.
-    SerialGPS.setRxBufferSize(512);
+    SerialGPS.setRxBufferSize(256);  // NMEA max sentence is 82 bytes; 256 is sufficient
     SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    delay(100);
-    WiFi.mode(WIFI_STA); delay(50);
+    delay(WIFI_MODE_SETTLE_MEDIUM_MS);
+    WiFi.mode(WIFI_STA); delay(WIFI_MODE_SETTLE_SHORT_MS);
     boot_animate(38 + random(0, 4), "connecting GPS");
     boot_animate(46 + random(0, 4), "drawing interface");
 
@@ -6623,7 +9992,7 @@ void setup() {
     setCpuFrequencyMhz(240);
     boot_animate(62 + random(0, 3), "boosting CPU");
     ble_event_queue = xQueueCreate(BLE_POOL_SIZE, sizeof(uint8_t));
-    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 4096, NULL, 1, &BLEWorkerHandle, 1);
+    xTaskCreatePinnedToCore(ble_worker_task, "BLEWorker", 2752, NULL, 1, &BLEWorkerHandle, 1);
     boot_animate(68, "starting Bluetooth");
 
     memset(seen_mac_table, 0, sizeof(seen_mac_table));
@@ -6669,7 +10038,14 @@ void setup() {
         load_session_from_flash();
         load_wifi_credentials();
         load_detections_from_flash();
+        load_whitelist();
     }
+    // Apply persisted settings that require hardware calls after load
+    if (night_mode)     apply_color_palette();
+    if (low_power_mode)    setCpuFrequencyMhz(80);
+    if (turbo_mode_active) setCpuFrequencyMhz(240);
+    if (stealth_mode)      M5Cardputer.Display.setBrightness(5);
+    if (is_muted)       M5Cardputer.Speaker.setVolume(0);
     Serial.printf("[BOOT] Free heap after LittleFS: %u\n",
                   (unsigned)esp_get_free_heap_size());
     boot_animate(78 + random(0, 3), "loading session");
@@ -6692,17 +10068,17 @@ void setup() {
     session_start_time = millis();
 
     // WiFi promiscuous mode — complete before scanner screen appears
-    WiFi.disconnect(); delay(100); esp_wifi_set_ps(WIFI_PS_NONE);
+    WiFi.disconnect(); delay(WIFI_MODE_SETTLE_MEDIUM_MS); esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_promiscuous_filter_t filt; filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&filt); esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
-    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(100);
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE); delay(WIFI_MODE_SETTLE_MEDIUM_MS);
     Serial.printf("[BOOT] Free heap after WiFi promisc: %u\n",
                   (unsigned)esp_get_free_heap_size());
     boot_animate(88, "starting sniffer");
 
     // NimBLE — complete before scanner screen appears
-    NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::init(""); NimBLEDevice::setMTU(23); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     Serial.printf("[BOOT] Free heap after NimBLE init: %u\n",
                   (unsigned)esp_get_free_heap_size());
     pBLEScan = NimBLEDevice::getScan();
@@ -6718,14 +10094,14 @@ void setup() {
 
     // Tasks
     last_channel_hop = millis(); last_ble_scan = millis(); last_sd_flush = millis(); last_persist_save = millis();
-    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 3072, NULL, 1, &ScannerTaskHandle, 0);
-    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 2560, NULL, 1, &GPSTaskHandle, 0);
+    xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 2048, NULL, 1, &ScannerTaskHandle, 0);
+    xTaskCreatePinnedToCore(GPSLoopTask, "GPSTask", 2048, NULL, 1, &GPSTaskHandle, 0);
     last_user_input_ms = millis();
     system_fully_booted = true;
 
     // Spawn the LED task at priority 1 on Core 1 — must come after WiFi+BLE
     // are up so RMT/radio contention is avoided.
-    xTaskCreatePinnedToCore(LedTask, "LedTask", 2048, NULL, 1, &LedTaskHandle, 1);
+    xTaskCreatePinnedToCore(LedTask, "LedTask", 1536, NULL, 1, &LedTaskHandle, 1);
 
     // WDT was already initialized early in setup(); each watched task
     // self-subscribes via esp_task_wdt_add(NULL) inside its loop.
@@ -6735,70 +10111,134 @@ void setup() {
 
     // Gate: wait for the WiFi sniffer to confirm radios are up (~15 packets) or
     // 4 seconds, whichever comes first. Pump event queues during the wait so the
-    // live feed buffer pre-populates before the scanner screen appears.
+    // live feed buffer pre-populates before the scanner screen appears. The
+    // 800ms feed-push throttle is bypassed here — boot wants maximum population
+    // speed, not smooth UI animation.
     {
         unsigned long feed_gate_start = millis();
-        const unsigned long FEED_GATE_MAX_MS = 4500;
+        const unsigned long FEED_GATE_MAX_MS = 1500;
+        last_feed_push_ms = 0;
         while ((millis() - feed_gate_start) < FEED_GATE_MAX_MS) {
-            if (ambient_packet_count >= 15) break;
+            if (ambient_packet_count >= 5) break;
             draw_boot_screen(100, "listening for signals");
             delay(30);
             M5Cardputer.update();
             process_wifi_event_queue();
+            last_feed_push_ms = 0;
             feed_commit_pending();
         }
+        // Final drain — anything that arrived during the last delay(30).
+        process_wifi_event_queue();
+        last_feed_push_ms = 0;
+        feed_commit_pending();
         // Reset so a later boot-screen draw (shouldn't happen) would repaint cleanly
         boot_prev_fill_w = 0;
     }
 
-    // ── Crossfade from boot screen to scanner via the backlight PWM ──
-    // Fade-out: ramp brightness to 0 over ~400ms, so the still-rendered boot
-    // content dims away. Swap sprite contents while the screen is dark.
-    // Fade-in: ramp brightness back to the user's target over ~400ms.
+    // Pre-populate the scanner feed snapshot so the first frame of
+    // draw_scanner_screen() already has rows to display.
     {
-        int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
-        const int FADE_STEPS   = 12;
-        const int FADE_STEP_MS = 16;   // 12 × 16ms ≈ 192ms per phase
-
-        for (int i = 1; i <= FADE_STEPS; i++) {
-            int b = (start_brightness * (FADE_STEPS - i)) / FADE_STEPS;
-            M5Cardputer.Display.setBrightness(b);
-            delay(FADE_STEP_MS);
-        }
-
-        // Screen is dark — swap to the scanner content
-        draw_current_screen();
-        spr.pushSprite(0, 0);
-
-        for (int i = 1; i <= FADE_STEPS; i++) {
-            int b = (start_brightness * i) / FADE_STEPS;
-            M5Cardputer.Display.setBrightness(b);
-            delay(FADE_STEP_MS);
-        }
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+        scan_local_count = feed_count;
+        scan_local_head  = feed_head;
+        for (int i = 0; i < FEED_SIZE; i++) scan_local_feed[i] = feed_entries[i];
+        xSemaphoreGiveRecursive(dataMutex);
+        scan_feed_last_snapshot = millis();
     }
 
-    // Boot chime — plays after the scanner is visible
+    // ── Title card boot sequence ──
+    {
+        int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
+
+        // Phase 1: Fade out boot screen
+        {
+            int steps = 12;
+            for (int i = 1; i <= steps; i++) {
+                float t = (float)i / (float)steps;
+                M5Cardputer.Display.setBrightness((uint8_t)(start_brightness * (1.0f - t)));
+                delay(25);
+            }
+        }
+
+        // Phase 2: Draw title card on dark background, fade in
+        {
+            spr.fillSprite(BG_COLOR);
+            draw_title_card_overlay(1.0f);
+            spr.pushSprite(0, 0);
+
+            int steps = 12;
+            for (int i = 1; i <= steps; i++) {
+                float t = (float)i / (float)steps;
+                M5Cardputer.Display.setBrightness((uint8_t)(start_brightness * t));
+                delay(25);
+            }
+        }
+
+        // Phase 3: Hold on title card (~2 seconds)
+        {
+            unsigned long hold_start = millis();
+            while (millis() - hold_start < 2000) {
+                spr.fillSprite(BG_COLOR);
+                draw_title_card_overlay(1.0f);
+                spr.pushSprite(0, 0);
+                delay(30);
+            }
+        }
+
+        // Phase 4: Dissolve dark → scanner over 1 second
+        {
+            title_card_start_ms = millis();
+            unsigned long dissolve_start = millis();
+            unsigned long dissolve_ms = 1000;
+
+            while (millis() - dissolve_start < dissolve_ms) {
+                float alpha = 1.0f - (float)(millis() - dissolve_start) / (float)dissolve_ms;
+
+                draw_current_screen();
+
+                for (int y = CONTENT_Y; y < DISP_H; y++) {
+                    for (int x = 0; x < DISP_W; x++) {
+                        uint16_t px = spr.readPixel(x, y);
+                        spr.drawPixel(x, y, lerp_col16(px, BG_COLOR, alpha));
+                    }
+                }
+
+                draw_title_card_overlay(alpha);
+                spr.pushSprite(0, 0);
+                delay(16);
+            }
+        }
+
+        // Phase 5: Clean transition to normal operation
+        title_card_active = false;
+        draw_current_screen();
+        render_frame();
+    }
+
+    // Boot chime — plays after the scanner is visible. Vintage descending
+    // tone settles on a middle pitch for a 70s-terminal feel.
     if (!is_muted) {
         int boot_vol = current_volume > 25 ? 25 : current_volume;
         M5Cardputer.Speaker.setVolume(boot_vol);
         delay(120);
-        // Vintage chime — F major arpeggio rising slowly. Lower octave + longer
-        // note duration matches the deliberate rhythm of the boot animations
-        // (each note ≈ UI_ANIM_QUICK; gaps ≈ UI_ANIM_QUICK/4).
-        M5Cardputer.Speaker.tone(349, 180); delay(220);  // F4
-        M5Cardputer.Speaker.tone(440, 180); delay(220);  // A4
-        M5Cardputer.Speaker.tone(523, 260); delay(300);  // C5
+        M5Cardputer.Speaker.tone(240, 180); delay(220);
+        M5Cardputer.Speaker.tone(180, 180); delay(220);
+        M5Cardputer.Speaker.tone(200, 260); delay(300);
     }
     M5Cardputer.Speaker.setVolume(current_volume);
 
-    // Drop to 160MHz for normal operation. Boot and radio init benefit from
-    // 240MHz; steady-state scanning, rendering, and BLE processing do not.
-    // Saves ~20mA continuous draw (~2 hours extra on 1750mAh).
-    setCpuFrequencyMhz(160);
+    // Set CPU frequency based on persisted mode. Boot and radio init ran at
+    // 240MHz; now drop to the appropriate steady-state clock.
+    if (turbo_mode_active)
+        setCpuFrequencyMhz(240);
+    else if (low_power_mode)
+        setCpuFrequencyMhz(80);
+    else
+        setCpuFrequencyMhz(160);
 
-    if (lifetime_boots <= 3) {
-        set_toast_direct("TAB = help  M = menu", HEADER_COLOR);
-    }
+    // Ungate callbacks — both WiFi and BLE were discarding packets until now.
+    scanner_ready = true;
+    Serial.println("[BOOT] Scanner ready — promiscuous callbacks enabled");
 }
 
 // ============================================================================
@@ -6819,7 +10259,18 @@ void loop() {
     if (export_mode_active) {
         if (export_server) export_server->handleClient();
         if ((millis() - export_mode_started_at) > EXPORT_MODE_MAX_MS) {
-            export_mode_stop();
+            if (!export_server) {
+                export_mode_stop();
+            } else {
+                WiFiClient check_client = export_server->client();
+                if (!check_client || !check_client.connected()) {
+                    export_mode_stop();
+                } else {
+                    // Extend 60s while a client is active; prevents premature
+                    // server teardown during slow chunked transfers.
+                    export_mode_started_at = millis() - EXPORT_MODE_MAX_MS + 60000UL;
+                }
+            }
         }
     }
 
@@ -6828,43 +10279,134 @@ void loop() {
 
     int32_t loop_mv = get_filtered_voltage();
 
-    // Low-battery voltage warnings — once per crossing, 100mV hysteresis to re-arm.
+    // Low-battery voltage warnings:
+    //   - Initial toast on each threshold crossing (3.7V warning, 3.5V critical).
+    //   - 100mV hysteresis so a noisy ADC doesn't strobe the toast.
+    //   - Periodic re-warn every 10 minutes while voltage stays below warning,
+    //     because dismissing one toast shouldn't silence all future reminders.
+    //   - Re-warn cadence tightens to 2 minutes once below the critical threshold.
     {
+        static const unsigned long BATT_REWARN_LOW_MS  = 10UL * 60UL * 1000UL;
+        static const unsigned long BATT_REWARN_CRIT_MS =  2UL * 60UL * 1000UL;
+
         static int32_t last_battery_warning_mv = 9999;
+        static unsigned long last_battery_warn_toast_ms = 0;
+        unsigned long batt_now = millis();
+
+        // Initial crossing-detection (unchanged behavior).
         if (loop_mv <= 3500 && last_battery_warning_mv > 3500) {
-            set_toast_direct("BATT CRITICAL 3.5V", CAUTION_COLOR);
+            set_toast_direct("BATT CRITICAL 3.5V", TOAST_WARNING, false);
             last_battery_warning_mv = 3500;
+            last_battery_warn_toast_ms = batt_now;
         } else if (loop_mv <= 3700 && last_battery_warning_mv > 3700) {
-            set_toast_direct("BATT LOW 3.7V", CAUTION_COLOR);
+            set_toast_direct("BATT LOW 3.7V", TOAST_WARNING, false);
             last_battery_warning_mv = 3700;
+            last_battery_warn_toast_ms = batt_now;
         } else if (last_battery_warning_mv < 9999
                    && loop_mv >= last_battery_warning_mv + 100) {
+            // Voltage recovered (charger plugged in, or rebound from load drop).
             last_battery_warning_mv = 9999;
+            last_battery_warn_toast_ms = 0;
+        }
+
+        // Periodic re-warn while below a threshold.
+        if (last_battery_warning_mv == 3500 && last_battery_warn_toast_ms != 0
+            && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_CRIT_MS) {
+            char buf[TOAST_TEXT_LEN];
+            int32_t mv_now = loop_mv;
+            snprintf(buf, sizeof(buf), "BATT CRITICAL %ld.%02ldV",
+                     (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
+            set_toast_direct(buf, TOAST_WARNING, false);
+            last_battery_warn_toast_ms = batt_now;
+        } else if (last_battery_warning_mv == 3700 && last_battery_warn_toast_ms != 0
+                   && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_LOW_MS) {
+            char buf[TOAST_TEXT_LEN];
+            int32_t mv_now = loop_mv;
+            snprintf(buf, sizeof(buf), "BATT LOW %ld.%02ldV",
+                     (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
+            set_toast_direct(buf, TOAST_WARNING, false);
+            last_battery_warn_toast_ms = batt_now;
         }
     }
 
-    // One-time stack usage diagnostic — logs after 60s when all code paths
-    // (WiFi events, BLE scans, GPS parsing, SD flushes, alarms) have fired
-    // at least once. Values are in bytes of unused stack (high-water mark).
-    // If any value is >1500, the task's stack can be safely reduced by that
-    // amount minus a 256-byte safety margin.
+    // Stack health monitoring — three layers:
+    //   1. One-shot 60s baseline log (initial usage after all code paths hit).
+    //   2. Periodic hourly re-log (catches slow growth under sustained load).
+    //   3. Per-second critical-low check (toasts if any task is near overflow).
+    //
+    // Watermark values are bytes of *unused* stack. Once under STACK_CRITICAL_BYTES,
+    // the task is one bad call away from corrupting whatever sits below its stack —
+    // typically another task's stack or FreeRTOS internal state.
     {
-        static bool stack_reported = false;
-        if (!stack_reported && millis() > 60000) {
-            stack_reported = true;
-            UBaseType_t scan_hw = uxTaskGetStackHighWaterMark(ScannerTaskHandle);
-            UBaseType_t gps_hw  = uxTaskGetStackHighWaterMark(GPSTaskHandle);
-            UBaseType_t ble_hw  = BLEWorkerHandle ? uxTaskGetStackHighWaterMark(BLEWorkerHandle) : 0;
-            UBaseType_t led_hw  = LedTaskHandle ? uxTaskGetStackHighWaterMark(LedTaskHandle) : 0;
-            UBaseType_t loop_hw = uxTaskGetStackHighWaterMark(NULL);  // NULL = calling task (loop)
-            Serial.printf("[STACK] High-water marks (bytes remaining):\n");
-            Serial.printf("  Scanner: %u / 3072\n", (unsigned)scan_hw);
-            Serial.printf("  GPS:     %u / 2560\n", (unsigned)gps_hw);
-            Serial.printf("  BLE:     %u / 4096\n", (unsigned)ble_hw);
-            Serial.printf("  LED:     %u / 2048\n", (unsigned)led_hw);
-            Serial.printf("  Loop:    %u / 8192\n", (unsigned)loop_hw);
+        static const UBaseType_t STACK_CRITICAL_BYTES = 256;
+        static const unsigned long STACK_REPORT_INTERVAL_MS = 60UL * 60UL * 1000UL;
+        static const unsigned long STACK_CRITICAL_CHECK_MS  = 1000UL;
+        static const unsigned long STACK_TOAST_COOLDOWN_MS  = 60UL * 1000UL;
+
+        static bool stack_baseline_reported = false;
+        static unsigned long stack_last_report_ms = 0;
+        static unsigned long stack_last_critical_check_ms = 0;
+        static unsigned long stack_last_toast_ms[5] = {0};
+
+        unsigned long stack_now = millis();
+
+        auto gather_watermarks = [&](UBaseType_t out[5]) {
+            out[0] = ScannerTaskHandle ? uxTaskGetStackHighWaterMark(ScannerTaskHandle) : (UBaseType_t)-1;
+            out[1] = GPSTaskHandle     ? uxTaskGetStackHighWaterMark(GPSTaskHandle)     : (UBaseType_t)-1;
+            out[2] = BLEWorkerHandle   ? uxTaskGetStackHighWaterMark(BLEWorkerHandle)   : (UBaseType_t)-1;
+            out[3] = LedTaskHandle     ? uxTaskGetStackHighWaterMark(LedTaskHandle)     : (UBaseType_t)-1;
+            out[4] = uxTaskGetStackHighWaterMark(NULL);
+        };
+
+        auto log_watermarks = [&](const char* tag, const UBaseType_t hw[5]) {
+            Serial.printf("[STACK] %s — bytes remaining:\n", tag);
+            Serial.printf("  Scanner: %u / 2048\n", (unsigned)hw[0]);
+            Serial.printf("  GPS:     %u / 2048\n", (unsigned)hw[1]);
+            Serial.printf("  BLE:     %u / 2752\n", (unsigned)hw[2]);
+            Serial.printf("  LED:     %u / 1536\n", (unsigned)hw[3]);
+            Serial.printf("  Loop:    %u / 7168\n", (unsigned)hw[4]);
+        };
+
+        // Layer 1: baseline log at 60 seconds.
+        if (!stack_baseline_reported && stack_now > 60000) {
+            stack_baseline_reported = true;
+            UBaseType_t hw[5];
+            gather_watermarks(hw);
+            log_watermarks("baseline @ 60s", hw);
             Serial.printf("[STACK] Safe to reduce any task where remaining > 512 bytes.\n");
             Serial.printf("  Recommended: new_stack = current - (remaining - 256)\n");
+            stack_last_report_ms = stack_now;
+        }
+
+        // Layer 2: periodic re-log every hour after baseline.
+        if (stack_baseline_reported &&
+            (stack_now - stack_last_report_ms) >= STACK_REPORT_INTERVAL_MS) {
+            stack_last_report_ms = stack_now;
+            UBaseType_t hw[5];
+            gather_watermarks(hw);
+            log_watermarks("hourly check", hw);
+        }
+
+        // Layer 3: critical-low check every second. Five register reads — negligible cost.
+        if ((stack_now - stack_last_critical_check_ms) >= STACK_CRITICAL_CHECK_MS) {
+            stack_last_critical_check_ms = stack_now;
+            UBaseType_t hw[5];
+            gather_watermarks(hw);
+            static const char* task_names[5] = { "SCANNER", "GPS", "BLE", "LED", "LOOP" };
+            for (int i = 0; i < 5; i++) {
+                if (hw[i] == (UBaseType_t)-1) continue;
+                if (hw[i] < STACK_CRITICAL_BYTES) {
+                    Serial.printf("[STACK] CRITICAL: %s task has %u bytes free\n",
+                                  task_names[i], (unsigned)hw[i]);
+                    if ((stack_now - stack_last_toast_ms[i]) >= STACK_TOAST_COOLDOWN_MS) {
+                        stack_last_toast_ms[i] = stack_now;
+                        char toast_buf[TOAST_TEXT_LEN];
+                        snprintf(toast_buf, sizeof(toast_buf),
+                                 "STACK LOW: %s %uB", task_names[i], (unsigned)hw[i]);
+                        set_toast_direct(toast_buf, TOAST_WARNING, false);
+                    }
+                }
+            }
         }
     }
 
@@ -6875,31 +10417,66 @@ void loop() {
         size_t free_heap = esp_get_free_heap_size();
         static size_t min_heap_seen = 999999;
         if (free_heap < min_heap_seen) min_heap_seen = free_heap;
+        if (free_heap < 3000) {
+            Serial.printf("[HEAP] FATAL: %u bytes free — restarting\n", (unsigned)free_heap);
+            delay(100);
+            ESP.restart();
+        }
         if (free_heap < 6000) {
             static unsigned long last_heap_warn = 0;
             if (millis() - last_heap_warn > 30000) {
                 Serial.printf("[HEAP] CRITICAL: %u bytes free (min: %u)\n",
                               (unsigned)free_heap, (unsigned)min_heap_seen);
-                set_toast_direct("LOW MEMORY", CAUTION_COLOR);
+                set_toast_direct("LOW MEMORY", TOAST_WARNING, false);
                 last_heap_warn = millis();
+            }
+        }
+        size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        if (largest_block < 2048) {
+            static unsigned long last_frag_log = 0;
+            if (millis() - last_frag_log > 60000) {
+                last_frag_log = millis();
+                Serial.printf("[HEAP] Fragmented: largest block %u bytes (free: %u)\n",
+                              (unsigned)largest_block, (unsigned)free_heap);
             }
         }
     }
 
+    if (pending_delete_count > 0 && pending_delete_dirty_ms != 0 &&
+        (millis() - pending_delete_dirty_ms) > 5000)
+        flush_pending_deletes();
+
     process_wifi_event_queue();
     feed_commit_pending();
+    update_channel_histogram();
+
+    // Gap-fill: push a floor-level sample when the target is silent so the
+    // trace curve drops rather than freezing at the last reading.
+    if (signal_active) {
+        unsigned long now = millis();
+        if ((now - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            if (signal_active && (millis() - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
+                sig_trace[sig_trace_head].rssi = (int8_t)RSSI_VIS_FLOOR;
+                sig_trace_head = (sig_trace_head + 1) % SIG_TRACE_SIZE;
+                if (sig_trace_count < SIG_TRACE_SIZE) sig_trace_count++;
+                sig_trace_last_sample = millis();
+            }
+            xSemaphoreGiveRecursive(dataMutex);
+        }
+    }
     if (wdt_subscribed) esp_task_wdt_reset();
 
     int conf_snapshot = 0;
     int src_snapshot = 0;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     if (trigger_alarm_confidence >= 50) {
         conf_snapshot = trigger_alarm_confidence;
         src_snapshot = trigger_alarm_source;
     }
     trigger_alarm_confidence = 0;
     trigger_alarm_source = 0;
-    xSemaphoreGive(dataMutex);
+    xSemaphoreGiveRecursive(dataMutex);
 
     if (conf_snapshot >= 50) {
         play_escalated_alarm(conf_snapshot, src_snapshot);
@@ -6915,15 +10492,17 @@ void loop() {
             // (often a UI click or alarm chime) doesn't hit a DMA assertion.
             M5Cardputer.Speaker.stop();
         }
-        if (show_menu) {
-            show_menu = false;
-            draw_current_screen();
-            spr.pushSprite(0, 0);
+        if (menu_open) {
+            menu_open = false;
+            screen_dirty = true;
         } else if (show_feed_expanded) {
             show_feed_expanded = false;
             draw_current_screen();
-            spr.pushSprite(0, 0);
-        } else {
+            render_frame();
+        } else if (!(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())) {
+            // Only advance on BtnA when no keyboard key is simultaneously
+            // pressed — prevents double-transition when BtnA fires
+            // alongside an arrow key on the Cardputer keyboard deck.
             int next_screen = current_screen + 1;
             int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
             if (next_screen >= NUM_SCREENS) next_screen = 0;
@@ -6940,20 +10519,26 @@ void loop() {
             // Same I2S wake as the BtnA path.
             M5Cardputer.Speaker.stop();
         }
+        if (title_card_active) {
+            title_card_active = false;
+            screen_dirty = true;
+        }
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         
         if (status.tab && !stealth_mode) {
             show_help_overlay = !show_help_overlay;
             if (show_help_overlay) {
+                show_feed_expanded = false;
                 help_ease_start = millis();
             }
-            draw_current_screen(); spr.pushSprite(0,0);
+            draw_current_screen(); render_frame();
         }
 
         // Tracks whether ENTER was already handled by the status.word loop
         // so the status.enter fallback below doesn't re-fire the same action
         // on firmwares that report ENTER in both places.
         bool enter_consumed = false;
+        bool screen_transitioned = false;
 
         for (auto c : status.word) {
 
@@ -6991,7 +10576,17 @@ void loop() {
                         }
                         wifi_config_editing = false;
                         wifi_config_cursor = 0;
-                    } else if (c >= 32 && c <= 126 && cur_len < max_len) {
+                    } else if (IS_KEY_LEFT(c)) {
+                        if (wifi_config_cursor > 0) wifi_config_cursor--;
+                    } else if (IS_KEY_RIGHT(c)) {
+                        if (wifi_config_cursor < cur_len) wifi_config_cursor++;
+                    } else if (IS_KEY_UP(c)) {
+                        wifi_config_cursor = 0;
+                    } else if (IS_KEY_DOWN(c)) {
+                        wifi_config_cursor = cur_len;
+                    } else if (c >= 32 && c <= 126 && cur_len < max_len
+                               && !IS_KEY_UP(c) && !IS_KEY_DOWN(c)
+                               && !IS_KEY_LEFT(c) && !IS_KEY_RIGHT(c)) {
                         // Insert at cursor
                         for (int i = cur_len + 1; i > wifi_config_cursor; i--) {
                             buf[i] = buf[i - 1];
@@ -7002,24 +10597,24 @@ void loop() {
                     // DEL handled in status.del block below
                 } else {
                     // Navigation mode — arrow keys move between fields
-                    if (c == ';') {
+                    if (IS_KEY_UP(c)) {
                         wifi_config_field--;
                         if (wifi_config_field < 0) wifi_config_field = 0;
                         M5Cardputer.Speaker.tone(660, 5);
-                    } else if (c == '.') {
+                    } else if (IS_KEY_DOWN(c)) {
                         wifi_config_field++;
                         if (wifi_config_field > 3) wifi_config_field = 3;
+                        M5Cardputer.Speaker.tone(660, 5);
+                    } else if (c == 's' && wifi_config_field == 1) {
+                        // Toggle plaintext reveal of the password field.
+                        wifi_config_show_pass = !wifi_config_show_pass;
                         M5Cardputer.Speaker.tone(660, 5);
                     } else if (c == '\n' || c == '\r') {
                         if (wifi_config_field == 0 || wifi_config_field == 1) {
                             wifi_config_editing = true;
                             if (wifi_config_field == 0) {
-                                strncpy(wifi_config_ssid_buf, export_ssid, sizeof(wifi_config_ssid_buf) - 1);
-                                wifi_config_ssid_buf[sizeof(wifi_config_ssid_buf) - 1] = '\0';
                                 wifi_config_cursor = strlen(wifi_config_ssid_buf);
                             } else {
-                                strncpy(wifi_config_pass_buf, export_pass, sizeof(wifi_config_pass_buf) - 1);
-                                wifi_config_pass_buf[sizeof(wifi_config_pass_buf) - 1] = '\0';
                                 wifi_config_cursor = strlen(wifi_config_pass_buf);
                             }
                             M5Cardputer.Speaker.tone(660, 5);
@@ -7031,8 +10626,9 @@ void loop() {
                             export_pass[sizeof(export_pass) - 1] = '\0';
                             save_wifi_credentials();
                             if (!persist_in_flight) schedule_persist();
-                            set_toast_direct("WIFI SAVED", ACCENT_COLOR);
+                            set_toast_direct("WIFI SAVED", TOAST_SUCCESS);
                             wifi_config_open = false;
+                            wifi_config_show_pass = false;  // never persist plaintext reveal
                         } else if (wifi_config_field == 3) {
                             // Clear
                             export_ssid[0] = '\0';
@@ -7041,57 +10637,61 @@ void loop() {
                             wifi_config_pass_buf[0] = '\0';
                             save_wifi_credentials();
                             if (!persist_in_flight) schedule_persist();
-                            set_toast_direct("WIFI CLEARED", CAUTION_COLOR);
+                            set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
                             wifi_config_open = false;
+                            wifi_config_show_pass = false;  // never persist plaintext reveal
                         }
                     } else if (c == 0x1B) {
                         wifi_config_open = false;
+                        wifi_config_show_pass = false;  // never persist plaintext reveal
                     }
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
                 continue;  // swallow all keys while wifi config is open
             }
 
-            // ── Menu input intercept — when menu is open, swallow nav keys ──
-            // ; is up-arrow, . is down-arrow on the M5Cardputer keyboard.
-            if (show_menu) {
-                if (c == ';') {
-                    int prev = menu_selected;
-                    menu_selected--;
-                    if (menu_selected < 0) menu_selected = 0;
-                    if (menu_selected != prev) menu_click();
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (c == '.') {
-                    int prev = menu_selected;
-                    menu_selected++;
-                    if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
-                    if (menu_selected != prev) menu_click();
-                    draw_current_screen(); spr.pushSprite(0, 0);
-                } else if (c == '\n' || c == '\r') {
+            // ── Menu navigation — swallow all keys while menu is open ──
+            if (menu_open) {
+                if (IS_KEY_UP(c)) {
+                    menu_selected = (menu_selected - 1 + MENU_ITEM_COUNT) % MENU_ITEM_COUNT;
                     menu_click();
+                } else if (IS_KEY_DOWN(c)) {
+                    menu_selected = (menu_selected + 1) % MENU_ITEM_COUNT;
+                    menu_click();
+                } else if (c == '\n' || c == '\r') {
+                    menu_open = false;
                     handle_menu_select();
-                } else if (c == 0x1B || c == 'm') {
-                    show_menu = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                } else if (c == 0x08 || c == 0x7F || c == 0x1B || c == 'm' || IS_KEY_LEFT(c)) {
+                    menu_open = false;
+                    screen_dirty = true;
                 }
-                continue;  // swallow all keys while menu is open
+                continue;  // swallow ALL keys while menu is open
             }
+
+
 
             if (c == 0x1B && !stealth_mode) {  // ASCII Escape
                 // Priority order: close overlays first, then navigate home.
+                if (menu_open) {
+                    menu_open = false;
+                    screen_dirty = true;
+                    continue;
+                }
                 if (show_feed_expanded) {
                     show_feed_expanded = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (show_help_overlay) {
                     show_help_overlay = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (current_screen == 2 && hist_detail_open) {
+                    hist_delete_confirming = false;
                     hist_detail_open = false;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    screen_dirty = true;
+                    draw_current_screen(); render_frame();
                     continue;
                 }
                 if (current_screen != 0) {
@@ -7102,58 +10702,152 @@ void loop() {
             }
             else if (c == 'm') {
                 if (!stealth_mode) {
-                    show_menu = !show_menu;
-                    if (show_menu) {
-                        menu_open_ms = millis();
-                        menu_highlight_init = false;
-                        menu_scroll_offset = 0;
+                    menu_open = !menu_open;
+                    if (menu_open) {
                         show_feed_expanded = false;
-                        show_help_overlay = false;
+                        menu_open_ms = millis();
+                        menu_scroll_offset = 0;
+                        menu_scroll_y_f    = 0.0f;
+                        menu_last_frame_ms = 0;
+                        menu_sel_y_seeded  = false;
+                        menu_click();
                     }
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    screen_dirty = true;
                 }
             }
             else if (c == '`') {
                 if (is_muted) {
-                    // Unmute — restore to a reasonable default if volume was zeroed
                     is_muted = false;
                     if (current_volume == 0) current_volume = 75;
                     M5Cardputer.Speaker.setVolume(current_volume);
                     beep(600, 50);
+                    set_toast_direct("UNMUTED", TOAST_SUCCESS);
                 } else {
-                    // Mute — zero out volume
                     is_muted = true;
                     current_volume = 0;
                     M5Cardputer.Speaker.setVolume(0);
+                    set_toast_direct("MUTED", TOAST_NEUTRAL);
                 }
-                draw_current_screen(); spr.pushSprite(0,0);
+                screen_dirty = true;
             }
-            else if (c == ';') {
-                // Up arrow — context-dependent scroll
+            else if (IS_KEY_UP(c)) {
+                if (show_feed_expanded) {
+                    if (feed_expanded_selected > 0) feed_expanded_selected--;
+                    draw_current_screen(); render_frame();
+                    continue;
+                }
                 if (current_screen == 2) {
-                    history_selected_idx--;
-                    if (history_selected_idx < 0) history_selected_idx = 0;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    if (hist_detail_open) { /* no nav while detail is open */ }
+                    else {
+                        if (history_selected_idx <= 0) {
+                            if (!screen_transitioned) {
+                                int prev = current_screen - 1;
+                                if (prev < 0) prev = NUM_SCREENS - 1;
+                                transition_screen(prev, -1);
+                                screen_transitioned = true;
+                            }
+                        } else {
+                            history_selected_idx--;
+                            if (history_selected_idx < history_scroll_offset)
+                                history_scroll_offset = history_selected_idx;
+                            draw_current_screen(); render_frame();
+                        }
+                    }
                 } else if (current_screen == 4) {
-                    device_info_scroll -= 12;
-                    if (device_info_scroll < 0) device_info_scroll = 0;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    if (stats_scroll_target <= 0) {
+                        if (!screen_transitioned) {
+                            int prev = current_screen - 1;
+                            if (prev < 0) prev = NUM_SCREENS - 1;
+                            transition_screen(prev, -1);
+                            screen_transitioned = true;
+                        }
+                    } else {
+                        stats_scroll_target -= STATS_SCROLL_STEP;
+                        if (stats_scroll_target < 0) stats_scroll_target = 0;
+                        screen_dirty = true;
+                    }
+                } else if (!stealth_mode && !screen_transitioned) {
+                    int prev = current_screen - 1;
+                    int d = (prev < 0) ? 1 : -1;
+                    if (prev < 0) prev = NUM_SCREENS - 1;
+                    transition_screen(prev, d);
+                    screen_transitioned = true;
                 }
             }
-            else if (c == '.') {
-                // Down arrow — context-dependent scroll
+            else if (IS_KEY_DOWN(c)) {
+                if (show_feed_expanded) {
+                    int max_sel = min(scan_local_count, 6) - 1;
+                    if (max_sel < 0) max_sel = 0;
+                    if (feed_expanded_selected < max_sel) feed_expanded_selected++;
+                    draw_current_screen(); render_frame();
+                    continue;
+                }
                 if (current_screen == 2) {
-                    int hist_total = sd_available ? sd_hist_count : capture_history_count;
-                    history_selected_idx++;
-                    if (history_selected_idx >= hist_total) history_selected_idx = max(0, hist_total - 1);
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    if (hist_detail_open) { /* no nav while detail is open */ }
+                    else {
+                        int hist_total = sd_available ? sd_hist_count : capture_history_count;
+                        if (history_selected_idx >= hist_total - 1) {
+                            if (!screen_transitioned) {
+                                int next = current_screen + 1;
+                                if (next >= NUM_SCREENS) next = 0;
+                                transition_screen(next, 1);
+                                screen_transitioned = true;
+                            }
+                        } else {
+                            history_selected_idx++;
+                            if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+                                history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                            draw_current_screen(); render_frame();
+                        }
+                    }
                 } else if (current_screen == 4) {
-                    int visible_h = DISP_H - 18;
-                    int max_scroll = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
-                    if (max_scroll < 0) max_scroll = 0;
-                    device_info_scroll += 12;
-                    if (device_info_scroll > max_scroll) device_info_scroll = max_scroll;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    if (stats_scroll_target >= STATS_MAX_SCROLL) {
+                        if (!screen_transitioned) {
+                            int next = current_screen + 1;
+                            if (next >= NUM_SCREENS) next = 0;
+                            transition_screen(next, 1);
+                            screen_transitioned = true;
+                        }
+                    } else {
+                        stats_scroll_target += STATS_SCROLL_STEP;
+                        if (stats_scroll_target > STATS_MAX_SCROLL)
+                            stats_scroll_target = STATS_MAX_SCROLL;
+                        screen_dirty = true;
+                    }
+                } else if (!stealth_mode && !screen_transitioned) {
+                    int next = current_screen + 1;
+                    int d = (next >= NUM_SCREENS) ? -1 : 1;
+                    if (next >= NUM_SCREENS) next = 0;
+                    transition_screen(next, d);
+                    screen_transitioned = true;
+                }
+            }
+            else if (IS_KEY_LEFT(c)) {
+                if (show_feed_expanded) {
+                    show_feed_expanded = false;
+                    draw_current_screen(); render_frame();
+                    continue;
+                }
+                if (!stealth_mode && !screen_transitioned) {
+                    int prev = current_screen - 1;
+                    int d = (prev < 0) ? 1 : -1;
+                    if (prev < 0) prev = NUM_SCREENS - 1;
+                    transition_screen(prev, d);
+                    screen_transitioned = true;
+                }
+            }
+            else if (IS_KEY_RIGHT(c)) {
+                if (show_feed_expanded) {
+                    show_feed_expanded = false;
+                    draw_current_screen(); render_frame();
+                    continue;
+                }
+                if (!stealth_mode && !screen_transitioned) {
+                    int next = current_screen + 1;
+                    int d = (next >= NUM_SCREENS) ? -1 : 1;
+                    if (next >= NUM_SCREENS) next = 0;
+                    transition_screen(next, d);
+                    screen_transitioned = true;
                 }
             }
             else if (c == '-') {
@@ -7167,7 +10861,7 @@ void loop() {
                     unsigned long el = millis() - vol_overlay_start;
                     if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
             }
             else if (c == '+' || c == '=') {
                 // Volume up
@@ -7180,71 +10874,142 @@ void loop() {
                     unsigned long el = millis() - vol_overlay_start;
                     if (el >= 120 && el <= 1380) vol_overlay_start = millis() - 120;
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
             }
+            else if (c == 'v') {
+                if (!stealth_mode && current_screen == 0) {
+                    int prev_mode = scanner_viz_mode;
+                    scanner_viz_mode = (scanner_viz_mode + 1) % SCANNER_VIZ_COUNT;
+                    screen_dirty = true;
+                    menu_click();
+
+                }
+            }
+            else if (c == 'd') {
+                if (!stealth_mode && current_screen == 2 && hist_detail_open) {
+                    if (hist_delete_confirming) {
+                        // Second press of 'd' also confirms (alternative to ENTER)
+                        perform_detection_delete(history_selected_idx);
+                        hist_delete_confirming = false;
+                        hist_detail_open       = false;
+                    } else {
+                        hist_delete_confirming = true;
+                    }
+                    screen_dirty = true;
+                    draw_current_screen(); render_frame();
+                }
+            }
+            else if (c == 'w') {
+                if (!stealth_mode && current_screen == 2 && hist_detail_open && !hist_delete_confirming) {
+                    int hist_total = sd_available ? sd_hist_count : capture_history_count;
+                    if (hist_total > 0) {
+                        const char* mac_to_wl = "";
+                        int idx = history_selected_idx;
+                        if (sd_available && idx < sd_hist_count)
+                            mac_to_wl = sd_hist[idx].mac;
+                        else if (idx < capture_history_count)
+                            mac_to_wl = capture_history[idx].mac;
+
+                        if (whitelist_add(mac_to_wl)) {
+                            save_whitelist();
+                            char wl_toast[TOAST_TEXT_LEN];
+                            snprintf(wl_toast, sizeof(wl_toast), "WHITELISTED %d/%d", mac_whitelist_count, MAX_WHITELIST);
+                            set_toast_direct(wl_toast, TOAST_SUCCESS);
+                        } else if (is_mac_whitelisted(mac_to_wl)) {
+                            set_toast_direct("ALREADY WHITELISTED", TOAST_NEUTRAL);
+                        } else {
+                            set_toast_direct("WHITELIST FULL", TOAST_WARNING, false);
+                        }
+                        screen_dirty = true;
+                    }
+                }
+            }
+#if DEBUG_KEYS
             else if (c == 'x') {
                 if (!stealth_mode) {
                     static bool sim_wifi = true;
                     char fake_mac[18];
                     snprintf(fake_mac, sizeof(fake_mac), "00:11:22:33:%02X:%02X", random(0, 255), random(0, 255));
-                    
+
                     if (sim_wifi) {
                         log_detection("SIMULATION", "WIFI", random(-80, -30), fake_mac, "Test_WiFi", 6, 0, "Beacon", "manual_test", 100, 1);
-                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                         session_flock_wifi--; session_wifi--; lifetime_wifi--;
                         lifetime_flock_total--;
-                        xSemaphoreGive(dataMutex);
+                        xSemaphoreGiveRecursive(dataMutex);
                     } else {
                         log_detection("SIMULATION", "BLE", random(-90, -40), fake_mac, "Test_BLE", 0, 0, "Adv", "manual_test", 100, 1);
-                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                         session_flock_ble--; session_ble--; lifetime_ble--;
                         lifetime_flock_total--;
-                        xSemaphoreGive(dataMutex);
+                        xSemaphoreGiveRecursive(dataMutex);
                     }
                     // Set alarm trigger under mutex — both fields together,
                     // matching the producer pattern in process_wifi_event_queue
                     // and ble_worker_task.
-                    xSemaphoreTake(dataMutex, portMAX_DELAY);
+                    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                     trigger_alarm_confidence = 100;
                     trigger_alarm_source = sim_wifi ? 0 : 1;  // 0=WiFi, 1=BLE
-                    xSemaphoreGive(dataMutex);
+                    xSemaphoreGiveRecursive(dataMutex);
 
                     sim_wifi = !sim_wifi;
                 }
             }
-            else if (c == 't') { 
-                if (!stealth_mode && capture_history_count > 0) {
+#endif // DEBUG_KEYS
+            else if (c == 't') {
+                if (!stealth_mode && show_feed_expanded) {
+                    if (scan_local_count > 0 && feed_expanded_selected < scan_local_count) {
+                        int idx = (scan_local_head - feed_expanded_selected + FEED_SIZE * 2) % FEED_SIZE;
+                        FeedEntry& fe = scan_local_feed[idx];
+                        if (fe.mac[0] != '\0') {
+                            const char* type_str = fe.is_flock
+                                ? (fe.proto == 0 ? "FLOCK_WIFI" : "FLOCK_BLE")
+                                : (fe.proto == 0 ? "WIFI" : "BLE");
+                            signal_start(fe.mac, fe.name, type_str, 0);
+                            trigger_toast("TARGET", fe.name, 0);
+                            show_feed_expanded = false;
+                            transition_screen(1, 1);
+                        }
+                    }
+                } else if (!stealth_mode && current_screen == 2 && hist_detail_open) {
+                    // Target the detection currently shown in detail view
+                    const char* t_mac = "";
+                    const char* t_name = "";
+                    const char* t_type = "";
+                    int t_id = 0;
+                    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                    int idx = history_selected_idx;
+                    if (sd_available && idx < sd_hist_count) {
+                        t_mac = sd_hist[idx].mac; t_name = sd_hist[idx].name;
+                        t_type = sd_hist[idx].type; t_id = sd_hist[idx].id;
+                    } else if (idx < capture_history_count) {
+                        t_mac = capture_history[idx].mac; t_name = capture_history[idx].name;
+                        t_type = capture_history[idx].type; t_id = capture_history[idx].id;
+                    }
+                    xSemaphoreGiveRecursive(dataMutex);
+                    if (strlen(t_mac) > 0) {
+                        signal_start(t_mac, t_name, t_type, t_id);
+                        trigger_toast("TARGET", t_name, 0);
+                        hist_detail_open = false;
+                        transition_screen(1, 1);
+                    }
+                } else if (!stealth_mode && capture_history_count > 0) {
                     static int target_select_idx = -1;
-                    xSemaphoreTake(dataMutex, portMAX_DELAY);
+                    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
                     int current_hist_count = capture_history_count;
                     target_select_idx = (target_select_idx + 1) % current_hist_count;
                     char t_mac[18];  strncpy(t_mac,  capture_history[target_select_idx].mac,  17); t_mac[17]  = '\0';
                     char t_name[65]; strncpy(t_name, capture_history[target_select_idx].name, 64); t_name[64] = '\0';
                     char t_type[16]; strncpy(t_type, capture_history[target_select_idx].type, 15); t_type[15] = '\0';
                     int t_conf = capture_history[target_select_idx].confidence;
-                    xSemaphoreGive(dataMutex);
+                    int t_id   = capture_history[target_select_idx].id;
+                    xSemaphoreGiveRecursive(dataMutex);
 
-                    locator_start(t_mac, t_name, t_type);
+                    signal_start(t_mac, t_name, t_type, t_id);
                     trigger_toast("TARGET", t_name, t_conf);
                     transition_screen(1, 1);
                 } else if (!stealth_mode) {
                     trigger_toast("INFO", "No targets yet", 0);
-                }
-            }
-            else if (c == '/') {
-                if (!stealth_mode) {
-                    int next = current_screen + 1;
-                    int d = (next >= NUM_SCREENS) ? -1 : 1;
-                    if (next >= NUM_SCREENS) next = 0;
-                    transition_screen(next, d);
-                }
-            }
-            else if (c == ',') {
-                if (!stealth_mode) {
-                    int prev = current_screen - 1;
-                    int d = (prev < 0) ? 1 : -1;
-                    if (prev < 0) prev = NUM_SCREENS - 1;
-                    transition_screen(prev, d);
                 }
             }
             else if (c == 'b') {
@@ -7257,23 +11022,29 @@ void loop() {
                     } else {
                         led_breathing_on = true;
                     }
+                    schedule_persist();
                 }
             }
-            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); spr.pushSprite(0,0); } }
+            else if (c == 's') { stealth_mode = !stealth_mode; if (stealth_mode) { M5Cardputer.Display.setBrightness(5); } else { M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]); draw_current_screen(); render_frame(); } schedule_persist(); }
             else if (c == 'n') {
-                if (current_screen == 1) {
-                    // Locator screen: toggle Pointing North mode
-                    north_mode = !north_mode;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                if (!stealth_mode) {
+                    night_mode = !night_mode;
+                    apply_color_palette();
+                    screen_dirty = true;
+                    schedule_persist();
+                    if (night_mode) {
+                        set_toast_direct("NIGHT MODE", TOAST_SUCCESS);
+                    } else {
+                        set_toast_direct("DAY MODE", TOAST_NEUTRAL);
+                    }
                 }
-                // On other screens, 'n' is currently a no-op.
             }
             else if (c == 'l') {
-                // Instant locator stop from any screen. No-op when inactive.
-                if (locator_active) {
-                    locator_stop();
-                    trigger_toast("INFO", "Locator stopped", 0);
+                if (signal_active && !stealth_mode) {
+                    signal_stop();
+                    trigger_toast("SIGNAL", "Target cleared", 0);
                     beep(500, 60);
+                    screen_dirty = true;
                 }
             }
             else if (c == '\\') {
@@ -7309,88 +11080,38 @@ void loop() {
                     if (show_feed_expanded) {
                         show_feed_expanded = false;
                     } else {
-                        if (current_screen != 0) transition_screen(0, -1);
+                        if (current_screen != 0 && current_screen != 1) transition_screen(0, -1);
+                        menu_open        = false;
+                        show_help_overlay = false;
+                        wifi_config_open  = false;
                         show_feed_expanded = true;
                         feed_expand_ms = millis();
+                        feed_expanded_selected = 0;
                     }
                     draw_current_screen();
-                    spr.pushSprite(0, 0);
+                    render_frame();
                 }
             }
             else if (c == '\n' || c == '\r') {
                 if (!stealth_mode && current_screen == 2) {
                     int hist_total = sd_available ? sd_hist_count : capture_history_count;
                     if (hist_total > 0) {
-                        hist_detail_open = !hist_detail_open;
-                        draw_current_screen(); spr.pushSprite(0, 0);
+                        if (hist_detail_open && hist_delete_confirming) {
+                            perform_detection_delete(history_selected_idx);
+                            hist_delete_confirming = false;
+                            hist_detail_open       = false;
+                        } else if (!hist_detail_open) {
+                            hist_detail_open    = true;
+                            hist_detail_open_ms = millis();
+                        } else {
+                            hist_detail_open       = false;
+                            hist_delete_confirming = false;
+                        }
+                        screen_dirty = true;
+                        draw_current_screen(); render_frame();
                     }
                 }
                 // ENTER on other screens is a no-op (menu handles navigation)
-            }
-        }
-
-        // ── Key-hold repeat for the ; / . arrow keys ──
-        // The M5Cardputer keyboard doesn't auto-repeat; we track hold state
-        // ourselves so a held arrow keeps scrolling at REPEAT_INTERVAL after
-        // a HOLD_DELAY initial wait.
-        {
-            static unsigned long arrow_hold_start = 0;
-            static unsigned long arrow_last_repeat = 0;
-            static char arrow_held_key = 0;
-            const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
-            const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
-
-            bool up_held = false, down_held = false;
-            for (auto c : status.word) {
-                if (c == ';') up_held = true;
-                if (c == '.') down_held = true;
-            }
-            char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
-
-            if (cur_arrow && cur_arrow == arrow_held_key) {
-                unsigned long hold_dur = millis() - arrow_hold_start;
-                if (hold_dur > HOLD_DELAY &&
-                    (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
-                    if (show_menu) {
-                        if (cur_arrow == ';') {
-                            menu_selected--;
-                            if (menu_selected < 0) menu_selected = 0;
-                        } else {
-                            menu_selected++;
-                            if (menu_selected >= MENU_ITEM_COUNT) menu_selected = MENU_ITEM_COUNT - 1;
-                        }
-                        draw_current_screen(); spr.pushSprite(0, 0);
-                    } else if (current_screen == 2) {
-                        if (cur_arrow == ';') {
-                            history_selected_idx--;
-                            if (history_selected_idx < 0) history_selected_idx = 0;
-                        } else {
-                            int ht = sd_available ? sd_hist_count : capture_history_count;
-                            history_selected_idx++;
-                            if (history_selected_idx >= ht) history_selected_idx = max(0, ht - 1);
-                        }
-                        draw_current_screen(); spr.pushSprite(0, 0);
-                    } else if (current_screen == 4) {
-                        int visible_h = DISP_H - 18;
-                        int ms = DEVICE_INFO_CONTENT_HEIGHT - visible_h;
-                        if (ms < 0) ms = 0;
-                        if (cur_arrow == ';') {
-                            device_info_scroll -= 12;
-                            if (device_info_scroll < 0) device_info_scroll = 0;
-                        } else {
-                            device_info_scroll += 12;
-                            if (device_info_scroll > ms) device_info_scroll = ms;
-                        }
-                        draw_current_screen(); spr.pushSprite(0, 0);
-                    }
-                    arrow_last_repeat = millis();
-                }
-            } else if (cur_arrow) {
-                arrow_held_key = cur_arrow;
-                arrow_hold_start = millis();
-                arrow_last_repeat = millis();
-            } else {
-                arrow_held_key = 0;
             }
         }
 
@@ -7399,14 +11120,62 @@ void loop() {
         // loop above didn't already act on it (firmwares that report ENTER
         // in both places would otherwise toggle every action twice).
         if (status.enter && !enter_consumed && !stealth_mode) {
-            if (show_menu) {
-                menu_click();
+            if (wifi_config_open) {
+                if (wifi_config_editing) {
+                    wifi_config_editing = false;
+                    menu_click();
+                } else {
+                    if (wifi_config_field == 0 || wifi_config_field == 1) {
+                        wifi_config_editing = true;
+                        if (wifi_config_field == 0) {
+                            wifi_config_cursor = strlen(wifi_config_ssid_buf);
+                        } else {
+                            wifi_config_cursor = strlen(wifi_config_pass_buf);
+                        }
+                        menu_click();
+                    } else if (wifi_config_field == 2) {
+                        strncpy(export_ssid, wifi_config_ssid_buf, sizeof(export_ssid) - 1);
+                        export_ssid[sizeof(export_ssid) - 1] = '\0';
+                        strncpy(export_pass, wifi_config_pass_buf, sizeof(export_pass) - 1);
+                        export_pass[sizeof(export_pass) - 1] = '\0';
+                        save_wifi_credentials();
+                        if (!persist_in_flight) schedule_persist();
+                        set_toast_direct("WIFI SAVED", TOAST_SUCCESS);
+                        wifi_config_open = false;
+                        wifi_config_show_pass = false;  // never persist plaintext reveal
+                    } else if (wifi_config_field == 3) {
+                        export_ssid[0] = '\0';
+                        export_pass[0] = '\0';
+                        wifi_config_ssid_buf[0] = '\0';
+                        wifi_config_pass_buf[0] = '\0';
+                        save_wifi_credentials();
+                        if (!persist_in_flight) schedule_persist();
+                        set_toast_direct("WIFI CLEARED", TOAST_WARNING, false);
+                        wifi_config_open = false;
+                        wifi_config_show_pass = false;  // never persist plaintext reveal
+                    }
+                }
+                draw_current_screen(); render_frame();
+            } else if (menu_open) {
+                menu_open = false;
                 handle_menu_select();
             } else if (current_screen == 2) {
                 int hist_total = sd_available ? sd_hist_count : capture_history_count;
                 if (hist_total > 0) {
-                    hist_detail_open = !hist_detail_open;
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    if (hist_detail_open && hist_delete_confirming) {
+                        // ENTER confirms delete
+                        perform_detection_delete(history_selected_idx);
+                        hist_delete_confirming = false;
+                        hist_detail_open       = false;
+                    } else if (!hist_detail_open) {
+                        hist_detail_open    = true;
+                        hist_detail_open_ms = millis();
+                    } else {
+                        hist_detail_open = false;
+                        hist_delete_confirming = false;
+                    }
+                    screen_dirty = true;
+                    draw_current_screen(); render_frame();
                 }
             }
         }
@@ -7424,39 +11193,122 @@ void loop() {
                         }
                         wifi_config_cursor--;
                     }
-                } else {
-                    wifi_config_open = false;
+                } else if (wifi_config_field <= 1) {
+                    // On a text field — enter editing mode and backspace the last char
+                    char* buf = (wifi_config_field == 0) ? wifi_config_ssid_buf : wifi_config_pass_buf;
+                    int cur_len = strlen(buf);
+                    if (cur_len > 0) {
+                        wifi_config_editing = true;
+                        wifi_config_cursor  = cur_len;
+                        buf[--wifi_config_cursor] = '\0';
+                    }
+                    // Empty field: no-op — use ESC to close
                 }
-                draw_current_screen(); spr.pushSprite(0, 0);
+                // DEL never closes the overlay; use ESC for that
+                draw_current_screen(); render_frame();
             } else if (show_feed_expanded) {
                 show_feed_expanded = false;
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
             } else if (show_help_overlay) {
                 show_help_overlay = false;
-                draw_current_screen(); spr.pushSprite(0, 0);
-            } else if (show_menu) {
-                show_menu = false;
-                draw_current_screen(); spr.pushSprite(0, 0);
+                draw_current_screen(); render_frame();
+            } else if (menu_open) {
+                menu_open = false;
+                screen_dirty = true;
             } else if (current_screen == 2 && hist_detail_open) {
+                hist_delete_confirming = false;
                 hist_detail_open = false;
-                draw_current_screen(); spr.pushSprite(0, 0);
+                screen_dirty = true;
+                draw_current_screen(); render_frame();
             } else if (current_screen != 0) {
                 // Nothing to close — go home to scanner
                 transition_screen(0, -1);
             }
         }
     }
+
     if (wdt_subscribed) esp_task_wdt_reset();
 
-    // Fire pending '\' single-press action if double-tap window expired
-    if (bs_pending_exists && millis() >= bs_pending_until) {
+    // ── Key-hold repeat for the ; / . arrow keys ──
+    // Runs OUTSIDE the isChange() block so it fires during sustained holds.
+    // isChange() is edge-triggered — only true on press/release transitions,
+    // not during a continuous hold. The repeat logic needs to run every
+    // loop iteration to detect when HOLD_DELAY has elapsed.
+    {
+        static unsigned long arrow_hold_start = 0;
+        static unsigned long arrow_last_repeat = 0;
+        static char arrow_held_key = 0;
+        const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
+        const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
+
+        bool up_held = false, down_held = false;
+        if (!menu_open && !wifi_config_open) {
+            Keyboard_Class::KeysState hold_st = M5Cardputer.Keyboard.keysState();
+            for (auto c : hold_st.word) {
+                if (IS_KEY_UP(c))   up_held   = true;
+                if (IS_KEY_DOWN(c)) down_held = true;
+            }
+        }
+        char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
+
+        if (cur_arrow && cur_arrow == arrow_held_key) {
+            unsigned long hold_dur = millis() - arrow_hold_start;
+            if (hold_dur > HOLD_DELAY &&
+                (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
+                if (current_screen == 2 && !hist_detail_open) {
+                    if (IS_KEY_UP(cur_arrow)) {
+                        if (history_selected_idx > 0) {
+                            history_selected_idx--;
+                            if (history_selected_idx < history_scroll_offset)
+                                history_scroll_offset = history_selected_idx;
+                        }
+                    } else {
+                        int ht = sd_available ? sd_hist_count : capture_history_count;
+                        if (history_selected_idx < ht - 1) {
+                            history_selected_idx++;
+                            if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+                                history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                        }
+                    }
+                    screen_dirty = true;
+                } else if (current_screen == 4) {
+                    if (IS_KEY_UP(cur_arrow)) {
+                        if (stats_scroll_target > 0) {
+                            stats_scroll_target -= STATS_SCROLL_STEP;
+                            if (stats_scroll_target < 0) stats_scroll_target = 0;
+                        }
+                    } else {
+                        if (stats_scroll_target < STATS_MAX_SCROLL) {
+                            stats_scroll_target += STATS_SCROLL_STEP;
+                            if (stats_scroll_target > STATS_MAX_SCROLL)
+                                stats_scroll_target = STATS_MAX_SCROLL;
+                        }
+                    }
+                    screen_dirty = true;
+                }
+                // LEFT/RIGHT omitted: screen transitions don't benefit from
+                // auto-repeat and would oscillate due to animation overlap.
+                arrow_last_repeat = millis();
+            }
+        } else if (cur_arrow) {
+            arrow_held_key = cur_arrow;
+            arrow_hold_start = millis();
+            arrow_last_repeat = millis();
+        } else {
+            arrow_held_key = 0;
+        }
+    }
+
+    // Fire pending '\' single-press action if double-tap window expired.
+    // Signed-diff compare handles the 49-day millis() wraparound edge case.
+    if (bs_pending_exists && (long)(millis() - bs_pending_until) >= 0) {
         bs_pending_exists = false;
         bs_pending_until = 0;
         led_breathing_on = !led_breathing_on;
         beep(led_breathing_on ? 800 : 400, 30);
     }
 
-    if (millis() - last_time_save >= 1000) { xSemaphoreTake(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGive(dataMutex); last_time_save = millis(); }
+    if (millis() - last_time_save >= 1000) { xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGiveRecursive(dataMutex); last_time_save = millis(); }
     if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) {
         // Only advance the gate when the spawn actually took. If heap was
         // too low to allocate the task stack, retry on the next loop tick
@@ -7466,19 +11318,58 @@ void loop() {
         }
     }
     rssi_track_expire();
+    if (take_data_mutex()) {
+        seen_mac_expire();
+        give_data_mutex();
+    }
 
     // Periodic BLE stack health restart — prevents NimBLE internal state
     // corruption that can build up during multi-hour continuous scanning.
-    if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
+    // Skip when export is active: NimBLE is already deinited then.
+    if (export_mode_active || export_connecting) {
+        last_ble_restart_ms = millis();  // skip this cycle
+    } else if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
         last_ble_restart_ms = millis();
-        // Suspend ScannerLoopTask first — without this, the Core 0 task can
-        // be inside pBLEScan->start()/isScanning() while we deinit the stack
-        // and free the underlying object, dereferencing a dangling pointer.
+
+        // 1. Stop scanning so the callback stops producing new events.
+        scanner_ready = false;
         if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
         if (pBLEScan) {
             pBLEScan->stop();
             pBLEScan->clearResults();
         }
+
+        // 2. Drain the BLE event queue so the worker doesn't pick up stale
+        //    slot indices after deinit.
+        xQueueReset(ble_event_queue);
+
+        // 3. Wait for any in-flight pool slot to finish. Timeout 500ms.
+        {
+            unsigned long drain_start = millis();
+            bool all_clear = false;
+            while ((millis() - drain_start) < 500) {
+                all_clear = true;
+                for (int i = 0; i < BLE_POOL_SIZE; i++) {
+                    if (__atomic_load_n(&ble_pool[i].in_use, __ATOMIC_ACQUIRE)) {
+                        all_clear = false;
+                        break;
+                    }
+                }
+                if (all_clear) break;
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+            }
+            if (!all_clear) {
+                Serial.println("[BLE] Warning: pool slots still in-use after drain timeout");
+                for (int i = 0; i < BLE_POOL_SIZE; i++) {
+                    __atomic_store_n(&ble_pool[i].in_use, 0u, __ATOMIC_RELEASE);
+                }
+            }
+        }
+
+        // 4. Reset write cursor so post-reinit callbacks start clean.
+        __atomic_store_n(&ble_pool_write, 0u, __ATOMIC_RELEASE);
+
+        // 5. Tear down and reinitialize the stack.
         NimBLEDevice::deinit(true);
         delay(100);
         NimBLEDevice::init("");
@@ -7487,9 +11378,10 @@ void loop() {
         pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
         pBLEScan->setActiveScan(false);
         apply_ble_scan_params();
-        pBLEScan->setMaxResults(0);  // see setup() — callback handles everything
+        pBLEScan->setMaxResults(0);
         last_ble_scan = millis();
         if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
+        scanner_ready = true;
         Serial.println("[BLE] Periodic stack restart completed");
     }
 
@@ -7497,92 +11389,32 @@ void loop() {
     sd_check_hotplug();
     if (wdt_subscribed) esp_task_wdt_reset();
 
-    // I2C bus health check — detect and recover from SDA stuck low.
-    // Only runs every 30s to avoid overhead. The TCA8418 keyboard controller
-    // is the primary I2C device; if it stops responding, the bus is likely hung.
-    {
-        static unsigned long last_i2c_check_ms = 0;
-        if (millis() - last_i2c_check_ms > 30000) {
-            last_i2c_check_ms = millis();
-
-            // Quick probe: try to read from the TCA8418 (address 0x34).
-            // A stuck bus will cause this to fail immediately.
-            Wire.beginTransmission(0x34);
-            uint8_t i2c_err = Wire.endTransmission();
-
-            if (i2c_err != 0) {
-                // Bus error — attempt recovery
-                Serial.printf("[I2C] Bus probe failed (err=%d), attempting recovery\n", i2c_err);
-                bool ok = i2c_bus_recover();
-                if (ok) {
-                    set_toast_direct("I2C RECOVERED", ACCENT_COLOR);
-                } else {
-                    set_toast_direct("I2C BUS FAULT", CAUTION_COLOR);
-                    // The 30-minute BLE restart will also reinitialize the bus.
-                    // If recovery fails here, the device is still functional for
-                    // WiFi detection — only keyboard input is affected.
-                }
-            }
-        }
-    }
-
     if (millis() - last_sd_flush_check >= 500) {
         last_sd_flush_check = millis(); 
         bool should_flush = false; 
         
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
         if (sd_write_count >= MAX_LOG_BUFFER || pcap_write_count >= MAX_PCAP_BUFFER ||
             ble_pcap_write_count >= MAX_PCAP_BUFFER ||
             (millis() - last_sd_flush > SD_FLUSH_INTERVAL &&
              (sd_write_count > 0 || pcap_write_count > 0 || ble_pcap_write_count > 0))) {
             should_flush = true;
         }
-        xSemaphoreGive(dataMutex); 
+        xSemaphoreGiveRecursive(dataMutex); 
         
         if (should_flush) flush_sd_buffer();
     }
     if (wdt_subscribed) esp_task_wdt_reset();
 
     {
-        bool need_update;
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        need_update = locator_active && locator_has_estimate;
-        if (need_update && gps.location.isValid() && gps.location.age() < 2000) {
-            double my_lat = gps.location.lat();
-            double my_lng = gps.location.lng();
-            double tgt_lat = locator_est_lat;
-            double tgt_lng = locator_est_lng;
-            xSemaphoreGive(dataMutex);
-
-            float dist = (float)haversine_m(my_lat, my_lng, tgt_lat, tgt_lng);
-            float brng = bearing_to(my_lat, my_lng, tgt_lat, tgt_lng);
-
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            locator_est_distance = dist;
-            locator_bearing = brng;
-            // Sample the distance into the trend history (every ~500ms)
-            unsigned long now_t = millis();
-            if (now_t - locator_last_trend_sample_ms > 500) {
-                locator_dist_history[locator_dist_history_head] = dist;
-                locator_dist_history_head = (locator_dist_history_head + 1) % LOC_TREND_SAMPLES;
-                if (locator_dist_history_count < LOC_TREND_SAMPLES) locator_dist_history_count++;
-                locator_last_trend_sample_ms = now_t;
-            }
-            xSemaphoreGive(dataMutex);
-        } else {
-            xSemaphoreGive(dataMutex);
-        }
-    }
-
-    {
         bool was_dirty = false;
         if (current_screen == 2 && !hist_detail_open) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             if (sd_hist_dirty) {
                 sd_hist_dirty = false;
                 was_dirty = true;
             }
-            xSemaphoreGive(dataMutex);
+            xSemaphoreGiveRecursive(dataMutex);
         }
         if (was_dirty) {
             // Same timed-take pattern — skip the load if PersistTask is busy;
@@ -7595,58 +11427,54 @@ void loop() {
         }
     }
 
-    if (locator_announce_pending) {
-        locator_announce_pending = false;
-        trigger_toast("INFO", "Estimate ready", 0);
-        if (!is_muted && !stealth_mode) {
-            xTaskCreate(LocatorChimeTask, "LocChime", 2048, NULL, 2, NULL);
+    // Recompute timezone from GPS every 5 minutes (handles driving across zones)
+    if (millis() - auto_tz_last_compute_ms > AUTO_TZ_INTERVAL_MS || !auto_tz_valid) {
+        bool tz_gps_ok = false;
+        double tz_lat = 0, tz_lng = 0;
+        int tz_year = 0, tz_month = 0, tz_day = 0;
+        if (take_data_mutex()) {
+            if (gps.location.isValid() && gps.location.age() < 5000 &&
+                gps.date.isValid() && gps.date.year() >= 2020) {
+                tz_lat   = gps.location.lat();
+                tz_lng   = gps.location.lng();
+                tz_year  = gps.date.year();
+                tz_month = gps.date.month();
+                tz_day   = gps.date.day();
+                tz_gps_ok = true;
+            }
+            give_data_mutex();
         }
+        if (tz_gps_ok) tz_compute(tz_lat, tz_lng, tz_year, tz_month, tz_day);
     }
 
     // Enter ambient mode after sustained idle
-    if (!ambient_mode && !stealth_mode && !toast_active && !locator_active && !export_mode_active &&
+    if (!ambient_mode && !stealth_mode && !toast_active && !signal_active && !export_mode_active &&
         (millis() - last_user_input_ms) > AMBIENT_TIMEOUT_MS) {
         ambient_mode = true;
+        show_feed_expanded = false;
         M5Cardputer.Display.setBrightness(AMBIENT_BRIGHTNESS);
     }
 
     // Exit ambient if conditions change from non-input sources
-    if (ambient_mode && (locator_active || export_mode_active || toast_active)) {
+    if (ambient_mode && (signal_active || export_mode_active || toast_active)) {
         ambient_mode = false;
         M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
     }
 
     if (ambient_mode) {
+        // Render the normal scanner screen at reduced framerate (~15 fps).
+        // Same layout, same feed, same viz — just dimmed via backlight.
         static unsigned long last_ambient_draw = 0;
-        static float amb_x = DISP_W / 2.0f, amb_y = DISP_H / 2.0f;
-        static float amb_vx = 0.7f, amb_vy = 0.5f;
         unsigned long now_amb = millis();
-        if (now_amb - last_ambient_draw > 33) {  // ~30fps
-            long det_total;
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            det_total = session_flock_wifi + session_flock_ble + session_raven;
-            xSemaphoreGive(dataMutex);
-
-            // Bounce the text block (approx 48px wide, 26px tall)
-            const int text_half_w = 24, text_half_h = 13;
-            amb_x += amb_vx;
-            amb_y += amb_vy;
-            if (amb_x - text_half_w < 2)  { amb_x = 2 + text_half_w;  amb_vx = fabsf(amb_vx); }
-            if (amb_x + text_half_w > DISP_W - 2) { amb_x = DISP_W - 2 - text_half_w; amb_vx = -fabsf(amb_vx); }
-            if (amb_y - text_half_h < 2)  { amb_y = 2 + text_half_h;  amb_vy = fabsf(amb_vy); }
-            if (amb_y + text_half_h > DISP_H - 2) { amb_y = DISP_H - 2 - text_half_h; amb_vy = -fabsf(amb_vy); }
-
-            spr.fillSprite(BG_COLOR);
-            char det_buf[16];
-            snprintf(det_buf, sizeof(det_buf), "%ld", det_total);
-            spr.setTextDatum(MC_DATUM);
-            spr.setTextColor(DIM_COLOR, BG_COLOR);
-            spr.setTextSize(3);
-            spr.drawString(det_buf, (int)amb_x, (int)amb_y - 6);
-            spr.setTextSize(1);
-            spr.drawString("DETECTIONS", (int)amb_x, (int)amb_y + 16);
-            spr.setTextDatum(TL_DATUM);
-            spr.pushSprite(0, 0);
+        if (now_amb - last_ambient_draw > 66) {
+            // Force scanner screen if user idled on another screen
+            if (current_screen != 0) {
+                current_screen = 0;
+                feed_anim_prev_head = -1;
+                feed_anim_shift_ms  = 0;
+            }
+            draw_current_screen();
+            render_frame();
             last_ambient_draw = now_amb;
         }
     } else if (stealth_mode) {
@@ -7656,22 +11484,79 @@ void loop() {
             spr.fillSprite(BG_COLOR);
             uint16_t s_col = lerp_col16(BG_COLOR, lgfx::color565(180, 30, 30), 0.6f);
             spr.setTextColor(s_col, BG_COLOR);
-            spr.setTextSize(1);
+            spr.setTextSize(TS_MICRO);
             spr.setCursor(DISP_W - 8, DISP_H - 9);
             spr.print("S");
-            spr.pushSprite(0, 0);
+            render_frame();
             last_stealth_draw = millis();
         }
     } else {
         static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
 
-        if (current_screen == 0 || current_screen == 1 || current_screen == 3 || show_vol_overlay || toast_active || (now - last_fast_anim < 30)) {
-            if (now - last_fast_anim >= 15) { draw_current_screen(); spr.pushSprite(0, 0); last_fast_anim = now; screen_dirty = false; }
+        // Screen 4 escalates to the fast path while the eased scroll position
+        // is still chasing its target — keeps the smooth scroll animation
+        // running at ~60fps without permanently promoting stats to fast path.
+        bool stats_scrolling = (current_screen == 4) &&
+            (fabsf(stats_scroll_y_f - (float)stats_scroll_target) > 0.5f);
+
+        // Same idea for per-character roll-ups: while any glyph anim is
+        // still in flight (within UI_ANIM_QUICK of its start), drive the
+        // fast path so the slide is actually animated frame-by-frame.
+        bool stats_rolling = false;
+        if (current_screen == 4) {
+            for (int i = 0; i < STATS_CARD_COUNT && !stats_rolling; i++) {
+                for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
+                    if (stats_char_anim[i][ci] != 0 &&
+                        (now - stats_char_anim[i][ci]) < UI_ANIM_QUICK) {
+                        stats_rolling = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Detections screen escalates while the selection ease is chasing
+        // its target or while the detail overlay open fade is in flight.
+        // (Close is instant — no animation to gate.)
+        bool hist_animating = false;
+        if (current_screen == 2) {
+            int hist_target_y = CONTENT_Y +
+                (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
+            bool sel_settling = fabsf(hist_sel_y_f - (float)hist_target_y) > 0.5f;
+            bool open_running = (hist_detail_open &&
+                                 hist_detail_open_ms != 0 &&
+                                 (now - hist_detail_open_ms) < UI_FADE_IN_MS + 30);
+            hist_animating = sel_settling || open_running;
+        }
+
+        if (menu_open ||
+            current_screen == 0 || current_screen == 1 || current_screen == 3 ||
+            show_vol_overlay || toast_active || title_card_active || stats_scrolling || stats_rolling ||
+            hist_animating ||
+            (now - last_fast_anim < 30)) {
+            // Stats screen caps at 30 fps to suppress the SPI/scan-line
+            // tearing that 60 fps pushes produced. Other animated screens
+            // stay at 60 fps where the artifact isn't visible.
+            unsigned long min_frame_ms = (current_screen == 4) ? 33 : 15;
+            if (now - last_fast_anim >= min_frame_ms) {
+                draw_current_screen();
+                render_frame();
+                last_fast_anim = now;
+                screen_dirty = false;
+            }
         }
         else {
+            // Screen 4 has a live SESSION timer. Mark dirty every slow-UI
+            // cycle (100ms) so the seconds digit updates within one tick of
+            // the actual boundary. Roll animation is gated by stats_rolling,
+            // so this doesn't promote stats to the fast path when idle.
+            if (current_screen == 4) {
+                screen_dirty = true;
+            }
             if (now - last_slow_ui >= 100) {
                 if (screen_dirty || toast_active) {
-                    draw_current_screen(); spr.pushSprite(0, 0);
+                    draw_current_screen();
+                    render_frame();
                     screen_dirty = false;
                 }
                 last_slow_ui = now;
