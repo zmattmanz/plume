@@ -1,5 +1,5 @@
 // ============================================================================
-// FLOCK FINDER v9.0-ADV — Tactical Edition (Build 2)
+// PLUME v1.0-beta
 // ============================================================================
 
 #include <M5Cardputer.h>
@@ -555,7 +555,7 @@ static inline unsigned long current_dedup_window_ms() {
 
 // Version strings — update BOTH when bumping.
 // Also update: CHANGELOG.md, README.md badge
-#define VERSION_STRING "FLOCK FINDER v1.0-beta"
+#define VERSION_STRING "PLUME v1.0-beta"
 #define VERSION_SHORT  "v1.0b"
 
 // Set to 1 to enable the 'x' key simulation trigger (development only).
@@ -633,9 +633,9 @@ int  sd_write_count = 0;
 unsigned long last_sd_flush = 0;
 static int flash_write_fail_count = 0; 
 
-static const char* current_log_file = "/FLOCK_FINDER/logs/FlockLog.csv";
-static const char* current_pcap_file = "/FLOCK_FINDER/captures/Threats.pcap";
-static const char* current_ble_pcap_file = "/FLOCK_FINDER/captures/BLE_Threats.pcap";
+static const char* current_log_file = "/PLUME/logs/PlumeLog.csv";
+static const char* current_pcap_file = "/PLUME/captures/Threats.pcap";
+static const char* current_ble_pcap_file = "/PLUME/captures/BLE_Threats.pcap";
 
 // Export server state
 static WebServer* export_server = nullptr;
@@ -653,7 +653,7 @@ static char export_ssid[33] = "";  // configured WiFi SSID (persisted)
 static char export_pass[65] = "";  // configured WiFi password (persisted)
 static char export_ip_str[20] = "0.0.0.0";
 static char export_auth_pass[8] = "";
-static const char* export_auth_user = "flock";
+static const char* export_auth_user = "plume";
 
 // Derive a 4-char hex password from the device's eFuse MAC.
 // Deterministic — same device always produces the same password.
@@ -1725,7 +1725,7 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
 static bool export_check_auth() {
     if (!export_server) return false;
     if (!export_server->authenticate(export_auth_user, export_auth_pass)) {
-        export_server->requestAuthentication(BASIC_AUTH, "Flock Finder");
+        export_server->requestAuthentication(BASIC_AUTH, "Plume");
         return false;
     }
     return true;
@@ -1744,7 +1744,7 @@ static bool export_check_auth() {
 static const char EXPORT_PAGE_TEMPLATE[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Flock Finder Export</title>
+<title>Plume Export</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap');
 :root{--bg:#050A14;--card:#1D3258;--cb:#2E4670;--h:#4DDBC2;--t:#E8EFFF;
@@ -1820,7 +1820,7 @@ background:rgba(255,181,71,.12);margin-bottom:14px}
 .fr{flex-direction:column;align-items:flex-start;gap:8px}
 .fr a.pl{align-self:flex-end}}
 </style></head><body><div class="pg">
-<div class="hs fi2"><span class="ht">Flock Finder</span>
+<div class="hs fi2"><span class="ht">Plume</span>
 <div style="display:flex;gap:6px;align-items:center">
 <span class="pl po">v1.0b</span><span class="pl ph">EXP</span></div></div>
 <div class="fi2" style="margin-bottom:18px"><div class="sb">
@@ -1895,7 +1895,7 @@ void export_server_setup_routes() {
         int foff = 0;
         if (sd_available) {
             foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
-                "/FlockLog.csv", "FlockLog.csv", "Detections log",
+                "/PlumeLog.csv", "PlumeLog.csv", "Detections log",
                 FILE_ICON_WIFI, "ph");
             foff += build_file_row(file_rows + foff, sizeof(file_rows) - foff,
                 "/Threats.pcap", "Threats.pcap", "WiFi packet capture",
@@ -2013,14 +2013,14 @@ void export_server_setup_routes() {
         }
     };
 
-    export_server->on("/FlockLog.csv", HTTP_GET, [serve_sd_file]() {
-        serve_sd_file("/FLOCK_FINDER/logs/FlockLog.csv", "text/csv");
+    export_server->on("/PlumeLog.csv", HTTP_GET, [serve_sd_file]() {
+        serve_sd_file("/PLUME/logs/PlumeLog.csv", "text/csv");
     });
     export_server->on("/Threats.pcap", HTTP_GET, [serve_sd_file]() {
-        serve_sd_file("/FLOCK_FINDER/captures/Threats.pcap", "application/vnd.tcpdump.pcap");
+        serve_sd_file("/PLUME/captures/Threats.pcap", "application/vnd.tcpdump.pcap");
     });
     export_server->on("/BLE_Threats.pcap", HTTP_GET, [serve_sd_file]() {
-        serve_sd_file("/FLOCK_FINDER/captures/BLE_Threats.pcap", "application/vnd.tcpdump.pcap");
+        serve_sd_file("/PLUME/captures/BLE_Threats.pcap", "application/vnd.tcpdump.pcap");
     });
 
     export_server->onNotFound([]() {
@@ -2384,7 +2384,7 @@ static void perform_detection_delete(int idx) {
     set_toast_direct("DETECTION DELETED", TOAST_WARNING, false);
 }
 
-// Rewrite FlockLog.csv once, removing every MAC in pending_deletes[].
+// Rewrite PlumeLog.csv once, removing every MAC in pending_deletes[].
 // Called on screen-leave, 5s idle, export start, or stats clear.
 static void flush_pending_deletes() {
     if (pending_delete_count == 0) return;
@@ -2396,8 +2396,8 @@ static void flush_pending_deletes() {
     if (!sd_available) { pending_delete_count = 0; pending_delete_dirty_ms = 0; return; }
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) != pdTRUE) return;
 
-    const char* tmp_path = "/FLOCK_FINDER/logs/FlockLog.tmp";
-    const char* bak_path = "/FLOCK_FINDER/logs/FlockLog.bak";
+    const char* tmp_path = "/PLUME/logs/PlumeLog.tmp";
+    const char* bak_path = "/PLUME/logs/PlumeLog.bak";
 
     File src = SD.open(current_log_file, FILE_READ);
     if (!src) { xSemaphoreGive(sdMutex); return; }
@@ -2883,7 +2883,7 @@ void save_stats_to_sd() {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         return;
     }
-    File f = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
+    File f = SD.open("/PLUME/stats/lifetime.txt", FILE_WRITE);
     if (f) {
         f.printf("lifetime_wifi=%ld\n",          l_wifi);
         f.printf("lifetime_ble=%ld\n",           l_ble);
@@ -2898,7 +2898,7 @@ void save_stats_to_sd() {
 
 // ── SD hot-plug: attempt remount when absent, detect silent removal ──────────
 // Called every SD_CHECK_INTERVAL_MS from loop(). When no card is present, tries
-// SD.begin() at 4 MHz then 20 MHz; on success, recreates the /FLOCK_FINDER
+// SD.begin() at 4 MHz then 20 MHz; on success, recreates the /PLUME
 // directory tree, writes PCAP headers, reloads history, and toasts. When a
 // card is present, probes a known file; if the open fails silently, treats it
 // as a removal.
@@ -2929,10 +2929,10 @@ static void sd_check_hotplug() {
         esp_task_wdt_reset();  // SD.begin can take several hundred ms
 
         if (mounted) {
-            if (!SD.exists("/FLOCK_FINDER"))          SD.mkdir("/FLOCK_FINDER");
-            if (!SD.exists("/FLOCK_FINDER/logs"))     SD.mkdir("/FLOCK_FINDER/logs");
-            if (!SD.exists("/FLOCK_FINDER/captures")) SD.mkdir("/FLOCK_FINDER/captures");
-            if (!SD.exists("/FLOCK_FINDER/stats"))    SD.mkdir("/FLOCK_FINDER/stats");
+            if (!SD.exists("/PLUME"))          SD.mkdir("/PLUME");
+            if (!SD.exists("/PLUME/logs"))     SD.mkdir("/PLUME/logs");
+            if (!SD.exists("/PLUME/captures")) SD.mkdir("/PLUME/captures");
+            if (!SD.exists("/PLUME/stats"))    SD.mkdir("/PLUME/stats");
             esp_task_wdt_reset();
 
             if (!SD.exists(current_log_file)) {
@@ -2988,7 +2988,7 @@ static void sd_check_hotplug() {
                 long          l_writes = lifetime_flash_writes;
                 xSemaphoreGiveRecursive(dataMutex);
 
-                File sf = SD.open("/FLOCK_FINDER/stats/lifetime.txt", FILE_WRITE);
+                File sf = SD.open("/PLUME/stats/lifetime.txt", FILE_WRITE);
                 if (sf) {
                     sf.printf("lifetime_wifi=%ld\n",          l_wifi);
                     sf.printf("lifetime_ble=%ld\n",           l_ble);
@@ -3009,7 +3009,7 @@ static void sd_check_hotplug() {
     } else {
         // Probe at the controller level — independent of any file existing.
         // The previous file-probe falsely reported "removed" within the first
-        // 60s of boot when /FLOCK_FINDER/stats/lifetime.txt had not yet been
+        // 60s of boot when /PLUME/stats/lifetime.txt had not yet been
         // written by the persist task.
         if (SD.cardType() == CARD_NONE && sd_was_available) {
             sd_available = false;
@@ -3751,7 +3751,7 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
         // Append to sd_hist in-memory so the Detections screen doesn't
         // need to re-scan the SD log file. We already hold dataMutex.
-        // Without this, every new MAC would trigger a full FlockLog.csv
+        // Without this, every new MAC would trigger a full PlumeLog.csv
         // re-read in loop() — which is megabytes after a day of use.
 
         // Remove any existing entry with the same MAC before inserting.
@@ -5691,7 +5691,8 @@ static void draw_title_card_overlay(float alpha) {
 
     // ── Pill with title ──
     spr.setTextSize(2);
-    int title_w = spr.textWidth("FLOCK FINDER");
+    int kern = 2;
+    int title_w = spr.textWidth("PLUME") + kern * (strlen("PLUME") - 1);
     int title_h = spr.fontHeight();
 
     int pad_x = 26, pad_y = 18;
@@ -5709,9 +5710,18 @@ static void draw_title_card_overlay(float alpha) {
     spr.fillRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, pill_fill);
     spr.drawRoundRect(pill_x, pill_y, pill_w, pill_h, pill_r, border_col);
 
-    spr.setTextDatum(MC_DATUM);
     spr.setTextColor(title_col, pill_fill);
-    spr.drawString("FLOCK FINDER", pill_x + pill_w / 2, pill_y + pill_h / 2);
+    spr.setTextDatum(TL_DATUM);
+    {
+        const char* title = "PLUME";
+        int cx = pill_x + pill_w / 2 - title_w / 2;
+        int cy = pill_y + pill_h / 2 - title_h / 2;
+        for (int i = 0; title[i]; i++) {
+            char tmp[2] = { title[i], 0 };
+            spr.drawString(tmp, cx, cy);
+            cx += spr.textWidth(tmp) + kern;
+        }
+    }
 
     spr.setTextSize(TS_MICRO);
     spr.setTextColor(ver_col, BG_COLOR);
@@ -9894,25 +9904,25 @@ void setup() {
         Serial.printf("[BOOT] Free heap after SD init: %u\n",
                       (unsigned)esp_get_free_heap_size());
 
-        if (!SD.exists("/FLOCK_FINDER"))           SD.mkdir("/FLOCK_FINDER");
-        if (!SD.exists("/FLOCK_FINDER/logs"))      SD.mkdir("/FLOCK_FINDER/logs");
-        if (!SD.exists("/FLOCK_FINDER/captures"))  SD.mkdir("/FLOCK_FINDER/captures");
-        if (!SD.exists("/FLOCK_FINDER/stats"))     SD.mkdir("/FLOCK_FINDER/stats");
+        if (!SD.exists("/PLUME"))           SD.mkdir("/PLUME");
+        if (!SD.exists("/PLUME/logs"))      SD.mkdir("/PLUME/logs");
+        if (!SD.exists("/PLUME/captures"))  SD.mkdir("/PLUME/captures");
+        if (!SD.exists("/PLUME/stats"))     SD.mkdir("/PLUME/stats");
         Serial.println("[SD] Directory structure OK");
 
         // Recover from a power loss mid-delete: if .bak exists but the main file
         // is missing, restore the backup. If both exist, the rename completed —
         // just clean up the orphan.
         {
-            const char* main_path = "/FLOCK_FINDER/logs/FlockLog.csv";
-            const char* bak_path  = "/FLOCK_FINDER/logs/FlockLog.bak";
+            const char* main_path = "/PLUME/logs/PlumeLog.csv";
+            const char* bak_path  = "/PLUME/logs/PlumeLog.bak";
             if (SD.exists(bak_path)) {
                 if (!SD.exists(main_path)) {
                     SD.rename(bak_path, main_path);
-                    Serial.println("[SD] Recovered FlockLog.csv from .bak");
+                    Serial.println("[SD] Recovered PlumeLog.csv from .bak");
                 } else {
                     SD.remove(bak_path);
-                    Serial.println("[SD] Cleaned orphan FlockLog.bak");
+                    Serial.println("[SD] Cleaned orphan PlumeLog.bak");
                 }
             }
         }
@@ -10738,41 +10748,20 @@ void loop() {
                 }
                 if (current_screen == 2) {
                     if (hist_detail_open) { /* no nav while detail is open */ }
-                    else {
-                        if (history_selected_idx <= 0) {
-                            if (!screen_transitioned) {
-                                int prev = current_screen - 1;
-                                if (prev < 0) prev = NUM_SCREENS - 1;
-                                transition_screen(prev, -1);
-                                screen_transitioned = true;
-                            }
-                        } else {
-                            history_selected_idx--;
-                            if (history_selected_idx < history_scroll_offset)
-                                history_scroll_offset = history_selected_idx;
-                            draw_current_screen(); render_frame();
-                        }
+                    else if (history_selected_idx > 0) {
+                        history_selected_idx--;
+                        if (history_selected_idx < history_scroll_offset)
+                            history_scroll_offset = history_selected_idx;
+                        draw_current_screen(); render_frame();
                     }
                 } else if (current_screen == 4) {
-                    if (stats_scroll_target <= 0) {
-                        if (!screen_transitioned) {
-                            int prev = current_screen - 1;
-                            if (prev < 0) prev = NUM_SCREENS - 1;
-                            transition_screen(prev, -1);
-                            screen_transitioned = true;
-                        }
-                    } else {
+                    if (stats_scroll_target > 0) {
                         stats_scroll_target -= STATS_SCROLL_STEP;
                         if (stats_scroll_target < 0) stats_scroll_target = 0;
                         screen_dirty = true;
                     }
-                } else if (!stealth_mode && !screen_transitioned) {
-                    int prev = current_screen - 1;
-                    int d = (prev < 0) ? 1 : -1;
-                    if (prev < 0) prev = NUM_SCREENS - 1;
-                    transition_screen(prev, d);
-                    screen_transitioned = true;
                 }
+                // Up never changes screen — only left/right do
             }
             else if (IS_KEY_DOWN(c)) {
                 if (show_feed_expanded) {
@@ -10786,14 +10775,7 @@ void loop() {
                     if (hist_detail_open) { /* no nav while detail is open */ }
                     else {
                         int hist_total = sd_available ? sd_hist_count : capture_history_count;
-                        if (history_selected_idx >= hist_total - 1) {
-                            if (!screen_transitioned) {
-                                int next = current_screen + 1;
-                                if (next >= NUM_SCREENS) next = 0;
-                                transition_screen(next, 1);
-                                screen_transitioned = true;
-                            }
-                        } else {
+                        if (history_selected_idx < hist_total - 1) {
                             history_selected_idx++;
                             if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
                                 history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
@@ -10801,26 +10783,14 @@ void loop() {
                         }
                     }
                 } else if (current_screen == 4) {
-                    if (stats_scroll_target >= STATS_MAX_SCROLL) {
-                        if (!screen_transitioned) {
-                            int next = current_screen + 1;
-                            if (next >= NUM_SCREENS) next = 0;
-                            transition_screen(next, 1);
-                            screen_transitioned = true;
-                        }
-                    } else {
+                    if (stats_scroll_target < STATS_MAX_SCROLL) {
                         stats_scroll_target += STATS_SCROLL_STEP;
                         if (stats_scroll_target > STATS_MAX_SCROLL)
                             stats_scroll_target = STATS_MAX_SCROLL;
                         screen_dirty = true;
                     }
-                } else if (!stealth_mode && !screen_transitioned) {
-                    int next = current_screen + 1;
-                    int d = (next >= NUM_SCREENS) ? -1 : 1;
-                    if (next >= NUM_SCREENS) next = 0;
-                    transition_screen(next, d);
-                    screen_transitioned = true;
                 }
+                // Down never changes screen — only left/right do
             }
             else if (IS_KEY_LEFT(c)) {
                 if (show_feed_expanded) {
