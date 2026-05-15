@@ -1,6 +1,6 @@
-# Flock Finder for M5Cardputer ADV Edition
+![Plume — Surveillance Awareness](banner.png)
 
-> **Note:** Project name is changing. Find-and-replace "Flock Finder" when the new name is chosen.
+# Plume — M5Cardputer ADV Edition
 
 Passive RF scanner that detects Flock Safety ALPR cameras and Raven surveillance devices using WiFi promiscuous mode and Bluetooth Low Energy scanning. Runs on the M5Cardputer ADV (ESP32-S3) with a 240×135 color LCD, full QWERTY keyboard, GPS, and SD card logging.
 
@@ -20,12 +20,7 @@ Passive RF scanner that detects Flock Safety ALPR cameras and Raven surveillance
 2. Install libraries: `M5Cardputer`, `NimBLE-Arduino`, `TinyGPSPlus`
 3. Set board to `M5Cardputer` (or `ESP32-S3 Dev Module` with USB CDC enabled)
 4. Set partition scheme to include SPIFFS/LittleFS
-5. Before first flash, edit the WiFi credentials near the top of the file if you want export mode to work out of the box:
-   ```c
-   #define EXPORT_WIFI_SSID "YOUR_SSID_HERE"
-   #define EXPORT_WIFI_PASS "YOUR_PASSWORD_HERE"
-   ```
-6. Flash via USB-C
+5. Flash via USB-C
 
 ## 🚀 Quick Start
 
@@ -38,6 +33,8 @@ When a detection occurs:
 - 💾 The detection is logged to the SD card with GPS coordinates, signal strength, and detection method
 
 Navigate between screens using the arrow keys (`;` up, `.` down, `,` left, `/` right) or press `m` to open the menu.
+
+To configure WiFi for export mode, use Menu → WiFi Config on the device — no need to edit the source code.
 
 ---
 
@@ -159,7 +156,7 @@ Export mode pauses all scanning and starts a local web server so you can downloa
 1. Menu → Export Mode (or select from tools)
 2. The device connects to WiFi and shows the server URL and password
 3. Open the URL in any browser on the same network
-4. Enter username `flock` and the displayed 4-character hex password
+4. Enter username `plume` and the displayed 4-character hex password
 5. Download files from the web interface
 
 Export auto-exits after 10 minutes (extended while a client is actively downloading). Press `m` → Stop Export to exit manually.
@@ -167,7 +164,7 @@ Export auto-exits after 10 minutes (extended while a client is actively download
 ### 📁 Files
 | File | Description |
 |------|-------------|
-| `FlockLog.csv` | All detections with timestamps, GPS, RSSI, confidence, detection method |
+| `PlumeLog.csv` | All detections with timestamps, GPS, RSSI, confidence, detection method |
 | `Threats.pcap` | Raw WiFi packet captures (open in Wireshark) |
 | `BLE_Threats.pcap` | Raw BLE advertisement captures (open in Wireshark) |
 
@@ -176,9 +173,9 @@ Export auto-exits after 10 minutes (extended while a client is actively download
 ## 💾 SD Card Structure
 
 ```
-/FLOCK_FINDER/
+/PLUME/
 ├── logs/
-│   └── FlockLog.csv
+│   └── PlumeLog.csv
 ├── captures/
 │   ├── Threats.pcap
 │   └── BLE_Threats.pcap
@@ -282,7 +279,7 @@ A recursive FreeRTOS mutex (`dataMutex`) protects all shared state between cores
 
 ## 📟 Prior Hardware
 
-This firmware is the M5Cardputer ADV edition. The original Flock Finder ran on a [Seeed Studio XIAO ESP32-S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html) with an SSD1306 128×64 monochrome OLED, external buzzer, and NEO-6M GPS module. The detection engine, signature database, and scoring logic are shared between both editions. The original XIAO version is available at [github.com/zmattmanz/flock-detection](https://github.com/zmattmanz/flock-detection).
+This firmware is the M5Cardputer ADV edition. The original version ran on a [Seeed Studio XIAO ESP32-S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html) with an SSD1306 128×64 monochrome OLED, external buzzer, and NEO-6M GPS module. The detection engine, signature database, and scoring logic are shared between both editions. The original XIAO version is available at [github.com/zmattmanz/flock-detection](https://github.com/zmattmanz/flock-detection).
 
 ---
 
@@ -311,6 +308,8 @@ This project builds on the work of the surveillance detection community:
 ## ⚖️ Legal
 
 This tool is intended for security research, privacy auditing, FOIA documentation, and educational purposes. Detecting the presence of surveillance hardware in public spaces is legal in most jurisdictions. Always comply with local laws regarding wireless scanning and signal interception.
+
+This device operates in a purely passive mode — it receives publicly broadcast RF signals but never transmits, connects to, or interacts with any detected device.
 
 ## 📄 License
 
