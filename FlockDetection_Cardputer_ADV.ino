@@ -5654,10 +5654,10 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
 static void draw_title_card_overlay(float alpha) {
     if (alpha <= 0.01f) return;
 
-    int card_w = 120;
-    int card_h = 36;
+    int card_w = 150;
+    int card_h = 46;
     int card_x = (DISP_W - card_w) / 2;
-    int card_y = CONTENT_Y + ((DISP_H - CONTENT_Y - card_h) / 2);
+    int card_y = (DISP_H - card_h) / 2;
 
     uint16_t border_col = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
     uint16_t title_col  = lerp_col16(BG_COLOR, HEADER_COLOR, alpha);
@@ -5670,16 +5670,15 @@ static void draw_title_card_overlay(float alpha) {
     int title_x = card_x + (card_w - title_w) / 2;
     spr.setTextColor(title_col, BG_COLOR);
     spr.setTextSize(TS_BODY);
-    spr.setCursor(title_x, card_y + 8);
+    spr.setCursor(title_x, card_y + 10);
     kprint(spr, "FLOCK FINDER", 1);
 
-    const char* ver = VERSION_STRING;
-    int ver_w = (int)strlen(ver) * ts_char_w(TS_MICRO);
+    int ver_w = (int)strlen(VERSION_STRING) * ts_char_w(TS_MICRO);
     int ver_x = card_x + (card_w - ver_w) / 2;
     spr.setTextColor(ver_col, BG_COLOR);
     spr.setTextSize(TS_MICRO);
-    spr.setCursor(ver_x, card_y + 22);
-    spr.print(ver);
+    spr.setCursor(ver_x, card_y + 28);
+    spr.print(VERSION_STRING);
 }
 
 static void draw_title_card() {
@@ -5694,14 +5693,6 @@ static void draw_title_card() {
     float alpha = 1.0f;
     if (elapsed > TITLE_CARD_HOLD_MS) {
         alpha = 1.0f - (float)(elapsed - TITLE_CARD_HOLD_MS) / (float)TITLE_CARD_FADE_MS;
-    }
-
-    uint16_t title_bg = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
-    for (int y = CONTENT_Y; y < DISP_H; y++) {
-        for (int x = 0; x < DISP_W; x++) {
-            uint16_t px = spr.readPixel(x, y);
-            spr.drawPixel(x, y, lerp_col16(px, title_bg, alpha));
-        }
     }
 
     draw_title_card_overlay(alpha);
@@ -10165,7 +10156,6 @@ void setup() {
     // ── Title card boot sequence ──
     {
         int start_brightness = BRIGHTNESS_LEVELS[brightness_level];
-        uint16_t title_bg = lerp_col16(BG_COLOR, HEADER_COLOR, 0.18f);
 
         // Phase 1: Fade out boot screen
         {
@@ -10177,11 +10167,26 @@ void setup() {
             }
         }
 
-        // Phase 2: Switch to blue title card, fade in
+        // Phase 2: Draw title card on dark background, fade in
         {
-            spr.fillSprite(title_bg);
-            draw_title_card_overlay(1.0f);
-            render_frame();
+            spr.fillSprite(BG_COLOR);
+            int card_w = 150, card_h = 46;
+            int card_x = (DISP_W - card_w) / 2;
+            int card_y = (DISP_H - card_h) / 2;
+            spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, HEADER_COLOR);
+            int title_w = 12 * 7;
+            int title_x = card_x + (card_w - title_w) / 2;
+            spr.setTextColor(HEADER_COLOR, BG_COLOR);
+            spr.setTextSize(TS_BODY);
+            spr.setCursor(title_x, card_y + 10);
+            kprint(spr, "FLOCK FINDER", 1);
+            int ver_w = (int)strlen(VERSION_STRING) * ts_char_w(TS_MICRO);
+            int ver_x = card_x + (card_w - ver_w) / 2;
+            spr.setTextColor(DIM_COLOR, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(ver_x, card_y + 28);
+            spr.print(VERSION_STRING);
+            spr.pushSprite(0, 0);
 
             int steps = 12;
             for (int i = 1; i <= steps; i++) {
@@ -10191,18 +10196,33 @@ void setup() {
             }
         }
 
-        // Phase 3: Hold on blue title card (~2 seconds)
+        // Phase 3: Hold on title card (~2 seconds)
         {
             unsigned long hold_start = millis();
             while (millis() - hold_start < 2000) {
-                spr.fillSprite(title_bg);
-                draw_title_card_overlay(1.0f);
-                render_frame();
+                spr.fillSprite(BG_COLOR);
+                int card_w = 150, card_h = 46;
+                int card_x = (DISP_W - card_w) / 2;
+                int card_y = (DISP_H - card_h) / 2;
+                spr.drawRoundRect(card_x, card_y, card_w, card_h, 3, HEADER_COLOR);
+                int title_w = 12 * 7;
+                int title_x = card_x + (card_w - title_w) / 2;
+                spr.setTextColor(HEADER_COLOR, BG_COLOR);
+                spr.setTextSize(TS_BODY);
+                spr.setCursor(title_x, card_y + 10);
+                kprint(spr, "FLOCK FINDER", 1);
+                int ver_w = (int)strlen(VERSION_STRING) * ts_char_w(TS_MICRO);
+                int ver_x = card_x + (card_w - ver_w) / 2;
+                spr.setTextColor(DIM_COLOR, BG_COLOR);
+                spr.setTextSize(TS_MICRO);
+                spr.setCursor(ver_x, card_y + 28);
+                spr.print(VERSION_STRING);
+                spr.pushSprite(0, 0);
                 delay(30);
             }
         }
 
-        // Phase 4: Dissolve blue → scanner over 1 second
+        // Phase 4: Dissolve dark → scanner over 1 second
         {
             title_card_start_ms = millis();
             unsigned long dissolve_start = millis();
@@ -10216,12 +10236,12 @@ void setup() {
                 for (int y = CONTENT_Y; y < DISP_H; y++) {
                     for (int x = 0; x < DISP_W; x++) {
                         uint16_t px = spr.readPixel(x, y);
-                        spr.drawPixel(x, y, lerp_col16(px, title_bg, alpha));
+                        spr.drawPixel(x, y, lerp_col16(px, BG_COLOR, alpha));
                     }
                 }
 
                 draw_title_card_overlay(alpha);
-                render_frame();
+                spr.pushSprite(0, 0);
                 delay(16);
             }
         }
