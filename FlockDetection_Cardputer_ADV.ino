@@ -50,7 +50,7 @@ enum BootPersonality {
 // FORWARD DECLARATIONS
 // ============================================================================
 void draw_header_spr(int screen_num);
-void draw_header_lcd(int screen_num);
+void draw_header_lcd(int screen_num, const char* name_override = nullptr);
 static void draw_overlay_header_lcd(const char* label);
 static void render_frame();
 void draw_toast_spr();
@@ -194,8 +194,8 @@ static const MenuItem nav_items[] = {
 
 static const MenuItem settings_items[] = {
     {"Night Mode",       true,  false, 5},
-    {"Low Power Mode",   true,  false, 6},
     {"Mute Beeps",       true,  false, 7},
+    {"Low Power Mode",   true,  false, 6},
     {"Turbo Mode",       true,  false, 8},
 };
 
@@ -541,8 +541,7 @@ static inline unsigned long current_dedup_window_ms() {
 #define SCORE_DEFINITIVE 100  
 #define SCORE_STRONG     60   
 #define SCORE_WEAK       25   
-#define SCORE_BONUS_RSSI 10   
-#define SCORE_BONUS_STAT 15   
+#define SCORE_BONUS_RSSI 10
 
 #define CONFIDENCE_ALARM_THRESHOLD 75   
 #define CONFIDENCE_HIGH            85   
@@ -652,7 +651,8 @@ static const unsigned long EXPORT_CONNECT_TIMEOUT_MS = 5000UL;
 static char export_ssid[33] = "";  // configured WiFi SSID (persisted)
 static char export_pass[65] = "";  // configured WiFi password (persisted)
 static char export_ip_str[20] = "0.0.0.0";
-static char export_auth_pass[8] = "";
+static char export_auth_pass[12] = "";
+static bool export_grid_needs_reset = false;
 static const char* export_auth_user = "plume";
 
 // Derive a 4-char hex password from the device's eFuse MAC.
@@ -667,8 +667,7 @@ static void export_derive_password() {
         h ^= mac[i];
         h *= 16777619u;
     }
-    uint16_t code = (uint16_t)(h ^ (h >> 16));
-    snprintf(export_auth_pass, sizeof(export_auth_pass), "%04X", code);
+    snprintf(export_auth_pass, sizeof(export_auth_pass), "%08X", h);
 }
 
 int current_screen = 0;
@@ -1127,10 +1126,9 @@ static unsigned long last_bs_press_ms = 0;
 
 struct RSSITrack { 
     char mac[18];
-    int samples[RSSI_TRACK_SAMPLES]; 
-    int sample_count; 
-    unsigned long last_seen; 
-    bool scored; 
+    int samples[RSSI_TRACK_SAMPLES];
+    int sample_count;
+    unsigned long last_seen;
 };
 RSSITrack rssi_tracker[RSSI_TRACK_MAX_DEVICES];
 int rssi_tracker_count = 0;
@@ -1301,11 +1299,11 @@ void LedTask(void* pv) {
                             (export_on || (led_breathing_on && brightness_level >= 2));
             if (show_led) {
                 float breath = anim_pulse(export_on ? UI_PULSE_MEDIUM : UI_PULSE_BREATHE);
-                float dim    = 0.15f + breath * 0.35f;
+                float dim    = export_on ? (0.30f + breath * 0.55f) : (0.15f + breath * 0.35f);
                 if (export_on) {
                     r = (uint8_t)(255.0f * dim);
-                    g = (uint8_t)(181.0f * dim);
-                    b = (uint8_t)( 71.0f * dim);
+                    g = (uint8_t)(130.0f * dim);
+                    b = 0;
                 } else {
                     r = (uint8_t)((float)led_r * dim);
                     g = (uint8_t)((float)led_g * dim);
@@ -1435,36 +1433,45 @@ void clean_device_name_char(char* str) {
 // ============================================================================
 static const char* wifi_ssid_patterns[] = {
     "FS Ext Battery", "Penguin", "Pigvision", "FlockOS",
-    "flocksafety", "OFS_IoT", "PFS_", "test_flck"
+    "flocksafety", "OFS_IoT", "PFS_"
 };
 static const int NUM_SSID_PATTERNS = sizeof(wifi_ssid_patterns) / sizeof(wifi_ssid_patterns[0]);
 
 static const char* mac_prefixes_tier1[] = {
-    "8c:1f:64", "4c:6e:44",
-    "ec:1b:bd", "58:8e:81", "d8:a0:d8",
-    "dc:54:75", "e0:e2:e6", "f0:9f:c2", "68:b6:b3", "a0:b7:65", "24:0a:c4",
-    "a4:e5:7c", "78:e3:6d", "fc:f5:c4", "b0:b2:1c",
-    "b4:1e:52", "90:35:ea", "f0:82:c0", "b4:e3:f9", "04:0d:84"
+    "b4:1e:52",   // Flock Safety — IEEE registered OUI
+    "e4:aa:ea",   // LiteOn — most-observed Flock production OUI
+    "00:09:01",   // XUNTONG — Flock Penguin battery (Field Reference May 2026)
+    // Pending manual IEEE lookup — keep until registrant confirmed or denied
+    "4c:6e:44", "d8:a0:d8", "a0:b7:65", "f0:82:c0", "b4:e3:f9", "04:0d:84"
 };
 static const int NUM_MAC_TIER1 = sizeof(mac_prefixes_tier1) / sizeof(mac_prefixes_tier1[0]);
 
 static const char* mac_prefixes_tier2[] = {
-    "48:e7:29", "74:4c:a1", "94:34:69", "38:5b:44",
+    "74:4c:a1", "94:34:69", "38:5b:44",
     "94:08:53", "1c:34:f1", "a4:cf:12",
-    "3c:91:80", "80:30:49", "14:5a:fc", "9c:2f:9d", "e4:aa:ea",
-    "c8:c9:a3", "70:c9:4e", "d0:39:57",
-    "24:b2:b9", "00:f4:8d", "e0:0a:f6",
+    "3c:91:80", "80:30:49", "14:5a:fc", "9c:2f:9d",
+    "c8:c9:a3", "70:c9:4e",
+    "24:b2:b9", "00:f4:8d",
     "08:3a:88", "d8:f3:bc",
     // Field-validated additions from the NitekryDPaul 31-prefix research list.
+    // NitekryDPaul entries #22, #23, #26 — demoted from Tier 1 for consistency
+    // Same provenance as all other NitekryDPaul OUIs (field-validated component-vendor)
+    "ec:1b:bd", "58:8e:81", "90:35:ea",
     "b8:35:32", "c0:35:32", "f4:6a:dd", "f8:a2:d6",
     "e8:d0:fc", "e0:4f:43", "b8:1e:a4", "70:08:94",
     "3c:71:bf", "58:00:e3", "5c:93:a2", "64:6e:69",
-    "48:27:ea", "82:6b:f2"
+    "48:27:ea", "82:6b:f2",
+    // LiteOn Technology Corporation — WCBN3510A WiFi+BT module
+    // Confirmed in Falcon, Sparrow, Falcon Flex, Falcon LR
+    // d0:39:57 via NitekryDPaul, e0:0a:f6 via IEEE lookup May 2026
+    // e8:2a:44 through 94:97:4f via Field Reference May 2026
+    "d0:39:57", "e0:0a:f6",
+    "e8:2a:44", "30:d1:6b", "b8:ee:65", "a4:db:30", "40:f0:2f", "30:52:cb", "94:97:4f"
 };
 static const int NUM_MAC_TIER2 = sizeof(mac_prefixes_tier2) / sizeof(mac_prefixes_tier2[0]);
 
 static const char* device_name_patterns[] = {
-    "FS Ext Battery", "Penguin", "Flock", "Pigvision", "FlockCam", "FS-", "RWLS-"
+    "FS Ext Battery", "Penguin", "Flock", "Pigvision", "FlockCam", "RWLS-"
 };
 static const int NUM_NAME_PATTERNS = sizeof(device_name_patterns) / sizeof(device_name_patterns[0]);
 
@@ -1527,9 +1534,9 @@ bool check_device_name_pattern(const char* name) {
 }
 
 bool is_penguin_numeric_name(const char* name) {
-    if (!name) return false; 
+    if (!name) return false;
     int len = strlen(name);
-    if (len < 8 || len > 12) return false;
+    if (len != 10) return false;
     for (int i = 0; i < len; i++) {
         if (!isdigit(name[i])) return false;
     }
@@ -1603,8 +1610,8 @@ static void methods_to_human(const char* methods, char* out, size_t out_len) {
         {"mfg_0x09C8",     "Flock mfg ID"},
         {"tn_serial",      "TN serial"},
         {"ssid_fmt",       "Flock SSID format"},
-        {"wildcard_probe", "Wildcard probe (Flock sig)"},
-        {"wpa2_psk",       "WPA2-PSK"},
+        {"wildcard_probe",    "Wildcard probe (Flock sig)"},
+        {"wildcard_probe_t2", "Wildcard probe (Tier 2 OUI)"},
         {"penguin_num",    "Penguin name"},
         {"name",           "Known name"},
         {"mac_t1",         "Known MAC"},
@@ -1613,6 +1620,8 @@ static void methods_to_human(const char* methods, char* out, size_t out_len) {
         {"static_addr",    "Static addr"},
         {"addr1_t1",       "Receiver MAC (known)"},
         {"addr1_t2",       "Receiver MAC (similar)"},
+        {"pepwave_oui",    "Pepwave router OUI"},
+        {"pepwave_ssid",   "Pepwave SSID"},
     };
     static const int N_TOKENS = (int)(sizeof(tokens) / sizeof(tokens[0]));
 
@@ -1734,7 +1743,8 @@ static bool export_check_auth() {
 // ── Export page HTML template (stored in flash via PROGMEM) ──────────────
 // Dynamic placeholders (in order):
 //   %s  = export_auth_user
-//   %s  = export_auth_pass
+//   %s  = export_auth_pass (mousedown reveal)
+//   %s  = export_auth_pass (touchstart reveal)
 //   %s  = file rows HTML (built separately based on sd_available)
 //   %u  = remaining minutes
 //   %02u = remaining seconds
@@ -1833,7 +1843,7 @@ background:rgba(255,181,71,.12);margin-bottom:14px}
 <span>All scanning paused during export</span></div>
 <div class="fi2"><div class="sl">Credentials</div><div class="cd">
 <div class="kv"><span class="kl">User</span><span class="kv2">%s</span></div>
-<div class="kv"><span class="kl">Pass</span><span class="kv2">%s</span></div>
+<div class="kv"><span class="kl">Pass</span><span class="kv2" style="display:flex;align-items:center;gap:6px"><span id="pw" style="letter-spacing:2px">&#x2022;&#x2022;&#x2022;&#x2022;</span><span id="pe" onmousedown="document.getElementById('pw').textContent='%s'" onmouseup="document.getElementById('pw').textContent='&#x2022;&#x2022;&#x2022;&#x2022;'" ontouchstart="document.getElementById('pw').textContent='%s'" ontouchend="document.getElementById('pw').textContent='&#x2022;&#x2022;&#x2022;&#x2022;'" style="cursor:pointer;opacity:0.5;font-size:10px">&#x1F441;</span></span></div>
 </div></div>
 <div class="fi2"><div class="sl">Files</div><div class="cd">%s</div></div>
 <div class="fi2"><div class="sl">Session</div><div class="cd">
@@ -1888,7 +1898,6 @@ void export_server_setup_routes() {
 
     export_server->on("/", HTTP_GET, []() {
         if (!export_check_auth()) return;
-        export_mode_started_at = millis();
 
         // ── Build the dynamic file-rows block ──
         char file_rows[2048] = "";
@@ -1919,7 +1928,7 @@ void export_server_setup_routes() {
 
         // ── Render into a heap buffer ──
         // Template is ~3.5KB, dynamic content adds ~500B, total < 5KB.
-        const size_t PAGE_BUF_SIZE = 8192;
+        const size_t PAGE_BUF_SIZE = 10240;
         char* page = (char*)malloc(PAGE_BUF_SIZE);
         if (!page) {
             export_server->send(503, "text/plain", "Low memory");
@@ -1928,7 +1937,8 @@ void export_server_setup_routes() {
 
         snprintf(page, PAGE_BUF_SIZE, EXPORT_PAGE_TEMPLATE,
             export_auth_user,           // %s  credentials user
-            export_auth_pass,           // %s  credentials pass
+            export_auth_pass,           // %s  credentials pass (mousedown)
+            export_auth_pass,           // %s  credentials pass (touchstart)
             file_rows,                  // %s  file row HTML
             rm,                         // %u  minutes
             rs,                         // %02u seconds
@@ -2200,15 +2210,11 @@ static bool export_finalize_connect() {
     export_server_setup_routes();
     export_server->begin();
 
+    export_grid_needs_reset = true;
     export_mode_active = true;
     export_mode_started_at = millis();
 
-    // Show IP + password so the user can authenticate from their browser.
-    // Format: "http://192.168.1.5 pw:A3F2"
-    char ip_toast[TOAST_TEXT_LEN];
-    snprintf(ip_toast, sizeof(ip_toast), "http://%s pw:%s",
-             export_ip_str, export_auth_pass);
-    set_toast_direct(ip_toast, TOAST_SUCCESS);
+    set_toast_direct("EXPORT ACTIVE", TOAST_SUCCESS);
     return true;
 }
 
@@ -3318,7 +3324,6 @@ void rssi_track_update(const char* mac, int rssi) {
             } else {
                 for (int j = 0; j < RSSI_TRACK_SAMPLES - 1; j++) rssi_tracker[i].samples[j] = rssi_tracker[i].samples[j + 1];
                 rssi_tracker[i].samples[RSSI_TRACK_SAMPLES - 1] = rssi;
-                rssi_tracker[i].scored = false;
             }
             rssi_tracker[i].last_seen = now;
             if (signal_active && strncmp(rssi_tracker[i].mac, signal_target_mac, 17) == 0) {
@@ -3334,47 +3339,12 @@ void rssi_track_update(const char* mac, int rssi) {
         rssi_tracker[rssi_tracker_count].samples[0] = rssi;
         rssi_tracker[rssi_tracker_count].sample_count = 1;
         rssi_tracker[rssi_tracker_count].last_seen = now;
-        rssi_tracker[rssi_tracker_count].scored = false;
         rssi_tracker_count++;
     }
     give_data_mutex();
 }
 
-bool rssi_track_is_stationary(const char* mac) {
-    bool result = false;
-    if (!take_data_mutex()) return false;
-    for (int i = 0; i < rssi_tracker_count; i++) {
-        if (strncmp(rssi_tracker[i].mac, mac, 17) == 0
-            && rssi_tracker[i].sample_count >= 3
-            && !rssi_tracker[i].scored) {
-            int n = rssi_tracker[i].sample_count;
-            int* s = rssi_tracker[i].samples;
 
-            // Branch A: peak-shape (operator moving past stationary device)
-            int peak_idx = 0;
-            for (int j = 1; j < n; j++) if (s[j] > s[peak_idx]) peak_idx = j;
-            int range_peak = s[peak_idx] - min(s[0], s[n - 1]);
-            bool peak_match = (peak_idx > 0 && peak_idx < n - 1 && range_peak >= 6);
-
-            // Branch B: flat variance (both device and operator stationary)
-            int s_min = s[0], s_max = s[0];
-            for (int j = 1; j < n; j++) {
-                if (s[j] < s_min) s_min = s[j];
-                if (s[j] > s_max) s_max = s[j];
-            }
-            int total_range = s_max - s_min;
-            bool flat_match = (total_range <= 3);
-
-            if (peak_match || flat_match) {
-                rssi_tracker[i].scored = true;
-                result = true;
-            }
-            break;
-        }
-    }
-    give_data_mutex();
-    return result;
-}
 
 void rssi_track_expire() {
     if (!take_data_mutex()) return;
@@ -3399,7 +3369,7 @@ void rssi_track_expire() {
 // Each slot tracks a live device. Angle is derived from MAC hash for
 // spatial stability; radial position maps RSSI → radius via anim_filter.
 // Sweep brightness uses phosphor decay: illuminate on sweep pass, fade.
-#define SCAN_MAX_DEVICES 12
+#define SCAN_MAX_DEVICES 10
 
 struct ScanDevice {
     char     mac[18];
@@ -4048,7 +4018,6 @@ struct WifiEvent {
     uint16_t payload_snap_len;
     uint16_t orig_len;
     volatile uint32_t ready;
-    bool     is_wpa2_psk;
     uint8_t  vendor_ouis[4][3];
     uint8_t  vendor_oui_count;
 };
@@ -4118,7 +4087,6 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
 
     // Clear parsed fields — they'll be populated by parse_wifi_event()
     memset(ev->ssid, 0, sizeof(ev->ssid));
-    ev->is_wpa2_psk = false;
     ev->vendor_oui_count = 0;
 
     __atomic_store_n(&ev->ready, 1u, __ATOMIC_RELEASE);
@@ -4166,8 +4134,7 @@ static void parse_wifi_event(WifiEvent* ev) {
         ev->ssid[tagged_params[1]] = '\0';
     }
 
-    // ── RSN and vendor OUI parsing ──
-    ev->is_wpa2_psk = false;
+    // ── Vendor OUI parsing ──
     ev->vendor_oui_count = 0;
 
     if (ev->is_beacon) {
@@ -4177,30 +4144,6 @@ static void parse_wifi_event(WifiEvent* ev) {
             uint8_t tag_id = p[0];
             uint8_t tag_len = p[1];
             if (tag_len > rem - 2) break;
-
-            // RSN Information Element (tag 48) — check for WPA2-PSK AKM
-            if (tag_id == 48 && tag_len >= 20) {
-                uint8_t* rsn = p + 2;
-                int rsn_len = tag_len;
-                if (rsn_len >= 8) {
-                    uint16_t pw_count = rsn[6] | (rsn[7] << 8);
-                    if (pw_count <= 10) {
-                        int akm_off = 8 + pw_count * 4;
-                        if (akm_off + 2 <= rsn_len) {
-                            uint16_t akm_count = rsn[akm_off] | (rsn[akm_off + 1] << 8);
-                            int akm_list = akm_off + 2;
-                            for (uint16_t a = 0; a < akm_count && akm_list + 4 <= rsn_len; a++) {
-                                if (rsn[akm_list] == 0x00 && rsn[akm_list+1] == 0x0F
-                                    && rsn[akm_list+2] == 0xAC && rsn[akm_list+3] == 0x02) {
-                                    ev->is_wpa2_psk = true;
-                                    break;
-                                }
-                                akm_list += 4;
-                            }
-                        }
-                    }
-                }
-            }
 
             // Vendor-specific IE (tag 221) — collect unique OUIs
             if (tag_id == 221 && tag_len >= 4 && ev->vendor_oui_count < 4) {
@@ -4280,6 +4223,15 @@ void process_wifi_event_queue() {
         bool ssid_generic  = (strlen(local.ssid) > 0 && check_ssid_pattern(local.ssid));
         bool ssid_flock_fmt = (strlen(local.ssid) > 0 && is_flock_ssid_format(local.ssid));
 
+        // ── test_flck: CVE-2025-59409 hardcoded SSID, always-on emission ──
+        // Falcon/Sparrow firmware emits STA-mode probes for this SSID
+        // continuously regardless of hotspot state. Unique to Flock devices.
+        if (local.is_probe_req && strlen(local.ssid) > 0
+            && strcmp(local.ssid, "test_flck") == 0) {
+            confidence = SCORE_DEFINITIVE;
+            strlcat(methods, "test_flck_cve ", sizeof(methods));
+        }
+
         if (ssid_flock_fmt) {
             confidence = SCORE_DEFINITIVE; strlcat(methods, "ssid_fmt ", sizeof(methods));
         } else if (mac_score == 1) {
@@ -4297,15 +4249,20 @@ void process_wifi_event_queue() {
         // positives. Only mgmt subtype 4 (Probe Request) qualifies.
         // Field-tested: 11/12 cameras caught with 2 false positives (Joplin).
         if (local.is_probe_req && mac_score > 0 && strlen(local.ssid) == 0) {
-            confidence = SCORE_DEFINITIVE;
-            strlcat(methods, "wildcard_probe ", sizeof(methods));
+            if (mac_score == 1) {
+                // Tier 1 OUI + wildcard probe = definitive Flock signature
+                confidence = SCORE_DEFINITIVE;
+                strlcat(methods, "wildcard_probe ", sizeof(methods));
+            } else {
+                // Tier 2 OUI + wildcard probe = strong signal, not definitive
+                // Component-vendor OUIs are shared with non-Flock devices
+                // that also do wildcard probing during normal WiFi scans
+                confidence = SCORE_STRONG;
+                strlcat(methods, "wildcard_probe_t2 ", sizeof(methods));
+            }
         }
 
         if (confidence > 0 && local.rssi > -50) confidence += SCORE_BONUS_RSSI;
-        if (ssid_flock_fmt && local.is_wpa2_psk) {
-            strlcat(methods, "wpa2_psk ", sizeof(methods));
-            confidence += 10;
-        }
 
         const char* name_str       = (strlen(local.ssid) > 0) ? local.ssid : "Hidden";
         const char* frame_type_str = local.is_beacon ? "Beacon" : "ProbeReq";
@@ -4346,7 +4303,6 @@ void process_wifi_event_queue() {
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
             __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_str, local.rssi);
-            if (rssi_track_is_stationary(mac_str)) confidence += SCORE_BONUS_STAT;
             if (confidence > 100) confidence = 100;
 
             int mlen = strlen(methods);
@@ -4380,6 +4336,40 @@ void process_wifi_event_queue() {
                     last_buzzer_time = millis();
                 }
                 xSemaphoreGiveRecursive(dataMutex);
+            }
+        }
+
+        // ── Pepwave trailer infrastructure — correlated signal only ──
+        // Flock Mobile Security Trailers use Pepwave cellular-bonded routers
+        // (OUI A8:C0:EA, SSID "PEPWAVE_*"). Only log when the session already
+        // has confirmed Flock detections — a Pepwave router alone is not
+        // surveillance-indicative. Field Reference May 2026, §10.
+        if (confidence < CONFIDENCE_ALARM_THRESHOLD) {
+            bool is_pepwave_oui = (local.mac[0] == 0xa8
+                                && local.mac[1] == 0xc0
+                                && local.mac[2] == 0xea);
+            bool is_pepwave_ssid = (strlen(local.ssid) >= 8
+                                 && strncasecmp(local.ssid, "PEPWAVE_", 8) == 0);
+
+            if ((is_pepwave_oui || is_pepwave_ssid)
+                && (session_flock_wifi + session_flock_ble) > 0) {
+
+                int pepwave_conf = SCORE_WEAK;
+                char pepwave_methods[32] = "";
+                if (is_pepwave_oui)  strlcat(pepwave_methods, "pepwave_oui ", sizeof(pepwave_methods));
+                if (is_pepwave_ssid) strlcat(pepwave_methods, "pepwave_ssid ", sizeof(pepwave_methods));
+                if (is_pepwave_oui && is_pepwave_ssid) pepwave_conf = SCORE_STRONG;
+
+                int mlen = strlen(pepwave_methods);
+                if (mlen > 0 && pepwave_methods[mlen - 1] == ' ')
+                    pepwave_methods[mlen - 1] = '\0';
+
+                if (!is_mac_whitelisted(mac_str)) {
+                    log_detection("FLOCK_INFRA", "WIFI", local.rssi, mac_str,
+                                  strlen(local.ssid) > 0 ? local.ssid : "Pepwave",
+                                  local.channel, 0, "Pepwave trailer router",
+                                  pepwave_methods, pepwave_conf, local.seq_num);
+                }
             }
         }
     }
@@ -4487,11 +4477,11 @@ static void ble_worker_task(void* pvParameters) {
         } else if (mac_score == 1) {
             confidence = SCORE_STRONG;
             strlcat(methods, "mac_t1 ", sizeof(methods));
-            if (got_penguin_name) { confidence = SCORE_DEFINITIVE; }
+            if (got_penguin_name && got_mfg) { confidence = SCORE_DEFINITIVE; }
         } else {
             if (mac_score == 2) { confidence += SCORE_WEAK; strlcat(methods, "mac_t2 ", sizeof(methods)); }
-            if (got_penguin_name) { confidence += SCORE_WEAK; }
-            if ((mac_score == 2 || got_penguin_name) &&
+            if (got_penguin_name && got_mfg) { confidence += SCORE_WEAK; }
+            if ((mac_score == 2 || (got_penguin_name && got_mfg)) &&
                 (ev->addr_type == 0 || (ev->addr_type == 1 && (ev->mac[0] >> 6) == 0x03))) {
                 confidence += SCORE_WEAK; strlcat(methods, "static_addr ", sizeof(methods));
             }
@@ -4506,7 +4496,6 @@ static void ble_worker_task(void* pvParameters) {
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
             __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_string, ev->rssi);
-            if (rssi_track_is_stationary(mac_string)) confidence += SCORE_BONUS_STAT;
         }
         if (confidence > 100) confidence = 100;
 
@@ -4792,12 +4781,6 @@ void draw_header_spr(int screen_num) {
         }
     }
 
-    // Export mode indicator
-    if (export_mode_active) {
-        drawPill(icon_right - 27, icon_y, "EXP", CAUTION_COLOR, 0.0f, true);
-        icon_right -= 29;
-    }
-
     // Muted indicator
     if (muted_now) {
         drawPill(icon_right - 13, icon_y, "M", DIM_COLOR);
@@ -4927,8 +4910,8 @@ void draw_toast_spr() {
     int text_w   = text_len * char_w;
     int pip_w    = 7;
     int gap      = 3;
-    int pad_lr   = 8;
-    int th       = 16;
+    int pad_lr   = 9;
+    int th       = 17;
 
     char queue_str[6] = "";
     int queue_w = 0;
@@ -5032,8 +5015,8 @@ void draw_vol_overlay() {
 
     int char_w   = ts_char_w(TS_BODY);
     int label_w  = (int)strlen(label) * char_w;
-    int pad_lr   = 8;
-    int th       = 16;
+    int pad_lr   = 9;
+    int th       = 17;
     int bar_gap  = 5;
     int bar_w    = 50;
     int bar_h    = 4;
@@ -5078,8 +5061,8 @@ void drawCard(int x, int y, int w, int h) {
 // filled: if true, the pill is solid accent_col with BG-colored text.
 static void drawPill(int x, int y, const char* text, uint16_t accent_col,
                      float bg_accent_pct, bool filled) {
-    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 6;
-    int th = 11;
+    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 7;
+    int th = 12;
     uint16_t bg = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, bg_accent_pct);
     uint16_t fg = filled ? BG_COLOR : TEXT_COLOR;
     uint16_t border = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, 0.4f);
@@ -5109,8 +5092,8 @@ static void kprint_lcd(const char* text, int extra = 1) {
 static void drawPill_lcd(int x, int y, const char* text, uint16_t accent_col,
                          float bg_accent_pct = 0.18f, bool filled = false) {
     auto& lcd = M5Cardputer.Display;
-    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 6;
-    int th = 11;
+    int tw = (int)strlen(text) * ts_char_w(TS_MICRO) + 7;
+    int th = 12;
     uint16_t bg = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, bg_accent_pct);
     uint16_t fg = filled ? BG_COLOR : TEXT_COLOR;
     uint16_t border = filled ? accent_col : lerp_col16(BG_COLOR, accent_col, 0.4f);
@@ -5122,7 +5105,7 @@ static void drawPill_lcd(int x, int y, const char* text, uint16_t accent_col,
     lcd.print(text);
 }
 
-void draw_header_lcd(int screen_num) {
+void draw_header_lcd(int screen_num, const char* name_override) {
     auto& lcd = M5Cardputer.Display;
     static const char* screen_names[NUM_SCREENS] = {
         "SCANNER", "SIGNAL", "DETECTIONS", "GPS", "STATS"
@@ -5133,8 +5116,9 @@ void draw_header_lcd(int screen_num) {
     lcd.drawFastHLine(0, 18, DISP_W, CARD_BORDER);
     lcd.setTextColor(HEADER_COLOR, BG_COLOR);
     lcd.setTextSize(TS_BODY);
+    const char* display_name = name_override ? name_override : screen_names[screen_num];
     lcd.setCursor(TEXT_LEFT, 5);
-    kprint_lcd(screen_names[screen_num]);
+    kprint_lcd(display_name);
 
     // ── Status pill row (mirrors draw_header_spr exactly) ──
     bool gps_lock_now;
@@ -5166,12 +5150,6 @@ void draw_header_lcd(int screen_num) {
             drawPill_lcd(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
             icon_right -= pw + 2;
         }
-    }
-
-    // Export mode indicator
-    if (export_mode_active) {
-        drawPill_lcd(icon_right - 27, icon_y, "EXP", CAUTION_COLOR, 0.0f, true);
-        icon_right -= 29;
     }
 
     // Muted indicator
@@ -5340,7 +5318,7 @@ static void render_frame() {
         } else if (wifi_config_open) {
             draw_overlay_header_lcd("WIFI CONFIG");
         } else if (export_mode_active) {
-            draw_overlay_header_lcd("EXPORT");
+            draw_header_lcd(current_screen, "EXPORT");
         } else {
             draw_header_lcd(current_screen);
             if (show_feed_expanded) {
@@ -5791,8 +5769,8 @@ static void draw_menu_overlay() {
         {2, -1, ""},
         {0, -1, "SETTINGS"},
         {1,  5, "Night Mode"},
-        {1,  6, "Low Power"},
         {1,  7, "Mute Beeps"},
+        {1,  6, "Low Power"},
         {1,  8, "Turbo Mode"},
         {2, -1, ""},
         {0, -1, "ACTIONS"},
@@ -6123,6 +6101,7 @@ static void set_turbo_mode(bool on) {
 void handle_menu_select() {
     switch (menu_selected) {
         case 0: case 1: case 2: case 3: case 4: {
+            if (export_mode_active) break;
             int target = menu_selected;
             transition_screen(target, (target >= current_screen) ? 1 : -1);
             break;
@@ -6386,90 +6365,108 @@ static void timeline_init(unsigned long frame_ms) {
 static void draw_export_info() {
     spr.fillSprite(BG_COLOR);
 
-    const int LBL_X = UI_PAD_SM + 2;
-    const int VAL_X = 46;
-    int ry = CONTENT_Y + UI_PAD_SM;
-
-    // Status badge
+    // ── Animated grid background (matches title card) ──
     {
-        const char* status_str = "EXPORT ACTIVE";
-        int bw = (int)strlen(status_str) * ts_char_w(TS_BODY) + 12;
-        uint16_t sfill = lerp_col16(BG_COLOR, HEADER_COLOR, 0.22f);
-        spr.fillRoundRect(LBL_X, ry, bw, 16, 5, sfill);
-        spr.drawRoundRect(LBL_X, ry, bw, 16, 5, HEADER_COLOR);
-        spr.setTextColor(HEADER_COLOR, sfill);
-        spr.setTextSize(TS_BODY);
-        spr.setCursor(LBL_X + 6, ry + 4);
-        kprint(spr, status_str);
-    }
-    ry += 24;
+        uint16_t grid_col = lerp_col16(BG_COLOR, HEADER_COLOR, 0.16f);
+        int spacing = 20;
 
-    // URL
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+        static float export_grid_dx = 0.0f, export_grid_dy = 0.0f;
+        static bool export_grid_dir_set = false;
+        if (export_grid_needs_reset) {
+            export_grid_dir_set = false;
+            export_grid_needs_reset = false;
+        }
+        if (!export_grid_dir_set) {
+            float angle = (float)random(0, 628) / 100.0f;
+            export_grid_dx = cosf(angle) * 14.0f;
+            export_grid_dy = sinf(angle) * 14.0f;
+            export_grid_dir_set = true;
+        }
+
+        float t = (float)millis() / 1000.0f;
+        int off_x = ((int)(t * export_grid_dx) % spacing + spacing) % spacing;
+        int off_y = ((int)(t * export_grid_dy) % spacing + spacing) % spacing;
+
+        for (int y = CONTENT_Y + (off_y % spacing); y < DISP_H; y += spacing) {
+            spr.drawFastHLine(0, y, DISP_W, grid_col);
+        }
+        for (int x = off_x % spacing; x < DISP_W; x += spacing) {
+            spr.drawFastVLine(x, CONTENT_Y, DISP_H - CONTENT_Y, grid_col);
+        }
+    }
+
+    const int LBL_X = UI_PAD_SM + 2;
+    int ry = CONTENT_Y + UI_PAD_SM + 2;
+
+    // Row 1: PASSWORD label (left) + EXPORT ACTIVE badge (right)
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
+    spr.setTextSize(TS_MICRO);
+    spr.setCursor(LBL_X, ry);
+    kprint(spr, "PASSWORD");
+
+    {
+        const char* badge_str = "EXPORT ACTIVE";
+        int bw = (int)strlen(badge_str) * (ts_char_w(TS_MICRO) + 1) + 13;
+        int bx = DISP_W - 4 - bw;
+        uint16_t sfill = lerp_col16(BG_COLOR, CAUTION_COLOR, 0.22f);
+        spr.fillRoundRect(bx, ry - 2, bw, 16, 5, sfill);
+        spr.drawRoundRect(bx, ry - 2, bw, 16, 5, CAUTION_COLOR);
+        spr.setTextColor(CAUTION_COLOR, sfill);
+        spr.setTextSize(TS_MICRO);
+        spr.setCursor(bx + 6, ry + 2);
+        kprint(spr, badge_str);
+    }
+
+    // Password value — large and prominent
+    ry += 14;
+    spr.setTextColor(TEXT_COLOR, BG_COLOR);
+    spr.setTextSize(TS_STRONG);
+    spr.setCursor(LBL_X, ry);
+    spr.print(export_auth_pass);
+
+    // Row 2: URL
+    ry += 24;
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(LBL_X, ry);
     kprint(spr, "URL");
-    ry += 11;
 
+    ry += 14;
     spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setTextSize(TS_BODY);
+    spr.setTextSize(TS_STRONG);
     spr.setCursor(LBL_X, ry);
     {
         char url[32];
         snprintf(url, sizeof(url), "http://%s", export_ip_str);
-        kprint(spr, url);
+        spr.print(url);
     }
-    ry += 16;
 
-    // User + Password side by side
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
+    // Row 3: Time remaining — white, not gray
+    ry += 22;
+    spr.setTextColor(HEADER_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(LBL_X, ry);
-    kprint(spr, "USER");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setCursor(VAL_X, ry);
-    spr.print(export_auth_user);
+    kprint(spr, "TIME");
 
-    int pass_x = 120;
-    spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-    spr.setCursor(pass_x, ry);
-    kprint(spr, "PASS");
-    spr.setTextColor(TEXT_COLOR, BG_COLOR);
-    spr.setCursor(pass_x + 36, ry);
-    spr.print(export_auth_pass);
-    ry += 16;
-
-    // Time remaining
     {
         unsigned long elapsed = millis() - export_mode_started_at;
         unsigned long remaining_ms = (elapsed < EXPORT_MODE_MAX_MS)
                                    ? (EXPORT_MODE_MAX_MS - elapsed) : 0;
         unsigned int rm = (unsigned int)(remaining_ms / 60000UL);
         unsigned int rs = (unsigned int)((remaining_ms / 1000UL) % 60);
-
-        spr.setTextColor(ACCENT_COLOR, BG_COLOR);
-        spr.setTextSize(TS_MICRO);
-        spr.setCursor(LBL_X, ry);
-        kprint(spr, "TIME");
-        spr.setTextColor(DIM_COLOR, BG_COLOR);
-        spr.setCursor(VAL_X, ry);
         char time_buf[12];
         snprintf(time_buf, sizeof(time_buf), "%um %02us", rm, rs);
+        spr.setTextColor(TEXT_COLOR, BG_COLOR);
+        spr.setTextSize(TS_STRONG);
+        spr.setCursor(LBL_X + 42, ry);
         spr.print(time_buf);
     }
-    ry += 16;
-
-    // WiFi scanning paused notice
-    spr.setTextColor(CAUTION_COLOR, BG_COLOR);
-    spr.setTextSize(TS_MICRO);
-    spr.setCursor(LBL_X, ry);
-    spr.print("All scanning paused");
 
     // Footer
     spr.setTextColor(DIM_COLOR, BG_COLOR);
     spr.setTextSize(TS_MICRO);
     spr.setCursor(UI_PAD_SM, DISP_H - 10);
-    spr.print("M menu  ESC home");
+    spr.print("ESC stop export  M menu");
 }
 
 void draw_scanner_screen() {
@@ -6779,15 +6776,21 @@ static void prox_radar_refresh(unsigned long frame_ms) {
                 if (!scan_devs[pi].occupied) { slot = pi; break; }
             }
             if (slot < 0) {
-                unsigned long oldest_time = ULONG_MAX;
-                int oldest_idx = 0;
+                int weakest_idx = 0;
+                int weakest_rssi = 0;
                 for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
-                    if (scan_devs[pi].last_seen_ms < oldest_time) {
-                        oldest_time = scan_devs[pi].last_seen_ms;
-                        oldest_idx = pi;
+                    if (!matched[pi] && scan_devs[pi].occupied) {
+                        if (weakest_rssi == 0 || scan_devs[pi].rssi < weakest_rssi) {
+                            weakest_rssi = scan_devs[pi].rssi;
+                            weakest_idx = pi;
+                        }
                     }
                 }
-                slot = oldest_idx;
+                if (e.rssi > weakest_rssi) {
+                    slot = weakest_idx;
+                } else {
+                    continue;
+                }
             }
             ScanDevice& d = scan_devs[slot];
             d.occupied     = true;
@@ -6812,7 +6815,15 @@ static void prox_radar_refresh(unsigned long frame_ms) {
 
     for (int pi = 0; pi < SCAN_MAX_DEVICES; pi++) {
         if (scan_devs[pi].occupied && !matched[pi]) {
-            if ((frame_ms - scan_devs[pi].last_seen_ms) > 22000UL) {
+            unsigned long expire_ms = 22000UL;
+            {
+                int occupied_count = 0;
+                for (int k = 0; k < SCAN_MAX_DEVICES; k++) {
+                    if (scan_devs[k].occupied) occupied_count++;
+                }
+                if (occupied_count >= SCAN_MAX_DEVICES - 1) expire_ms = 10000UL;
+            }
+            if ((frame_ms - scan_devs[pi].last_seen_ms) > expire_ms) {
                 scan_devs[pi].occupied = false;
             }
         }
@@ -8361,8 +8372,8 @@ void draw_signal_screen() {
         if (!active) { badge_text = "No Target"; badge_col = DIM_COLOR; }
         else         { badge_text = is_flock ? "Hunting" : "Tracking";
                        badge_col = is_flock ? HEADER_COLOR : CAUTION_COLOR; }
-        int bw = (int)strlen(badge_text) * (ts_char_w(TS_MICRO) + 1) + 12;
-        int bh = 16;
+        int bw = (int)strlen(badge_text) * (ts_char_w(TS_MICRO) + 1) + 13;
+        int bh = 17;
         int bx = DISP_W - TL - bw;
         int by = CONTENT_Y + UI_PAD_XS;
         uint16_t sfill = lerp_col16(BG_COLOR, badge_col, 0.22f);
@@ -10227,15 +10238,20 @@ void setup() {
 
     // Boot chime — plays after the scanner is visible. Vintage descending
     // tone settles on a middle pitch for a 70s-terminal feel.
-    if (!is_muted) {
-        int boot_vol = current_volume > 25 ? 25 : current_volume;
-        M5Cardputer.Speaker.setVolume(boot_vol);
-        delay(120);
+    if (!stealth_mode) {
+        M5Cardputer.Speaker.end();
+        delay(50);
+        M5Cardputer.Speaker.begin();
+        delay(50);
+        M5Cardputer.Speaker.setVolume(25);
+        M5Cardputer.Speaker.setChannelVolume(0, 25);
+        delay(100);
         M5Cardputer.Speaker.tone(240, 180); delay(220);
         M5Cardputer.Speaker.tone(180, 180); delay(220);
         M5Cardputer.Speaker.tone(200, 260); delay(300);
+        M5Cardputer.Speaker.stop();
     }
-    M5Cardputer.Speaker.setVolume(current_volume);
+    M5Cardputer.Speaker.setVolume(is_muted ? 0 : current_volume);
 
     // Set CPU frequency based on persisted mode. Boot and radio init ran at
     // 240MHz; now drop to the appropriate steady-state clock.
@@ -10513,10 +10529,12 @@ void loop() {
             // Only advance on BtnA when no keyboard key is simultaneously
             // pressed — prevents double-transition when BtnA fires
             // alongside an arrow key on the Cardputer keyboard deck.
-            int next_screen = current_screen + 1;
-            int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
-            if (next_screen >= NUM_SCREENS) next_screen = 0;
-            transition_screen(next_screen, dir);
+            if (!export_mode_active) {
+                int next_screen = current_screen + 1;
+                int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
+                if (next_screen >= NUM_SCREENS) next_screen = 0;
+                transition_screen(next_screen, dir);
+            }
         }
     }
 
@@ -10672,6 +10690,11 @@ void loop() {
 
             if (c == 0x1B && !stealth_mode) {  // ASCII Escape
                 // Priority order: close overlays first, then navigate home.
+                if (export_mode_active || export_connecting) {
+                    export_mode_stop();
+                    screen_dirty = true;
+                    continue;
+                }
                 if (menu_open) {
                     menu_open = false;
                     screen_dirty = true;
@@ -10783,6 +10806,7 @@ void loop() {
                 // Down never changes screen — only left/right do
             }
             else if (IS_KEY_LEFT(c)) {
+                if (export_mode_active) continue;
                 if (show_feed_expanded) {
                     show_feed_expanded = false;
                     draw_current_screen(); render_frame();
@@ -10797,6 +10821,7 @@ void loop() {
                 }
             }
             else if (IS_KEY_RIGHT(c)) {
+                if (export_mode_active) continue;
                 if (show_feed_expanded) {
                     show_feed_expanded = false;
                     draw_current_screen(); render_frame();
