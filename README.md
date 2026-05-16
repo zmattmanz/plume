@@ -192,30 +192,168 @@ Hot-plug is supported — you can insert or remove the SD card while the device 
 
 The firmware scores each device against a multi-factor signature database. 75% confidence or higher triggers an alarm. Scores cap at 100%.
 
-### WiFi Signatures
-- **Known Flock MAC prefixes** — tier 1 (20 OUIs, strong match) and tier 2 (34 OUIs including NitekryDPaul's 31-prefix research list, supporting evidence)
-- **SSID patterns** — `Flock-XXXX` hex format is definitive. Known SSIDs like "FS Ext Battery", "Penguin", "FlockOS" are supporting.
-- **Wildcard probe requests from known OUIs** — DeFlockJoplin technique: empty SSID + mgmt subtype 4 + known MAC = definitive
-- **WPA2-PSK on Flock-format SSIDs** — RSN IE tag 48 AKM suite check
-- **Receiver MAC analysis via addr1** — catches sleeping cameras that appear as destinations of nearby AP frames (NitekryDPaul technique)
-- **Vendor OUI collection** from tagged parameter IE 221
-- Locally-administered (randomized) MACs are excluded from OUI scoring but still matched on SSID
+### WiFi MAC OUI Prefixes
+
+The firmware checks the source MAC (addr2) of every WiFi frame against two tiers of known Flock-associated OUI prefixes. Locally-administered (randomized) MACs — where bit 1 of byte 0 is set — are excluded from OUI scoring since randomized addresses can coincidentally match a Flock prefix. Those still get checked against SSID patterns.
+
+It also checks the destination MAC (addr1) using the NitekryDPaul technique. Flock cameras spend most of their time asleep and never transmit, but nearby APs still address frames to them. Checking addr1 catches these sleeping cameras that would otherwise be invisible.
+
+**Tier 1 — Strong Match (20 OUIs)**
+
+These are high-confidence Flock Safety OUIs. A tier 1 match alone scores 60%.
+
+| OUI | Association |
+|-----|-------------|
+| `8c:1f:64` | Flock Safety |
+| `4c:6e:44` | Flock Safety |
+| `ec:1b:bd` | Flock Safety |
+| `58:8e:81` | Flock Safety |
+| `d8:a0:d8` | Penguin battery BLE |
+| `dc:54:75` | Flock Safety |
+| `e0:e2:e6` | Flock Safety |
+| `f0:9f:c2` | Flock Safety |
+| `68:b6:b3` | Flock Safety |
+| `a0:b7:65` | Flock Safety |
+| `24:0a:c4` | Flock Safety |
+| `a4:e5:7c` | Flock Safety |
+| `78:e3:6d` | Flock Safety |
+| `fc:f5:c4` | Flock Safety |
+| `b0:b2:1c` | Flock Safety |
+| `b4:1e:52` | Flock Safety |
+| `90:35:ea` | Flock Safety |
+| `f0:82:c0` | Flock Safety |
+| `b4:e3:f9` | Flock Safety |
+| `04:0d:84` | Cradlepoint modem |
+
+**Tier 2 — Supporting Evidence (34 OUIs)**
+
+These are lower-confidence associations — component vendors, shared chipsets, and field-reported OUIs that need corroboration from other signals. A tier 2 match contributes 25% as supporting evidence and stacks with other factors.
+
+Includes 14 OUIs from the NitekryDPaul 31-prefix research list, field-validated during the Joplin test (11/12 cameras detected, 2 false positives).
+
+| OUI | Association |
+|-----|-------------|
+| `48:e7:29` | Flock Safety (newer hardware) |
+| `74:4c:a1` | LiteOn (WCBN3510A WiFi/BT in Falcon V2) |
+| `94:34:69` | Flock Safety |
+| `38:5b:44` | Flock Safety |
+| `94:08:53` | Flock Safety |
+| `1c:34:f1` | Flock Safety |
+| `a4:cf:12` | Espressif (ext battery modules use ESP32) |
+| `3c:91:80` | Flock Safety |
+| `80:30:49` | Flock Safety |
+| `14:5a:fc` | Flock Safety |
+| `9c:2f:9d` | Flock Safety |
+| `e4:aa:ea` | Flock Safety |
+| `c8:c9:a3` | Flock Safety (Condor PTZ models) |
+| `70:c9:4e` | LiteOn |
+| `d0:39:57` | Flock Safety |
+| `24:b2:b9` | Flock Safety |
+| `00:f4:8d` | Flock Safety |
+| `e0:0a:f6` | Flock Safety |
+| `08:3a:88` | Murata (BLE modules) |
+| `d8:f3:bc` | Flock Safety |
+| `b8:35:32` | NitekryDPaul research list |
+| `c0:35:32` | NitekryDPaul research list |
+| `f4:6a:dd` | NitekryDPaul research list |
+| `f8:a2:d6` | NitekryDPaul research list |
+| `e8:d0:fc` | NitekryDPaul research list |
+| `e0:4f:43` | NitekryDPaul research list |
+| `b8:1e:a4` | NitekryDPaul research list |
+| `70:08:94` | NitekryDPaul research list |
+| `3c:71:bf` | NitekryDPaul research list |
+| `58:00:e3` | NitekryDPaul research list |
+| `5c:93:a2` | NitekryDPaul research list |
+| `64:6e:69` | NitekryDPaul research list |
+| `48:27:ea` | NitekryDPaul research list |
+| `82:6b:f2` | NitekryDPaul research list |
+
+### WiFi SSID Patterns
+
+| Pattern | Type | Score |
+|---------|------|-------|
+| `Flock-XXXX` (hex format, e.g. `Flock-3A88`) | Definitive | 100% |
+| `FS Ext Battery` | Known name | Supporting |
+| `Penguin` | Known name | Supporting |
+| `FlockOS` | Known name | Supporting |
+| `flocksafety` | Known name | Supporting |
+| `OFS_IoT` | Field-reported infra | Supporting |
+| `PFS_` | Field-reported prefix | Supporting |
+| `test_flck` | Dev/test unit | Supporting |
+
+The firmware also checks for WPA2-PSK on Flock-format SSIDs via RSN IE tag 48 AKM suite parsing — real Flock cameras use WPA2-PSK, so an open network named `Flock-XXXX` would score lower.
+
+### WiFi Wildcard Probe Requests
+
+The DeFlockJoplin technique: when a device sends a probe request with an empty SSID (wildcard), management frame subtype 4, from a known Flock OUI — that's a definitive match at 100%. This catches cameras that are actively scanning for their configured AP but not yet associated.
 
 ### BLE Signatures
-- **Flock manufacturer ID** (`0x09C8` / XUNTONG)
-- **Raven custom service UUIDs** (3100–3500 range)
-- **Raven standard service UUIDs** (180a, 1809, 1819 — legacy firmware)
-- **Known device name patterns** — Penguin numeric names, FS- prefix, RWLS- prefix
-- **TN serial** in manufacturer data
-- **Static address analysis** for supporting evidence (addr_type check)
 
-### Scoring
-- **Definitive match** (SSID format, Raven multi-UUID, name + manufacturer, wildcard probe from known OUI): 100%
-- **Strong match** (tier 1 MAC, tier 1 MAC + SSID): 60–100%
-- **Weak supporting evidence** (tier 2 MAC, name pattern, static address): 25% per factor, cumulative
-- **Bonuses:** strong RSSI above -50 dBm (+10%), stationary behavior via RSSI tracker (+15%)
+**Flock Manufacturer ID**
 
-Stationary detection uses two algorithms: peak-shape (you're driving past a fixed device — RSSI rises then falls with ≥6 dB range) and flat variance (both you and the device are stationary — RSSI range ≤3 dB across samples).
+Company ID `0x09C8` (XUNTONG) in the BLE manufacturer data field. This is a strong single-factor match.
+
+**BLE Device Name Patterns**
+
+| Pattern | What It Is |
+|---------|------------|
+| `FS Ext Battery` | Flock external battery BLE relay |
+| `FS-XXXXXX` | Newer Flock BLE device naming (e.g. `FS-85068D`) |
+| `RWLS-[MAC]` | Field-observed Flock device pattern (e.g. `RWLS-38:5B:44:B3:0F:5A`) |
+| Penguin (10-digit numeric) | Penguin devices — firmware dropped the `Penguin-` prefix in March 2025, now just broadcasts a bare number like `1234567890` |
+| `Pigvision` | Pigvision system |
+| `FlockCam` | Seen in some BLE advertisements |
+
+**TN Serial Detection**
+
+The firmware extracts TN serial numbers from BLE manufacturer data. Presence of a TN serial is a strong match signal.
+
+**BLE Address Type**
+
+Public addresses and random static addresses (what Flock batteries use) get a confidence bonus. Random resolvable addresses — the kind phones rotate every ~15 minutes — get nothing. This filters out pedestrian devices from the scoring.
+
+### Raven (SoundThinking / ShotSpotter) BLE Service UUIDs
+
+Raven acoustic surveillance devices advertise a distinctive combination of custom and standard BLE service UUIDs. The firmware fingerprints the approximate firmware generation based on which UUIDs are present.
+
+| UUID | Service | Firmware |
+|------|---------|----------|
+| `00003100-0000-1000-8000-00805f9b34fb` | GPS / Location | 1.2.x+ |
+| `00003200-0000-1000-8000-00805f9b34fb` | Power Management | 1.2.x+ |
+| `00003300-0000-1000-8000-00805f9b34fb` | Network Status | 1.2.x+ |
+| `00003400-0000-1000-8000-00805f9b34fb` | Uptime / Health | 1.3.x+ |
+| `00003500-0000-1000-8000-00805f9b34fb` | Error Reporting | 1.3.x+ |
+| `0000180a-0000-1000-8000-00805f9b34fb` | Device Information | 1.1.x (legacy) |
+| `00001809-0000-1000-8000-00805f9b34fb` | Health Thermometer | 1.1.x (legacy) |
+| `00001819-0000-1000-8000-00805f9b34fb` | Location and Navigation | 1.1.x (legacy) |
+
+1 custom UUID (3100–3500) = strong match. 3+ UUIDs = definitive (100%). The firmware classifies as 1.1.x-LEGACY, 1.2.x, or 1.3.x and logs the generation.
+
+### Confidence Scoring
+
+| Condition | Score | Notes |
+|-----------|-------|-------|
+| `Flock-XXXX` SSID format match | 100% | Definitive — hex format with partial MAC |
+| Raven 3+ UUID match | 100% | Definitive — unique service combination |
+| BLE name + manufacturer ID match | 100% | Definitive — two independent strong signals |
+| Wildcard probe from known OUI | 100% | Definitive — DeFlockJoplin technique |
+| Tier 1 MAC + SSID pattern | 100% | Two strong corroborating signals |
+| Tier 1 MAC alone | 60% | Strong single factor |
+| Tier 2 MAC | 25% | Supporting — needs corroboration |
+| BLE name pattern match | 25% | Supporting |
+| Static BLE address | 25% | Supporting |
+| RSSI above -50 dBm | +10% | Bonus — strong signal suggests proximity |
+| Stationary behavior detected | +15% | Bonus — fixed installation pattern |
+
+Supporting evidence stacks. A tier 2 MAC (25%) plus a name pattern match (25%) plus strong RSSI (+10%) gets you to 60%. Add stationary behavior (+15%) and you're at 75% — alarm threshold.
+
+### Stationary Detection
+
+Two algorithms run against the RSSI sample buffer for each tracked device:
+
+**Peak-shape** — you're driving past a fixed installation. RSSI rises as you approach, peaks, then falls as you pass. The firmware looks for ≥6 dB range across the sample window. This is the classic "drive-past" pattern.
+
+**Flat variance** — both you and the device are stationary. RSSI stays within ≤3 dB range across all samples. You're parked near a camera, or stopped at a light next to one.
 
 ---
 
@@ -249,25 +387,6 @@ Press `n` or toggle in the menu. Shifts the entire UI to a red-shifted palette t
 ## Ambient Mode
 
 After 2 minutes with no input, the screen dims to minimum brightness and the scanner keeps running at ~15 fps. Forces scanner screen if you idled on another screen. Any keypress wakes it. Disabled when signal tracking is active, export mode is running, or a toast is showing.
-
----
-
-## Raven Detection (SoundThinking / ShotSpotter)
-
-The firmware detects Raven acoustic surveillance devices via BLE service UUID fingerprinting. Ravens advertise a distinctive combination of custom and standard UUIDs that vary by firmware version:
-
-| UUID | Service | Firmware |
-|------|---------|----------|
-| `00003100-...` | GPS / Location | 1.2.x+ |
-| `00003200-...` | Power Management | 1.2.x+ |
-| `00003300-...` | Network Status | 1.2.x+ |
-| `00003400-...` | Uptime / Health | 1.3.x+ |
-| `00003500-...` | Error Reporting | 1.3.x+ |
-| `0000180a-...` | Device Information | 1.1.x (legacy) |
-| `00001809-...` | Health Thermometer | 1.1.x (legacy) |
-| `00001819-...` | Location and Navigation | 1.1.x (legacy) |
-
-1 custom UUID = strong match. 3+ = definitive. The firmware identifies the approximate firmware generation (1.1.x-LEGACY, 1.2.x, 1.3.x) and logs it.
 
 ---
 
