@@ -10586,17 +10586,7 @@ void loop() {
                         }
                         wifi_config_editing = false;
                         wifi_config_cursor = 0;
-                    } else if (IS_KEY_LEFT(c)) {
-                        if (wifi_config_cursor > 0) wifi_config_cursor--;
-                    } else if (IS_KEY_RIGHT(c)) {
-                        if (wifi_config_cursor < cur_len) wifi_config_cursor++;
-                    } else if (IS_KEY_UP(c)) {
-                        wifi_config_cursor = 0;
-                    } else if (IS_KEY_DOWN(c)) {
-                        wifi_config_cursor = cur_len;
-                    } else if (c >= 32 && c <= 126 && cur_len < max_len
-                               && !IS_KEY_UP(c) && !IS_KEY_DOWN(c)
-                               && !IS_KEY_LEFT(c) && !IS_KEY_RIGHT(c)) {
+                    } else if (c >= 32 && c <= 126 && cur_len < max_len) {
                         // Insert at cursor
                         for (int i = cur_len + 1; i > wifi_config_cursor; i--) {
                             buf[i] = buf[i - 1];
