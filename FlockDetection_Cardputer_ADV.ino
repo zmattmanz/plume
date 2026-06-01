@@ -10620,6 +10620,22 @@ static void service_heap_health() {
     }
 }
 
+static void service_ambient_mode() {
+    // Enter ambient mode after sustained idle
+    if (!ambient_mode && !stealth_mode && !toast_active && !signal_active && !export_mode_active &&
+        (millis() - last_user_input_ms) > AMBIENT_TIMEOUT_MS) {
+        ambient_mode = true;
+        show_feed_expanded = false;
+        M5Cardputer.Display.setBrightness(AMBIENT_BRIGHTNESS);
+    }
+
+    // Exit ambient if conditions change from non-input sources
+    if (ambient_mode && (signal_active || export_mode_active || toast_active)) {
+        ambient_mode = false;
+        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+    }
+}
+
 static void service_gps_timezone() {
     // Recompute timezone from GPS every 5 minutes (handles driving across zones)
     if (millis() - auto_tz_last_compute_ms > AUTO_TZ_INTERVAL_MS || !auto_tz_valid) {
@@ -11617,19 +11633,7 @@ void loop() {
 
     service_gps_timezone();
 
-    // Enter ambient mode after sustained idle
-    if (!ambient_mode && !stealth_mode && !toast_active && !signal_active && !export_mode_active &&
-        (millis() - last_user_input_ms) > AMBIENT_TIMEOUT_MS) {
-        ambient_mode = true;
-        show_feed_expanded = false;
-        M5Cardputer.Display.setBrightness(AMBIENT_BRIGHTNESS);
-    }
-
-    // Exit ambient if conditions change from non-input sources
-    if (ambient_mode && (signal_active || export_mode_active || toast_active)) {
-        ambient_mode = false;
-        M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
-    }
+    service_ambient_mode();
 
     if (ambient_mode) {
         // Render the normal scanner screen at reduced framerate (~15 fps).
