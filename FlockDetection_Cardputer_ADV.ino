@@ -10766,6 +10766,110 @@ static void service_ble_restart() {
     }
 }
 
+static void redraw_now() { draw_current_screen(); render_frame(); }
+
+static void service_stealth_and_stats_render() {
+    if (ambient_mode) {
+        // Render the normal scanner screen at reduced framerate (~15 fps).
+        // Same layout, same feed, same viz — just dimmed via backlight.
+        static unsigned long last_ambient_draw = 0;
+        unsigned long now_amb = millis();
+        if (now_amb - last_ambient_draw > 66) {
+            // Force scanner screen if user idled on another screen
+            if (current_screen != 0) {
+                current_screen = 0;
+                feed_anim_prev_head = -1;
+                feed_anim_shift_ms  = 0;
+            }
+            redraw_now();
+            last_ambient_draw = now_amb;
+        }
+    } else if (stealth_mode) {
+        // Minimal stealth render: tiny dim "S" in bottom-right corner every 2s.
+        static unsigned long last_stealth_draw = 0;
+        if (millis() - last_stealth_draw > 2000) {
+            spr.fillSprite(BG_COLOR);
+            uint16_t s_col = lerp_col16(BG_COLOR, lgfx::color565(180, 30, 30), 0.6f);
+            spr.setTextColor(s_col, BG_COLOR);
+            spr.setTextSize(TS_MICRO);
+            spr.setCursor(DISP_W - 8, DISP_H - 9);
+            spr.print("S");
+            render_frame();
+            last_stealth_draw = millis();
+        }
+    } else {
+        static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
+
+        // Screen 4 escalates to the fast path while the eased scroll position
+        // is still chasing its target — keeps the smooth scroll animation
+        // running at ~60fps without permanently promoting stats to fast path.
+        bool stats_scrolling = (current_screen == 4) &&
+            (fabsf(stats_scroll_y_f - (float)stats_scroll_target) > 0.5f);
+
+        // Same idea for per-character roll-ups: while any glyph anim is
+        // still in flight (within UI_ANIM_QUICK of its start), drive the
+        // fast path so the slide is actually animated frame-by-frame.
+        bool stats_rolling = false;
+        if (current_screen == 4) {
+            for (int i = 0; i < STATS_CARD_COUNT && !stats_rolling; i++) {
+                for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
+                    if (stats_char_anim[i][ci] != 0 &&
+                        (now - stats_char_anim[i][ci]) < UI_ANIM_QUICK) {
+                        stats_rolling = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Detections screen escalates while the selection ease is chasing
+        // its target or while the detail overlay open fade is in flight.
+        // (Close is instant — no animation to gate.)
+        bool hist_animating = false;
+        if (current_screen == 2) {
+            int hist_target_y = CONTENT_Y +
+                (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
+            bool sel_settling = fabsf(hist_sel_y_f - (float)hist_target_y) > 0.5f;
+            bool open_running = (hist_detail_open &&
+                                 hist_detail_open_ms != 0 &&
+                                 (now - hist_detail_open_ms) < UI_FADE_IN_MS + 30);
+            hist_animating = sel_settling || open_running;
+        }
+
+        if (menu_open ||
+            current_screen == 0 || current_screen == 1 || current_screen == 3 ||
+            show_vol_overlay || toast_active || title_card_active || stats_scrolling || stats_rolling ||
+            hist_animating ||
+            (now - last_fast_anim < 30)) {
+            // Stats screen caps at 30 fps to suppress the SPI/scan-line
+            // tearing that 60 fps pushes produced. Other animated screens
+            // stay at 60 fps where the artifact isn't visible.
+            unsigned long min_frame_ms = (current_screen == 4) ? 33 : 15;
+            if (now - last_fast_anim >= min_frame_ms) {
+                redraw_now();
+                last_fast_anim = now;
+                screen_dirty = false;
+            }
+        }
+        else {
+            // Screen 4 has a live SESSION timer. Mark dirty every slow-UI
+            // cycle (100ms) so the seconds digit updates within one tick of
+            // the actual boundary. Roll animation is gated by stats_rolling,
+            // so this doesn't promote stats to the fast path when idle.
+            if (current_screen == 4) {
+                screen_dirty = true;
+            }
+            if (now - last_slow_ui >= 100) {
+                if (screen_dirty || toast_active) {
+                    redraw_now();
+                    screen_dirty = false;
+                }
+                last_slow_ui = now;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // MAIN LOOP
 // ============================================================================
@@ -10842,8 +10946,7 @@ void loop() {
             screen_dirty = true;
         } else if (show_feed_expanded) {
             show_feed_expanded = false;
-            draw_current_screen();
-            render_frame();
+            redraw_now();
         } else if (!(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())) {
             // Only advance on BtnA when no keyboard key is simultaneously
             // pressed — prevents double-transition when BtnA fires
@@ -11635,107 +11738,6 @@ void loop() {
 
     service_ambient_mode();
 
-    if (ambient_mode) {
-        // Render the normal scanner screen at reduced framerate (~15 fps).
-        // Same layout, same feed, same viz — just dimmed via backlight.
-        static unsigned long last_ambient_draw = 0;
-        unsigned long now_amb = millis();
-        if (now_amb - last_ambient_draw > 66) {
-            // Force scanner screen if user idled on another screen
-            if (current_screen != 0) {
-                current_screen = 0;
-                feed_anim_prev_head = -1;
-                feed_anim_shift_ms  = 0;
-            }
-            draw_current_screen();
-            render_frame();
-            last_ambient_draw = now_amb;
-        }
-    } else if (stealth_mode) {
-        // Minimal stealth render: tiny dim "S" in bottom-right corner every 2s.
-        static unsigned long last_stealth_draw = 0;
-        if (millis() - last_stealth_draw > 2000) {
-            spr.fillSprite(BG_COLOR);
-            uint16_t s_col = lerp_col16(BG_COLOR, lgfx::color565(180, 30, 30), 0.6f);
-            spr.setTextColor(s_col, BG_COLOR);
-            spr.setTextSize(TS_MICRO);
-            spr.setCursor(DISP_W - 8, DISP_H - 9);
-            spr.print("S");
-            render_frame();
-            last_stealth_draw = millis();
-        }
-    } else {
-        static unsigned long last_fast_anim = 0; static unsigned long last_slow_ui = 0; unsigned long now = millis();
-
-        // Screen 4 escalates to the fast path while the eased scroll position
-        // is still chasing its target — keeps the smooth scroll animation
-        // running at ~60fps without permanently promoting stats to fast path.
-        bool stats_scrolling = (current_screen == 4) &&
-            (fabsf(stats_scroll_y_f - (float)stats_scroll_target) > 0.5f);
-
-        // Same idea for per-character roll-ups: while any glyph anim is
-        // still in flight (within UI_ANIM_QUICK of its start), drive the
-        // fast path so the slide is actually animated frame-by-frame.
-        bool stats_rolling = false;
-        if (current_screen == 4) {
-            for (int i = 0; i < STATS_CARD_COUNT && !stats_rolling; i++) {
-                for (int ci = 0; ci < STAT_MAX_CHARS; ci++) {
-                    if (stats_char_anim[i][ci] != 0 &&
-                        (now - stats_char_anim[i][ci]) < UI_ANIM_QUICK) {
-                        stats_rolling = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Detections screen escalates while the selection ease is chasing
-        // its target or while the detail overlay open fade is in flight.
-        // (Close is instant — no animation to gate.)
-        bool hist_animating = false;
-        if (current_screen == 2) {
-            int hist_target_y = CONTENT_Y +
-                (history_selected_idx - history_scroll_offset) * HIST_ROW_H;
-            bool sel_settling = fabsf(hist_sel_y_f - (float)hist_target_y) > 0.5f;
-            bool open_running = (hist_detail_open &&
-                                 hist_detail_open_ms != 0 &&
-                                 (now - hist_detail_open_ms) < UI_FADE_IN_MS + 30);
-            hist_animating = sel_settling || open_running;
-        }
-
-        if (menu_open ||
-            current_screen == 0 || current_screen == 1 || current_screen == 3 ||
-            show_vol_overlay || toast_active || title_card_active || stats_scrolling || stats_rolling ||
-            hist_animating ||
-            (now - last_fast_anim < 30)) {
-            // Stats screen caps at 30 fps to suppress the SPI/scan-line
-            // tearing that 60 fps pushes produced. Other animated screens
-            // stay at 60 fps where the artifact isn't visible.
-            unsigned long min_frame_ms = (current_screen == 4) ? 33 : 15;
-            if (now - last_fast_anim >= min_frame_ms) {
-                draw_current_screen();
-                render_frame();
-                last_fast_anim = now;
-                screen_dirty = false;
-            }
-        }
-        else {
-            // Screen 4 has a live SESSION timer. Mark dirty every slow-UI
-            // cycle (100ms) so the seconds digit updates within one tick of
-            // the actual boundary. Roll animation is gated by stats_rolling,
-            // so this doesn't promote stats to the fast path when idle.
-            if (current_screen == 4) {
-                screen_dirty = true;
-            }
-            if (now - last_slow_ui >= 100) {
-                if (screen_dirty || toast_active) {
-                    draw_current_screen();
-                    render_frame();
-                    screen_dirty = false;
-                }
-                last_slow_ui = now;
-            }
-        }
-    }
+    service_stealth_and_stats_render();
     vTaskDelay(10 / portTICK_PERIOD_MS);
 }
