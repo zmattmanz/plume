@@ -10620,6 +10620,50 @@ static void service_heap_health() {
     }
 }
 
+static void service_sd_hotplug() {
+    // SD hot-plug: periodically attempt remount if card is absent, or probe if present
+    sd_check_hotplug();
+    if (wdt_subscribed) esp_task_wdt_reset();
+
+    if (millis() - last_sd_flush_check >= 500) {
+        last_sd_flush_check = millis();
+        bool should_flush = false;
+
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+        if (sd_write_count >= MAX_LOG_BUFFER || pcap_write_count >= MAX_PCAP_BUFFER ||
+            ble_pcap_write_count >= MAX_PCAP_BUFFER ||
+            (millis() - last_sd_flush > SD_FLUSH_INTERVAL &&
+             (sd_write_count > 0 || pcap_write_count > 0 || ble_pcap_write_count > 0))) {
+            should_flush = true;
+        }
+        xSemaphoreGiveRecursive(dataMutex);
+
+        if (should_flush) flush_sd_buffer();
+    }
+    if (wdt_subscribed) esp_task_wdt_reset();
+
+    {
+        bool was_dirty = false;
+        if (current_screen == 2 && !hist_detail_open) {
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            if (sd_hist_dirty) {
+                sd_hist_dirty = false;
+                was_dirty = true;
+            }
+            xSemaphoreGiveRecursive(dataMutex);
+        }
+        if (was_dirty) {
+            // Same timed-take pattern — skip the load if PersistTask is busy;
+            // sd_hist_dirty has already been cleared, so this iteration just
+            // shows the previous snapshot until the next dirty cycle.
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                load_sd_history();
+                xSemaphoreGive(sdMutex);
+            }
+        }
+    }
+}
+
 static void service_ble_restart() {
     // Periodic BLE stack health restart — prevents NimBLE internal state
     // corruption that can build up during multi-hour continuous scanning.
@@ -11547,47 +11591,7 @@ void loop() {
 
     service_ble_restart();
 
-    // SD hot-plug: periodically attempt remount if card is absent, or probe if present
-    sd_check_hotplug();
-    if (wdt_subscribed) esp_task_wdt_reset();
-
-    if (millis() - last_sd_flush_check >= 500) {
-        last_sd_flush_check = millis(); 
-        bool should_flush = false; 
-        
-        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-        if (sd_write_count >= MAX_LOG_BUFFER || pcap_write_count >= MAX_PCAP_BUFFER ||
-            ble_pcap_write_count >= MAX_PCAP_BUFFER ||
-            (millis() - last_sd_flush > SD_FLUSH_INTERVAL &&
-             (sd_write_count > 0 || pcap_write_count > 0 || ble_pcap_write_count > 0))) {
-            should_flush = true;
-        }
-        xSemaphoreGiveRecursive(dataMutex); 
-        
-        if (should_flush) flush_sd_buffer();
-    }
-    if (wdt_subscribed) esp_task_wdt_reset();
-
-    {
-        bool was_dirty = false;
-        if (current_screen == 2 && !hist_detail_open) {
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            if (sd_hist_dirty) {
-                sd_hist_dirty = false;
-                was_dirty = true;
-            }
-            xSemaphoreGiveRecursive(dataMutex);
-        }
-        if (was_dirty) {
-            // Same timed-take pattern — skip the load if PersistTask is busy;
-            // sd_hist_dirty has already been cleared, so this iteration just
-            // shows the previous snapshot until the next dirty cycle.
-            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                load_sd_history();
-                xSemaphoreGive(sdMutex);
-            }
-        }
-    }
+    service_sd_hotplug();
 
     // Recompute timezone from GPS every 5 minutes (handles driving across zones)
     if (millis() - auto_tz_last_compute_ms > AUTO_TZ_INTERVAL_MS || !auto_tz_valid) {
