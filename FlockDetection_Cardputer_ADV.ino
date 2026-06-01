@@ -10620,6 +10620,70 @@ static void service_heap_health() {
     }
 }
 
+static void service_ble_restart() {
+    // Periodic BLE stack health restart — prevents NimBLE internal state
+    // corruption that can build up during multi-hour continuous scanning.
+    // Skip when export is active: NimBLE is already deinited then.
+    if (export_mode_active || export_connecting) {
+        last_ble_restart_ms = millis();  // skip this cycle
+    } else if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
+        last_ble_restart_ms = millis();
+
+        // 1. Stop scanning so the callback stops producing new events.
+        scanner_ready = false;
+        if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
+        if (pBLEScan) {
+            pBLEScan->stop();
+            pBLEScan->clearResults();
+        }
+
+        // 2. Drain the BLE event queue so the worker doesn't pick up stale
+        //    slot indices after deinit.
+        xQueueReset(ble_event_queue);
+
+        // 3. Wait for any in-flight pool slot to finish. Timeout 500ms.
+        {
+            unsigned long drain_start = millis();
+            bool all_clear = false;
+            while ((millis() - drain_start) < 500) {
+                all_clear = true;
+                for (int i = 0; i < BLE_POOL_SIZE; i++) {
+                    if (__atomic_load_n(&ble_pool[i].in_use, __ATOMIC_ACQUIRE)) {
+                        all_clear = false;
+                        break;
+                    }
+                }
+                if (all_clear) break;
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+            }
+            if (!all_clear) {
+                Serial.println("[BLE] Warning: pool slots still in-use after drain timeout");
+                for (int i = 0; i < BLE_POOL_SIZE; i++) {
+                    __atomic_store_n(&ble_pool[i].in_use, 0u, __ATOMIC_RELEASE);
+                }
+            }
+        }
+
+        // 4. Reset write cursor so post-reinit callbacks start clean.
+        __atomic_store_n(&ble_pool_write, 0u, __ATOMIC_RELEASE);
+
+        // 5. Tear down and reinitialize the stack.
+        NimBLEDevice::deinit(true);
+        delay(100);
+        NimBLEDevice::init("");
+        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+        pBLEScan = NimBLEDevice::getScan();
+        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
+        pBLEScan->setActiveScan(false);
+        apply_ble_scan_params();
+        pBLEScan->setMaxResults(0);
+        last_ble_scan = millis();
+        if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
+        scanner_ready = true;
+        Serial.println("[BLE] Periodic stack restart completed");
+    }
+}
+
 // ============================================================================
 // MAIN LOOP
 // ============================================================================
@@ -11481,67 +11545,7 @@ void loop() {
         give_data_mutex();
     }
 
-    // Periodic BLE stack health restart — prevents NimBLE internal state
-    // corruption that can build up during multi-hour continuous scanning.
-    // Skip when export is active: NimBLE is already deinited then.
-    if (export_mode_active || export_connecting) {
-        last_ble_restart_ms = millis();  // skip this cycle
-    } else if (millis() - last_ble_restart_ms > BLE_RESTART_INTERVAL_MS) {
-        last_ble_restart_ms = millis();
-
-        // 1. Stop scanning so the callback stops producing new events.
-        scanner_ready = false;
-        if (ScannerTaskHandle) vTaskSuspend(ScannerTaskHandle);
-        if (pBLEScan) {
-            pBLEScan->stop();
-            pBLEScan->clearResults();
-        }
-
-        // 2. Drain the BLE event queue so the worker doesn't pick up stale
-        //    slot indices after deinit.
-        xQueueReset(ble_event_queue);
-
-        // 3. Wait for any in-flight pool slot to finish. Timeout 500ms.
-        {
-            unsigned long drain_start = millis();
-            bool all_clear = false;
-            while ((millis() - drain_start) < 500) {
-                all_clear = true;
-                for (int i = 0; i < BLE_POOL_SIZE; i++) {
-                    if (__atomic_load_n(&ble_pool[i].in_use, __ATOMIC_ACQUIRE)) {
-                        all_clear = false;
-                        break;
-                    }
-                }
-                if (all_clear) break;
-                vTaskDelay(5 / portTICK_PERIOD_MS);
-            }
-            if (!all_clear) {
-                Serial.println("[BLE] Warning: pool slots still in-use after drain timeout");
-                for (int i = 0; i < BLE_POOL_SIZE; i++) {
-                    __atomic_store_n(&ble_pool[i].in_use, 0u, __ATOMIC_RELEASE);
-                }
-            }
-        }
-
-        // 4. Reset write cursor so post-reinit callbacks start clean.
-        __atomic_store_n(&ble_pool_write, 0u, __ATOMIC_RELEASE);
-
-        // 5. Tear down and reinitialize the stack.
-        NimBLEDevice::deinit(true);
-        delay(100);
-        NimBLEDevice::init("");
-        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-        pBLEScan = NimBLEDevice::getScan();
-        pBLEScan->setAdvertisedDeviceCallbacks(&ble_cb_singleton, false);
-        pBLEScan->setActiveScan(false);
-        apply_ble_scan_params();
-        pBLEScan->setMaxResults(0);
-        last_ble_scan = millis();
-        if (ScannerTaskHandle) vTaskResume(ScannerTaskHandle);
-        scanner_ready = true;
-        Serial.println("[BLE] Periodic stack restart completed");
-    }
+    service_ble_restart();
 
     // SD hot-plug: periodically attempt remount if card is absent, or probe if present
     sd_check_hotplug();
