@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // PLUME v1.0-beta
 // ============================================================================
 
@@ -10870,96 +10870,7 @@ static void service_stealth_and_stats_render() {
     }
 }
 
-// ============================================================================
-// MAIN LOOP
-// ============================================================================
-void loop() {
-    service_watchdog();
-    M5Cardputer.update(); yield();
-
-    service_export_mode();
-
-    // Dynamically calculate expected hardware voltage sag for this loop iteration
-    update_load_sag();
-
-    int32_t loop_mv = get_filtered_voltage();
-
-    service_battery_warnings(loop_mv);
-
-    service_stack_health();
-
-    service_heap_health();
-
-    if (pending_delete_count > 0 && pending_delete_dirty_ms != 0 &&
-        (millis() - pending_delete_dirty_ms) > 5000)
-        flush_pending_deletes();
-
-    process_wifi_event_queue();
-    process_c5_serial();        // drain 5 GHz hits from the C5 (self-guards when link is off)
-    feed_commit_pending();
-    update_channel_histogram();
-
-    // Gap-fill: push a floor-level sample when the target is silent so the
-    // trace curve drops rather than freezing at the last reading.
-    if (signal_active) {
-        unsigned long now = millis();
-        if ((now - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
-            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-            if (signal_active && (millis() - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
-                sig_trace[sig_trace_head].rssi = (int8_t)RSSI_VIS_FLOOR;
-                sig_trace_head = (sig_trace_head + 1) % SIG_TRACE_SIZE;
-                if (sig_trace_count < SIG_TRACE_SIZE) sig_trace_count++;
-                sig_trace_last_sample = millis();
-            }
-            xSemaphoreGiveRecursive(dataMutex);
-        }
-    }
-    if (wdt_subscribed) esp_task_wdt_reset();
-
-    int conf_snapshot = 0;
-    int src_snapshot = 0;
-    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-    if (trigger_alarm_confidence >= 50) {
-        conf_snapshot = trigger_alarm_confidence;
-        src_snapshot = trigger_alarm_source;
-    }
-    trigger_alarm_confidence = 0;
-    trigger_alarm_source = 0;
-    xSemaphoreGiveRecursive(dataMutex);
-
-    if (conf_snapshot >= 50) {
-        play_escalated_alarm(conf_snapshot, src_snapshot);
-    }
-    if (wdt_subscribed) esp_task_wdt_reset();
-
-    if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
-        last_user_input_ms = millis();
-        if (ambient_mode) {
-            ambient_mode = false;
-            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
-            // Wake the I2S peripheral from idle so the next tone() call
-            // (often a UI click or alarm chime) doesn't hit a DMA assertion.
-            M5Cardputer.Speaker.stop();
-        }
-        if (menu_open) {
-            menu_open = false;
-            screen_dirty = true;
-        } else if (show_feed_expanded) {
-            show_feed_expanded = false;
-            redraw_now();
-        } else if (!(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())) {
-            // Only advance on BtnA when no keyboard key is simultaneously
-            // pressed — prevents double-transition when BtnA fires
-            // alongside an arrow key on the Cardputer keyboard deck.
-            if (!export_mode_active) {
-                int next_screen = current_screen + 1;
-                int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
-                if (next_screen >= NUM_SCREENS) next_screen = 0;
-                transition_screen(next_screen, dir);
-            }
-        }
-    }
-
+static void handle_keyboard_input() {
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
         last_user_input_ms = millis();
         screen_dirty = true;
@@ -11633,6 +11544,99 @@ void loop() {
             }
         }
     }
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+    service_watchdog();
+    M5Cardputer.update(); yield();
+
+    service_export_mode();
+
+    // Dynamically calculate expected hardware voltage sag for this loop iteration
+    update_load_sag();
+
+    int32_t loop_mv = get_filtered_voltage();
+
+    service_battery_warnings(loop_mv);
+
+    service_stack_health();
+
+    service_heap_health();
+
+    if (pending_delete_count > 0 && pending_delete_dirty_ms != 0 &&
+        (millis() - pending_delete_dirty_ms) > 5000)
+        flush_pending_deletes();
+
+    process_wifi_event_queue();
+    process_c5_serial();        // drain 5 GHz hits from the C5 (self-guards when link is off)
+    feed_commit_pending();
+    update_channel_histogram();
+
+    // Gap-fill: push a floor-level sample when the target is silent so the
+    // trace curve drops rather than freezing at the last reading.
+    if (signal_active) {
+        unsigned long now = millis();
+        if ((now - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            if (signal_active && (millis() - sig_trace_last_sample) >= SIG_TRACE_INTERVAL_MS) {
+                sig_trace[sig_trace_head].rssi = (int8_t)RSSI_VIS_FLOOR;
+                sig_trace_head = (sig_trace_head + 1) % SIG_TRACE_SIZE;
+                if (sig_trace_count < SIG_TRACE_SIZE) sig_trace_count++;
+                sig_trace_last_sample = millis();
+            }
+            xSemaphoreGiveRecursive(dataMutex);
+        }
+    }
+    if (wdt_subscribed) esp_task_wdt_reset();
+
+    int conf_snapshot = 0;
+    int src_snapshot = 0;
+    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+    if (trigger_alarm_confidence >= 50) {
+        conf_snapshot = trigger_alarm_confidence;
+        src_snapshot = trigger_alarm_source;
+    }
+    trigger_alarm_confidence = 0;
+    trigger_alarm_source = 0;
+    xSemaphoreGiveRecursive(dataMutex);
+
+    if (conf_snapshot >= 50) {
+        play_escalated_alarm(conf_snapshot, src_snapshot);
+    }
+    if (wdt_subscribed) esp_task_wdt_reset();
+
+    if (M5Cardputer.BtnA.wasClicked() && !stealth_mode) {
+        last_user_input_ms = millis();
+        if (ambient_mode) {
+            ambient_mode = false;
+            M5Cardputer.Display.setBrightness(BRIGHTNESS_LEVELS[brightness_level]);
+            // Wake the I2S peripheral from idle so the next tone() call
+            // (often a UI click or alarm chime) doesn't hit a DMA assertion.
+            M5Cardputer.Speaker.stop();
+        }
+        if (menu_open) {
+            menu_open = false;
+            screen_dirty = true;
+        } else if (show_feed_expanded) {
+            show_feed_expanded = false;
+            redraw_now();
+        } else if (!(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())) {
+            // Only advance on BtnA when no keyboard key is simultaneously
+            // pressed — prevents double-transition when BtnA fires
+            // alongside an arrow key on the Cardputer keyboard deck.
+            if (!export_mode_active) {
+                int next_screen = current_screen + 1;
+                int dir = (next_screen >= NUM_SCREENS) ? -1 : 1;
+                if (next_screen >= NUM_SCREENS) next_screen = 0;
+                transition_screen(next_screen, dir);
+            }
+        }
+    }
+
+    handle_keyboard_input();
 
     if (wdt_subscribed) esp_task_wdt_reset();
 
