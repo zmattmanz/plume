@@ -11618,6 +11618,17 @@ static void handle_key_repeat() {
     }
 }
 
+static void handle_pending_backslash() {
+    // Fire pending '\' single-press action if double-tap window expired.
+    // Signed-diff compare handles the 49-day millis() wraparound edge case.
+    if (bs_pending_exists && (long)(millis() - bs_pending_until) >= 0) {
+        bs_pending_exists = false;
+        bs_pending_until = 0;
+        led_breathing_on = !led_breathing_on;
+        beep(led_breathing_on ? 800 : 400, 30);
+    }
+}
+
 // ============================================================================
 // MAIN LOOP
 // ============================================================================
@@ -11714,14 +11725,7 @@ void loop() {
 
     handle_key_repeat();
 
-    // Fire pending '\' single-press action if double-tap window expired.
-    // Signed-diff compare handles the 49-day millis() wraparound edge case.
-    if (bs_pending_exists && (long)(millis() - bs_pending_until) >= 0) {
-        bs_pending_exists = false;
-        bs_pending_until = 0;
-        led_breathing_on = !led_breathing_on;
-        beep(led_breathing_on ? 800 : 400, 30);
-    }
+    handle_pending_backslash();
 
     if (millis() - last_time_save >= 1000) { xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY); lifetime_seconds++; xSemaphoreGiveRecursive(dataMutex); last_time_save = millis(); }
     if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) {
