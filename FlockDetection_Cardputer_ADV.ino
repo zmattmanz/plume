@@ -10473,9 +10473,9 @@ static void service_battery_warnings(int32_t loop_mv) {
     }
 }
 
+static bool wdt_subscribed = false;
 // Subscribe this task to the hardware watchdog (once), then pet it each iteration.
 static void service_watchdog() {
-    static bool wdt_subscribed = false;
     if (!wdt_subscribed) {
         esp_err_t err = esp_task_wdt_add(NULL);
         if (err == ESP_OK || err == ESP_ERR_INVALID_ARG) wdt_subscribed = true;
