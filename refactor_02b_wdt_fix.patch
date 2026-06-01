@@ -1,0 +1,20 @@
+diff --git a/FlockDetection_Cardputer_ADV.ino b/FlockDetection_Cardputer_ADV.ino
+index 65f6991..16eba21 100644
+--- a/FlockDetection_Cardputer_ADV.ino
++++ b/FlockDetection_Cardputer_ADV.ino
+@@ -10473,9 +10473,14 @@ static void service_battery_warnings(int32_t loop_mv) {
+     }
+ }
+ 
++// File-scope so loop() can also pet the watchdog from its long-running sections
++// via bare `if (wdt_subscribed) esp_task_wdt_reset();` calls. Declared here (after
++// the unrelated function-local wdt_subscribed vars earlier in the file), so it
++// only takes effect from this point onward — those earlier locals are untouched.
++static bool wdt_subscribed = false;
++
+ // Subscribe this task to the hardware watchdog (once), then pet it each iteration.
+ static void service_watchdog() {
+-    static bool wdt_subscribed = false;
+     if (!wdt_subscribed) {
+         esp_err_t err = esp_task_wdt_add(NULL);
+         if (err == ESP_OK || err == ESP_ERR_INVALID_ARG) wdt_subscribed = true;

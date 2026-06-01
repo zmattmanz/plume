@@ -82,6 +82,11 @@ void load_sd_history();
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type);
 static void set_toast_direct(const char* text, uint16_t accent, bool is_info = true);
 static void apply_ble_scan_params();
+// ── ESP32-C5 5 GHz co-processor link (Grove/UART1) — defined in C5 LINK section ──
+void c5_link_begin();
+void c5_link_end();
+void process_c5_serial();
+bool c5_is_present();
 struct WifiEvent;
 static void parse_wifi_event(struct WifiEvent* ev);
 static void update_channel_histogram();
@@ -124,6 +129,7 @@ uint16_t SCALE_LABEL_COLOR;    // lerp(BG, DIM, 0.80) — dBm scale tick labels
 #define TOAST_WARNING  CAUTION_COLOR  // errors, warnings, destructive actions
 #define TOAST_NEUTRAL  DIM_COLOR      // informational, dismissed, hints
 bool night_mode = false;
+bool c5_enabled = true;   // 5 GHz C5 co-processor link (Grove/UART1); harmless with no C5 attached
 bool show_help_overlay = false;
 static unsigned long help_ease_start = 0;
 
@@ -197,6 +203,7 @@ static const MenuItem settings_items[] = {
     {"Mute Beeps",       true,  false, 7},
     {"Low Power Mode",   true,  false, 6},
     {"Turbo Mode",       true,  false, 8},
+    {"5GHz Radio",       true,  false, 12},
 };
 
 static const MenuItem tools_items[] = {
@@ -207,7 +214,7 @@ static const MenuItem tools_items[] = {
 
 static const MenuSection menu_sections[] = {
     {"NAVIGATE", nav_items,      5},
-    {"SETTINGS", settings_items, 4},
+    {"SETTINGS", settings_items, 5},
     {"TOOLS",    tools_items,    3},
 };
 static const int MENU_SECTION_COUNT = 3;
@@ -2779,7 +2786,7 @@ static void save_session_to_flash() {
 
     long l_wifi, l_ble, l_sec, l_flock, l_boots, l_writes, l_next_id;
     int l_vol, l_brightness;
-    bool l_night, l_low_power, l_stealth, l_muted, l_turbo;
+    bool l_night, l_low_power, l_stealth, l_muted, l_turbo, l_c5;
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     l_wifi = lifetime_wifi; l_ble = lifetime_ble; l_sec = lifetime_seconds;
     l_flock = lifetime_flock_total; l_vol = current_volume; l_boots = lifetime_boots;
@@ -2791,6 +2798,7 @@ static void save_session_to_flash() {
     l_stealth    = stealth_mode;
     l_muted      = is_muted;
     l_turbo      = turbo_mode_active;
+    l_c5         = c5_enabled;
     xSemaphoreGiveRecursive(dataMutex);
 
     // Minimum acceptable byte count for a complete write. Computed from
@@ -2832,6 +2840,7 @@ static void save_session_to_flash() {
             wp(f.printf("stealth=%d\n",     l_stealth ? 1 : 0));
             wp(f.printf("muted=%d\n",       l_muted ? 1 : 0));
             wp(f.printf("turbo=%d\n",       l_turbo ? 1 : 0));
+            wp(f.printf("c5=%d\n",          l_c5 ? 1 : 0));
             return !any_short && written >= PERSIST_MIN_BYTES;
         });
         if (atomic_ok) {
@@ -3099,6 +3108,7 @@ void load_session_from_flash() {
         else if (key == "stealth")    stealth_mode = (val.toInt() != 0);
         else if (key == "muted")      is_muted = (val.toInt() != 0);
         else if (key == "turbo")      turbo_mode_active = (val.toInt() != 0);
+        else if (key == "c5")         c5_enabled = (val.toInt() != 0);
         else if (key == "ssid") {
             if (val.length() > 0 && val.length() < sizeof(export_ssid)) {
                 strncpy(export_ssid, val.c_str(), sizeof(export_ssid) - 1);
@@ -4765,15 +4775,16 @@ void draw_header_spr(int screen_num) {
             const char* letter;
             uint16_t color;
         };
-        ModeBadge badges[6] = {
+        ModeBadge badges[7] = {
             { ambient_mode,      "A", DIM_COLOR },
             { night_mode,        "N", HEADER_COLOR },
             { stealth_mode,      "S", DIM_COLOR },
             { signal_active,    "L", CAUTION_COLOR },
             { low_power_mode,    "P", ACCENT_COLOR },
             { turbo_mode_active, "T", CAUTION_COLOR },
+            { c5_is_present(),   "5G", HEADER_COLOR },
         };
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 7; i++) {
             if (!badges[i].active) continue;
             int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
             drawPill(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
@@ -5136,15 +5147,16 @@ void draw_header_lcd(int screen_num, const char* name_override) {
     // Mode badges
     {
         struct ModeBadge { bool active; const char* letter; uint16_t color; };
-        ModeBadge badges[6] = {
+        ModeBadge badges[7] = {
             { ambient_mode,      "A", DIM_COLOR },
             { night_mode,        "N", HEADER_COLOR },
             { stealth_mode,      "S", DIM_COLOR },
             { signal_active,    "L", CAUTION_COLOR },
             { low_power_mode,    "P", ACCENT_COLOR },
             { turbo_mode_active, "T", CAUTION_COLOR },
+            { c5_is_present(),   "5G", HEADER_COLOR },
         };
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 7; i++) {
             if (!badges[i].active) continue;
             int pw = (int)strlen(badges[i].letter) * ts_char_w(TS_MICRO) + 6;
             drawPill_lcd(icon_right - pw, icon_y, badges[i].letter, badges[i].color);
@@ -5629,6 +5641,7 @@ static void menu_draw_icon(int flat_idx, int x, int y, uint16_t col) {
         case 6:  menu_icon_power(x, y, col);      break;
         case 7:  menu_icon_mute(x, y, col);       break;
         case 8:  menu_icon_signal(x, y, col);     break;
+        case 12: menu_icon_signal(x, y, col);     break;
         case 9:  menu_icon_wifi(x, y, col);       break;
         case 10: menu_icon_export(x, y, col);     break;
         case 11: menu_icon_trash(x, y, col);      break;
@@ -5880,12 +5893,13 @@ static void draw_menu_overlay() {
                 spr.fillCircle(dot_x, ry + ROW_H / 2, 2, ea(HEADER_COLOR));
             }
 
-            // Toggle pills for settings (idx 5-8)
-            if (idx >= 5 && idx <= 8) {
+            // Toggle pills for settings (idx 5-8, plus 5GHz radio = 12)
+            if ((idx >= 5 && idx <= 8) || idx == 12) {
                 bool on = (idx == 5) ? night_mode
                         : (idx == 6) ? low_power_mode
                         : (idx == 7) ? is_muted
-                        : turbo_mode_active;
+                        : (idx == 8) ? turbo_mode_active
+                        : c5_enabled;
                 if (on) {
                     int pw = 14, ph = 9;
                     int px = DISP_W - pw - UI_PAD_SM - 4;
@@ -6134,6 +6148,13 @@ void handle_menu_select() {
             break;
         case 8:
             set_turbo_mode(!turbo_mode_active);
+            break;
+        case 12:
+            c5_enabled = !c5_enabled;
+            if (c5_enabled) { c5_link_begin(); set_toast_direct("5GHz RADIO ON",  TOAST_SUCCESS); }
+            else            { c5_link_end();   set_toast_direct("5GHz RADIO OFF", TOAST_NEUTRAL); }
+            schedule_persist();
+            screen_dirty = true;
             break;
         case 9:
             show_feed_expanded = false;
@@ -9779,6 +9800,139 @@ static void apply_ble_scan_params() {
 
 SET_LOOP_TASK_STACK_SIZE(7168);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ESP32-C5 5 GHz CO-PROCESSOR LINK
+//
+// A separate ESP32-C5 board wired to the Cardputer ADV's Grove port acts as a
+// 5 GHz radio ear (the S3 only hears 2.4 GHz). The C5 sniffs the 5 GHz Wi-Fi
+// channels, matches the same Flock/Raven signatures, and reports each hit as
+// one newline-terminated, '|'-delimited line over UART. We parse those lines
+// and push them straight through log_detection() — so a 5 GHz hit is logged,
+// counted, GPS-tagged, alarmed and shown exactly like a 2.4 GHz hit.
+//
+// Wire protocol (C5 -> Cardputer):
+//   D|mac|name|rssi|ch|conf|methods    a detection
+//   H|fw|ver                           hello / heartbeat (drives the 5G badge)
+// Example:  D|aa:bb:cc:dd:ee:ff|flock-1a2b|-67|149|85|ssid_match oui_match
+//
+// Link: UART1 on Grove G1/G2 (GPIO1 = S3 TX, GPIO2 = S3 RX). GPS owns UART2.
+// 3.3 V logic both ends — no level shifter. Harmless with no C5 attached:
+// nothing arrives, c5_is_present() stays false, the UI is unchanged.
+// ═══════════════════════════════════════════════════════════════════════════
+#define C5_RX_PIN              2        // Grove G2 (yellow) — S3 RX <- C5 TXD
+#define C5_TX_PIN              1        // Grove G1 (white)  — S3 TX -> C5 RXD
+#define C5_BAUD                115200
+#define C5_PRESENT_TIMEOUT_MS  8000     // C5 deemed "gone" after this much silence
+
+static HardwareSerial SerialC5(1);      // UART1 (SerialGPS owns UART2)
+static bool           c5_link_started = false;
+static unsigned long  c5_last_msg_ms  = 0;
+static char           c5_line_buf[160];
+static uint8_t        c5_line_len     = 0;
+
+// True only when a C5 has actually reported in recently — a user with no C5
+// never sees the 5G badge light.
+bool c5_is_present() {
+    return c5_link_started
+        && c5_last_msg_ms != 0
+        && (millis() - c5_last_msg_ms) < C5_PRESENT_TIMEOUT_MS;
+}
+
+void c5_link_begin() {
+    if (c5_link_started) return;
+    SerialC5.setRxBufferSize(512);                       // must precede begin()
+    SerialC5.begin(C5_BAUD, SERIAL_8N1, C5_RX_PIN, C5_TX_PIN);
+    c5_line_len     = 0;
+    c5_link_started = true;
+    Serial.println("[C5] link up on UART1 (Grove G1/G2)");
+}
+
+void c5_link_end() {
+    if (!c5_link_started) return;
+    SerialC5.end();
+    c5_link_started = false;
+    c5_last_msg_ms  = 0;
+    Serial.println("[C5] link down");
+}
+
+// Split a '|'-delimited line in place; fields[] point into buf. The final
+// field (methods) may legitimately contain spaces.
+static int c5_split(char* buf, char* fields[], int max_fields) {
+    int n = 0;
+    fields[n++] = buf;
+    for (char* p = buf; *p && n < max_fields; p++) {
+        if (*p == '|') { *p = '\0'; fields[n++] = p + 1; }
+    }
+    return n;
+}
+
+static void c5_handle_line(char* line) {
+    int len = (int)strlen(line);
+    while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ')) line[--len] = '\0';
+    if (len == 0) return;
+
+    char* f[8];
+    int nf = c5_split(line, f, 8);
+    if (nf < 1 || f[0][0] == '\0') return;
+
+    if (f[0][0] == 'H') {                 // H|fw|ver — hello / heartbeat
+        c5_last_msg_ms = millis();
+        return;
+    }
+
+    if (f[0][0] == 'D' && nf >= 7) {      // D|mac|name|rssi|ch|conf|methods
+        c5_last_msg_ms = millis();
+
+        const char* mac     = f[1];
+        const char* name    = f[2];
+        int         rssi    = atoi(f[3]);
+        int         channel = atoi(f[4]);
+        int         conf    = atoi(f[5]);
+        const char* methods = f[6];
+
+        if (conf < 0)   conf = 0;
+        if (conf > 100) conf = 100;
+        if (mac[0] == '\0')          return;
+        if (is_mac_whitelisted(mac)) return;       // honor the user's whitelist
+
+        // Same pipeline as a 2.4 GHz hit. proto "WIFI" keeps the alarm/visual
+        // routing identical; the 5 GHz channel (36-165) marks the band, and
+        // extra_data flags the source. GPS tagging happens inside log_detection.
+        log_detection("FLOCK_5G", "WIFI", rssi, mac, name,
+                      channel, 0, "5GHz radio", methods, conf, 0);
+
+        // The one thing log_detection() doesn't do itself: arm the buzzer.
+        // Mirror the 2.4 GHz call site so a strong 5 GHz hit sounds the alarm.
+        if (conf >= CONFIDENCE_ALARM_THRESHOLD) {
+            xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+            if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
+                trigger_alarm_confidence = conf;
+                trigger_alarm_source     = 0;       // WiFi-class ascending tone
+                last_buzzer_time         = millis();
+            }
+            xSemaphoreGiveRecursive(dataMutex);
+        }
+    }
+    // Unknown tags ignored — forward-compatible with future C5 message types.
+}
+
+// Call once per loop(). Drains all waiting bytes and assembles whole lines.
+void process_c5_serial() {
+    if (!c5_link_started) return;
+    while (SerialC5.available() > 0) {
+        char c = (char)SerialC5.read();
+        if (c == '\n') {
+            c5_line_buf[c5_line_len] = '\0';
+            c5_handle_line(c5_line_buf);
+            c5_line_len = 0;
+        } else if (c5_line_len < sizeof(c5_line_buf) - 1) {
+            c5_line_buf[c5_line_len++] = c;
+        } else {
+            c5_line_len = 0;   // overlong line — resync on next newline
+        }
+    }
+}
+
 void setup() {
     // ── Safe WDT reconfiguration ────────────────────────────────────
     // esp_task_wdt_deinit() is NOT safe on IDF 5.x — it wraps IDLE
@@ -10067,6 +10221,7 @@ void setup() {
     if (turbo_mode_active) setCpuFrequencyMhz(240);
     if (stealth_mode)      M5Cardputer.Display.setBrightness(5);
     if (is_muted)       M5Cardputer.Speaker.setVolume(0);
+    if (c5_enabled)        c5_link_begin();   // bring up 5 GHz C5 link if enabled
     Serial.printf("[BOOT] Free heap after LittleFS: %u\n",
                   (unsigned)esp_get_free_heap_size());
     boot_animate(78 + random(0, 3), "loading session");
@@ -10268,17 +10423,68 @@ void setup() {
 }
 
 // ============================================================================
-// MAIN LOOP
+// PERIODIC SERVICES — lifted verbatim out of loop() for readability.
+// Behavior-identical: same logic, same static state, same call order. The only
+// change is that loop-locals they relied on (e.g. loop_mv) are now parameters.
 // ============================================================================
-void loop() {
+
+// Low-battery voltage warnings (crossing toasts + periodic re-warn w/ hysteresis).
+static void service_battery_warnings(int32_t loop_mv) {
+    static const unsigned long BATT_REWARN_LOW_MS  = 10UL * 60UL * 1000UL;
+    static const unsigned long BATT_REWARN_CRIT_MS =  2UL * 60UL * 1000UL;
+
+    static int32_t last_battery_warning_mv = 9999;
+    static unsigned long last_battery_warn_toast_ms = 0;
+    unsigned long batt_now = millis();
+
+    // Initial crossing-detection (unchanged behavior).
+    if (loop_mv <= 3500 && last_battery_warning_mv > 3500) {
+        set_toast_direct("BATT CRITICAL 3.5V", TOAST_WARNING, false);
+        last_battery_warning_mv = 3500;
+        last_battery_warn_toast_ms = batt_now;
+    } else if (loop_mv <= 3700 && last_battery_warning_mv > 3700) {
+        set_toast_direct("BATT LOW 3.7V", TOAST_WARNING, false);
+        last_battery_warning_mv = 3700;
+        last_battery_warn_toast_ms = batt_now;
+    } else if (last_battery_warning_mv < 9999
+               && loop_mv >= last_battery_warning_mv + 100) {
+        // Voltage recovered (charger plugged in, or rebound from load drop).
+        last_battery_warning_mv = 9999;
+        last_battery_warn_toast_ms = 0;
+    }
+
+    // Periodic re-warn while below a threshold.
+    if (last_battery_warning_mv == 3500 && last_battery_warn_toast_ms != 0
+        && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_CRIT_MS) {
+        char buf[TOAST_TEXT_LEN];
+        int32_t mv_now = loop_mv;
+        snprintf(buf, sizeof(buf), "BATT CRITICAL %ld.%02ldV",
+                 (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
+        set_toast_direct(buf, TOAST_WARNING, false);
+        last_battery_warn_toast_ms = batt_now;
+    } else if (last_battery_warning_mv == 3700 && last_battery_warn_toast_ms != 0
+               && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_LOW_MS) {
+        char buf[TOAST_TEXT_LEN];
+        int32_t mv_now = loop_mv;
+        snprintf(buf, sizeof(buf), "BATT LOW %ld.%02ldV",
+                 (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
+        set_toast_direct(buf, TOAST_WARNING, false);
+        last_battery_warn_toast_ms = batt_now;
+    }
+}
+
+// Subscribe this task to the hardware watchdog (once), then pet it each iteration.
+static void service_watchdog() {
     static bool wdt_subscribed = false;
     if (!wdt_subscribed) {
         esp_err_t err = esp_task_wdt_add(NULL);
         if (err == ESP_OK || err == ESP_ERR_INVALID_ARG) wdt_subscribed = true;
     }
     if (wdt_subscribed) esp_task_wdt_reset();
-    M5Cardputer.update(); yield();
+}
 
+// Drive export web-server mode: tick connect, service clients, time-box the session.
+static void service_export_mode() {
     if (export_connecting) {
         export_tick_connect();
     }
@@ -10299,180 +10505,147 @@ void loop() {
             }
         }
     }
+}
+
+// Stack health monitoring — three layers:
+//   1. One-shot 60s baseline log (initial usage after all code paths hit).
+//   2. Periodic hourly re-log (catches slow growth under sustained load).
+//   3. Per-second critical-low check (toasts if any task is near overflow).
+//
+// Watermark values are bytes of *unused* stack. Once under STACK_CRITICAL_BYTES,
+// the task is one bad call away from corrupting whatever sits below its stack —
+// typically another task's stack or FreeRTOS internal state.
+static void service_stack_health() {
+    static const UBaseType_t STACK_CRITICAL_BYTES = 256;
+    static const unsigned long STACK_REPORT_INTERVAL_MS = 60UL * 60UL * 1000UL;
+    static const unsigned long STACK_CRITICAL_CHECK_MS  = 1000UL;
+    static const unsigned long STACK_TOAST_COOLDOWN_MS  = 60UL * 1000UL;
+
+    static bool stack_baseline_reported = false;
+    static unsigned long stack_last_report_ms = 0;
+    static unsigned long stack_last_critical_check_ms = 0;
+    static unsigned long stack_last_toast_ms[5] = {0};
+
+    unsigned long stack_now = millis();
+
+    auto gather_watermarks = [&](UBaseType_t out[5]) {
+        out[0] = ScannerTaskHandle ? uxTaskGetStackHighWaterMark(ScannerTaskHandle) : (UBaseType_t)-1;
+        out[1] = GPSTaskHandle     ? uxTaskGetStackHighWaterMark(GPSTaskHandle)     : (UBaseType_t)-1;
+        out[2] = BLEWorkerHandle   ? uxTaskGetStackHighWaterMark(BLEWorkerHandle)   : (UBaseType_t)-1;
+        out[3] = LedTaskHandle     ? uxTaskGetStackHighWaterMark(LedTaskHandle)     : (UBaseType_t)-1;
+        out[4] = uxTaskGetStackHighWaterMark(NULL);
+    };
+
+    auto log_watermarks = [&](const char* tag, const UBaseType_t hw[5]) {
+        Serial.printf("[STACK] %s — bytes remaining:\n", tag);
+        Serial.printf("  Scanner: %u / 2048\n", (unsigned)hw[0]);
+        Serial.printf("  GPS:     %u / 2048\n", (unsigned)hw[1]);
+        Serial.printf("  BLE:     %u / 2752\n", (unsigned)hw[2]);
+        Serial.printf("  LED:     %u / 1536\n", (unsigned)hw[3]);
+        Serial.printf("  Loop:    %u / 7168\n", (unsigned)hw[4]);
+    };
+
+    // Layer 1: baseline log at 60 seconds.
+    if (!stack_baseline_reported && stack_now > 60000) {
+        stack_baseline_reported = true;
+        UBaseType_t hw[5];
+        gather_watermarks(hw);
+        log_watermarks("baseline @ 60s", hw);
+        Serial.printf("[STACK] Safe to reduce any task where remaining > 512 bytes.\n");
+        Serial.printf("  Recommended: new_stack = current - (remaining - 256)\n");
+        stack_last_report_ms = stack_now;
+    }
+
+    // Layer 2: periodic re-log every hour after baseline.
+    if (stack_baseline_reported &&
+        (stack_now - stack_last_report_ms) >= STACK_REPORT_INTERVAL_MS) {
+        stack_last_report_ms = stack_now;
+        UBaseType_t hw[5];
+        gather_watermarks(hw);
+        log_watermarks("hourly check", hw);
+    }
+
+    // Layer 3: critical-low check every second. Five register reads — negligible cost.
+    if ((stack_now - stack_last_critical_check_ms) >= STACK_CRITICAL_CHECK_MS) {
+        stack_last_critical_check_ms = stack_now;
+        UBaseType_t hw[5];
+        gather_watermarks(hw);
+        static const char* task_names[5] = { "SCANNER", "GPS", "BLE", "LED", "LOOP" };
+        for (int i = 0; i < 5; i++) {
+            if (hw[i] == (UBaseType_t)-1) continue;
+            if (hw[i] < STACK_CRITICAL_BYTES) {
+                Serial.printf("[STACK] CRITICAL: %s task has %u bytes free\n",
+                              task_names[i], (unsigned)hw[i]);
+                if ((stack_now - stack_last_toast_ms[i]) >= STACK_TOAST_COOLDOWN_MS) {
+                    stack_last_toast_ms[i] = stack_now;
+                    char toast_buf[TOAST_TEXT_LEN];
+                    snprintf(toast_buf, sizeof(toast_buf),
+                             "STACK LOW: %s %uB", task_names[i], (unsigned)hw[i]);
+                    set_toast_direct(toast_buf, TOAST_WARNING, false);
+                }
+            }
+        }
+    }
+}
+
+// Heap health: warn (and toast) when free internal heap drops below 8KB.
+// Catches slow leaks / FAT-driver mallocs piling up before they cause
+// an unrecoverable abort.
+static void service_heap_health() {
+    size_t free_heap = esp_get_free_heap_size();
+    static size_t min_heap_seen = 999999;
+    if (free_heap < min_heap_seen) min_heap_seen = free_heap;
+    if (free_heap < 3000) {
+        Serial.printf("[HEAP] FATAL: %u bytes free — restarting\n", (unsigned)free_heap);
+        delay(100);
+        ESP.restart();
+    }
+    if (free_heap < 6000) {
+        static unsigned long last_heap_warn = 0;
+        if (millis() - last_heap_warn > 30000) {
+            Serial.printf("[HEAP] CRITICAL: %u bytes free (min: %u)\n",
+                          (unsigned)free_heap, (unsigned)min_heap_seen);
+            set_toast_direct("LOW MEMORY", TOAST_WARNING, false);
+            last_heap_warn = millis();
+        }
+    }
+    size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    if (largest_block < 2048) {
+        static unsigned long last_frag_log = 0;
+        if (millis() - last_frag_log > 60000) {
+            last_frag_log = millis();
+            Serial.printf("[HEAP] Fragmented: largest block %u bytes (free: %u)\n",
+                          (unsigned)largest_block, (unsigned)free_heap);
+        }
+    }
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+    service_watchdog();
+    M5Cardputer.update(); yield();
+
+    service_export_mode();
 
     // Dynamically calculate expected hardware voltage sag for this loop iteration
     update_load_sag();
 
     int32_t loop_mv = get_filtered_voltage();
 
-    // Low-battery voltage warnings:
-    //   - Initial toast on each threshold crossing (3.7V warning, 3.5V critical).
-    //   - 100mV hysteresis so a noisy ADC doesn't strobe the toast.
-    //   - Periodic re-warn every 10 minutes while voltage stays below warning,
-    //     because dismissing one toast shouldn't silence all future reminders.
-    //   - Re-warn cadence tightens to 2 minutes once below the critical threshold.
-    {
-        static const unsigned long BATT_REWARN_LOW_MS  = 10UL * 60UL * 1000UL;
-        static const unsigned long BATT_REWARN_CRIT_MS =  2UL * 60UL * 1000UL;
+    service_battery_warnings(loop_mv);
 
-        static int32_t last_battery_warning_mv = 9999;
-        static unsigned long last_battery_warn_toast_ms = 0;
-        unsigned long batt_now = millis();
+    service_stack_health();
 
-        // Initial crossing-detection (unchanged behavior).
-        if (loop_mv <= 3500 && last_battery_warning_mv > 3500) {
-            set_toast_direct("BATT CRITICAL 3.5V", TOAST_WARNING, false);
-            last_battery_warning_mv = 3500;
-            last_battery_warn_toast_ms = batt_now;
-        } else if (loop_mv <= 3700 && last_battery_warning_mv > 3700) {
-            set_toast_direct("BATT LOW 3.7V", TOAST_WARNING, false);
-            last_battery_warning_mv = 3700;
-            last_battery_warn_toast_ms = batt_now;
-        } else if (last_battery_warning_mv < 9999
-                   && loop_mv >= last_battery_warning_mv + 100) {
-            // Voltage recovered (charger plugged in, or rebound from load drop).
-            last_battery_warning_mv = 9999;
-            last_battery_warn_toast_ms = 0;
-        }
-
-        // Periodic re-warn while below a threshold.
-        if (last_battery_warning_mv == 3500 && last_battery_warn_toast_ms != 0
-            && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_CRIT_MS) {
-            char buf[TOAST_TEXT_LEN];
-            int32_t mv_now = loop_mv;
-            snprintf(buf, sizeof(buf), "BATT CRITICAL %ld.%02ldV",
-                     (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
-            set_toast_direct(buf, TOAST_WARNING, false);
-            last_battery_warn_toast_ms = batt_now;
-        } else if (last_battery_warning_mv == 3700 && last_battery_warn_toast_ms != 0
-                   && (batt_now - last_battery_warn_toast_ms) >= BATT_REWARN_LOW_MS) {
-            char buf[TOAST_TEXT_LEN];
-            int32_t mv_now = loop_mv;
-            snprintf(buf, sizeof(buf), "BATT LOW %ld.%02ldV",
-                     (long)(mv_now / 1000), (long)((mv_now % 1000) / 10));
-            set_toast_direct(buf, TOAST_WARNING, false);
-            last_battery_warn_toast_ms = batt_now;
-        }
-    }
-
-    // Stack health monitoring — three layers:
-    //   1. One-shot 60s baseline log (initial usage after all code paths hit).
-    //   2. Periodic hourly re-log (catches slow growth under sustained load).
-    //   3. Per-second critical-low check (toasts if any task is near overflow).
-    //
-    // Watermark values are bytes of *unused* stack. Once under STACK_CRITICAL_BYTES,
-    // the task is one bad call away from corrupting whatever sits below its stack —
-    // typically another task's stack or FreeRTOS internal state.
-    {
-        static const UBaseType_t STACK_CRITICAL_BYTES = 256;
-        static const unsigned long STACK_REPORT_INTERVAL_MS = 60UL * 60UL * 1000UL;
-        static const unsigned long STACK_CRITICAL_CHECK_MS  = 1000UL;
-        static const unsigned long STACK_TOAST_COOLDOWN_MS  = 60UL * 1000UL;
-
-        static bool stack_baseline_reported = false;
-        static unsigned long stack_last_report_ms = 0;
-        static unsigned long stack_last_critical_check_ms = 0;
-        static unsigned long stack_last_toast_ms[5] = {0};
-
-        unsigned long stack_now = millis();
-
-        auto gather_watermarks = [&](UBaseType_t out[5]) {
-            out[0] = ScannerTaskHandle ? uxTaskGetStackHighWaterMark(ScannerTaskHandle) : (UBaseType_t)-1;
-            out[1] = GPSTaskHandle     ? uxTaskGetStackHighWaterMark(GPSTaskHandle)     : (UBaseType_t)-1;
-            out[2] = BLEWorkerHandle   ? uxTaskGetStackHighWaterMark(BLEWorkerHandle)   : (UBaseType_t)-1;
-            out[3] = LedTaskHandle     ? uxTaskGetStackHighWaterMark(LedTaskHandle)     : (UBaseType_t)-1;
-            out[4] = uxTaskGetStackHighWaterMark(NULL);
-        };
-
-        auto log_watermarks = [&](const char* tag, const UBaseType_t hw[5]) {
-            Serial.printf("[STACK] %s — bytes remaining:\n", tag);
-            Serial.printf("  Scanner: %u / 2048\n", (unsigned)hw[0]);
-            Serial.printf("  GPS:     %u / 2048\n", (unsigned)hw[1]);
-            Serial.printf("  BLE:     %u / 2752\n", (unsigned)hw[2]);
-            Serial.printf("  LED:     %u / 1536\n", (unsigned)hw[3]);
-            Serial.printf("  Loop:    %u / 7168\n", (unsigned)hw[4]);
-        };
-
-        // Layer 1: baseline log at 60 seconds.
-        if (!stack_baseline_reported && stack_now > 60000) {
-            stack_baseline_reported = true;
-            UBaseType_t hw[5];
-            gather_watermarks(hw);
-            log_watermarks("baseline @ 60s", hw);
-            Serial.printf("[STACK] Safe to reduce any task where remaining > 512 bytes.\n");
-            Serial.printf("  Recommended: new_stack = current - (remaining - 256)\n");
-            stack_last_report_ms = stack_now;
-        }
-
-        // Layer 2: periodic re-log every hour after baseline.
-        if (stack_baseline_reported &&
-            (stack_now - stack_last_report_ms) >= STACK_REPORT_INTERVAL_MS) {
-            stack_last_report_ms = stack_now;
-            UBaseType_t hw[5];
-            gather_watermarks(hw);
-            log_watermarks("hourly check", hw);
-        }
-
-        // Layer 3: critical-low check every second. Five register reads — negligible cost.
-        if ((stack_now - stack_last_critical_check_ms) >= STACK_CRITICAL_CHECK_MS) {
-            stack_last_critical_check_ms = stack_now;
-            UBaseType_t hw[5];
-            gather_watermarks(hw);
-            static const char* task_names[5] = { "SCANNER", "GPS", "BLE", "LED", "LOOP" };
-            for (int i = 0; i < 5; i++) {
-                if (hw[i] == (UBaseType_t)-1) continue;
-                if (hw[i] < STACK_CRITICAL_BYTES) {
-                    Serial.printf("[STACK] CRITICAL: %s task has %u bytes free\n",
-                                  task_names[i], (unsigned)hw[i]);
-                    if ((stack_now - stack_last_toast_ms[i]) >= STACK_TOAST_COOLDOWN_MS) {
-                        stack_last_toast_ms[i] = stack_now;
-                        char toast_buf[TOAST_TEXT_LEN];
-                        snprintf(toast_buf, sizeof(toast_buf),
-                                 "STACK LOW: %s %uB", task_names[i], (unsigned)hw[i]);
-                        set_toast_direct(toast_buf, TOAST_WARNING, false);
-                    }
-                }
-            }
-        }
-    }
-
-    // Heap health: warn (and toast) when free internal heap drops below 8KB.
-    // Catches slow leaks / FAT-driver mallocs piling up before they cause
-    // an unrecoverable abort.
-    {
-        size_t free_heap = esp_get_free_heap_size();
-        static size_t min_heap_seen = 999999;
-        if (free_heap < min_heap_seen) min_heap_seen = free_heap;
-        if (free_heap < 3000) {
-            Serial.printf("[HEAP] FATAL: %u bytes free — restarting\n", (unsigned)free_heap);
-            delay(100);
-            ESP.restart();
-        }
-        if (free_heap < 6000) {
-            static unsigned long last_heap_warn = 0;
-            if (millis() - last_heap_warn > 30000) {
-                Serial.printf("[HEAP] CRITICAL: %u bytes free (min: %u)\n",
-                              (unsigned)free_heap, (unsigned)min_heap_seen);
-                set_toast_direct("LOW MEMORY", TOAST_WARNING, false);
-                last_heap_warn = millis();
-            }
-        }
-        size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        if (largest_block < 2048) {
-            static unsigned long last_frag_log = 0;
-            if (millis() - last_frag_log > 60000) {
-                last_frag_log = millis();
-                Serial.printf("[HEAP] Fragmented: largest block %u bytes (free: %u)\n",
-                              (unsigned)largest_block, (unsigned)free_heap);
-            }
-        }
-    }
+    service_heap_health();
 
     if (pending_delete_count > 0 && pending_delete_dirty_ms != 0 &&
         (millis() - pending_delete_dirty_ms) > 5000)
         flush_pending_deletes();
 
     process_wifi_event_queue();
+    process_c5_serial();        // drain 5 GHz hits from the C5 (self-guards when link is off)
     feed_commit_pending();
     update_channel_histogram();
 
