@@ -10620,6 +10620,28 @@ static void service_heap_health() {
     }
 }
 
+static void service_gps_timezone() {
+    // Recompute timezone from GPS every 5 minutes (handles driving across zones)
+    if (millis() - auto_tz_last_compute_ms > AUTO_TZ_INTERVAL_MS || !auto_tz_valid) {
+        bool tz_gps_ok = false;
+        double tz_lat = 0, tz_lng = 0;
+        int tz_year = 0, tz_month = 0, tz_day = 0;
+        if (take_data_mutex()) {
+            if (gps.location.isValid() && gps.location.age() < 5000 &&
+                gps.date.isValid() && gps.date.year() >= 2020) {
+                tz_lat   = gps.location.lat();
+                tz_lng   = gps.location.lng();
+                tz_year  = gps.date.year();
+                tz_month = gps.date.month();
+                tz_day   = gps.date.day();
+                tz_gps_ok = true;
+            }
+            give_data_mutex();
+        }
+        if (tz_gps_ok) tz_compute(tz_lat, tz_lng, tz_year, tz_month, tz_day);
+    }
+}
+
 static void service_sd_hotplug() {
     // SD hot-plug: periodically attempt remount if card is absent, or probe if present
     sd_check_hotplug();
@@ -11593,25 +11615,7 @@ void loop() {
 
     service_sd_hotplug();
 
-    // Recompute timezone from GPS every 5 minutes (handles driving across zones)
-    if (millis() - auto_tz_last_compute_ms > AUTO_TZ_INTERVAL_MS || !auto_tz_valid) {
-        bool tz_gps_ok = false;
-        double tz_lat = 0, tz_lng = 0;
-        int tz_year = 0, tz_month = 0, tz_day = 0;
-        if (take_data_mutex()) {
-            if (gps.location.isValid() && gps.location.age() < 5000 &&
-                gps.date.isValid() && gps.date.year() >= 2020) {
-                tz_lat   = gps.location.lat();
-                tz_lng   = gps.location.lng();
-                tz_year  = gps.date.year();
-                tz_month = gps.date.month();
-                tz_day   = gps.date.day();
-                tz_gps_ok = true;
-            }
-            give_data_mutex();
-        }
-        if (tz_gps_ok) tz_compute(tz_lat, tz_lng, tz_year, tz_month, tz_day);
-    }
+    service_gps_timezone();
 
     // Enter ambient mode after sustained idle
     if (!ambient_mode && !stealth_mode && !toast_active && !signal_active && !export_mode_active &&
