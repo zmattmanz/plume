@@ -11546,6 +11546,78 @@ static void handle_keyboard_input() {
     }
 }
 
+static void handle_key_repeat() {
+    // ── Key-hold repeat for the ; / . arrow keys ──
+    // Runs OUTSIDE the isChange() block so it fires during sustained holds.
+    // isChange() is edge-triggered — only true on press/release transitions,
+    // not during a continuous hold. The repeat logic needs to run every
+    // loop iteration to detect when HOLD_DELAY has elapsed.
+    {
+        static unsigned long arrow_hold_start = 0;
+        static unsigned long arrow_last_repeat = 0;
+        static char arrow_held_key = 0;
+        const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
+        const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
+
+        bool up_held = false, down_held = false;
+        if (!menu_open && !wifi_config_open) {
+            Keyboard_Class::KeysState hold_st = M5Cardputer.Keyboard.keysState();
+            for (auto c : hold_st.word) {
+                if (IS_KEY_UP(c))   up_held   = true;
+                if (IS_KEY_DOWN(c)) down_held = true;
+            }
+        }
+        char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
+
+        if (cur_arrow && cur_arrow == arrow_held_key) {
+            unsigned long hold_dur = millis() - arrow_hold_start;
+            if (hold_dur > HOLD_DELAY &&
+                (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
+                if (current_screen == 2 && !hist_detail_open) {
+                    if (IS_KEY_UP(cur_arrow)) {
+                        if (history_selected_idx > 0) {
+                            history_selected_idx--;
+                            if (history_selected_idx < history_scroll_offset)
+                                history_scroll_offset = history_selected_idx;
+                        }
+                    } else {
+                        int ht = sd_available ? sd_hist_count : capture_history_count;
+                        if (history_selected_idx < ht - 1) {
+                            history_selected_idx++;
+                            if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
+                                history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
+                        }
+                    }
+                    screen_dirty = true;
+                } else if (current_screen == 4) {
+                    if (IS_KEY_UP(cur_arrow)) {
+                        if (stats_scroll_target > 0) {
+                            stats_scroll_target -= STATS_SCROLL_STEP;
+                            if (stats_scroll_target < 0) stats_scroll_target = 0;
+                        }
+                    } else {
+                        if (stats_scroll_target < STATS_MAX_SCROLL) {
+                            stats_scroll_target += STATS_SCROLL_STEP;
+                            if (stats_scroll_target > STATS_MAX_SCROLL)
+                                stats_scroll_target = STATS_MAX_SCROLL;
+                        }
+                    }
+                    screen_dirty = true;
+                }
+                // LEFT/RIGHT omitted: screen transitions don't benefit from
+                // auto-repeat and would oscillate due to animation overlap.
+                arrow_last_repeat = millis();
+            }
+        } else if (cur_arrow) {
+            arrow_held_key = cur_arrow;
+            arrow_hold_start = millis();
+            arrow_last_repeat = millis();
+        } else {
+            arrow_held_key = 0;
+        }
+    }
+}
+
 // ============================================================================
 // MAIN LOOP
 // ============================================================================
@@ -11640,75 +11712,7 @@ void loop() {
 
     if (wdt_subscribed) esp_task_wdt_reset();
 
-    // ── Key-hold repeat for the ; / . arrow keys ──
-    // Runs OUTSIDE the isChange() block so it fires during sustained holds.
-    // isChange() is edge-triggered — only true on press/release transitions,
-    // not during a continuous hold. The repeat logic needs to run every
-    // loop iteration to detect when HOLD_DELAY has elapsed.
-    {
-        static unsigned long arrow_hold_start = 0;
-        static unsigned long arrow_last_repeat = 0;
-        static char arrow_held_key = 0;
-        const unsigned long HOLD_DELAY      = 500;  // ms before repeat starts
-        const unsigned long REPEAT_INTERVAL = 150;  // ms between repeats
-
-        bool up_held = false, down_held = false;
-        if (!menu_open && !wifi_config_open) {
-            Keyboard_Class::KeysState hold_st = M5Cardputer.Keyboard.keysState();
-            for (auto c : hold_st.word) {
-                if (IS_KEY_UP(c))   up_held   = true;
-                if (IS_KEY_DOWN(c)) down_held = true;
-            }
-        }
-        char cur_arrow = up_held ? ';' : (down_held ? '.' : 0);
-
-        if (cur_arrow && cur_arrow == arrow_held_key) {
-            unsigned long hold_dur = millis() - arrow_hold_start;
-            if (hold_dur > HOLD_DELAY &&
-                (millis() - arrow_last_repeat) > REPEAT_INTERVAL) {
-                if (current_screen == 2 && !hist_detail_open) {
-                    if (IS_KEY_UP(cur_arrow)) {
-                        if (history_selected_idx > 0) {
-                            history_selected_idx--;
-                            if (history_selected_idx < history_scroll_offset)
-                                history_scroll_offset = history_selected_idx;
-                        }
-                    } else {
-                        int ht = sd_available ? sd_hist_count : capture_history_count;
-                        if (history_selected_idx < ht - 1) {
-                            history_selected_idx++;
-                            if (history_selected_idx >= history_scroll_offset + HIST_VISIBLE_ROWS)
-                                history_scroll_offset = history_selected_idx - HIST_VISIBLE_ROWS + 1;
-                        }
-                    }
-                    screen_dirty = true;
-                } else if (current_screen == 4) {
-                    if (IS_KEY_UP(cur_arrow)) {
-                        if (stats_scroll_target > 0) {
-                            stats_scroll_target -= STATS_SCROLL_STEP;
-                            if (stats_scroll_target < 0) stats_scroll_target = 0;
-                        }
-                    } else {
-                        if (stats_scroll_target < STATS_MAX_SCROLL) {
-                            stats_scroll_target += STATS_SCROLL_STEP;
-                            if (stats_scroll_target > STATS_MAX_SCROLL)
-                                stats_scroll_target = STATS_MAX_SCROLL;
-                        }
-                    }
-                    screen_dirty = true;
-                }
-                // LEFT/RIGHT omitted: screen transitions don't benefit from
-                // auto-repeat and would oscillate due to animation overlap.
-                arrow_last_repeat = millis();
-            }
-        } else if (cur_arrow) {
-            arrow_held_key = cur_arrow;
-            arrow_hold_start = millis();
-            arrow_last_repeat = millis();
-        } else {
-            arrow_held_key = 0;
-        }
-    }
+    handle_key_repeat();
 
     // Fire pending '\' single-press action if double-tap window expired.
     // Signed-diff compare handles the 49-day millis() wraparound edge case.
