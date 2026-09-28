@@ -2,7 +2,7 @@
 
 # Plume — M5Cardputer ADV Edition
 
-Passive RF scanner that detects Flock Safety ALPR cameras and Raven surveillance devices using WiFi promiscuous mode and BLE scanning. Runs on the M5Cardputer ADV (ESP32-S3) with a 240×135 color LCD, full QWERTY keyboard, GPS, and SD card logging.
+Passive RF scanner that classifies Flock Safety, Raven/SoundThinking, and evidence-backed Axon-associated broadcasts using WiFi promiscuous mode and BLE scanning. Runs on the M5Cardputer ADV (ESP32-S3) with a 240×135 color LCD, full QWERTY keyboard, GPS, and SD card logging.
 
 No network connection. No cloud. Everything runs locally on the device. It receives publicly broadcast RF signals but never transmits, connects to, or interacts with any detected device.
 
@@ -11,24 +11,27 @@ No network connection. No cloud. Everything runs locally on the device. It recei
 ## Hardware
 
 - **M5Cardputer ADV** (ESP32-S3, no PSRAM variant supported)
-- **GPS module** via UART (pins 15/13, 115200 baud) — NEO-6M, BN-220, or similar
+- **M5Cardputer ADV GPS** via UART (pins 15/13); firmware auto-detects 9600, 115200, and 38400 baud
 - **MicroSD card** (FAT32, any size) — for detection logs, packet captures, and stats
 
 ## Flashing
 
-1. Install the Arduino IDE with ESP32-S3 board support
-2. Install libraries: `M5Cardputer`, `NimBLE-Arduino`, `TinyGPSPlus`
-3. Set board to `M5Cardputer` (or `ESP32-S3 Dev Module` with USB CDC enabled)
-4. Set partition scheme to include SPIFFS/LittleFS
-5. Flash via USB-C
+The reproducible baseline uses Arduino CLI 1.5.1, ESP32 Arduino core 3.3.10, M5Cardputer 1.1.1, M5Unified 0.2.19, M5GFX 0.2.26, NimBLE-Arduino 2.5.0, and TinyGPSPlus 1.0.3.
+
+```sh
+./scripts/bootstrap-dev.sh
+./scripts/build-cardputer.sh
+```
+
+The build script selects `esp32:esp32:m5stack_cardputer:PartitionScheme=huge_app`, stages the sketch under the Arduino-required matching filename, and leaves artifacts in ignored `.build/`. See [`docs/BASELINE.md`](docs/BASELINE.md) for the exact command, partitions, and verified memory use. Flash only a positively identified Cardputer port with the upload command printed by the build script.
 
 WiFi credentials for export mode are configured on-device via Menu → WiFi Config. No need to edit source code.
 
 ## Quick Start
 
-Power on. You'll see a boot screen, then an animated title card, then it drops into the scanner. It's already scanning WiFi and BLE channels for known Flock/Raven signatures.
+Power on. You'll see a boot screen, then an animated title card, then it drops into the scanner. It's already scanning WiFi and BLE channels for known Flock, Raven, and Axon evidence.
 
-When it finds something:
+When it finds an alarm-eligible classification:
 - An audible alarm plays (ascending tones for WiFi, descending for BLE — pitch indicates confidence)
 - The LED flashes the protocol color for 15 seconds
 - A toast notification shows the device name and confidence percentage
@@ -44,14 +47,13 @@ Navigate screens with `,` and `/`. Press `m` to open the menu. `Tab` shows a hel
 
 The main screen. Split into two panels.
 
-**Left panel** cycles through three visualizations (press `v`):
+**Left panel** cycles through two visualizations (press `v`):
 - **SCAN** — Proximity radar with phosphor sweep. Devices show up as triangles (WiFi) or diamonds (BLE), positioned by signal strength. Flock detections pulse amber. Icons fade as devices age.
 - **LINE** — 13-channel WiFi spectrum with Catmull-Rom smoothing. A scan line tracks the current hopping channel. Shifts purple when BLE is scanning. Channel labels at 1, 6, 11, 13.
-- **TIME** — 5-minute layered timeline showing WiFi (teal) and BLE (purple) activity as ribbons. Flock detections show as amber dots. Time marks from "now" to "-5m".
 
 **Right panel** is a live feed of all observed devices, sorted by recency. Each row shows a protocol symbol, device name, and signal strength. Flock devices show in amber. Rows fade at 30 seconds and disappear at 90. Press `f` to expand the feed fullscreen with RSSI columns, then use arrows to select a device and `t` to target it for signal tracking.
 
-### Signal
+### Signal (target detail flow)
 
 RSSI proximity tracker for a targeted device. Shows:
 - Target name with a status badge ("Hunting" for Flock, "Tracking" for everything else)
@@ -65,7 +67,7 @@ When signal drops out, the trace drops to the floor rather than freezing at the 
 
 ### Detections
 
-Scrollable list of confirmed Flock/Raven detections from the SD card log. Most recent first. Each row shows device name, type, RSSI, and a confidence bar. Up to 8 entries in the recent view.
+Scrollable list of logged classifications and associated-device evidence from the SD card log. Most recent first. Each row shows device name, type, RSSI, and a confidence bar. Up to 8 entries appear in the recent view.
 
 Press Enter to open the detail view: protocol symbol, device name, confidence bar with label (CERTAIN/HIGH/MEDIUM), MAC address, detection ID, signal strength with tier label, detection method, timestamp, date, and GPS coordinates.
 
@@ -87,7 +89,7 @@ Right panel shows status (GPS LOCKED / Searching... / Reattempting...), coordina
 
 Scrollable grid of stat cards with eased scrolling. Digits that change do a roll-up animation — only the ones that actually moved.
 
-Cards: Session Detections / Lifetime Detections, WiFi / BLE / Raven, Session Uptime / Lifetime Uptime, Battery / Heap, Packets / SD Card, Boots / Flash Writes, Version / Voltage.
+Cards: Session Detections / Lifetime Detections, Flock WiFi / Flock BLE / Raven / Axon, Session Uptime / Lifetime Uptime, Battery / Heap, Packets / SD Card, Boots / Flash Writes, Version / Voltage.
 
 ---
 
@@ -128,7 +130,7 @@ Cards: Session Detections / Lifetime Detections, WiFi / BLE / Raven, Session Upt
 
 Press `m`. Navigate with up/down, select with Enter.
 
-**Screens:** Scanner, Signal, Detections, GPS Status, Device Stats — current screen is marked.
+**Screens:** Scanner, Detections, GPS Status, Device Stats — current screen is marked. Signal tracking is opened from a selected feed or detection with `t`, rather than being a menu screen.
 
 **Settings:**
 - Night Mode — red-shifted palette for dark environments
@@ -158,7 +160,7 @@ Export mode pauses all scanning — WiFi promiscuous mode and BLE shut down comp
 1. Menu → Export Mode
 2. The device connects to WiFi (UI stays responsive during connect) and shows the server URL and password
 3. Open the URL in any browser on the same network
-4. Username is `plume`, password is the displayed 4-character hex code (deterministic per device, derived from eFuse MAC)
+4. Username is `plume`, password is the displayed 8-character hex code (deterministic per device, derived from eFuse MAC)
 5. Download files from the web interface
 
 Export auto-exits after 10 minutes (extended while someone is downloading). Exit manually with `esc` (the `` ` `` key, Fn not required), `del`, or `m` → Stop Export. NimBLE is fully deinitialized during export to free ~20-30KB of heap for the WiFi TCP stack, then reinitialized on exit.
@@ -185,13 +187,13 @@ Export auto-exits after 10 minutes (extended while someone is downloading). Exit
     └── lifetime.txt
 ```
 
-Hot-plug is supported — you can insert or remove the SD card while the device is running. It auto-remounts (directory creation, PCAP header verification, history reload) with a toast notification. Removal is detected via `SD.cardType()` probe every 5 seconds. Writes are buffered and flushed every 500ms or when buffers fill. A heap check skips flushes below 6KB free to prevent FAT driver allocation failures.
+Hot-plug is supported — you can insert or remove the SD card while the device is running. It auto-remounts (directory creation, PCAP header verification, history reload) with a toast notification. Removal is detected via `SD.cardType()` probe every 5 seconds. The service checks buffers every 500 ms, writes on the 10-second interval or when a buffer is full, retains unwritten records after ordinary open/write failures, and reports producer-side drop counters in serial health telemetry. A heap check skips flushes below 6 KB free to prevent FAT driver allocation failures.
 
 ---
 
 ## Detection Methods
 
-The firmware scores each device against a multi-factor signature database. 75% confidence or higher triggers an alarm. Scores cap at 100%.
+The firmware scores each device against a multi-factor signature database. 70% confidence or higher normally triggers an alarm. Scores cap at 100%; an Axon OUI by itself is explicitly non-alarming even when signal strength is high.
 
 ### WiFi MAC OUI Prefixes
 
@@ -199,75 +201,15 @@ The firmware checks the source MAC (addr2) of every WiFi frame against two tiers
 
 It also checks the destination MAC (addr1) using the NitekryDPaul technique. Flock cameras spend most of their time asleep and never transmit, but nearby APs still address frames to them. Checking addr1 catches these sleeping cameras that would otherwise be invisible.
 
-**Tier 1 — Strong Match (20 OUIs)**
+**Tier 1 — registry-specific (1 OUI)**
 
-These are high-confidence Flock Safety OUIs. A tier 1 match alone scores 60%.
+`b4:1e:52` is the sole compiled OUI independently registered to Flock Safety. It scores 60%; close-range RSSI can bring it to the 70-point alarm threshold.
 
-| OUI | Association |
-|-----|-------------|
-| `8c:1f:64` | Flock Safety |
-| `4c:6e:44` | Flock Safety |
-| `ec:1b:bd` | Flock Safety |
-| `58:8e:81` | Flock Safety |
-| `d8:a0:d8` | Penguin battery BLE |
-| `dc:54:75` | Flock Safety |
-| `e0:e2:e6` | Flock Safety |
-| `f0:9f:c2` | Flock Safety |
-| `68:b6:b3` | Flock Safety |
-| `a0:b7:65` | Flock Safety |
-| `24:0a:c4` | Flock Safety |
-| `a4:e5:7c` | Flock Safety |
-| `78:e3:6d` | Flock Safety |
-| `fc:f5:c4` | Flock Safety |
-| `b0:b2:1c` | Flock Safety |
-| `b4:1e:52` | Flock Safety |
-| `90:35:ea` | Flock Safety |
-| `f0:82:c0` | Flock Safety |
-| `b4:e3:f9` | Flock Safety |
-| `04:0d:84` | Cradlepoint modem |
+**Tier 2 — supporting evidence (53 OUIs)**
 
-**Tier 2 — Supporting Evidence (34 OUIs)**
+The compiled Tier-2 table contains component-vendor, field-observed, ambiguous, and explicitly unvalidated prefixes. A match contributes 25% and cannot classify on ordinary proximity alone. A Tier-2 wildcard probe is stronger behavioral evidence (60%) and reaches the alarm threshold only with the close-range RSSI bonus. Treat `cc:cc:cc`, `4c:6e:44`, and `d8:a0:d8` especially cautiously; source comments retain their provenance and limitations.
 
-These are lower-confidence associations — component vendors, shared chipsets, and field-reported OUIs that need corroboration from other signals. A tier 2 match contributes 25% as supporting evidence and stacks with other factors.
-
-Includes 14 OUIs from the NitekryDPaul 31-prefix research list, field-validated during the Joplin test (11/12 cameras detected, 2 false positives).
-
-| OUI | Association |
-|-----|-------------|
-| `48:e7:29` | Flock Safety (newer hardware) |
-| `74:4c:a1` | LiteOn (WCBN3510A WiFi/BT in Falcon V2) |
-| `94:34:69` | Flock Safety |
-| `38:5b:44` | Flock Safety |
-| `94:08:53` | Flock Safety |
-| `1c:34:f1` | Flock Safety |
-| `a4:cf:12` | Espressif (ext battery modules use ESP32) |
-| `3c:91:80` | Flock Safety |
-| `80:30:49` | Flock Safety |
-| `14:5a:fc` | Flock Safety |
-| `9c:2f:9d` | Flock Safety |
-| `e4:aa:ea` | Flock Safety |
-| `c8:c9:a3` | Flock Safety (Condor PTZ models) |
-| `70:c9:4e` | LiteOn |
-| `d0:39:57` | Flock Safety |
-| `24:b2:b9` | Flock Safety |
-| `00:f4:8d` | Flock Safety |
-| `e0:0a:f6` | Flock Safety |
-| `08:3a:88` | Murata (BLE modules) |
-| `d8:f3:bc` | Flock Safety |
-| `b8:35:32` | NitekryDPaul research list |
-| `c0:35:32` | NitekryDPaul research list |
-| `f4:6a:dd` | NitekryDPaul research list |
-| `f8:a2:d6` | NitekryDPaul research list |
-| `e8:d0:fc` | NitekryDPaul research list |
-| `e0:4f:43` | NitekryDPaul research list |
-| `b8:1e:a4` | NitekryDPaul research list |
-| `70:08:94` | NitekryDPaul research list |
-| `3c:71:bf` | NitekryDPaul research list |
-| `58:00:e3` | NitekryDPaul research list |
-| `5c:93:a2` | NitekryDPaul research list |
-| `64:6e:69` | NitekryDPaul research list |
-| `48:27:ea` | NitekryDPaul research list |
-| `82:6b:f2` | NitekryDPaul research list |
+The executable tables in `FlockDetection_Cardputer_ADV.ino` are authoritative and are statically checked against the C5 fallback table by `tests/check-signature-sync.sh`. The complete audited inventory and provenance gaps are recorded in [`docs/AUDIT.md`](docs/AUDIT.md), avoiding another stale hand-maintained README copy.
 
 ### WiFi SSID Patterns
 
@@ -280,19 +222,20 @@ Includes 14 OUIs from the NitekryDPaul 31-prefix research list, field-validated 
 | `flocksafety` | Known name | Supporting |
 | `OFS_IoT` | Field-reported infra | Supporting |
 | `PFS_` | Field-reported prefix | Supporting |
-| `test_flck` | Dev/test unit | Supporting |
+| `test_flck` in a probe request | Firmware behavior signature | 100% |
+| case-insensitive substring `flock` | Broad name match | Supporting |
 
 The firmware also checks for WPA2-PSK on Flock-format SSIDs via RSN IE tag 48 AKM suite parsing — real Flock cameras use WPA2-PSK, so an open network named `Flock-XXXX` would score lower.
 
 ### WiFi Wildcard Probe Requests
 
-The DeFlockJoplin technique: when a device sends a probe request with an empty SSID (wildcard), management frame subtype 4, from a known Flock OUI — that's a definitive match at 100%. This catches cameras that are actively scanning for their configured AP but not yet associated.
+The DeFlockJoplin technique examines an empty-SSID management subtype-4 probe request from a known OUI. A Tier-1 OUI makes this definitive (100%). A shared Tier-2 OUI produces a strong 60-point signal and still needs close-range RSSI to alarm.
 
 ### BLE Signatures
 
 **Flock Manufacturer ID**
 
-Company ID `0x09C8` (XUNTONG) in the BLE manufacturer data field. This is a strong single-factor match.
+Company ID `0x09C8` (XUNTONG) in the BLE manufacturer data field. Current executable logic treats this as a definitive Flock match; its attribution and false-positive rate remain field-validation concerns.
 
 **BLE Device Name Patterns**
 
@@ -328,33 +271,37 @@ Raven acoustic surveillance devices advertise a distinctive combination of custo
 | `00001809-0000-1000-8000-00805f9b34fb` | Health Thermometer | 1.1.x (legacy) |
 | `00001819-0000-1000-8000-00805f9b34fb` | Location and Navigation | 1.1.x (legacy) |
 
-1 custom UUID (3100–3500) = strong match. 3+ UUIDs = definitive (100%). The firmware classifies as 1.1.x-LEGACY, 1.2.x, or 1.3.x and logs the generation.
+One recognized custom UUID, or at least two recognized UUIDs in total, currently produces a definitive Raven classification. The firmware heuristically labels the observed UUID combination as 1.1.x-LEGACY, 1.2.x, 1.3.x, or unknown; this is not proof of exact installed firmware.
+
+### Axon evidence
+
+- IEEE OUI `00:25:DF` is registered to Axon Enterprise. A public WiFi/BLE address match logs `AXON_ASSOC` at 60% but never alarms by itself and does not imply a product model.
+- Bluetooth company identifier `0x034D` is registered to TASER International, Axon's former corporate name. A matching BLE manufacturer field logs `AXON_BLE` at 85%.
+- Research-reported vendor service UUID `0xFC81` is corroboration only. It cannot classify alone; paired with `0x034D` it raises the event to 100%.
+
+The evidence strings stored with each result explain which identifiers matched. No signature claims that the observed product is specifically a body camera, dock, or ALPR unit.
 
 ### Confidence Scoring
 
 | Condition | Score | Notes |
 |-----------|-------|-------|
 | `Flock-XXXX` SSID format match | 100% | Definitive — hex format with partial MAC |
-| Raven 3+ UUID match | 100% | Definitive — unique service combination |
+| Recognized Raven custom UUID or multi-UUID condition | 100% | Definitive under current detector policy |
 | BLE name + manufacturer ID match | 100% | Definitive — two independent strong signals |
-| Wildcard probe from known OUI | 100% | Definitive — DeFlockJoplin technique |
+| Tier-1 wildcard probe | 100% | Definitive — OUI plus behavior |
+| Tier-2 wildcard probe | 60% | Strong, but shared-vendor evidence |
 | Tier 1 MAC + SSID pattern | 100% | Two strong corroborating signals |
 | Tier 1 MAC alone | 60% | Strong single factor |
 | Tier 2 MAC | 25% | Supporting — needs corroboration |
 | BLE name pattern match | 25% | Supporting |
 | Static BLE address | 25% | Supporting |
 | RSSI above -50 dBm | +10% | Bonus — strong signal suggests proximity |
-| Stationary behavior detected | +15% | Bonus — fixed installation pattern |
+| BLE TX power at least 0 dBm | +8% | Corroborator only |
+| Axon BLE company ID | 85% | High-confidence vendor classification, not a model |
+| Axon OUI alone | 60% | Associated only; explicitly non-alarming |
+| Axon company ID + OUI or UUID | 100% | Corroborated vendor classification |
 
-Supporting evidence stacks. A tier 2 MAC (25%) plus a name pattern match (25%) plus strong RSSI (+10%) gets you to 60%. Add stationary behavior (+15%) and you're at 75% — alarm threshold.
-
-### Stationary Detection
-
-Two algorithms run against the RSSI sample buffer for each tracked device:
-
-**Peak-shape** — you're driving past a fixed installation. RSSI rises as you approach, peaks, then falls as you pass. The firmware looks for ≥6 dB range across the sample window. This is the classic "drive-past" pattern.
-
-**Flat variance** — both you and the device are stationary. RSSI stays within ≤3 dB range across all samples. You're parked near a camera, or stopped at a light next to one.
+Supporting evidence stacks, but proximity is not identity. The current firmware does not add a stationary-behavior score; the Signal view's rolling trace is an operator aid only.
 
 ---
 
@@ -389,6 +336,8 @@ Press `n` or toggle in the menu. Shifts the entire UI to a red-shifted palette t
 
 After 2 minutes with no input, the screen dims to minimum brightness and the scanner keeps running at ~15 fps. Forces scanner screen if you idled on another screen. Any keypress wakes it. Disabled when signal tracking is active, export mode is running, or a toast is showing.
 
+An optional `/flock_signatures.csv` on SD can transactionally replace the OUI, SSID, and BLE-name tables independently. The parser validates the complete recognized input before committing; malformed or overflowing input leaves the active tables unchanged. The UI reports `BUILT-IN` or `SD`, and OUI/SSID tables synchronize to a connected C5. The format does not yet carry a database version, hash, or per-signature provenance.
+
 ---
 
 ## Architecture
@@ -398,11 +347,15 @@ Both cores of the ESP32-S3 are in use:
 - **Core 0** — Scanner task (WiFi channel hopping with configurable dwell, BLE scan scheduling with hang detection), GPS parsing
 - **Core 1** — Main loop (UI rendering via DMA-pushed sprite, keyboard, SD flushing, alarms), BLE worker task (advertisement processing from lock-free pool, detection scoring), LED breathing, one-shot persist task
 
-WiFi packets flow through an 8-slot lock-free ring buffer — the promiscuous callback writes raw frame snapshots, the main loop drains and parses tagged parameters. BLE advertisements use a 4-slot static pool with atomic CAS for slot claiming, fed through a FreeRTOS queue to the worker. Zero heap allocation in either hot path.
+WiFi packets flow through a 16-slot atomic ring buffer — the promiscuous callback writes bounded raw frame snapshots, and the main loop drains and parses tagged parameters. BLE advertisements use a 4-slot static pool with atomic CAS for slot claiming, fed through a FreeRTOS queue to the worker. Zero heap allocation occurs in either hot path.
 
-A recursive FreeRTOS mutex protects shared state between cores (500ms timeout, diagnostic logging on contention). A separate SD mutex serializes card I/O with short timed takes so nothing blocks the main loop for more than one frame.
+A recursive FreeRTOS mutex protects shared state between cores; call sites use both bounded waits and `portMAX_DELAY` according to context. A separate SD mutex serializes card I/O. Long filesystem operations remain a runtime responsiveness risk to measure on hardware.
 
-Channel hopping pauses for 10 seconds on detection (channel lock) to maximize packet capture. BLE scan parameters adapt to power mode: full duty cycle in normal, 50% in low power. Periodic BLE stack restart every 30 minutes prevents NimBLE state corruption during long sessions.
+Channel hopping pauses for 10 seconds on alarm-eligible detections to maximize packet capture. BLE scan parameters adapt to power mode: 60 ms window / 100 ms interval in normal mode and approximately 50% duty in low power. Periodic BLE stack restart every 30 minutes mitigates NimBLE instability during long sessions.
+
+## ESP32-C5 companion
+
+The optional `c5-sniffer/` firmware extends passive WiFi reception to supported 5 GHz channels. `PROTOCOL.md` is the Cardputer ↔ C5 wire contract; version 1 covers detections, ambient sightings, heartbeat, time/power/LED state, signature transactions, radio idle control, and Grove cable orientation detection. Build it with `./scripts/build-c5.sh`. Signature and threshold parity are checked by `./tests/check-signature-sync.sh`.
 
 ## Prior Hardware
 
@@ -426,7 +379,7 @@ This project builds on work from the surveillance detection community:
 
 ## Known Limitations
 
-- **No PSRAM.** The device runs on ~17 KB of free heap after all subsystems initialize. Memory-intensive operations manage heap carefully but can fail under extreme conditions. Auto-restart at 3KB free, SD/LittleFS writes skipped below 6KB.
+- **No PSRAM.** Runtime headroom has not yet been measured on the acquired hardware. The source contains a 3 KB auto-restart floor and skips SD/LittleFS work below 6 KB; a mixed-radio soak test is required before field-readiness claims.
 - **GPS accuracy** depends on environment. 3–5 m CEP typical. Indoor or urban canyon fix quality will suffer.
 - **RSSI is relative, not absolute.** Multipath, antenna orientation, and environmental factors all affect it. Use the Signal screen as a proximity guide, not a distance meter.
 - **Passive only.** Can't detect cameras that are powered off or not beaconing.

@@ -2,6 +2,39 @@
 
 All notable changes to Plume are recorded here.
 
+## Unreleased — Sentinel acquisition baseline
+
+### Added
+
+- Reproducible Arduino CLI bootstrap and build scripts pinned to ESP32 Arduino
+  core 3.3.10 and the audited Cardputer/C5 dependency versions.
+- Evidence-aware Axon classification: official vendor OUI `00:25:DF`, Bluetooth
+  company identifier `0x034D`, and research-reported UUID `0xFC81` as
+  corroboration only. OUI-only results are logged as non-alarming
+  `AXON_ASSOC`; no product model is inferred.
+- Separate Axon session accounting and Stats card.
+- Host-side signature parity/policy check for the Cardputer and C5 sketches.
+- Baseline, architecture audit, documentation-drift record, and Sentinel roadmap
+  under `docs/`.
+
+### Fixed
+
+- SD buffers now retain unwritten records across ordinary open/write failures;
+  CSV, WiFi-PCAP, and BLE-PCAP producer drops are counted in health telemetry.
+- SD signature overrides stage and validate the entire recognized transaction
+  before replacing active tables or reporting `SD` provenance.
+- C5 alarm threshold and built-in fallback signatures now match the Cardputer.
+- Both UART parsers discard complete overlong lines; C5 signature rows reject
+  invalid OUIs and tiers.
+- Exact OUI parsing, persisted-time termination, format arguments, and the
+  deprecated RGB LED call were corrected.
+
+### Documentation
+
+- README now matches the current two scanner visualizations, Signal navigation,
+  70-point threshold, signature tiers, SD cadence, BLE duty cycle, C5 support,
+  export password length, ring size, GPS baud detection, and pinned CLI build.
+
 ## v1.3
 
 The Signal screen, rebuilt against the `design_handoff_signal_screen` spec, and
