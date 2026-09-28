@@ -1,6 +1,8 @@
-![Plume — Surveillance Awareness](banner.png)
+# Plume — Surveillance Awareness
 
-# Plume — M5Cardputer ADV Edition
+[Plume — Surveillance Awareness](banner.png)
+
+## Plume — M5Cardputer ADV Edition
 
 Passive RF scanner that classifies Flock Safety, Raven/SoundThinking, and evidence-backed Axon-associated broadcasts using WiFi promiscuous mode and BLE scanning. Runs on the M5Cardputer ADV (ESP32-S3) with a 240×135 color LCD, full QWERTY keyboard, GPS, and SD card logging.
 
@@ -32,6 +34,7 @@ WiFi credentials for export mode are configured on-device via Menu → WiFi Conf
 Power on. You'll see a boot screen, then an animated title card, then it drops into the scanner. It's already scanning WiFi and BLE channels for known Flock, Raven, and Axon evidence.
 
 When it finds an alarm-eligible classification:
+
 - An audible alarm plays (ascending tones for WiFi, descending for BLE — pitch indicates confidence)
 - The LED flashes the protocol color for 15 seconds
 - A toast notification shows the device name and confidence percentage
@@ -48,6 +51,7 @@ Navigate screens with `,` and `/`. Press `m` to open the menu. `Tab` shows a hel
 The main screen. Split into two panels.
 
 **Left panel** cycles through two visualizations (press `v`):
+
 - **SCAN** — Proximity radar with phosphor sweep. Devices show up as triangles (WiFi) or diamonds (BLE), positioned by signal strength. Flock detections pulse amber. Icons fade as devices age.
 - **LINE** — 13-channel WiFi spectrum with Catmull-Rom smoothing. A scan line tracks the current hopping channel. Shifts purple when BLE is scanning. Channel labels at 1, 6, 11, 13.
 
@@ -56,6 +60,7 @@ The main screen. Split into two panels.
 ### Signal (target detail flow)
 
 RSSI proximity tracker for a targeted device. Shows:
+
 - Target name with a status badge ("Hunting" for Flock, "Tracking" for everything else)
 - Live dBm reading with CLOSER/FARTHER trend
 - Signal strength bar with smoothing and micro-jitter
@@ -72,6 +77,7 @@ Scrollable list of logged classifications and associated-device evidence from th
 Press Enter to open the detail view: protocol symbol, device name, confidence bar with label (CERTAIN/HIGH/MEDIUM), MAC address, detection ID, signal strength with tier label, detection method, timestamp, date, and GPS coordinates.
 
 From detail view:
+
 - `t` — target this device on the Signal screen
 - `d` — delete this detection (confirm with `d` or Enter again)
 - `w` — whitelist this MAC (suppresses future alarms)
@@ -96,8 +102,9 @@ Cards: Session Detections / Lifetime Detections, Flock WiFi / Flock BLE / Raven 
 ## Keyboard Controls
 
 ### Global
+
 | Key | Action |
-|-----|--------|
+| ----- | -------- |
 | `,` `/` | Previous / next screen |
 | `;` `.` | Up / down (screen-specific — never changes screens) |
 | `m` | Open / close menu |
@@ -116,8 +123,9 @@ Cards: Session Detections / Lifetime Detections, Flock WiFi / Flock BLE / Raven 
 | `v` | Cycle scanner visualization (scanner screen only) |
 
 ### Detections Screen
+
 | Key | Action |
-|-----|--------|
+| ----- | -------- |
 | `;` `.` | Navigate list (with key-hold repeat) |
 | `Enter` | Open / close detail view |
 | `d` | Delete detection (from detail view, requires confirmation) |
@@ -133,6 +141,7 @@ Press `m`. Navigate with up/down, select with Enter.
 **Screens:** Scanner, Detections, GPS Status, Device Stats — current screen is marked. Signal tracking is opened from a selected feed or detection with `t`, rather than being a menu screen.
 
 **Settings:**
+
 - Night Mode — red-shifted palette for dark environments
 - Low Power Mode — 80 MHz CPU, reduced BLE scan duty (50%), longer battery life. Mutually exclusive with turbo.
 - Mute Beeps — silences all tones
@@ -140,6 +149,7 @@ Press `m`. Navigate with up/down, select with Enter.
 - Charge Mode — reboots into a radios-off charging state with a live percent/voltage readout (same as the `c` key)
 
 **Tools:**
+
 - WiFi Config — set SSID and password for export mode (AES-encrypted on flash)
 - Export Mode — starts an HTTP server to download logs from a browser (toggles to "Stop Export" when active)
 - Clear All Stats — resets all session and lifetime counters
@@ -151,12 +161,14 @@ Press `m`. Navigate with up/down, select with Enter.
 Export mode pauses all scanning — WiFi promiscuous mode and BLE shut down completely — and starts a local HTTP server. You can download detection logs and packet captures from any device on the same network.
 
 ### Setup
+
 1. Menu → WiFi Config
 2. Enter your WiFi SSID and password using the on-screen keyboard
 3. Save (credentials are AES-128-CBC encrypted on flash with a device-unique key derived from the ESP32's eFuse MAC via HMAC-SHA256)
 4. Press `s` in the password field to toggle plaintext reveal
 
 ### Using It
+
 1. Menu → Export Mode
 2. The device connects to WiFi (UI stays responsive during connect) and shows the server URL and password
 3. Open the URL in any browser on the same network
@@ -166,8 +178,9 @@ Export mode pauses all scanning — WiFi promiscuous mode and BLE shut down comp
 Export auto-exits after 10 minutes (extended while someone is downloading). Exit manually with `esc` (the `` ` `` key, Fn not required), `del`, or `m` → Stop Export. NimBLE is fully deinitialized during export to free ~20-30KB of heap for the WiFi TCP stack, then reinitialized on exit.
 
 ### Files
+
 | File | What It Is |
-|------|------------|
+| ------ | ------------ |
 | `PlumeLog.csv` | All detections — timestamps, GPS, RSSI, confidence, detection method, detection ID |
 | `Threats.pcap` | Raw WiFi packet captures with GPS timestamps (Wireshark, link type 802.11) |
 | `BLE_Threats.pcap` | Raw BLE advertisement captures (Wireshark, link type Bluetooth LE LL) |
@@ -176,7 +189,7 @@ Export auto-exits after 10 minutes (extended while someone is downloading). Exit
 
 ## SD Card Structure
 
-```
+```md
 /PLUME/
 ├── logs/
 │   └── PlumeLog.csv
@@ -185,6 +198,7 @@ Export auto-exits after 10 minutes (extended while someone is downloading). Exit
 │   └── BLE_Threats.pcap
 └── stats/
     └── lifetime.txt
+
 ```
 
 Hot-plug is supported — you can insert or remove the SD card while the device is running. It auto-remounts (directory creation, PCAP header verification, history reload) with a toast notification. Removal is detected via `SD.cardType()` probe every 5 seconds. The service checks buffers every 500 ms, writes on the 10-second interval or when a buffer is full, retains unwritten records after ordinary open/write failures, and reports producer-side drop counters in serial health telemetry. A heap check skips flushes below 6 KB free to prevent FAT driver allocation failures.
@@ -201,11 +215,11 @@ The firmware checks the source MAC (addr2) of every WiFi frame against two tiers
 
 It also checks the destination MAC (addr1) using the NitekryDPaul technique. Flock cameras spend most of their time asleep and never transmit, but nearby APs still address frames to them. Checking addr1 catches these sleeping cameras that would otherwise be invisible.
 
-**Tier 1 — registry-specific (1 OUI)**
+## Tier 1 — registry-specific (1 OUI)**
 
 `b4:1e:52` is the sole compiled OUI independently registered to Flock Safety. It scores 60%; close-range RSSI can bring it to the 70-point alarm threshold.
 
-**Tier 2 — supporting evidence (53 OUIs)**
+## Tier 2 — supporting evidence (53 OUIs)**
 
 The compiled Tier-2 table contains component-vendor, field-observed, ambiguous, and explicitly unvalidated prefixes. A match contributes 25% and cannot classify on ordinary proximity alone. A Tier-2 wildcard probe is stronger behavioral evidence (60%) and reaches the alarm threshold only with the close-range RSSI bonus. Treat `cc:cc:cc`, `4c:6e:44`, and `d8:a0:d8` especially cautiously; source comments retain their provenance and limitations.
 
@@ -214,7 +228,7 @@ The executable tables in `FlockDetection_Cardputer_ADV.ino` are authoritative an
 ### WiFi SSID Patterns
 
 | Pattern | Type | Score |
-|---------|------|-------|
+| --------- | ------ | ------- |
 | `Flock-XXXX` (hex format, e.g. `Flock-3A88`) | Definitive | 100% |
 | `FS Ext Battery` | Known name | Supporting |
 | `Penguin` | Known name | Supporting |
@@ -233,14 +247,14 @@ The DeFlockJoplin technique examines an empty-SSID management subtype-4 probe re
 
 ### BLE Signatures
 
-**Flock Manufacturer ID**
+ #[#2](https://github.com/zmattmanz/plume/issues/2)Flock Manufacturer ID**
 
 Company ID `0x09C8` (XUNTONG) in the BLE manufacturer data field. Current executable logic treats this as a definitive Flock match; its attribution and false-positive rate remain field-validation concerns.
 
-**BLE Device Name Patterns**
+## BLE Device Name Patterns**
 
 | Pattern | What It Is |
-|---------|------------|
+| --------- | ------------ |
 | `FS Ext Battery` | Flock external battery BLE relay |
 | `FS-XXXXXX` | Newer Flock BLE device naming (e.g. `FS-85068D`) |
 | `RWLS-[MAC]` | Field-observed Flock device pattern (e.g. `RWLS-38:5B:44:B3:0F:5A`) |
@@ -248,11 +262,11 @@ Company ID `0x09C8` (XUNTONG) in the BLE manufacturer data field. Current execut
 | `Pigvision` | Pigvision system |
 | `FlockCam` | Seen in some BLE advertisements |
 
-**TN Serial Detection**
+## TN Serial Detection**
 
 The firmware extracts TN serial numbers from BLE manufacturer data. Presence of a TN serial is a strong match signal.
 
-**BLE Address Type**
+## BLE Address Type**
 
 Public addresses and random static addresses (what Flock batteries use) get a confidence bonus. Random resolvable addresses — the kind phones rotate every ~15 minutes — get nothing. This filters out pedestrian devices from the scoring.
 
@@ -261,7 +275,7 @@ Public addresses and random static addresses (what Flock batteries use) get a co
 Raven acoustic surveillance devices advertise a distinctive combination of custom and standard BLE service UUIDs. The firmware fingerprints the approximate firmware generation based on which UUIDs are present.
 
 | UUID | Service | Firmware |
-|------|---------|----------|
+| ------ | --------- | ---------- |
 | `00003100-0000-1000-8000-00805f9b34fb` | GPS / Location | 1.2.x+ |
 | `00003200-0000-1000-8000-00805f9b34fb` | Power Management | 1.2.x+ |
 | `00003300-0000-1000-8000-00805f9b34fb` | Network Status | 1.2.x+ |
@@ -284,7 +298,7 @@ The evidence strings stored with each result explain which identifiers matched. 
 ### Confidence Scoring
 
 | Condition | Score | Notes |
-|-----------|-------|-------|
+| ----------- | ------- | ------- |
 | `Flock-XXXX` SSID format match | 100% | Definitive — hex format with partial MAC |
 | Recognized Raven custom UUID or multi-UUID condition | 100% | Definitive under current detector policy |
 | BLE name + manufacturer ID match | 100% | Definitive — two independent strong signals |
@@ -324,6 +338,7 @@ Battery percentage uses a 9-point piecewise linear LiPo curve (4200mV=100% throu
 Warnings at 3.7V (low) and 3.5V (critical), with 100mV hysteresis to prevent strobe on noisy ADC. Re-warnings every 10 min (low) or 2 min (critical). Auto-restart at 3.0V to prevent deep discharge.
 
 **Approximate runtime:**
+
 - Normal mode (160 MHz): 4–6 hours depending on RF density
 - Low power (80 MHz): 6–8 hours
 - Turbo (240 MHz): 2.5–4 hours
@@ -404,4 +419,4 @@ MIT — see [LICENSE](LICENSE) for full text.
 
 ---
 
-**v1.3**
+## *v1.3**
