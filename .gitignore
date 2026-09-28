@@ -4,6 +4,8 @@
 
 # Arduino build artifacts
 build/
+.build/
+.arduino/
 *.ino.bin
 *.ino.elf
 *.ino.map
