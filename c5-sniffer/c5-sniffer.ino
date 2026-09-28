@@ -68,7 +68,7 @@ struct RawEvent;   // fwd-decl: lets Arduino's auto-generated prototypes resolve
 #define SCORE_STRONG       60
 #define SCORE_WEAK         25
 #define SCORE_BONUS_RSSI   10
-#define ALARM_THRESHOLD    75           // = CONFIDENCE_ALARM_THRESHOLD in Plume
+#define ALARM_THRESHOLD    70           // = CONFIDENCE_ALARM_THRESHOLD in Plume
 #define IGNORE_WEAK_RSSI   -80
 
 // ── 5 GHz channels (non-DFS only) ────────────────────────────────────────────
@@ -90,23 +90,24 @@ static const int     kNumChannels   = sizeof(kChannels) / sizeof(kChannels[0]);
 // ── Signatures — MUST MATCH Plume ────────────────────────────────────────────
 static const char* kSsidPatterns[] = {
     "FS Ext Battery", "Penguin", "Pigvision", "FlockOS",
-    "flocksafety", "OFS_IoT", "PFS_"
+    "flocksafety", "OFS_IoT", "PFS_", "flock"
 };
 static const int kNumSsidPatterns = sizeof(kSsidPatterns) / sizeof(kSsidPatterns[0]);
 
 static const char* kMacTier1[] = {           // high-confidence Flock OUIs
-    "b4:1e:52", "e4:aa:ea", "00:09:01",
-    "4c:6e:44", "d8:a0:d8", "a0:b7:65", "f0:82:c0", "b4:e3:f9", "04:0d:84"
+    "b4:1e:52"
 };
 static const int kNumMacTier1 = sizeof(kMacTier1) / sizeof(kMacTier1[0]);
 
 static const char* kMacTier2[] = {           // component-vendor OUIs (weaker)
-    "74:4c:a1", "94:34:69", "38:5b:44", "94:08:53", "1c:34:f1", "a4:cf:12",
+    "e4:aa:ea", "00:09:01", "a0:b7:65", "f0:82:c0", "b4:e3:f9", "04:0d:84",
+    "4c:6e:44", "d8:a0:d8", "74:4c:a1", "94:34:69", "38:5b:44", "94:08:53",
+    "1c:34:f1", "a4:cf:12", "d4:ad:fc", "ac:67:b2",
     "3c:91:80", "80:30:49", "14:5a:fc", "9c:2f:9d", "c8:c9:a3", "70:c9:4e",
     "24:b2:b9", "00:f4:8d", "08:3a:88", "d8:f3:bc", "ec:1b:bd", "58:8e:81",
     "90:35:ea", "b8:35:32", "c0:35:32", "f4:6a:dd", "f8:a2:d6", "e8:d0:fc",
     "e0:4f:43", "b8:1e:a4", "70:08:94", "3c:71:bf", "58:00:e3", "5c:93:a2",
-    "64:6e:69", "48:27:ea", "82:6b:f2", "d0:39:57", "e0:0a:f6", "e8:2a:44",
+    "64:6e:69", "48:27:ea", "82:6b:f2", "cc:cc:cc", "d0:39:57", "e0:0a:f6", "e8:2a:44",
     "30:d1:6b", "b8:ee:65", "a4:db:30", "40:f0:2f", "30:52:cb", "94:97:4f"
 };
 static const int kNumMacTier2 = sizeof(kMacTier2) / sizeof(kMacTier2[0]);
@@ -125,6 +126,11 @@ struct OuiRT { char prefix[OUI_PREFIX_LEN]; uint8_t bytes[3]; uint8_t tier; };  
 
 // Parse "aa:bb:cc" into 3 raw bytes. Returns false on malformed input.
 static bool oui_prefix_to_bytes(const char* str, uint8_t out[3]) {
+    if (!str || strlen(str) != 8 || str[2] != ':' || str[5] != ':') return false;
+    static const uint8_t hex_pos[] = {0, 1, 3, 4, 6, 7};
+    for (uint8_t i = 0; i < sizeof(hex_pos); i++) {
+        if (!isxdigit((unsigned char)str[hex_pos[i]])) return false;
+    }
     unsigned a1, b1, c1;
     if (sscanf(str, "%2x:%2x:%2x", &a1, &b1, &c1) != 3) return false;
     out[0] = (uint8_t)a1; out[1] = (uint8_t)b1; out[2] = (uint8_t)c1;
@@ -642,11 +648,19 @@ static void link_handle_line(char* line) {
     // SO|<prefix>|<tier>
     if (strcmp(f[0], "SO") == 0 && nf >= 3 && g_sig_syncing) {
         if (g_oui_stage_n < RT_OUI_MAX) {
-            strlcpy(g_oui_stage[g_oui_stage_n].prefix, f[1], OUI_PREFIX_LEN);
-            oui_prefix_to_bytes(g_oui_stage[g_oui_stage_n].prefix,
-                                g_oui_stage[g_oui_stage_n].bytes);
-            g_oui_stage[g_oui_stage_n].tier = (uint8_t)atoi(f[2]);
-            g_oui_stage_n++;
+            uint8_t parsed[3];
+            int tier = strcmp(f[2], "1") == 0 ? 1 : (strcmp(f[2], "2") == 0 ? 2 : 0);
+            if (oui_prefix_to_bytes(f[1], parsed) && tier != 0) {
+                strlcpy(g_oui_stage[g_oui_stage_n].prefix, f[1], OUI_PREFIX_LEN);
+                memcpy(g_oui_stage[g_oui_stage_n].bytes, parsed, sizeof(parsed));
+                g_oui_stage[g_oui_stage_n].tier = (uint8_t)tier;
+                g_oui_stage_n++;
+            } else {
+                // Poison the transaction: SE count validation will fail and
+                // preserve the last complete signature set.
+                g_sig_syncing = false;
+                DbgSerial.println("[C5] invalid SO row — discarded signature transaction");
+            }
         }
         return;
     }
@@ -676,12 +690,21 @@ static void link_handle_line(char* line) {
 
 static char    g_in_buf[96];
 static uint8_t g_in_len = 0;
+static bool    g_in_discarding = false;
 static void process_link_inbound() {
     while (LinkSerial.available() > 0) {
         char c = (char)LinkSerial.read();
-        if (c == '\n')                              { g_in_buf[g_in_len] = '\0'; link_handle_line(g_in_buf); g_in_len = 0; }
+        if (c == '\n') {
+            if (!g_in_discarding) {
+                g_in_buf[g_in_len] = '\0';
+                link_handle_line(g_in_buf);
+            }
+            g_in_len = 0;
+            g_in_discarding = false;
+        }
+        else if (g_in_discarding)                    { continue; }
         else if (g_in_len < sizeof(g_in_buf) - 1)   { g_in_buf[g_in_len++] = c; }
-        else                                        { g_in_len = 0; }   // overlong — resync on next NL
+        else                                        { g_in_len = 0; g_in_discarding = true; }
     }
 }
 

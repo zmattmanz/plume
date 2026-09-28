@@ -852,6 +852,9 @@ volatile bool is_alarming = false;
 char sd_write_buffer[MAX_LOG_BUFFER][SD_LINE_LEN];
 int  sd_write_count = 0;
 unsigned long last_sd_flush = 0;
+static uint32_t sd_log_dropped = 0;
+static uint32_t sd_wifi_pcap_dropped = 0;
+static uint32_t sd_ble_pcap_dropped = 0;
 static int flash_write_fail_count = 0; 
 
 static const char* current_log_file = "/PLUME/logs/PlumeLog.csv";
@@ -889,7 +892,7 @@ static void export_derive_password() {
         h ^= mac[i];
         h *= 16777619u;
     }
-    snprintf(export_auth_pass, sizeof(export_auth_pass), "%08X", h);
+    snprintf(export_auth_pass, sizeof(export_auth_pass), "%08lX", (unsigned long)h);
 }
 
 int current_screen = 0;
@@ -901,6 +904,7 @@ int current_volume = 150;
 long session_flock_wifi = 0;
 long session_flock_ble = 0;
 long session_raven = 0;
+long session_axon = 0;
 
 unsigned long session_start_time = 0;
 unsigned long lifetime_seconds = 0;
@@ -1204,7 +1208,7 @@ static const float STATS_SCROLL_TC = 80.0f;   // ms — snappier; 120 felt slugg
 // kicks off an anim_slide_in() roll for UI_ANIM_QUICK ms. PACKETS is
 // additionally throttled to a 3 s update cadence so it doesn't churn.
 enum StatsCardIdx {
-    SC_DET_SESSION = 0, SC_DET_LIFETIME, SC_WIFI, SC_BLE, SC_RAVEN,
+    SC_DET_SESSION = 0, SC_DET_LIFETIME, SC_WIFI, SC_BLE, SC_RAVEN, SC_AXON,
     SC_SESSION, SC_LIFETIME,
     SC_BATTERY, SC_HEAP,
     SC_PACKETS, SC_SD,
@@ -1571,7 +1575,7 @@ void beep(int frequency, int duration_ms) {
 }
 
 void set_cardputer_led(uint8_t r, uint8_t g, uint8_t b) {
-    neopixelWrite(21, r, g, b);
+    rgbLedWrite(21, r, g, b);
 }
 
 // ============================================================================
@@ -2494,6 +2498,15 @@ static bool uuid_base_short_code(const char* u, uint16_t* out) {
 
 #define FLOCK_MFG_COMPANY_ID 0x09C8
 
+// Axon vendor evidence. IEEE assigns 00:25:DF to Axon Enterprise, Inc.; the
+// Bluetooth SIG assigns company ID 0x034D to TASER International, Inc. (Axon's
+// former corporate name). 0xFC81 is reported by open detector research but is
+// not an adopted SIG service UUID, so it is corroboration only and never
+// classifies by itself.
+#define AXON_MFG_COMPANY_ID 0x034D
+#define AXON_SERVICE_UUID   0xFC81
+static const uint8_t AXON_OUI[3] = {0x00, 0x25, 0xDF};
+
 // ── Runtime signature tables (seeded from defaults, optionally replaced by SD) ──
 #define MAX_OUI_RT   64
 #define MAX_SSID_RT  32
@@ -2509,6 +2522,11 @@ char  rt_name[MAX_NAME_RT][SIG_STR_LEN];  int rt_name_count = 0;
 // Parse an "aa:bb:cc" OUI prefix string into 3 raw bytes. Returns false on
 // malformed input. Called only at signature-load time, never on the hot path.
 static inline bool oui_prefix_to_bytes(const char* s, uint8_t out[3]) {
+    if (!s || strlen(s) != 8 || s[2] != ':' || s[5] != ':') return false;
+    static const uint8_t hex_pos[] = {0, 1, 3, 4, 6, 7};
+    for (uint8_t i = 0; i < sizeof(hex_pos); i++) {
+        if (!isxdigit((unsigned char)s[hex_pos[i]])) return false;
+    }
     unsigned a, b, c;
     if (sscanf(s, "%2x:%2x:%2x", &a, &b, &c) != 3) return false;
     out[0] = (uint8_t)a; out[1] = (uint8_t)b; out[2] = (uint8_t)c;
@@ -2553,18 +2571,49 @@ void signatures_load_from_sd() {
     File f = SD.open(SIG_FILE, FILE_READ);
     if (!f) { Serial.println(F("Signatures: SD open failed, using defaults")); return; }
 
-    bool cleared_oui = false, cleared_ssid = false, cleared_name = false;
-    int n_oui = 0, n_ssid = 0, n_name = 0;
+    // Stage the entire file off to the side and commit only after every
+    // recognized row validates. This is a policy transaction: a typo on the
+    // first OUI row must never clear a working built-in detector table.
+    OuiRT* staged_oui = (OuiRT*)malloc(sizeof(rt_oui));
+    char (*staged_ssid)[SIG_STR_LEN] =
+        (char (*)[SIG_STR_LEN])malloc(sizeof(rt_ssid));
+    char (*staged_name)[SIG_STR_LEN] =
+        (char (*)[SIG_STR_LEN])malloc(sizeof(rt_name));
+    if (!staged_oui || !staged_ssid || !staged_name) {
+        free(staged_oui); free(staged_ssid); free(staged_name);
+        f.close();
+        Serial.println(F("Signatures: staging allocation failed, using defaults"));
+        return;
+    }
+
+    memcpy(staged_oui, rt_oui, sizeof(rt_oui));
+    memcpy(staged_ssid, rt_ssid, sizeof(rt_ssid));
+    memcpy(staged_name, rt_name, sizeof(rt_name));
+    int staged_oui_count = rt_oui_count;
+    int staged_ssid_count = rt_ssid_count;
+    int staged_name_count = rt_name_count;
+    bool saw_oui = false, saw_ssid = false, saw_name = false;
+    bool valid = true;
+    int line_no = 0;
     char line[80];
 
-    while (f.available()) {
+    while (f.available() && valid) {
+        line_no++;
         int len = f.readBytesUntil('\n', line, sizeof(line) - 1);
         line[len] = '\0';
+        if (len == (int)sizeof(line) - 1) {
+            while (f.available()) {
+                int c = f.read();
+                if (c == '\n') break;
+            }
+            valid = false;
+            break;
+        }
         while (len > 0 && (line[len-1] == '\r' || line[len-1] == ' ')) line[--len] = '\0';
         if (len == 0 || line[0] == '#') continue;
 
         char* comma = strchr(line, ',');
-        if (!comma) continue;
+        if (!comma) { valid = false; break; }
         *comma = '\0';
         char* type  = line;
         char* value = comma + 1;
@@ -2572,41 +2621,71 @@ void signatures_load_from_sd() {
         if (tier_str) { *tier_str = '\0'; tier_str++; }
 
         if (strcasecmp(type, "oui") == 0) {
-            if (!cleared_oui) { rt_oui_count = 0; cleared_oui = true; }
-            if (rt_oui_count < MAX_OUI_RT && strlen(value) >= 8) {
-                strncpy(rt_oui[rt_oui_count].prefix, value, 8);
-                rt_oui[rt_oui_count].prefix[8] = '\0';
-                if (oui_prefix_to_bytes(rt_oui[rt_oui_count].prefix, rt_oui[rt_oui_count].bytes)) {
-                    rt_oui[rt_oui_count].tier =
-                        (tier_str && strcasecmp(tier_str, "specific") == 0) ? OUI_SPECIFIC : OUI_GENERIC;
-                    rt_oui_count++; n_oui++;
-                }
+            if (!saw_oui) { staged_oui_count = 0; saw_oui = true; }
+            if (staged_oui_count >= MAX_OUI_RT || strlen(value) != 8 ||
+                !oui_prefix_to_bytes(value, staged_oui[staged_oui_count].bytes)) {
+                valid = false; break;
             }
+            if (tier_str && strcasecmp(tier_str, "specific") != 0 &&
+                strcasecmp(tier_str, "generic") != 0) {
+                valid = false; break;
+            }
+            strncpy(staged_oui[staged_oui_count].prefix, value, 8);
+            staged_oui[staged_oui_count].prefix[8] = '\0';
+            staged_oui[staged_oui_count].tier =
+                (tier_str && strcasecmp(tier_str, "specific") == 0) ? OUI_SPECIFIC : OUI_GENERIC;
+            staged_oui_count++;
         } else if (strcasecmp(type, "ssid") == 0) {
-            if (!cleared_ssid) { rt_ssid_count = 0; cleared_ssid = true; }
-            if (rt_ssid_count < MAX_SSID_RT && strlen(value) > 0) {
-                strncpy(rt_ssid[rt_ssid_count], value, SIG_STR_LEN - 1);
-                rt_ssid[rt_ssid_count][SIG_STR_LEN - 1] = '\0';
-                rt_ssid_count++; n_ssid++;
+            if (!saw_ssid) { staged_ssid_count = 0; saw_ssid = true; }
+            size_t value_len = strlen(value);
+            if (staged_ssid_count >= MAX_SSID_RT || value_len == 0 || value_len >= SIG_STR_LEN) {
+                valid = false; break;
             }
+            memcpy(staged_ssid[staged_ssid_count], value, value_len + 1);
+            staged_ssid_count++;
         } else if (strcasecmp(type, "name") == 0) {
-            if (!cleared_name) { rt_name_count = 0; cleared_name = true; }
-            if (rt_name_count < MAX_NAME_RT && strlen(value) > 0) {
-                strncpy(rt_name[rt_name_count], value, SIG_STR_LEN - 1);
-                rt_name[rt_name_count][SIG_STR_LEN - 1] = '\0';
-                rt_name_count++; n_name++;
+            if (!saw_name) { staged_name_count = 0; saw_name = true; }
+            size_t value_len = strlen(value);
+            if (staged_name_count >= MAX_NAME_RT || value_len == 0 || value_len >= SIG_STR_LEN) {
+                valid = false; break;
             }
+            memcpy(staged_name[staged_name_count], value, value_len + 1);
+            staged_name_count++;
         }
     }
     f.close();
-    // Only here — both early returns above leave sig_loaded_from_sd false, so the
-    // flag means "the file was opened and parsed", not "we looked for one".
+
+    bool any_type = saw_oui || saw_ssid || saw_name;
+    bool empty_type = (saw_oui && staged_oui_count == 0) ||
+                      (saw_ssid && staged_ssid_count == 0) ||
+                      (saw_name && staged_name_count == 0);
+    if (!valid || !any_type || empty_type) {
+        free(staged_oui); free(staged_ssid); free(staged_name);
+        Serial.printf("Signatures: invalid SD override at/near line %d, kept previous tables\n",
+                      line_no);
+        return;
+    }
+
+    if (saw_oui) {
+        memcpy(rt_oui, staged_oui, sizeof(OuiRT) * staged_oui_count);
+        rt_oui_count = staged_oui_count;
+    }
+    if (saw_ssid) {
+        memcpy(rt_ssid, staged_ssid, sizeof(rt_ssid[0]) * staged_ssid_count);
+        rt_ssid_count = staged_ssid_count;
+    }
+    if (saw_name) {
+        memcpy(rt_name, staged_name, sizeof(rt_name[0]) * staged_name_count);
+        rt_name_count = staged_name_count;
+    }
+    free(staged_oui); free(staged_ssid); free(staged_name);
+
     sig_loaded_from_sd = true;
-    sig_sd_oui  = n_oui;
-    sig_sd_ssid = n_ssid;
-    sig_sd_name = n_name;
+    sig_sd_oui  = saw_oui ? staged_oui_count : 0;
+    sig_sd_ssid = saw_ssid ? staged_ssid_count : 0;
+    sig_sd_name = saw_name ? staged_name_count : 0;
     Serial.printf("Signatures from SD: OUI=%d SSID=%d NAME=%d (absent types kept defaults)\n",
-                  n_oui, n_ssid, n_name);
+                  sig_sd_oui, sig_sd_ssid, sig_sd_name);
 }
 
 int check_mac_prefix(const uint8_t* mac) {
@@ -2692,12 +2771,17 @@ bool is_penguin_numeric_name(const char* name) {
     return true;
 }
 
-bool check_manufacturer_id(const uint8_t* mfg_data, size_t mfg_len) {
+static bool manufacturer_id_equals(const uint8_t* mfg_data, size_t mfg_len,
+                                   uint16_t expected) {
     if (mfg_len >= 2) {
         uint16_t mfg_id = mfg_data[0] | (mfg_data[1] << 8);
-        if (mfg_id == FLOCK_MFG_COMPANY_ID) return true;
+        if (mfg_id == expected) return true;
     }
     return false;
+}
+
+bool check_manufacturer_id(const uint8_t* mfg_data, size_t mfg_len) {
+    return manufacturer_id_equals(mfg_data, mfg_len, FLOCK_MFG_COMPANY_ID);
 }
 
 bool has_tn_serial(const uint8_t* mfg_data, size_t mfg_len) {
@@ -2756,6 +2840,9 @@ static void methods_to_human(const char* methods, char* out, size_t out_len) {
         {"raven_multi",    "3+ Raven UUIDs"},
         {"raven_custom",   "Raven custom UUID"},
         {"raven_uuid",     "Raven UUID"},
+        {"axon_mfg_0x034D", "Axon company ID"},
+        {"axon_uuid_fc81",  "Axon service UUID"},
+        {"axon_oui",        "Axon vendor OUI"},
         {"mfg_0x09C8",     "Flock mfg ID"},
         {"tn_serial",      "TN serial"},
         {"ssid_fmt",       "Flock SSID format"},
@@ -2854,6 +2941,8 @@ void write_threat_pcap(const uint8_t* payload, uint32_t length) {
         pcap_write_buffer[pcap_write_count].orig_len = length;
         memcpy(pcap_write_buffer[pcap_write_count].payload, payload, capture_len);
         pcap_write_count++;
+    } else {
+        sd_wifi_pcap_dropped++;
     }
     xSemaphoreGiveRecursive(dataMutex);
 }
@@ -2871,6 +2960,8 @@ void write_ble_pcap(const uint8_t* payload, uint32_t length) {
         ble_pcap_write_buffer[ble_pcap_write_count].orig_len = length;
         memcpy(ble_pcap_write_buffer[ble_pcap_write_count].payload, payload, capture_len);
         ble_pcap_write_count++;
+    } else {
+        sd_ble_pcap_dropped++;
     }
     xSemaphoreGiveRecursive(dataMutex);
 }
@@ -3669,7 +3760,7 @@ void load_detections_from_flash() {
         capture_history[idx].lat = line.substring(p4+1, p5>0?p5:line.length()).toDouble();
         capture_history[idx].lng = p5>0 ? line.substring(p5+1).toDouble() : 0.0;
         capture_history[idx].rssi = -70;  
-        strncpy(capture_history[idx].time, "??:??:??", 8);
+        safe_copy(capture_history[idx].time, "??:??:??", sizeof(capture_history[idx].time));
         capture_history_count++;
     }
     f.close();
@@ -4668,33 +4759,39 @@ void flush_sd_buffer() {
         return;
     }
 
-    // Short timed take — flush runs every 500ms and gladly retries on the
-    // next tick. Blocking for seconds here freezes the main loop and
-    // starves alarms / WiFi event processing.
+    // Short timed take — the service checks every 500 ms and retries full
+    // buffers immediately or partial buffers on the normal flush interval.
+    // Blocking for seconds here freezes the main loop and starves alarms /
+    // WiFi event processing.
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         return;
     }
 
-    // Now safe to snapshot and clear — we're guaranteed to write below.
+    // Snapshot without clearing. Producers only append while we write, so the
+    // snapshotted prefix remains stable. After each file write, remove only the
+    // successfully appended prefix. A transient open/write failure therefore
+    // retains unwritten records for the next eligible service pass instead of
+    // silently discarding the entire batch.
     xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
     log_count = sd_write_count;
     for (int i = 0; i < log_count; i++) {
         strncpy(local_log_buf[i], sd_write_buffer[i], SD_LINE_LEN - 1);
         local_log_buf[i][SD_LINE_LEN - 1] = '\0';
     }
-    sd_write_count = 0;
 
     pcap_count = pcap_write_count;
     for (int i = 0; i < pcap_count; i++) {
         local_pcap_buf[i] = pcap_write_buffer[i];
     }
-    pcap_write_count = 0;
     ble_pcap_count = ble_pcap_write_count;
     for (int i = 0; i < ble_pcap_count; i++) {
         local_ble_pcap_buf[i] = ble_pcap_write_buffer[i];
     }
-    ble_pcap_write_count = 0;
     xSemaphoreGiveRecursive(dataMutex);
+
+    int log_written = 0;
+    int pcap_written = 0;
+    int ble_pcap_written = 0;
 
     if (log_count > 0) {
         File file = SD.open(current_log_file, FILE_APPEND);
@@ -4702,12 +4799,14 @@ void flush_sd_buffer() {
             for (int i = 0; i < log_count; i++) {
                 if ((i & 0x0F) == 0) esp_task_wdt_reset();  // every 16 lines
                 size_t written = file.println(local_log_buf[i]);
-                if (written == 0 && !sd_full_warned) {
-                    sd_full_warned = true;
-                    set_toast_direct("SD CARD FULL", TOAST_WARNING, false);
-                }
+                if (written == 0) break;
+                log_written++;
             }
             file.close();
+            if (log_written < log_count && !sd_full_warned) {
+                sd_full_warned = true;
+                set_toast_direct("SD CARD FULL", TOAST_WARNING, false);
+            }
         } else if (sd_available) {
             // Soft failure: controller may be doing GC or a brief voltage dip.
             // Don't tear down the SD connection — the 5s hot-plug probe owns the
@@ -4727,8 +4826,12 @@ void flush_sd_buffer() {
                 pph.ts_usec = local_pcap_buf[i].ts_usec;
                 pph.incl_len = local_pcap_buf[i].incl_len;
                 pph.orig_len = local_pcap_buf[i].orig_len;
-                pfile.write((const uint8_t*)&pph, sizeof(pph));
-                pfile.write(local_pcap_buf[i].payload, local_pcap_buf[i].incl_len);
+                uint8_t record[sizeof(pph) + 256];
+                memcpy(record, &pph, sizeof(pph));
+                memcpy(record + sizeof(pph), local_pcap_buf[i].payload, local_pcap_buf[i].incl_len);
+                size_t record_len = sizeof(pph) + local_pcap_buf[i].incl_len;
+                if (pfile.write(record, record_len) != record_len) break;
+                pcap_written++;
             }
             pfile.close();
         }
@@ -4743,16 +4846,45 @@ void flush_sd_buffer() {
                 pph.ts_usec = local_ble_pcap_buf[i].ts_usec;
                 pph.incl_len = local_ble_pcap_buf[i].incl_len;
                 pph.orig_len = local_ble_pcap_buf[i].orig_len;
-                bfile.write((const uint8_t*)&pph, sizeof(pph));
-                bfile.write(local_ble_pcap_buf[i].payload, local_ble_pcap_buf[i].incl_len);
+                uint8_t record[sizeof(pph) + 256];
+                memcpy(record, &pph, sizeof(pph));
+                memcpy(record + sizeof(pph), local_ble_pcap_buf[i].payload, local_ble_pcap_buf[i].incl_len);
+                size_t record_len = sizeof(pph) + local_ble_pcap_buf[i].incl_len;
+                if (bfile.write(record, record_len) != record_len) break;
+                ble_pcap_written++;
             }
             bfile.close();
         }
     }
 
+    // Producers may have appended records after the snapshot. Remove only the
+    // successfully written prefix and shift any old remainder plus new tail.
+    if (log_written > 0 || pcap_written > 0 || ble_pcap_written > 0) {
+        xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+        if (log_written > 0 && log_written <= sd_write_count) {
+            for (int i = log_written; i < sd_write_count; i++) {
+                memcpy(sd_write_buffer[i - log_written], sd_write_buffer[i], SD_LINE_LEN);
+            }
+            sd_write_count -= log_written;
+        }
+        if (pcap_written > 0 && pcap_written <= pcap_write_count) {
+            for (int i = pcap_written; i < pcap_write_count; i++) {
+                pcap_write_buffer[i - pcap_written] = pcap_write_buffer[i];
+            }
+            pcap_write_count -= pcap_written;
+        }
+        if (ble_pcap_written > 0 && ble_pcap_written <= ble_pcap_write_count) {
+            for (int i = ble_pcap_written; i < ble_pcap_write_count; i++) {
+                ble_pcap_write_buffer[i - ble_pcap_written] = ble_pcap_write_buffer[i];
+            }
+            ble_pcap_write_count -= ble_pcap_written;
+        }
+        xSemaphoreGiveRecursive(dataMutex);
+    }
+
     xSemaphoreGive(sdMutex);
 
-    if (log_count > 0 || pcap_count > 0 || ble_pcap_count > 0) {
+    if (log_written > 0 || pcap_written > 0 || ble_pcap_written > 0) {
         last_sd_flush = millis();
     }
 }
@@ -4892,14 +5024,19 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
     if (is_new) {
         add_seen_mac(mac);
+        bool is_raven = strstr(type, "RAVEN") != NULL;
+        bool is_axon = strstr(type, "AXON") != NULL;
         if (strcmp(proto, "WIFI") == 0) {
-            lifetime_wifi++; session_flock_wifi++;
+            lifetime_wifi++;
+            if (is_axon) session_axon++;
+            else         session_flock_wifi++;
             blip_col = ACCENT_COLOR;   // condensed: all detections use accent
         } else {
             lifetime_ble++; blip_col = ACCENT_COLOR;
+            if (is_raven)      session_raven++;
+            else if (is_axon)  session_axon++;
+            else               session_flock_ble++;
         }
-        if (strstr(type, "RAVEN") != NULL) { session_raven++; blip_col = ACCENT_COLOR; }
-        else if (strcmp(proto, "BLE") == 0) { session_flock_ble++; }
         lifetime_flock_total++;
         add_to_capture_history(type, mac, name, rssi, confidence);
         // trigger_toast() is deferred until after we release dataMutex to minimize
@@ -5053,8 +5190,8 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 
         char local_line[SD_LINE_LEN];
         snprintf(local_line, SD_LINE_LEN,
-            "%lu,%u,%d,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s,%d",
-            now_ms, ts_epoch, ts_is_gps ? 1 : 0, channel, type, proto, rssi, mac, clean_name,
+            "%lu,%lu,%d,%d,%s,%s,%d,%s,%s,%d,%s,%d,%s,%s,%d,%s,%d",
+            now_ms, (unsigned long)ts_epoch, ts_is_gps ? 1 : 0, channel, type, proto, rssi, mac, clean_name,
             tx_power, detection_method, confidence,
             confidence_label(confidence), clean_extra, seq_num, gps_fields, assigned_det_id);
 
@@ -5064,6 +5201,8 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
                 strncpy(sd_write_buffer[sd_write_count], local_line, SD_LINE_LEN - 1);
                 sd_write_buffer[sd_write_count][SD_LINE_LEN - 1] = '\0';
                 sd_write_count++;
+            } else {
+                sd_log_dropped++;
             }
             xSemaphoreGiveRecursive(dataMutex);
         } else {
@@ -5474,6 +5613,23 @@ void process_wifi_event_queue() {
             xSemaphoreGiveRecursive(dataMutex);
         }
 
+        // IEEE vendor attribution is exact, but an OUI cannot distinguish an
+        // Axon body camera, vehicle system, dock, or another Axon product. Log
+        // it as associated evidence without sounding an alarm or claiming a
+        // model. Corroborated/high-confidence Axon classification is BLE-only
+        // until field captures establish a safe Wi-Fi discriminator.
+        if (!is_random_mac && memcmp(local.mac, AXON_OUI, sizeof(AXON_OUI)) == 0) {
+            if (!is_mac_whitelisted(mac_str)) {
+                const char* axon_name = strlen(local.ssid) > 0 ? local.ssid : "Axon-associated";
+                log_detection("AXON_ASSOC", "WIFI", local.rssi, mac_str, axon_name,
+                              local.channel, 0,
+                              local.is_beacon ? "Beacon" : "ProbeReq",
+                              "axon_oui", SCORE_STRONG, local.seq_num);
+                write_threat_pcap(local.payload_snap, local.payload_snap_len);
+            }
+            continue;
+        }
+
         int  confidence    = 0;
         char methods[64]   = {0};
         bool ssid_generic  = (strlen(local.ssid) > 0 && check_ssid_pattern(local.ssid));
@@ -5726,6 +5882,7 @@ static void ble_worker_task(void* pvParameters) {
         char methods[64]  = {0};
         char capture_type[16] = "FLOCK_BLE";
         bool got_name = false, got_mfg = false, got_raven = false;
+        bool got_axon_mfg = false, got_axon_uuid = false;
 
         bool got_penguin_name = false;
 
@@ -5770,6 +5927,8 @@ static void ble_worker_task(void* pvParameters) {
                 strlcat(methods, "mfg_0x09C8 ", sizeof(methods)); got_mfg = true;
                 if (has_tn_serial(ev->mfg_data, ev->mfg_data_len)) strlcat(methods, "tn_serial ", sizeof(methods));
             }
+            got_axon_mfg = manufacturer_id_equals(ev->mfg_data, ev->mfg_data_len,
+                                                  AXON_MFG_COMPANY_ID);
         }
 
         int raven_custom_count = 0;
@@ -5777,6 +5936,7 @@ static void ble_worker_task(void* pvParameters) {
         for (int i = 0; i < ev->uuid_count; i++) {
             uint16_t code;
             if (!uuid_base_short_code(ev->service_uuids[i], &code)) continue;  // non-base UUID can't be Raven
+            if (code == AXON_SERVICE_UUID) got_axon_uuid = true;
             for (int j = 0; j < NUM_RAVEN_CUSTOM_UUIDS; j++) {
                 if (code == raven_custom_codes[j]) { raven_custom_count++; break; }
             }
@@ -5793,26 +5953,57 @@ static void ble_worker_task(void* pvParameters) {
             else                              strlcat(methods, "raven_uuid ", sizeof(methods));
         }
 
-        if (got_raven || got_name || got_mfg) {
-            confidence = SCORE_DEFINITIVE;
-            if (mac_score == 1) strlcat(methods, "mac_t1 ", sizeof(methods));
-        } else if (mac_score == 1) {
-            confidence = SCORE_STRONG;
-            strlcat(methods, "mac_t1 ", sizeof(methods));
-            if (got_penguin_name && got_mfg) { confidence = SCORE_DEFINITIVE; }
+        bool got_axon_oui = (ev->addr_type == 0 &&
+                             memcmp(ev->mac, AXON_OUI, sizeof(AXON_OUI)) == 0);
+        bool is_axon_classification = got_axon_mfg || got_axon_oui;
+        // A public Axon OUI is useful supporting evidence, but it must never
+        // become alarm-eligible solely because RSSI/TX-power bonuses push the
+        // numeric score across the global threshold.
+        bool axon_alarm_eligible = got_axon_mfg;
+
+        if (is_axon_classification) {
+            if (got_axon_mfg) strlcat(methods, "axon_mfg_0x034D ", sizeof(methods));
+            if (got_axon_oui) strlcat(methods, "axon_oui ", sizeof(methods));
+            if (got_axon_uuid) strlcat(methods, "axon_uuid_fc81 ", sizeof(methods));
+
+            if (got_axon_mfg && (got_axon_oui || got_axon_uuid)) {
+                confidence = SCORE_DEFINITIVE;
+                strncpy(capture_type, "AXON_BLE", sizeof(capture_type));
+            } else if (got_axon_mfg) {
+                // A SIG company identifier is vendor-specific evidence, but
+                // still does not justify an exact product/model label.
+                confidence = CONFIDENCE_HIGH;
+                strncpy(capture_type, "AXON_BLE", sizeof(capture_type));
+            } else {
+                confidence = SCORE_STRONG;
+                strncpy(capture_type, "AXON_ASSOC", sizeof(capture_type));
+            }
         } else {
-            if (mac_score == 2) { confidence += SCORE_WEAK; strlcat(methods, "mac_t2 ", sizeof(methods)); }
-            if (got_penguin_name && got_mfg) { confidence += SCORE_WEAK; }
-            if ((mac_score == 2 || (got_penguin_name && got_mfg)) &&
-                (ev->addr_type == 0 || (ev->addr_type == 1 && (ev->mac[0] >> 6) == 0x03))) {
-                confidence += SCORE_WEAK; strlcat(methods, "static_addr ", sizeof(methods));
+            if (got_raven || got_name || got_mfg) {
+                confidence = SCORE_DEFINITIVE;
+                if (mac_score == 1) strlcat(methods, "mac_t1 ", sizeof(methods));
+            } else if (mac_score == 1) {
+                confidence = SCORE_STRONG;
+                strlcat(methods, "mac_t1 ", sizeof(methods));
+                if (got_penguin_name && got_mfg) { confidence = SCORE_DEFINITIVE; }
+            } else {
+                if (mac_score == 2) { confidence += SCORE_WEAK; strlcat(methods, "mac_t2 ", sizeof(methods)); }
+                if (got_penguin_name && got_mfg) { confidence += SCORE_WEAK; }
+                if ((mac_score == 2 || (got_penguin_name && got_mfg)) &&
+                    (ev->addr_type == 0 || (ev->addr_type == 1 && (ev->mac[0] >> 6) == 0x03))) {
+                    confidence += SCORE_WEAK; strlcat(methods, "static_addr ", sizeof(methods));
+                }
             }
         }
-        if (confidence > 0 && ev->rssi > -50) confidence += SCORE_BONUS_RSSI;
+        if (confidence > 0 && (!is_axon_classification || axon_alarm_eligible) &&
+            ev->rssi > -50) {
+            confidence += SCORE_BONUS_RSSI;
+        }
 
         // Advertised TX power: fixed infrastructure often emits at higher TX
         // power than a phone. Corroborator only — never trips alarm alone.
-        if (ev->have_tx_power && ev->tx_power >= TX_POWER_MIN_DBM) {
+        if (ev->have_tx_power && ev->tx_power >= TX_POWER_MIN_DBM &&
+            (!is_axon_classification || axon_alarm_eligible)) {
             confidence += CONF_BONUS_TX_POWER;
             strlcat(methods, "tx_pwr ", sizeof(methods));
         }
@@ -5822,13 +6013,14 @@ static void ble_worker_task(void* pvParameters) {
             ev->mac[0], ev->mac[1], ev->mac[2],
             ev->mac[3], ev->mac[4], ev->mac[5]);
 
-        if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+        if (confidence >= CONFIDENCE_ALARM_THRESHOLD &&
+            (!is_axon_classification || axon_alarm_eligible)) {
             __atomic_store_n(&channel_lock_until, millis() + 10000, __ATOMIC_RELAXED);
             rssi_track_update(mac_string, ev->rssi);
         }
         if (confidence > 100) confidence = 100;
 
-        if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+        if (confidence >= CONFIDENCE_ALARM_THRESHOLD || is_axon_classification) {
             char extra_data[96] = "";
             if (ev->have_mfg) {
                 static const char hx[] = "0123456789ABCDEF";
@@ -5899,13 +6091,16 @@ static void ble_worker_task(void* pvParameters) {
                               ev->adv_channel, ev->have_tx_power ? ev->tx_power : 0,
                               extra_data, methods, confidence, -1);
 
-                xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
-                if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
-                    trigger_alarm_confidence = confidence;
-                    trigger_alarm_source = 1;  // BLE
-                    last_buzzer_time = millis();
+                if (confidence >= CONFIDENCE_ALARM_THRESHOLD &&
+                    (!is_axon_classification || axon_alarm_eligible)) {
+                    xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
+                    if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
+                        trigger_alarm_confidence = confidence;
+                        trigger_alarm_source = 1;  // BLE
+                        last_buzzer_time = millis();
+                    }
+                    xSemaphoreGiveRecursive(dataMutex);
                 }
-                xSemaphoreGiveRecursive(dataMutex);
             }
         }
 
@@ -7407,7 +7602,7 @@ void handle_menu_select() {
             flush_pending_deletes();
             xSemaphoreTakeRecursive(dataMutex, portMAX_DELAY);
             session_flock_wifi = 0; session_flock_ble = 0;
-            session_raven = 0;
+            session_raven = 0; session_axon = 0;
             lifetime_wifi = 0; lifetime_ble = 0;
             lifetime_flock_total = 0;
             lifetime_seconds = 0;
@@ -9887,11 +10082,12 @@ void draw_device_info_screen() {
     unsigned long frame_ms = millis();
 
     // Snapshot stats under mutex
-    long lt, sr, sw, sb, lb, lfw;
+    long lt, sr, sa, sw, sb, lb, lfw;
     unsigned long l_sec;
     if (!take_data_mutex()) return;
     lt    = lifetime_flock_total;
     sr    = session_raven;
+    sa    = session_axon;
     sw    = session_flock_wifi;
     sb    = session_flock_ble;
     lb    = lifetime_boots;
@@ -9899,7 +10095,7 @@ void draw_device_info_screen() {
     l_sec = lifetime_seconds;
     give_data_mutex();
 
-    long session_det_total = sw + sb + sr;
+    long session_det_total = sw + sb + sr + sa;
 
     int32_t  bat_mv      = get_filtered_voltage();
     size_t   free_heap   = esp_get_free_heap_size();
@@ -9924,6 +10120,7 @@ void draw_device_info_screen() {
     char wifi_str[10];  snprintf(wifi_str,  sizeof(wifi_str),  "%ld", sw);
     char ble_str[10];   snprintf(ble_str,   sizeof(ble_str),   "%ld", sb);
     char raven_str[10]; snprintf(raven_str, sizeof(raven_str), "%ld", sr);
+    char axon_str[10];  snprintf(axon_str,  sizeof(axon_str),  "%ld", sa);
     char sess_str[10];  format_time_buf(sess_s, sess_str, sizeof(sess_str));
     char life_str[10];  format_time_buf(l_sec, life_str, sizeof(life_str));
     int bat_pct = voltage_to_percent(bat_mv);
@@ -9970,6 +10167,7 @@ void draw_device_info_screen() {
         seed[SC_WIFI]       = wifi_str;
         seed[SC_BLE]        = ble_str;
         seed[SC_RAVEN]      = raven_str;
+        seed[SC_AXON]       = axon_str;
         seed[SC_SESSION]    = sess_str;
         seed[SC_LIFETIME]   = life_str;
         seed[SC_BATTERY]    = volt_str;
@@ -10011,11 +10209,12 @@ void draw_device_info_screen() {
     // Cards entirely outside the viewport are skipped.
     const int x_full   = 4;        // full-width card x
     const int w_full   = 224;      // 240 - 8 (right edge at 228, scrollbar gutter 6 + track at 234)
-    const int x_t1     = 4;        // triple-card x positions
-    const int x_t2     = 80;       // x_t1 + 70 + 6 gap
-    const int x_t3     = 156;      // x_t2 + 70 + 6 gap
-    const int w_tA     = 70;       // first two triple widths
-    const int w_tC     = 72;       // last triple — absorbs the rounding
+    const int x_q1     = 4;        // four-card row x positions
+    const int x_q2     = 61;
+    const int x_q3     = 118;
+    const int x_q4     = 175;
+    const int w_q      = 51;
+    const int w_q_last = 53;       // absorbs the rounding
     const int x_h1     = 4;        // half-card x positions
     const int x_h2     = 119;      // x_h1 + 109 + 6 gap
     const int w_half   = 109;
@@ -10042,10 +10241,11 @@ void draw_device_info_screen() {
     card(x_h1, 0,   w_half, H_NORMAL, "SESS DET", det_sess_str, SC_DET_SESSION);
     card(x_h2, 0,   w_half, H_NORMAL, "LIFE DET", det_life_str, SC_DET_LIFETIME);
 
-    // Row 2 (vy = 42):  WIFI | BLE | RAVEN
-    card(x_t1, 42,  w_tA, H_NORMAL, "WIFI",  wifi_str,  SC_WIFI);
-    card(x_t2, 42,  w_tA, H_NORMAL, "BLE",   ble_str,   SC_BLE);
-    card(x_t3, 42,  w_tC, H_NORMAL, "RAVEN", raven_str, SC_RAVEN);
+    // Row 2 (vy = 42):  WIFI | BLE | RAVEN | AXON
+    card(x_q1, 42, w_q,      H_NORMAL, "WIFI",  wifi_str,  SC_WIFI);
+    card(x_q2, 42, w_q,      H_NORMAL, "BLE",   ble_str,   SC_BLE);
+    card(x_q3, 42, w_q,      H_NORMAL, "RAVEN", raven_str, SC_RAVEN);
+    card(x_q4, 42, w_q_last, H_NORMAL, "AXON",  axon_str,  SC_AXON);
 
     // Row 3 (vy = 84):  SESSION | LIFETIME
     card(x_h1, 84,  w_half, H_NORMAL, "SESSION",  sess_str, SC_SESSION);
@@ -10537,6 +10737,7 @@ static bool           c5_link_started = false;
 static unsigned long  c5_last_msg_ms  = 0;
 static char           c5_line_buf[160];
 static uint8_t        c5_line_len     = 0;
+static bool           c5_discarding_line = false;
 
 // ── TX/RX orientation probe ─────────────────────────────────────────────────
 // Swapping yellow and white on the Grove cable is the most common wiring
@@ -10579,6 +10780,7 @@ void c5_link_begin() {
     // at the probe state above.
     SerialC5.begin(C5_BAUD, SERIAL_8N1, C5_RX_PIN, -1);
     c5_line_len        = 0;
+    c5_discarding_line = false;
     c5_link_started    = true;
     c5_probe_rx        = C5_RX_PIN;
     c5_orient_locked   = false;
@@ -10712,6 +10914,7 @@ static void service_c5_probe() {
         SerialC5.setRxBufferSize(512);                   // must precede begin()
         SerialC5.begin(C5_BAUD, SERIAL_8N1, c5_probe_rx, tx);
         c5_line_len      = 0;
+        c5_discarding_line = false;
         c5_orient_locked = true;
         bool reversed = (c5_probe_rx != C5_RX_PIN);
         Serial.printf("[C5] orientation locked: RX=GPIO%d TX=GPIO%d%s\n",
@@ -10730,6 +10933,7 @@ static void service_c5_probe() {
     SerialC5.setRxBufferSize(512);                       // must precede begin()
     SerialC5.begin(C5_BAUD, SERIAL_8N1, c5_probe_rx, -1);
     c5_line_len        = 0;
+    c5_discarding_line = false;
     c5_probe_switch_ms = millis();
     if (c5_probe_rx == C5_RX_PIN) c5_probe_cycles++;     // wrapped = one full A/B pass
 
@@ -10845,13 +11049,19 @@ void process_c5_serial() {
     while (SerialC5.available() > 0) {
         char c = (char)SerialC5.read();
         if (c == '\n') {
-            c5_line_buf[c5_line_len] = '\0';
-            c5_handle_line(c5_line_buf);
+            if (!c5_discarding_line) {
+                c5_line_buf[c5_line_len] = '\0';
+                c5_handle_line(c5_line_buf);
+            }
             c5_line_len = 0;
+            c5_discarding_line = false;
+        } else if (c5_discarding_line) {
+            continue;
         } else if (c5_line_len < sizeof(c5_line_buf) - 1) {
             c5_line_buf[c5_line_len++] = c;
         } else {
-            c5_line_len = 0;   // overlong line — resync on next newline
+            c5_line_len = 0;
+            c5_discarding_line = true;  // consume through newline; never parse a suffix
         }
     }
 }
@@ -11332,7 +11542,8 @@ void setup() {
         setCpuFrequencyMhz(80);
     else
         setCpuFrequencyMhz(160);
-    Serial.printf("[BOOT] CPU %u MHz before radio init\n", getCpuFrequencyMhz());
+    Serial.printf("[BOOT] CPU %lu MHz before radio init\n",
+                  (unsigned long)getCpuFrequencyMhz());
 
     // WiFi promiscuous mode — complete before scanner screen appears
     WiFi.mode(WIFI_STA);          // re-assert STA HERE so the driver is guaranteed
@@ -11827,7 +12038,12 @@ static void service_heap_health() {
         uint32_t drop = __atomic_load_n(&wifi_pkt_dropped,  __ATOMIC_RELAXED);
         uint32_t pct  = (enq + drop > 0) ? (drop * 100u / (enq + drop)) : 0u;
         Serial.printf("[LOADLOG] enq=%u drop=%u drop_pct=%u free=%u largest=%u\n",
-                      enq, drop, pct, (unsigned)free_heap, (unsigned)largest_block);
+                      (unsigned)enq, (unsigned)drop, (unsigned)pct,
+                      (unsigned)free_heap, (unsigned)largest_block);
+        Serial.printf("[SDDROP] csv=%lu wifi_pcap=%lu ble_pcap=%lu\n",
+                      (unsigned long)sd_log_dropped,
+                      (unsigned long)sd_wifi_pcap_dropped,
+                      (unsigned long)sd_ble_pcap_dropped);
     }
 }
 
